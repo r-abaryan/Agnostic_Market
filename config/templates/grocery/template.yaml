@@ -1,0 +1,21 @@
+# Vertical template: grocery — category defaults a new grocery merchant inherits.
+# Grocery tends to lower per-order values + faster catalog freshness (perishables/stock).
+
+llm:
+  routing:   { provider: "anthropic", model: "claude-haiku-4-5" }
+  reasoning: { provider: "anthropic", model: "claude-opus-4-8" }
+
+policies:
+  max_order_value_usd: 500
+  refunds:
+    auto_approve_under_usd: 30
+    require_human_above_usd: 150
+  allow_ai_merchant_handoff: true
+
+integration:
+  catalog:
+    source: "ingested"
+    freshness_sla_min: 5
+
+isolation:
+  tier: "shared"

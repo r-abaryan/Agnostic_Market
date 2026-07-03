@@ -1,0 +1,43 @@
+# Merchant override layer — ONLY this merchant's fields (branding, instance, policy-within-bounds).
+# Inherits base (safety) + the fashion template (category defaults).
+merchant_id: "acme_store"
+extends_template: "fashion"
+display_name: "Acme Store"
+locale: "en-US"
+
+voice:
+  stt: { provider: "deepgram", model: "nova-3" }
+  tts: { provider: "cartesia", voice_id: "acme-voice-001" }
+
+telephony:
+  provider: "telnyx"
+  inbound_number: "+15551230001"
+
+# Policy within platform-enforced bounds (may raise its own cap, may not disable it).
+policies:
+  max_order_value_usd: 2000
+  refunds:
+    auto_approve_under_usd: 50
+    require_human_above_usd: 200
+  allow_ai_merchant_handoff: true
+
+prompts:
+  # Content-addressed, registry-resolved (Phase 3) — not a mutable path.
+  persona_ref: "prompt://acme_store/persona@sha256-000000000000"
+
+integration:
+  order_sor:
+    type: "api"
+    ref: "vault://merchants/acme_store/order_api"   # resolved via SecretResolver; never inline
+    idempotency: "supported"                          # does their SoR honor our key? (CR-4)
+  catalog:
+    source: "ingested"
+    # Phase 2: the real product dataset (open-source catalog) loads via the ingestion
+    # pipeline into this merchant's vector namespace — deferred, not built in Phase 0.
+    freshness_sla_min: 15
+
+isolation:
+  tier: "shared"
+
+vector_namespace: "acme_store"
+secrets_ref: "vault://merchants/acme_store"

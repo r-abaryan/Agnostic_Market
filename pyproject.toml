@@ -1,0 +1,56 @@
+[project]
+name = "agnostic-market"
+version = "0.0.0"
+description = "Multi-tenant, LLM-agnostic voice commerce agent platform (Phase 0 — config + tenancy foundation)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agnostic_market"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",     # pycodestyle + pyflakes
+  "I",               # import sorting
+  "N",               # naming
+  "UP",              # pyupgrade
+  "B",               # bugbear
+  "C4",              # comprehensions
+  "SIM",             # simplify
+  "ASYNC",           # async-correctness (important: real-time voice loop)
+  "S",               # flake8-bandit (basic security — multi-tenant/network app)
+  "RUF",             # ruff-specific
+]
+ignore = ["S101"]    # allow assert in tests (also relax per-file below)
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]   # asserts + test-only dummy secrets
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint.isort]
+known-first-party = ["agnostic_market"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

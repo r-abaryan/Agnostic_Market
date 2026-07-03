@@ -1,0 +1,40 @@
+# Second merchant — proves tenant isolation + a different vertical/isolation tier.
+merchant_id: "demo_shop"
+extends_template: "grocery"
+display_name: "Demo Shop"
+locale: "en-GB"
+
+voice:
+  stt: { provider: "deepgram", model: "nova-3" }
+  tts: { provider: "cartesia", voice_id: "demo-voice-002" }
+
+telephony:
+  provider: "telnyx"
+  inbound_number: "+15551230002"
+
+policies:
+  max_order_value_usd: 400
+  refunds:
+    auto_approve_under_usd: 25
+    require_human_above_usd: 120
+  allow_ai_merchant_handoff: false
+
+prompts:
+  persona_ref: "prompt://demo_shop/persona@sha256-111111111111"
+
+integration:
+  order_sor:
+    type: "api"
+    ref: "vault://merchants/demo_shop/order_api"
+    idempotency: "unsupported"     # agent-side dedup fallback (CR-4)
+  catalog:
+    source: "ingested"
+    # Phase 2: real product dataset loads here — deferred.
+    freshness_sla_min: 5
+
+# Demanding-merchant carve-out example: dedicated isolation tier (no code change, just config).
+isolation:
+  tier: "dedicated"
+
+vector_namespace: "demo_shop"
+secrets_ref: "vault://merchants/demo_shop"

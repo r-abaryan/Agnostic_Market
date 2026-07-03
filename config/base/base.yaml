@@ -1,0 +1,35 @@
+# Platform base layer — OWNED BY THE PLATFORM. NOT merchant-editable.
+# Safety + structure. Merged FIRST (base -> template -> override); any template/override that
+# touches a safety-locked path below is REJECTED by config/resolver.py.
+#
+# `_platform` holds platform-only safety concerns (guardrails, PCI, verification tiers,
+# committed-only auth, egress, CRITICAL_CONFIRMATION_FIELDS, tenant-isolation). These are
+# NOT fields of MerchantConfig — the resolver strips `_platform` and `_safety_locked` before
+# schema validation. They live here so the safety-lock has something concrete to protect.
+
+_safety_locked:
+  - _platform            # the whole platform safety block is immutable
+  - schema_version       # structural — merchant may not fork the schema version
+
+_platform:
+  # Guardrails / verification / PCI / egress — enforced in code; declared here as the locked
+  # platform posture. Values are illustrative structure for Phase 0 (the code is the authority).
+  guardrails:
+    committed_only_authorization: true
+    tenant_isolation: true
+  verification_tiers: [0, 1, 2]
+  payment:
+    out_of_band_only: true
+  egress:
+    default_deny: true
+  critical_confirmation_fields:
+    - quantity
+    - total_amount
+    - order_id
+    - return_id
+    - new_address
+    - new_payment_instrument_ref
+    - new_contact
+
+# Structural default shared by all merchants (override may not change it — locked above).
+schema_version: "0.2"

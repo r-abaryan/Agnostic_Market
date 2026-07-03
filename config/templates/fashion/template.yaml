@@ -1,0 +1,25 @@
+# Vertical template: fashion — category defaults a new fashion merchant inherits.
+# Merged between base and the merchant override. Merchants override identity/instance fields
+# (display_name, telephony number, voice_id, secrets_ref, ...) and may tune policy within bounds.
+
+# Sensible category LLM tiers (merchant may override provider/model, conformance-gated).
+llm:
+  routing:   { provider: "anthropic", model: "claude-haiku-4-5" }
+  reasoning: { provider: "anthropic", model: "claude-opus-4-8" }
+
+# Category policy defaults (bounded; merchant may tighten/adjust within platform limits).
+policies:
+  max_order_value_usd: 1500
+  refunds:
+    auto_approve_under_usd: 50
+    require_human_above_usd: 200
+  allow_ai_merchant_handoff: true
+
+# Category catalog freshness default (merchant integration overrides source/ref).
+integration:
+  catalog:
+    source: "ingested"
+    freshness_sla_min: 15
+
+isolation:
+  tier: "shared"
