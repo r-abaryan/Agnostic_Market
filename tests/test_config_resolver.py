@@ -73,10 +73,22 @@ def test_override_touching_safety_locked_key_is_rejected() -> None:
         resolve_merchant_config(_base(), _template(), bad)
 
 
-def test_override_touching_locked_descendant_is_rejected() -> None:
+def test_platform_locked_even_if_base_forgets_to_declare_it() -> None:
+    # F2: the lock floor is in code. A base that does NOT list `_platform` in _safety_locked
+    # must STILL reject an override touching `_platform` (authority in code, not the fixture).
+    base = {"_safety_locked": ["schema_version"], "schema_version": "0.2"}  # no _platform listed
     bad = _override()
     bad["_platform"] = {"payment": {"out_of_band_only": False}}
-    with pytest.raises(SafetyLockViolationError):
+    with pytest.raises(SafetyLockViolationError, match="_platform"):
+        resolve_merchant_config(base, _template(), bad)
+
+
+def test_override_cannot_ship_its_own_safety_lock_declaration() -> None:
+    # F2: `_safety_locked` is itself locked — an override shipping one is tampering, rejected
+    # (not silently ignored).
+    bad = _override()
+    bad["_safety_locked"] = []  # attempt to blank the lock set
+    with pytest.raises(SafetyLockViolationError, match="_safety_locked"):
         resolve_merchant_config(_base(), _template(), bad)
 
 

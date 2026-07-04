@@ -16,12 +16,18 @@ Expected config tree (BUILD_PLAN repo layout):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from agnostic_market.config.loader import ConfigError, config_version, load_yaml_layer
 from agnostic_market.config.resolver import resolve_merchant_config
 from agnostic_market.dtos.config import MerchantConfig
+
+# `extends_template` comes from the merchant override (semi-trusted, merchant-editable) and
+# is used to build a filesystem path — so it must be a bare name, never a path fragment.
+# This whitelist blocks traversal ('.', '/', '\\' are all excluded) and matches our naming.
+_TEMPLATE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
 
 class UnknownMerchantError(KeyError):
@@ -60,6 +66,11 @@ class ConfigRegistry:
             template_name = override.get("extends_template")
             if not template_name:
                 raise ConfigError(f"{override_path} is missing required 'extends_template'")
+            if not _TEMPLATE_NAME_RE.match(str(template_name)):
+                raise ConfigError(
+                    f"{override_path} has invalid extends_template {template_name!r} "
+                    f"(must match {_TEMPLATE_NAME_RE.pattern} — no path separators)"
+                )
             template = load_yaml_layer(
                 self._root / "templates" / str(template_name) / "template.yaml"
             )

@@ -1,4 +1,4 @@
-"""Resolve an inbound signal (phone# / domain / explicit button) to a merchant_id.
+"""Resolve an inbound signal (phone# / explicit button) to a merchant_id.
 
 Backed by the ConfigRegistry: the inbound-number index is built from each merchant's
 `telephony.inbound_number`. An explicit button press carries a merchant_id directly
@@ -7,6 +7,9 @@ mapped to the wrong tenant.
 
 DID (inbound number) is the isolation anchor for inbound calls (DESIGN_REVIEW L6). ANI /
 caller-ID is NOT used for tenant resolution of sensitive actions (SECURITY §2a).
+
+Domain-based resolution (for the web channel) is deferred: MerchantConfig has no domain
+field to index yet, so it lands with the web/voice work (Phase 2+), not here.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ class TenantResolutionError(RuntimeError):
 
 
 class TenantResolver:
-    """Map phone# / domain / explicit merchant_id -> merchant_id, via the registry."""
+    """Map phone# / explicit merchant_id -> merchant_id, via the registry. (Domain: Phase 2+.)"""
 
     def __init__(self, registry: ConfigRegistry) -> None:
         self._registry = registry
