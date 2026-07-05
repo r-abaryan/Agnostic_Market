@@ -1,0 +1,108 @@
+"""Scripted BaseChatModel fakes for the conformance suite — zero network.
+
+One configurable fake: the default flags produce a fully conformant model; each broken
+variant the suite must classify flips one flag. The fake picks the bound tool whose name
+appears in the prompt (falling back to the first bound tool — which is how the
+with_structured_output schema-tool gets selected), then emits the canned args for it.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.runnables import Runnable
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+# Valid args per probe tool / schema (names from llm/providers.py's suite).
+CONFORMANT_ARGS: dict[str, dict[str, Any]] = {
+    "get_order_status": {"order_id": "ORD-1001"},
+    "search_catalog": {"query": "running shoes"},
+    "CheckoutQuote": {
+        "items": [{"sku": "SKU-RED-42", "quantity": 2}],
+        "currency": "USD",
+        "total": 19.99,
+    },
+}
+
+# Fails CheckoutQuote validation (bad types + missing required field).
+BROKEN_QUOTE_ARGS: dict[str, dict[str, Any]] = {
+    **CONFORMANT_ARGS,
+    "CheckoutQuote": {"items": "not-a-list", "currency": "GBP"},
+}
+
+_TEXT_RESPONSE = "A light, cushioned running shoe. It grips well on wet roads."
+
+
+class FakeChatModel(BaseChatModel):
+    """Deterministic fake; flip flags to produce each broken variant."""
+
+    emit_tool_calls: bool = True
+    pick_wrong_tool: bool = False
+    canned_args: dict[str, dict[str, Any]] = CONFORMANT_ARGS
+    stream_chunks: int = 3
+    raise_transport: bool = False
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-conformance"
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Runnable:
+        return self.bind(tools=[convert_to_openai_tool(t) for t in tools], **kwargs)
+
+    def _pick_tool(self, tools: list[dict[str, Any]], messages: list[BaseMessage]) -> str:
+        names = [t["function"]["name"] for t in tools]
+        prompt = " ".join(str(m.content) for m in messages)
+        mentioned = [n for n in names if n in prompt]
+        correct = mentioned[0] if mentioned else names[0]
+        if self.pick_wrong_tool:
+            others = [n for n in names if n != correct]
+            return others[0] if others else correct
+        return correct
+
+    def _respond(self, messages: list[BaseMessage], **kwargs: Any) -> AIMessage:
+        if self.raise_transport:
+            raise ConnectionError("fake transport failure (simulated 429/timeout)")
+        tools = kwargs.get("tools") or []
+        if tools and self.emit_tool_calls:
+            name = self._pick_tool(tools, messages)
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": name,
+                        "args": self.canned_args.get(name, {}),
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        return AIMessage(content=_TEXT_RESPONSE)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return ChatResult(generations=[ChatGeneration(message=self._respond(messages, **kwargs))])
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        message = self._respond(messages, **kwargs)
+        text = str(message.content)
+        if self.stream_chunks <= 1 or not text:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=text))
+            return
+        size = max(len(text) // self.stream_chunks, 1)
+        for start in range(0, len(text), size):
+            yield ChatGenerationChunk(message=AIMessageChunk(content=text[start : start + size]))

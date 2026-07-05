@@ -1,0 +1,13 @@
+# What the live conformance run certifies (scripts/conformance_live.py).
+# Model IDs live HERE, not in code - add/swap a row, no code change.
+#
+# max_report_age_days: a commerce-ready report expires after this many days (fail-closed)
+# because these target IDs are ALIASES, not pinned snapshots - provider behavior can shift
+# under the same ID. max_retries: explicit transient-error retries (429/timeout) for the
+# live run's provider clients.
+max_report_age_days: 30
+max_retries: 3
+targets:
+  - { provider: "anthropic", model: "claude-haiku-4-5" }
+  - { provider: "anthropic", model: "claude-opus-4-8" }
+  - { provider: "openai", model: "gpt-5.4-mini" }
