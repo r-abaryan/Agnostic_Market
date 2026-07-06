@@ -1,0 +1,19 @@
+# Secrets — never commit (SECURITY: secrets resolve via refs, never inline)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# uv
+.venv/
+
+# OS / editor
+.DS_Store
