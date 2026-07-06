@@ -1,7 +1,8 @@
-"""Scripted BaseChatModel fakes for the conformance suite — zero network.
+"""Shared zero-network test fakes: a scripted BaseChatModel + a recording SecretResolver.
 
-One configurable fake: the default flags produce a fully conformant model; each broken
-variant the suite must classify flips one flag. The fake picks the bound tool whose name
+Used by the conformance suite, the gateway tests, and the voice tests. One configurable
+chat fake: the default flags produce a fully conformant model; each broken variant flips
+one flag; `tool_call_limit` bounds agent loops. The fake picks the bound tool whose name
 appears in the prompt (falling back to the first bound tool — which is how the
 with_structured_output schema-tool gets selected), then emits the canned args for it.
 """

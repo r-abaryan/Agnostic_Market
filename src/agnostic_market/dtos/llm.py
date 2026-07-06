@@ -31,7 +31,8 @@ class ProviderEntry(BaseModel):
 class ProviderCredentialsConfig(BaseModel):
     """Platform-owned provider -> credential-ref map (config/base/providers.yaml).
 
-    Doubles as the provider whitelist: the gateway serves only providers listed here.
+    Doubles as the provider whitelist: the LLM gateway AND the voice engine factories
+    serve only providers listed here.
     """
 
     model_config = _STRICT
