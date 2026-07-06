@@ -5,3 +5,5 @@
 providers:
   anthropic: { api_key_ref: "env://ANTHROPIC_API_KEY" }
   openai: { api_key_ref: "env://OPENAI_API_KEY" }
+  deepgram: { api_key_ref: "env://DEEPGRAM_API_KEY" }
+  cartesia: { api_key_ref: "env://CARTESIA_API_KEY" }

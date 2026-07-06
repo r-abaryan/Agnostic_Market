@@ -6,7 +6,7 @@ locale: "en-GB"
 
 voice:
   stt: { provider: "deepgram", model: "nova-3" }
-  tts: { provider: "cartesia", voice_id: "demo-voice-002" }
+  tts: { provider: "cartesia", model: "sonic-3.5-2026-05-04", voice_id: "demo-voice-002" }
 
 telephony:
   provider: "telnyx"

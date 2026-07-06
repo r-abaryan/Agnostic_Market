@@ -19,7 +19,7 @@ display_name: "M One"
 locale: "en-US"
 voice:
   stt: {{ provider: "deepgram", model: "nova-3" }}
-  tts: {{ provider: "cartesia", voice_id: "v1" }}
+  tts: {{ provider: "cartesia", model: "sonic-3.5-2026-05-04", voice_id: "v1" }}
 telephony: {{ provider: "telnyx", inbound_number: "+15550000000" }}
 prompts: {{ persona_ref: "prompt://m1/persona@sha256-abc" }}
 integration:
@@ -28,7 +28,10 @@ vector_namespace: "m1"
 secrets_ref: "vault://m1"
 """
 
-_BASE_BODY = '_safety_locked: []\nschema_version: "0.2"\n'
+_BASE_BODY = (
+    '_safety_locked: []\nschema_version: "0.2"\n'
+    'compliance: { call_start_disclosure: "Hi, this is an AI assistant." }\n'
+)
 
 _TEMPLATE_BODY = """\
 llm:

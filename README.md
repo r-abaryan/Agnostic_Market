@@ -2,22 +2,19 @@
 
 Multi-tenant, LLM-agnostic voice commerce agent platform.
 
-**Status: Phase 0** — config + tenancy foundation. Design docs are the source of truth: see [`docs/`](./docs) (start with [ARCHITECTURE.md](./docs/ARCHITECTURE.md) and [BUILD_PLAN.md](./docs/BUILD_PLAN.md)).
-
-## Phase 0 scope
-The foundational plumbing everything else sits on:
-- `dtos/` — the single Pydantic v2 source of truth for shared shapes.
-- `config/` — 3-layer config resolution (platform base → vertical template → merchant override) with safety-locked keys enforced in code.
-- `tenancy/` — resolve a caller/request to a `merchant_id` + an immutable per-session tenant context.
-- `secrets/` — a pluggable `SecretResolver` seam (env/dotenv dev impl; Vault/KMS later).
-
-Later planes (voice / reasoning / agents / stores / …) are built in their own phases (BUILD_PLAN.md).
+**Status: Phase 2** — minimal voice loop (LiveKit + Deepgram + LangGraph + Cartesia), on top of:
+- **Phase 0** — `dtos/` (single Pydantic v2 source of truth) · `config/` (3-layer resolution, safety-locked keys enforced in code) · `tenancy/` (merchant resolution + immutable session context) · `secrets/` (pluggable `SecretResolver`).
+- **Phase 1** — `llm/` (provider-agnostic gateway + fail-closed conformance gate: a model serves commerce turns only after passing certification).
+- **Phase 2** — `voice/` (config-driven STT/TTS engine factories, read-only tools, minimal graph behind LiveKit's `LLMAdapter`, call-start AI disclosure played first in code).
 
 ## Develop
+
 ```bash
-uv sync --extra dev
+uv sync
 uv run ruff check
 uv run ruff format --check
-uv run pytest
-uv run python scripts/smoke.py   # exercises the Phase-0 exit end-to-end
+uv run pytest        # zero-network; no keys needed
 ```
+
+Secrets are never committed: copy `.env.example` to `.env` and fill in keys; config
+files hold `env://NAME` refs only.

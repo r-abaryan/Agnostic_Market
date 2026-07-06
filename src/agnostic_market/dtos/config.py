@@ -52,6 +52,9 @@ class TTSConfig(BaseModel):
     model_config = _STRICT
 
     provider: str = Field(min_length=1)
+    # Pinned immutable snapshot, never a floating alias (VOICE_PIPELINE §1a) — a fast-moving
+    # TTS vendor can shift behavior under a floating ID.
+    model: str = Field(min_length=1)
     voice_id: str = Field(min_length=1)
 
 
@@ -86,6 +89,20 @@ class PolicyConfig(BaseModel):
     max_order_value_usd: float = Field(ge=0)
     refunds: RefundPolicy
     allow_ai_merchant_handoff: StrictBool
+
+
+class ComplianceConfig(BaseModel):
+    """Regulatory disclosure config (COMPLIANCE §2 / BUILD_PLAN §2.5).
+
+    `call_start_disclosure` wording is merchant-editable (brand/voice/locale); WHETHER it
+    plays is enforced in code (voice/pipeline.py plays it first, uninterruptible) — a
+    merchant can rephrase the disclosure, never remove it. `{display_name}` is formatted
+    at session build.
+    """
+
+    model_config = _STRICT
+
+    call_start_disclosure: str = Field(min_length=1)
 
 
 class PromptsConfig(BaseModel):
@@ -141,6 +158,7 @@ class MerchantConfig(BaseModel):
     telephony: TelephonyConfig
     policies: PolicyConfig
     prompts: PromptsConfig
+    compliance: ComplianceConfig
     integration: IntegrationConfig
     isolation: IsolationConfig
 

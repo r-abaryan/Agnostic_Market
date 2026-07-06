@@ -179,9 +179,10 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
             },
             "voice": {
                 "stt": {"provider": "deepgram", "model": "nova-3"},
-                "tts": {"provider": "cartesia", "voice_id": "v1"},
+                "tts": {"provider": "cartesia", "model": "sonic-3.5-2026-05-04", "voice_id": "v1"},
             },
             "telephony": {"provider": "telnyx", "inbound_number": "+15550000000"},
+            "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
             "policies": {
                 "max_order_value_usd": 1500,
                 "refunds": {"auto_approve_under_usd": 50, "require_human_above_usd": 200},

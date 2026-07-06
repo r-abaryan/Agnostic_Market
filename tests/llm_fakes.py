@@ -16,6 +16,19 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from pydantic import PrivateAttr
+
+
+class RecordingResolver:
+    """SecretResolver test double — records refs, returns a dummy key."""
+
+    def __init__(self) -> None:
+        self.resolved: list[str] = []
+
+    def resolve(self, ref: str) -> str:
+        self.resolved.append(ref)
+        return "sk-test-dummy"
+
 
 # Valid args per probe tool / schema (names from llm/providers.py's suite).
 CONFORMANT_ARGS: dict[str, dict[str, Any]] = {
@@ -45,6 +58,10 @@ class FakeChatModel(BaseChatModel):
     canned_args: dict[str, dict[str, Any]] = CONFORMANT_ARGS
     stream_chunks: int = 3
     raise_transport: bool = False
+    # None = tool-call on every tools-bound invoke (conformance-suite behavior). An int
+    # bounds it so an agent LOOP (model -> tool -> model) terminates with a text answer.
+    tool_call_limit: int | None = None
+    _tool_calls_made: int = PrivateAttr(default=0)
 
     @property
     def _llm_type(self) -> str:
@@ -67,7 +84,9 @@ class FakeChatModel(BaseChatModel):
         if self.raise_transport:
             raise ConnectionError("fake transport failure (simulated 429/timeout)")
         tools = kwargs.get("tools") or []
-        if tools and self.emit_tool_calls:
+        budget_left = self.tool_call_limit is None or self._tool_calls_made < self.tool_call_limit
+        if tools and self.emit_tool_calls and budget_left:
+            self._tool_calls_made += 1
             name = self._pick_tool(tools, messages)
             return AIMessage(
                 content="",

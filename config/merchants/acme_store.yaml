@@ -7,7 +7,9 @@ locale: "en-US"
 
 voice:
   stt: { provider: "deepgram", model: "nova-3" }
-  tts: { provider: "cartesia", voice_id: "acme-voice-001" }
+  # tts.model = pinned immutable snapshot (VOICE_PIPELINE 1a); voice_id = this merchant's
+  # Cartesia brand voice.
+  tts: { provider: "cartesia", model: "sonic-3.5-2026-05-04", voice_id: "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" }
 
 telephony:
   provider: "telnyx"

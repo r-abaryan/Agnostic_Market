@@ -15,6 +15,7 @@ def _base() -> dict:
         "_safety_locked": ["_platform", "schema_version"],
         "_platform": {"payment": {"out_of_band_only": True}},
         "schema_version": "0.2",
+        "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
     }
 
 
@@ -42,7 +43,7 @@ def _override() -> dict:
         "locale": "en-US",
         "voice": {
             "stt": {"provider": "deepgram", "model": "nova-3"},
-            "tts": {"provider": "cartesia", "voice_id": "v1"},
+            "tts": {"provider": "cartesia", "model": "sonic-3.5-2026-05-04", "voice_id": "v1"},
         },
         "telephony": {"provider": "telnyx", "inbound_number": "+15550000000"},
         # partial override merges (deep-merge keeps template's refund defaults)

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+from llm_fakes import RecordingResolver
 
 from agnostic_market.dtos.config import ProviderModel
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
@@ -14,17 +15,6 @@ from agnostic_market.llm.gateway import GatewayError, LLMGateway, load_provider_
 from agnostic_market.secrets.base import SecretResolutionError
 
 _REPO_CREDENTIALS = Path(__file__).resolve().parents[1] / "config" / "base" / "providers.yaml"
-
-
-class RecordingResolver:
-    """SecretResolver test double — records refs, returns a dummy key."""
-
-    def __init__(self) -> None:
-        self.resolved: list[str] = []
-
-    def resolve(self, ref: str) -> str:
-        self.resolved.append(ref)
-        return "sk-test-dummy"
 
 
 def _credentials() -> ProviderCredentialsConfig:
@@ -80,7 +70,7 @@ def test_secret_resolution_failure_propagates() -> None:
 
 def test_repo_credentials_file_loads_and_validates() -> None:
     credentials = load_provider_credentials(_REPO_CREDENTIALS)
-    assert set(credentials.providers) == {"anthropic", "openai"}
+    assert set(credentials.providers) == {"anthropic", "openai", "deepgram", "cartesia"}
     for entry in credentials.providers.values():
         assert entry.api_key_ref.startswith("env://")  # refs only — never values
 

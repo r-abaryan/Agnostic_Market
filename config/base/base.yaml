@@ -33,3 +33,10 @@ _platform:
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"
+
+# Call-start AI disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1), applies 2 Aug 2026).
+# WORDING is merchant-overridable (brand/voice/locale); WHETHER it plays is code
+# (voice/pipeline.py plays it first, uninterruptible) — so this key is NOT safety-locked.
+# Recording clause deliberately absent: nothing records in Phase 2 (recording policy = Phase 5).
+compliance:
+  call_start_disclosure: "Hi, you've reached {display_name}. I'm an automated AI assistant. How can I help?"
