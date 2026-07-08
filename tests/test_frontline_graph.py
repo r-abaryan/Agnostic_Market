@@ -9,19 +9,30 @@ from llm_fakes import FakeChatModel
 
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
-from agnostic_market.voice.tools import build_voice_tools, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.dtos.state import PolicyContext
+from agnostic_market.voice.tools import build_voice_tools
 
 _HANDOVER_ARGS = {"request_handover": {"destination": "support", "reason_code": "address_change"}}
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
 
 
-def _tools(config_root: Path) -> list:
-    fixture = load_orders_fixture(config_root, "acme_store")
-    return [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(fixture)]
+def _tools(store: OrderStore) -> list:
+    return [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store)]
 
 
-def _graph(config_root: Path, fake: FakeChatModel):
-    return build_frontline_graph(fake, _tools(config_root), display_name="Acme Store")
+def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
+    store = kwargs.pop("store", None) or OrderStore(load_orders_fixture(config_root, "acme_store"))
+    return build_frontline_graph(
+        fake,
+        _tools(store),
+        display_name="Acme Store",
+        # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
+        reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
+        store=store,
+        policy=PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True),
+        **kwargs,
+    )
 
 
 # --- the structural safety invariant (T1's structural half) --------------------------
@@ -141,3 +152,32 @@ async def test_plain_answer_ends_without_tools(config_root: Path) -> None:
     assert out.get("handover") is None
     assert isinstance(out["messages"][-1], AIMessage)
     assert out["messages"][-1].content
+
+
+async def test_runaway_tool_loop_is_bounded(config_root: Path) -> None:
+    # A model that never stops calling read tools must not spin forever: the hop guard
+    # ends the turn after _MAX_TOOL_HOPS round-trips (no framework loop protection here).
+    from agnostic_market.agents.frontline import _MAX_TOOL_HOPS
+
+    fake = FakeChatModel(force_tool="order_status", canned_args=_READ_ARGS)  # no limit set
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
+    hops = sum(1 for m in out["messages"] if isinstance(m, AIMessage) and m.tool_calls)
+    assert hops == _MAX_TOOL_HOPS + 1  # the hop that crossed the bound ended the turn
+
+
+async def test_answered_turn_writes_telemetry_negative(config_root: Path, tmp_path) -> None:
+    # The classifier dataset needs NEGATIVES: an answered (non-escalated) turn must leave
+    # a telemetry line too, not only handovers. (Telemetry is redirected to tmp by conftest.)
+    import json
+
+    from agnostic_market.agents import telemetry
+
+    fake = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, fake)
+    await graph.ainvoke({"messages": [HumanMessage("hi there")]})
+    lines = [
+        json.loads(line)
+        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(rec["outcome"] == "answered" and rec["utterance"] == "hi there" for rec in lines)

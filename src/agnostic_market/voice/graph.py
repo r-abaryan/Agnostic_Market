@@ -1,52 +1,91 @@
-"""SpeakableTokens — the filter between the frontline graph and livekit's LLMAdapter.
+"""GraphVoiceAdapter — the Plane-1 side of the ReasoningEngine seam (evolved from the
+Phase-2/3a `SpeakableTokens` filter).
 
-The frontline graph (agents/frontline.py) is the live reasoning graph; this module is only
-the transport-side filter that decides which streamed items become spoken audio.
+Sits where LiveKit's `LLMAdapter` expects a langgraph: presents `.astream(state, ...)`.
+Per turn it:
+  - extracts the NEW committed user turn from the transport input (the adapter passes the
+    full chat_ctx history each call; the engine's thread checkpoint carries history, so
+    only the last user message is fed — feeding the full list would duplicate state);
+  - gathers the §4a perception fact: whether the caller barged over the pending
+    confirmation readback (`ChatMessage.interrupted` on the last assistant history item —
+    consent over a truncated readback is not consent, VOICE_PIPELINE §4a);
+  - calls `engine.stream_turn(text, TurnFacts(...))` and renders TurnEvents as plain
+    strings (LLMAdapter's `_to_chat_chunk` accepts str — verified from plugin source).
 
-Why it exists (livekit-plugins-langchain 1.6.4, live-observed 2026-07-06): the adapter's
-`stream_mode="messages"` path turns EVERY streamed item into speakable text — including
-ToolMessages (raw tool output was spoken verbatim). We pass only text the caller should
-hear:
-  - `AIMessageChunk`  — the model node's streamed answer tokens (real provider streaming);
-  - node-authored full `AIMessage` from the `handover` node — the deferral line, which is
-    NOT streamed (a node return, emitted whole). Without this, gate-trip turns (model never
-    invoked) and model-handover turns would be SILENT.
-Everything else (ToolMessage, Human/System, the model node's non-streamed echo) is dropped.
+ALL LiveKit knowledge lives here; the engine imports nothing from the voice plane. The
+session is attached after construction (`attach_session`) because the AgentSession is
+built around this adapter.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import HumanMessage
 
-# Graph nodes whose full (non-streamed) AIMessage output must still be spoken.
-_SPEAKABLE_MESSAGE_NODES = frozenset({"handover"})
+from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.dtos.events import TurnFacts
+
+logger = logging.getLogger(__name__)
 
 
-class SpeakableTokens:
-    """`astream` pass-through yielding only caller-audible items (see module docstring)."""
+class GraphVoiceAdapter:
+    """`astream`-compatible facade over a ReasoningEngine, for LiveKit's LLMAdapter."""
 
-    def __init__(self, graph: Any) -> None:
-        self._graph = graph
+    def __init__(self, engine: ReasoningEngine) -> None:
+        self._engine = engine
+        self._session: Any = None
 
-    def astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        source = self._graph.astream(*args, **kwargs)
+    def attach_session(self, session: Any) -> None:
+        """Bind the live AgentSession (post-construction; the session wraps this adapter)."""
+        self._session = session
 
-        async def _speakable() -> AsyncIterator[Any]:
-            async for item in source:
-                token = item[0] if isinstance(item, tuple) and len(item) == 2 else item
-                meta = item[1] if isinstance(item, tuple) and len(item) == 2 else {}
-                # Streamed model tokens (the normal answer path).
-                if isinstance(token, AIMessageChunk):
-                    yield item
-                    continue
-                # A node-authored full AIMessage (e.g. the deferral) — speak it only from a
-                # node we designate, so the model node's own non-streamed echo isn't doubled.
-                if isinstance(token, AIMessage) and not isinstance(token, AIMessageChunk):
-                    node = meta.get("langgraph_node") if isinstance(meta, dict) else None
-                    if node in _SPEAKABLE_MESSAGE_NODES:
-                        yield item
+    @property
+    def engine(self) -> ReasoningEngine:
+        return self._engine
 
-        return _speakable()
+    def _last_user_text(self, state: dict[str, Any]) -> str:
+        for msg in reversed(state.get("messages", [])):
+            if isinstance(msg, HumanMessage):
+                return str(msg.content)
+        return ""
+
+    def _readback_interrupted(self) -> bool:
+        """§4a fact: was the last agent utterance (the pending readback) barged over?
+
+        Only meaningful while the engine is paused at a confirmation interrupt; reads
+        `interrupted` from the most recent assistant item in the session history.
+        """
+        if self._session is None:
+            return False
+        try:
+            items = list(self._session.history.items)
+        except AttributeError:
+            return False
+        for item in reversed(items):
+            is_message = getattr(item, "type", None) == "message"
+            if is_message and getattr(item, "role", "") == "assistant":
+                return bool(getattr(item, "interrupted", False))
+        return False
+
+    def astream(self, state: dict[str, Any], *args: Any, **kwargs: Any) -> AsyncIterator[str]:
+        """The LLMAdapter entry point. `state` is the chat_ctx-derived message dict; the
+        adapter's config/stream_mode args are ignored — the engine owns thread + modes."""
+        user_text = self._last_user_text(state)
+
+        async def _events() -> AsyncIterator[str]:
+            if not user_text:
+                logger.warning("voice adapter: no user message in transport input; empty turn")
+                return
+            facts = TurnFacts(
+                readback_interrupted=(
+                    self._engine.pending_interrupt() and self._readback_interrupted()
+                )
+            )
+            async for event in self._engine.stream_turn(user_text, facts):
+                # Token / spoken-message / interrupt prompt — all graph-authored text.
+                yield event.text if event.kind != "interrupt" else event.prompt
+
+        return _events()

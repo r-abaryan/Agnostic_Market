@@ -7,13 +7,17 @@ from pathlib import Path
 import pytest
 from langchain_core.tools import BaseTool
 
+from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
-from agnostic_market.voice.tools import build_voice_tools, load_orders_fixture
+from agnostic_market.voice.tools import build_voice_tools
+
+
+def _store(config_root: Path) -> OrderStore:
+    return OrderStore(load_orders_fixture(config_root, "acme_store"))
 
 
 def _tools_by_name(config_root: Path) -> dict[str, BaseTool]:
-    fixture = load_orders_fixture(config_root, "acme_store")
-    return {t.name: t for t in build_voice_tools(fixture)}
+    return {t.name: t for t in build_voice_tools(_store(config_root))}
 
 
 def test_fixture_loads_and_validates(config_root: Path) -> None:

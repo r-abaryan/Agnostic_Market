@@ -1,81 +1,126 @@
-"""SpeakableTokens — the transport filter: what streams to TTS and what is dropped."""
+"""GraphVoiceAdapter — the Plane-1 side of the seam, tested against a SCRIPTED fake
+engine (the §A0 mockability promise, proven: no graph, no LiveKit session, no network)."""
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from agnostic_market.voice.graph import SpeakableTokens
-
-
-class _ScriptedGraph:
-    """Graph double whose astream replays the item shapes langgraph's DEFAULT (v1)
-    messages handler emits — (message, metadata) tuples, including ToolMessages and
-    node-authored full AIMessages. Lets us pin the filter without a live model."""
-
-    def __init__(self, items: list) -> None:
-        self._items = items
-
-    def astream(self, *args, **kwargs):
-        async def _gen():
-            for item in self._items:
-                yield item
-
-        return _gen()
+from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
+from agnostic_market.voice.graph import GraphVoiceAdapter
 
 
-async def _speak(items: list) -> list:
-    return [item[0] async for item in SpeakableTokens(_ScriptedGraph(items)).astream({}, None)]
+class ScriptedEngine:
+    """ReasoningEngine double: replays canned TurnEvents, records what it was asked."""
+
+    def __init__(self, events: list, *, pending: bool = False) -> None:
+        self._events = events
+        self._pending = pending
+        self.calls: list[tuple[str, TurnFacts]] = []
+
+    def pending_interrupt(self) -> bool:
+        return self._pending
+
+    async def stream_turn(self, user_text: str, facts: TurnFacts):
+        self.calls.append((user_text, facts))
+        for event in self._events:
+            yield event
 
 
-async def test_raw_tool_output_is_never_speakable() -> None:
-    # The 2026-07-06 live bug: ToolMessages were spoken verbatim. They must be dropped.
-    model_meta = {"langgraph_node": "model"}
-    survived = await _speak(
+class _FakeHistoryItem:
+    def __init__(self, role: str, interrupted: bool) -> None:
+        self.type = "message"
+        self.role = role
+        self.interrupted = interrupted
+
+
+class _FakeSession:
+    """AgentSession double: just the history surface the adapter reads."""
+
+    def __init__(self, items: list[_FakeHistoryItem]) -> None:
+        class _History:
+            pass
+
+        self.history = _History()
+        self.history.items = items
+
+
+async def _spoken(adapter: GraphVoiceAdapter, state: dict) -> list[str]:
+    return [text async for text in adapter.astream(state, None)]
+
+
+async def test_adapter_renders_all_event_kinds_as_text() -> None:
+    engine = ScriptedEngine(
         [
-            (AIMessageChunk(content=""), model_meta),
-            (ToolMessage("Order ORD-1001: status shipped", tool_call_id="c1"), model_meta),
-            (AIMessageChunk(content="Your order is on "), model_meta),
-            (AIMessageChunk(content="its way."), model_meta),
+            TokenEvent(text="Your order "),
+            TokenEvent(text="shipped."),
+            SpokenMessageEvent(text="I'll pass it to support.", node="handover"),
+            InterruptEvent(prompt="2 x rain jacket, $258.00 total. Shall I place it?"),
         ]
     )
-    assert all(isinstance(t, AIMessageChunk) for t in survived)
-    spoken = "".join(t.text for t in survived)
-    assert "shipped" not in spoken  # raw tool string never spoken ...
-    assert "Your order is on its way." in spoken  # ... model's tokens all are
+    adapter = GraphVoiceAdapter(engine)
+    out = await _spoken(adapter, {"messages": [HumanMessage("where is it")]})
+    assert out == [
+        "Your order ",
+        "shipped.",
+        "I'll pass it to support.",
+        "2 x rain jacket, $258.00 total. Shall I place it?",
+    ]
 
 
-async def test_handover_deferral_message_is_spoken() -> None:
-    # The deferral is a node-authored FULL AIMessage (not streamed) — without passing it,
-    # gate-trip and model-handover turns would be SILENT.
-    survived = await _speak(
-        [(AIMessage("I'll make sure it reaches our support team."), {"langgraph_node": "handover"})]
+async def test_adapter_feeds_only_the_last_user_turn() -> None:
+    # The transport hands FULL history each call; the engine must get just the new turn
+    # (the thread checkpoint carries history — delta contract, verified 2026-07-08).
+    engine = ScriptedEngine([])
+    adapter = GraphVoiceAdapter(engine)
+    await _spoken(
+        adapter,
+        {
+            "messages": [
+                SystemMessage("sys"),
+                HumanMessage("first turn"),
+                AIMessage("answer"),
+                HumanMessage("second turn"),
+            ]
+        },
     )
-    assert len(survived) == 1
-    assert "support team" in survived[0].content
+    assert [call[0] for call in engine.calls] == ["second turn"]
 
 
-async def test_non_handover_full_message_is_not_doubled() -> None:
-    # A full AIMessage from the MODEL node (the non-streamed echo) must NOT be re-spoken —
-    # the model's answer already streamed as chunks.
-    survived = await _speak(
-        [
-            (AIMessageChunk(content="the answer"), {"langgraph_node": "model"}),
-            (AIMessage("the answer"), {"langgraph_node": "model"}),
-        ]
+async def test_empty_transport_input_is_an_empty_turn() -> None:
+    engine = ScriptedEngine([TokenEvent(text="should not appear")])
+    adapter = GraphVoiceAdapter(engine)
+    assert await _spoken(adapter, {"messages": []}) == []
+    assert engine.calls == []  # engine never invoked
+
+
+async def test_4a_fact_set_when_pending_and_readback_barged() -> None:
+    engine = ScriptedEngine([], pending=True)
+    adapter = GraphVoiceAdapter(engine)
+    adapter.attach_session(
+        _FakeSession(
+            [
+                _FakeHistoryItem("user", interrupted=False),
+                _FakeHistoryItem("assistant", interrupted=True),  # the barged readback
+            ]
+        )
     )
-    assert len(survived) == 1
-    assert isinstance(survived[0], AIMessageChunk)
+    await _spoken(adapter, {"messages": [HumanMessage("yes")]})
+    assert engine.calls[0][1].readback_interrupted is True
 
 
-async def test_human_and_system_messages_dropped() -> None:
-    from langchain_core.messages import SystemMessage
+async def test_4a_fact_false_when_no_pending_interrupt() -> None:
+    # An interrupted PAST utterance is irrelevant on a normal turn: the fact is only
+    # asserted while the engine is paused at a confirmation.
+    engine = ScriptedEngine([], pending=False)
+    adapter = GraphVoiceAdapter(engine)
+    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=True)]))
+    await _spoken(adapter, {"messages": [HumanMessage("what's the status")]})
+    assert engine.calls[0][1].readback_interrupted is False
 
-    survived = await _speak(
-        [
-            (HumanMessage("hi"), {"langgraph_node": "model"}),
-            (SystemMessage("prompt"), {"langgraph_node": "model"}),
-            (AIMessageChunk(content="hello"), {"langgraph_node": "model"}),
-        ]
-    )
-    assert len(survived) == 1
-    assert survived[0].content == "hello"
+
+async def test_4a_fact_false_when_readback_played_out() -> None:
+    engine = ScriptedEngine([], pending=True)
+    adapter = GraphVoiceAdapter(engine)
+    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=False)]))
+    await _spoken(adapter, {"messages": [HumanMessage("yes")]})
+    assert engine.calls[0][1].readback_interrupted is False

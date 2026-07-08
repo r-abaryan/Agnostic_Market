@@ -49,6 +49,33 @@ class PolicyContext(BaseModel):
     allow_ai_merchant_handoff: bool
 
 
+class PendingAction(BaseModel):
+    """A checkout awaiting HITL confirmation (AGENTS §A10) — everything the confirm
+    readback + the place effect need, minted BEFORE the interrupt (A10a rule 2).
+
+    `sku`/`total_usd` are CODE-resolved from the candidate list (never model-authored);
+    `idempotency_key` makes the place effect dedupable by the order SoR on any replay.
+    (The re-confirm loop needs no counter here: it is bounded STRUCTURALLY by the confirm
+    node's two fixed interrupt call sites — A10a rule 3.)
+    """
+
+    model_config = _FROZEN
+
+    sku: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    quantity: int = Field(ge=1)
+    total_usd: float = Field(ge=0)
+    idempotency_key: str = Field(min_length=1)
+    created_at: float  # unix seconds; Clock-A expiry is checked against this on resume
+
+
+# Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
+# "left_checkout" is a TURN-SCOPED marker (reset at entry): the model left the flow this
+# turn, so a same-turn checkout re-entry is blocked — breaks the assemble->gate->handover->
+# assemble cycle structurally instead of relying on the recursion limit.
+ActiveFlow = Literal["checkout", "left_checkout"]
+
+
 class HandoffRequest(BaseModel):
     """A frontline decision to hand a turn to a higher tier (AGENTS.md handover boundary).
 
@@ -65,12 +92,16 @@ class HandoffRequest(BaseModel):
 
 
 class ReasoningState(BaseModel):
-    """The frontline graph's state (Phase 3a slice of AGENTS.md §A1).
+    """The reasoning graph's state (Phase 3a/3b slice of AGENTS.md §A1).
 
     `messages` uses the append reducer. `handover`, when set, routes the turn to the
-    handover sink. Every non-`messages` field MUST default: livekit's LLMAdapter invokes
-    the graph with `{"messages": [...]}` only.
+    handover sink. `pending_action` + `active_flow` carry an in-flight checkout across
+    the HITL interrupt and across turns (the thread is checkpointed from 3b on).
+    Every non-`messages` field MUST default: the engine feeds turns as
+    `{"messages": [<new user message>]}` deltas.
     """
 
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     handover: HandoffRequest | None = None
+    pending_action: PendingAction | None = None
+    active_flow: ActiveFlow | None = None

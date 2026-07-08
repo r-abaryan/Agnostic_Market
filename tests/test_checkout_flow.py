@@ -1,0 +1,227 @@
+"""Checkout flow at the GRAPH level: entry routing, escapes, stickiness, guardrail,
+SKU discipline, structural A10a shape. Zero network (fake models + InMemorySaver)."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from llm_fakes import FakeChatModel
+
+from agnostic_market.agents import telemetry
+from agnostic_market.agents.checkout import build_checkout_nodes, speak_quantity
+from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.dtos.state import PendingAction, PolicyContext, ReasoningState
+from agnostic_market.voice.tools import build_voice_tools
+
+_POLICY = PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True)
+_CFG = {"configurable": {"thread_id": "t1"}}
+
+
+def _build(
+    config_root: Path,
+    *,
+    frontline: FakeChatModel | None = None,
+    reasoning: FakeChatModel | None = None,
+):
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store)]
+    graph = build_frontline_graph(
+        frontline or FakeChatModel(emit_tool_calls=False),
+        tools,
+        display_name="Acme Store",
+        reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
+        store=store,
+        policy=_POLICY,
+        checkpointer=InMemorySaver(),
+    )
+    return graph, store
+
+
+# --- speech-native rendering (VOICE_PIPELINE §7 — no 'x' for TTS to voice as 'ex') -------
+
+
+@pytest.mark.parametrize(
+    ("qty", "name", "expected"),
+    [
+        (1, "waterproof rain jacket", "1 waterproof rain jacket"),
+        (2, "waterproof rain jacket", "2 waterproof rain jackets"),
+        (3, "merino hiking sock", "3 merino hiking socks"),
+    ],
+)
+def test_speak_quantity_pluralizes_without_x(qty: int, name: str, expected: str) -> None:
+    result = speak_quantity(qty, name)
+    assert result == expected
+    assert " x " not in result  # the 'x' separator TTS mis-voices is gone
+
+
+# --- entering the flow -------------------------------------------------------------------
+
+
+async def test_model_handover_to_checkout_enters_the_flow(config_root: Path) -> None:
+    # Trigger-free purchase intent: the FRONTLINE model hands over to checkout, and the
+    # same turn continues INTO assemble -> confirm interrupt (no deferral spoken).
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        tool_call_limit=1,
+        canned_args={"request_handover": {"destination": "checkout", "reason_code": "cart_write"}},
+    )
+    reasoning = FakeChatModel(
+        force_tool="propose_order",
+        tool_call_limit=1,
+        canned_args={"propose_order": {"candidate_key": "1", "quantity": 1}},
+    )
+    graph, store = _build(config_root, frontline=frontline, reasoning=reasoning)
+    await graph.ainvoke(
+        {"messages": [HumanMessage("I'd like to get the waterproof rain jacket")]}, _CFG
+    )
+    state = graph.get_state(_CFG)
+    assert state.interrupts  # paused at the readback
+    pending = state.values["pending_action"]
+    assert pending.sku == "SKU-BLU-07"  # candidates narrowed to the jacket; key "1" = it
+    assert pending.total_usd == 129.00  # fixture price, code arithmetic
+    assert store.placed_count == 0
+
+
+# --- guardrail (code-enforced cap) -------------------------------------------------------
+
+
+async def test_order_over_value_cap_is_denied_in_code(config_root: Path) -> None:
+    reasoning = FakeChatModel(
+        force_tool="propose_order",
+        tool_call_limit=1,
+        canned_args={"propose_order": {"candidate_key": "2", "quantity": 100}},  # $12,900
+    )
+    graph, store = _build(config_root, reasoning=reasoning)
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    assert store.placed_count == 0
+    assert out.get("pending_action") is None
+    assert out.get("active_flow") is None
+    assert not graph.get_state(_CFG).interrupts  # never even reached the confirm gate
+    assert any(
+        isinstance(m, AIMessage) and "more than I'm able to place" in str(m.content)
+        for m in out["messages"]
+    )
+
+
+# --- SKU discipline (unoffered key is structurally unreachable) ---------------------------
+
+
+async def test_unoffered_candidate_key_never_places(config_root: Path) -> None:
+    # The fake keeps proposing key "99" (not in the candidate list): one corrective
+    # re-prompt, then assemble LEAVES the flow — and the same-turn checkout re-trip is
+    # blocked by the left_checkout marker (cycle-breaker), falling back to the deferral.
+    reasoning = FakeChatModel(
+        force_tool="propose_order",
+        canned_args={"propose_order": {"candidate_key": "99", "quantity": 1}},
+    )
+    graph, store = _build(config_root, reasoning=reasoning)
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    assert store.placed_count == 0
+    assert out.get("pending_action") is None
+    assert not graph.get_state(_CFG).interrupts
+    # The cycle-breaker deferral (honest checkout copy) was spoken instead of looping.
+    assert any(
+        isinstance(m, AIMessage) and "pass it along" in str(m.content) for m in out["messages"]
+    )
+
+
+# --- stickiness + escapes (multi-turn on one thread) --------------------------------------
+
+
+async def _clarify_turn(graph) -> None:
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    assert out["active_flow"] == "checkout"  # in flow, awaiting item/quantity
+
+
+async def test_followup_turn_stays_inside_checkout(config_root: Path) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False)
+    graph, _ = _build(config_root, frontline=frontline)
+    await _clarify_turn(graph)
+    out = await graph.ainvoke({"messages": [HumanMessage("the rain jacket, two of them")]}, _CFG)
+    assert out["active_flow"] == "checkout"  # still inside (clarify fake keeps asking)
+    assert out.get("handover") is None
+    # The frontline tier was NEVER consulted on either turn: the entry router bypassed it.
+    assert frontline._tool_calls_made == 0
+
+
+async def test_abort_escape_breaks_stickiness(config_root: Path) -> None:
+    graph, store = _build(config_root)
+    await _clarify_turn(graph)
+    out = await graph.ainvoke({"messages": [HumanMessage("actually never mind, stop")]}, _CFG)
+    assert out.get("active_flow") is None
+    assert store.placed_count == 0
+    assert any(
+        isinstance(m, AIMessage) and "Nothing has been ordered" in str(m.content)
+        for m in out["messages"]
+    )
+
+
+async def test_human_escape_breaks_stickiness_and_hands_over(config_root: Path) -> None:
+    graph, _ = _build(config_root)
+    await _clarify_turn(graph)
+    out = await graph.ainvoke(
+        {"messages": [HumanMessage("I want to talk to a human please")]}, _CFG
+    )
+    assert out.get("active_flow") is None
+    assert out["handover"].destination == "human"  # §A9: never trapped
+    assert any(
+        isinstance(m, AIMessage) and "person" in str(m.content) for m in out["messages"]
+    )
+
+
+# --- A10a structure + the effect node ----------------------------------------------------
+
+
+def test_place_is_reachable_only_through_confirm(config_root: Path) -> None:
+    graph, _ = _build(config_root)
+    edges = graph.get_graph().edges
+    sources_into_place = {e.source for e in edges if e.target == "checkout_place"}
+    assert sources_into_place == {"checkout_confirm"}
+
+
+def test_place_node_replay_yields_the_same_single_order(config_root: Path) -> None:
+    # A10a: the effect node may re-run (crash between effect and checkpoint); the store's
+    # key dedup makes the replay return the ORIGINAL order — same spoken id, one record.
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    nodes = build_checkout_nodes(FakeChatModel(), store, _POLICY, display_name="Acme Store")
+    state = ReasoningState(
+        messages=[],
+        pending_action=PendingAction(
+            sku="SKU-BLU-07",
+            name="waterproof rain jacket",
+            quantity=2,
+            total_usd=258.0,
+            idempotency_key="fixed-key",
+            created_at=time.time(),
+        ),
+    )
+    first = nodes.place(state)
+    replay = nodes.place(state)
+    assert store.placed_count == 1
+    assert str(first["messages"][0].content) == str(replay["messages"][0].content)
+    # The confirmed event landed in telemetry (redirected to tmp by conftest).
+    lines = [
+        json.loads(line)
+        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(rec.get("event") == "checkout_confirmed" for rec in lines)
+
+
+def test_speakable_nodes_are_graph_declared(config_root: Path) -> None:
+    graph, _ = _build(config_root)
+    assert graph.speakable_nodes == {
+        "handover",
+        "checkout_guardrail",
+        "checkout_confirm",
+        "checkout_place",
+        "checkout_abort",
+    }
+    # The structural safety set is unchanged: still no state-changing tool on the frontline.
+    assert graph.frontline_read_only_tools == {"order_status", "catalog_search"}

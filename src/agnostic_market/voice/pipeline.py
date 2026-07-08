@@ -16,21 +16,27 @@ barged over is enforced here in code.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from langgraph.checkpoint.memory import InMemorySaver
 from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent
 from livekit.plugins import langchain as lk_langchain
 
+from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.telemetry import write_event
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
+from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
-from agnostic_market.voice.graph import SpeakableTokens
+from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.stt_engine import build_stt
-from agnostic_market.voice.tools import build_voice_tools, load_orders_fixture
+from agnostic_market.voice.tools import build_voice_tools
 from agnostic_market.voice.tts_engine import build_tts
 
 logger = logging.getLogger(__name__)
@@ -59,6 +65,7 @@ class VoiceLoop:
 
     session: AgentSession
     agent: DisclosureFirstAgent
+    engine: ReasoningEngine
 
 
 def build_voice_loop(
@@ -70,21 +77,39 @@ def build_voice_loop(
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
-    fixture = load_orders_fixture(config_root, config.merchant_id)
-    chat_model = LLMGateway(credentials, secrets).chat_model(config.llm.routing)
-    # Read-only tools pass through the audit/tenant wrapper; the frontline graph owns its
-    # own system prompt + few-shot (F1), so the Agent below carries NO instructions.
-    tools = [wrap_readonly_tool(t, config.merchant_id) for t in build_voice_tools(fixture)]
-    graph = build_frontline_graph(chat_model, tools, display_name=config.display_name)
+    store = OrderStore(load_orders_fixture(config_root, config.merchant_id))
+    gateway = LLMGateway(credentials, secrets)
+    # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
+    # system prompts + few-shot (F1), so the Agent below carries NO instructions.
+    tools = [wrap_readonly_tool(t, config.merchant_id) for t in build_voice_tools(store)]
+    graph = build_frontline_graph(
+        chat_model=gateway.chat_model(config.llm.routing),
+        read_only_tools=tools,
+        display_name=config.display_name,
+        # Checkout runs on the reasoning tier (AGENTS §A11: big model for gated flows).
+        reasoning_model=gateway.chat_model(config.llm.reasoning),
+        store=store,
+        policy=PolicyContext(
+            max_order_value_usd=config.policies.max_order_value_usd,
+            allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
+        ),
+        # The checkout HITL interrupt needs a durable thread (in-memory for the build
+        # phase; the Redis saver is a constructor swap at deploy).
+        checkpointer=InMemorySaver(),
+    )
+    engine = ReasoningEngine(graph, thread_id=uuid.uuid4().hex)
+    adapter = GraphVoiceAdapter(engine)
 
     session = AgentSession(
         stt=build_stt(config.voice.stt, credentials, secrets),
-        # SpeakableTokens: only the model's answer tokens + the handover deferral reach TTS
-        # — never raw tool output (see graph.py).
-        llm=lk_langchain.LLMAdapter(SpeakableTokens(graph)),
+        # Only graph-authored speakable text reaches TTS — model tokens, node-authored
+        # lines, and the confirmation readback; never raw tool output (see graph.py).
+        llm=lk_langchain.LLMAdapter(adapter),
         tts=build_tts(config.voice.tts, credentials, secrets),
     )
+    adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
+    _attach_thread_reaper(session, engine)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -94,7 +119,26 @@ def build_voice_loop(
             "{display_name}", config.display_name
         ),
     )
-    return VoiceLoop(session=session, agent=agent)
+    return VoiceLoop(session=session, agent=agent, engine=engine)
+
+
+def _attach_thread_reaper(session: AgentSession, engine: ReasoningEngine) -> None:
+    """Clock B (AGENTS §A10 rule 4): on session close, the thread is reaped UNCONDITIONALLY
+    — a dropped call must never leave a resumable checkout. Re-entrant-safe: a double-fired
+    close deletes once and emits the abandoned event at most once. Nothing is spoken (the
+    caller is gone); expiry of a still-connected caller's pending action is Clock A, owned
+    by the graph's confirm node."""
+    reaped = False
+
+    @session.on("close")
+    def _reap(_event: object) -> None:
+        nonlocal reaped
+        if reaped:
+            return
+        reaped = True
+        if engine.pending_interrupt():
+            write_event({"event": "checkout_abandoned", "reason": "session_closed"})
+        engine.delete_thread()
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:

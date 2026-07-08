@@ -22,14 +22,18 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
+from agnostic_market.agents import telemetry
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
+from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
-from agnostic_market.voice.tools import build_voice_tools, load_orders_fixture
+from agnostic_market.voice.tools import build_voice_tools
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 _EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_t1.yaml"
@@ -37,29 +41,67 @@ _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
 
 
+_THREAD_SEQ = 0
+
+
 async def _outcome(graph, utterance: str) -> str | None:
-    """Handover source ('gate'/'model') if the turn escalated, else None (answered)."""
-    out = await graph.ainvoke({"messages": [HumanMessage(utterance)]})
+    """How the turn left the frontline, else None (answered).
+
+    3b semantics: a checkout-destination handover no longer ends at a spoken deferral —
+    it ENTERS the checkout flow (clearing the handover signal), so escalation shows up as
+    `active_flow`/`pending_action` in the output, or as a paused confirm interrupt.
+    Returns 'gate'/'model' (handover survived in state) or 'flow' (entered checkout).
+    Each utterance runs on a fresh thread (the flow's interrupt needs a checkpointer).
+    """
+    global _THREAD_SEQ
+    _THREAD_SEQ += 1
+    config = {"configurable": {"thread_id": f"eval-{_THREAD_SEQ}"}}
+    out = await graph.ainvoke({"messages": [HumanMessage(utterance)]}, config)
     handover = out.get("handover")
-    return handover.source if handover else None
+    if handover is not None:
+        return handover.source
+    if (
+        out.get("active_flow") is not None
+        or out.get("pending_action") is not None
+        or graph.get_state(config).interrupts
+    ):
+        return "flow"
+    return None
 
 
 async def _run() -> int:
     load_dotenv()
+    # Eval runs must not pollute the LIVE telemetry dataset (classifier data): redirect
+    # this process's sink to a sibling eval file (same local-only, gitignored dir).
+    telemetry._TELEMETRY_PATH = telemetry._TELEMETRY_PATH.with_name("frontline_eval.jsonl")
     secrets = EnvSecretResolver()
     credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
     resolved = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID)
     chat_model = LLMGateway(credentials, secrets).chat_model(resolved.config.llm.routing)
-    tools = [
-        wrap_readonly_tool(t, _MERCHANT_ID)
-        for t in build_voice_tools(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
-    ]
-    graph = build_frontline_graph(chat_model, tools, display_name=resolved.config.display_name)
+    store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
+    tools = [wrap_readonly_tool(t, _MERCHANT_ID) for t in build_voice_tools(store)]
+    config = resolved.config
+    graph = build_frontline_graph(
+        chat_model,
+        tools,
+        display_name=config.display_name,
+        # The T1 eval never enters checkout (text-only escalation probes), but the graph
+        # compiles as ONE shape — same construction path as production (F1 discipline).
+        reasoning_model=LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
+        store=store,
+        policy=PolicyContext(
+            max_order_value_usd=config.policies.max_order_value_usd,
+            allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
+        ),
+        # An utterance that reaches the confirm readback pauses at an interrupt, which
+        # needs a checkpointer even in the text eval (fresh thread per utterance).
+        checkpointer=InMemorySaver(),
+    )
     data = load_yaml_layer(_EVAL_PATH)
 
-    # --- PRIMARY: escalation recall (gate OR model) on should_escalate ---
+    # --- PRIMARY: escalation recall (gate OR model OR checkout-flow entry) ---
     escalate = data["should_escalate"]
-    by_gate = by_model = 0
+    by_gate = by_model = by_flow = 0
     misses: list[str] = []
     for utt in escalate:
         source = await _outcome(graph, utt)
@@ -67,12 +109,17 @@ async def _run() -> int:
             by_gate += 1
         elif source == "model":
             by_model += 1
+        elif source == "flow":
+            by_flow += 1
         else:
             misses.append(utt)
-    escalated = by_gate + by_model
+    escalated = by_gate + by_model + by_flow
     recall = escalated / len(escalate)
     print(f"[should_escalate] recall: {escalated}/{len(escalate)} ({recall:.0%})")
-    print(f"    gate caught {by_gate} (informational fast-path) | model caught {by_model}")
+    print(
+        f"    gate caught {by_gate} (informational fast-path) | model caught {by_model} "
+        f"| entered checkout flow {by_flow}"
+    )
     for miss in misses:
         print(f"    MISS (answered instead of escalated - triage prompt/few-shot): {miss!r}")
 

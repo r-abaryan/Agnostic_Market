@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import re
 
-from agnostic_market.dtos.state import HandoffReasonCode
+from agnostic_market.dtos.state import HandoffDestination, HandoffReasonCode
 
 # Irreversible-action triggers ONLY. High precision: each is a request to DO the
 # irreversible thing, guarded against the read/question phrasings that would collide.
-_RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, str], ...] = (
+_RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, HandoffDestination], ...] = (
     # cancel an order (NOT "why was my order cancelled" — a read about a past cancel)
     (
         re.compile(
@@ -63,7 +63,7 @@ _RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, str], ...] = (
 )
 
 
-def gate_check(text: str) -> tuple[HandoffReasonCode, str] | None:
+def gate_check(text: str) -> tuple[HandoffReasonCode, HandoffDestination] | None:
     """Return (reason_code, destination) for a high-certainty irreversible request, else None.
 
     First matching rule wins. Everything else — address/payment/cart changes, paraphrases,
