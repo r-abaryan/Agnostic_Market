@@ -22,24 +22,18 @@ from pathlib import Path
 from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent
 from livekit.plugins import langchain as lk_langchain
 
+from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
-from agnostic_market.voice.graph import SpeakableTokens, build_voice_graph
+from agnostic_market.voice.graph import SpeakableTokens
 from agnostic_market.voice.stt_engine import build_stt
 from agnostic_market.voice.tools import build_voice_tools, load_orders_fixture
 from agnostic_market.voice.tts_engine import build_tts
 
 logger = logging.getLogger(__name__)
-
-_INSTRUCTIONS = (
-    "You are the voice assistant for {display_name}. You answer order-status questions "
-    "(use the order_status tool) and product questions (use the catalog_search tool). "
-    "You have no other abilities: you cannot modify carts, place orders, or issue "
-    "refunds - say so and offer what you can do instead. Keep answers to one or two "
-    "short spoken sentences."
-)
 
 
 class DisclosureFirstAgent(Agent):
@@ -78,18 +72,23 @@ def build_voice_loop(
     config = resolved.config
     fixture = load_orders_fixture(config_root, config.merchant_id)
     chat_model = LLMGateway(credentials, secrets).chat_model(config.llm.routing)
-    graph = build_voice_graph(chat_model, build_voice_tools(fixture))
+    # Read-only tools pass through the audit/tenant wrapper; the frontline graph owns its
+    # own system prompt + few-shot (F1), so the Agent below carries NO instructions.
+    tools = [wrap_readonly_tool(t, config.merchant_id) for t in build_voice_tools(fixture)]
+    graph = build_frontline_graph(chat_model, tools, display_name=config.display_name)
 
     session = AgentSession(
         stt=build_stt(config.voice.stt, credentials, secrets),
-        # SpeakableTokens: only LLM tokens reach TTS — never raw tool output (see graph.py).
+        # SpeakableTokens: only the model's answer tokens + the handover deferral reach TTS
+        # — never raw tool output (see graph.py).
         llm=lk_langchain.LLMAdapter(SpeakableTokens(graph)),
         tts=build_tts(config.voice.tts, credentials, secrets),
     )
     _attach_turn_metrics_logger(session)
 
     agent = DisclosureFirstAgent(
-        instructions=_INSTRUCTIONS.format(display_name=config.display_name),
+        # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
+        instructions="",
         # `.replace`, not `.format`: merchant-authored wording may contain other braces.
         disclosure=config.compliance.call_start_disclosure.replace(
             "{display_name}", config.display_name

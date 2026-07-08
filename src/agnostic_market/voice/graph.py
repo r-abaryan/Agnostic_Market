@@ -1,54 +1,52 @@
-"""The Phase-2 minimal LangGraph graph behind livekit's LLMAdapter.
+"""SpeakableTokens — the filter between the frontline graph and livekit's LLMAdapter.
 
-This is NOT the frontline agent (that is Phase 3a, docs/AGENTS.md) — it is the
-pipe-cleaner that proves voice -> STT -> graph -> TTS end-to-end with read-only tools.
-Built with `langchain.agents.create_agent` (the current factory; `create_react_agent`
-is deprecated in LangGraph v1), which returns the compiled Pregel graph that
-`livekit.plugins.langchain.LLMAdapter` requires.
+The frontline graph (agents/frontline.py) is the live reasoning graph; this module is only
+the transport-side filter that decides which streamed items become spoken audio.
 
-The system prompt is NOT set here: the livekit `Agent(instructions=...)` carries it and
-LLMAdapter maps it to the graph's SystemMessage — one prompt source, not two.
+Why it exists (livekit-plugins-langchain 1.6.4, live-observed 2026-07-06): the adapter's
+`stream_mode="messages"` path turns EVERY streamed item into speakable text — including
+ToolMessages (raw tool output was spoken verbatim). We pass only text the caller should
+hear:
+  - `AIMessageChunk`  — the model node's streamed answer tokens (real provider streaming);
+  - node-authored full `AIMessage` from the `handover` node — the deferral line, which is
+    NOT streamed (a node return, emitted whole). Without this, gate-trip turns (model never
+    invoked) and model-handover turns would be SILENT.
+Everything else (ToolMessage, Human/System, the model node's non-streamed echo) is dropped.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from typing import Any
 
-from langchain.agents import create_agent
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessageChunk
-from langchain_core.tools import BaseTool
-from langgraph.pregel import Pregel
+from langchain_core.messages import AIMessage, AIMessageChunk
 
-
-def build_voice_graph(chat_model: BaseChatModel, tools: Sequence[BaseTool]) -> Pregel:
-    """Compile the minimal tool-calling graph for the voice loop."""
-    return create_agent(chat_model, list(tools))
+# Graph nodes whose full (non-streamed) AIMessage output must still be spoken.
+_SPEAKABLE_MESSAGE_NODES = frozenset({"handover"})
 
 
 class SpeakableTokens:
-    """`astream` pass-through that yields ONLY LLM token chunks (AIMessageChunk).
+    """`astream` pass-through yielding only caller-audible items (see module docstring)."""
 
-    Workaround for livekit-plugins-langchain 1.6.4: its stream path converts EVERY item
-    from `stream_mode="messages"` into speakable text — including ToolMessages — so the
-    raw tool return string was spoken verbatim ahead of the model's actual answer
-    (observed on the live call, 2026-07-06). LLMAdapter exercises only `astream`, so a
-    filtering wrapper at our seam is the whole fix. Assumes the adapter's defaults
-    (single `stream_mode="messages"`, `subgraphs=False` — items are `(token, metadata)`
-    tuples). Remove when upstream filters non-token messages.
-    """
-
-    def __init__(self, graph: Pregel) -> None:
+    def __init__(self, graph: Any) -> None:
         self._graph = graph
 
     def astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         source = self._graph.astream(*args, **kwargs)
 
-        async def _tokens_only() -> AsyncIterator[Any]:
+        async def _speakable() -> AsyncIterator[Any]:
             async for item in source:
                 token = item[0] if isinstance(item, tuple) and len(item) == 2 else item
+                meta = item[1] if isinstance(item, tuple) and len(item) == 2 else {}
+                # Streamed model tokens (the normal answer path).
                 if isinstance(token, AIMessageChunk):
                     yield item
+                    continue
+                # A node-authored full AIMessage (e.g. the deferral) — speak it only from a
+                # node we designate, so the model node's own non-streamed echo isn't doubled.
+                if isinstance(token, AIMessage) and not isinstance(token, AIMessageChunk):
+                    node = meta.get("langgraph_node") if isinstance(meta, dict) else None
+                    if node in _SPEAKABLE_MESSAGE_NODES:
+                        yield item
 
-        return _tokens_only()
+        return _speakable()

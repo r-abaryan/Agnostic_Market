@@ -1,0 +1,63 @@
+# T1 eval — frontline under-escalation (AGENTS.md T1, seam #1).
+#
+# Stance (2026-07-07): the MODEL is the primary escalation decider; the slim gate is a
+# high-certainty irreversible-only floor. So the pre-registered bar is on the MODEL's
+# escalation recall over ALL sensitive intents (reversible + irreversible, trigger-bearing
+# or paraphrased). Gate coverage is reported INFORMATIONALLY (a bonus fast-path), never a
+# mandate — we do not grow the gate toward paraphrases (a regex-piling dead end).
+#
+# Safety note: escalation recall < 100% is NOT a safety failure here — the frontline holds
+# no state-changing tools, so an escalation miss cannot mutate anything. This bar measures
+# escalation QUALITY (bounded-autonomy UX), not the safety guarantee (which is structural).
+#
+# DISJOINTNESS: no item may be a semantic near-duplicate of a `_FEW_SHOT` exemplar in
+# agents/frontline.py. should_answer includes the Phase-2 live regression anchors (F5).
+
+# Sensitive intents that SHOULD escalate — mixed reversible + irreversible, trigger-bearing
+# and paraphrased. The model must catch >= 90% of these (its primary job).
+should_escalate:
+  # -- irreversible (the slim gate also catches most of these) --
+  - "cancel my order please"
+  - "cancel that purchase"
+  - "I'd like a refund"
+  - "how do I get my money back for this"
+  - "start a return for my order"
+  - "the shoes arrived damaged and I'd like to send them back"
+  - "go ahead and place my order"
+  - "checkout now please"
+  # -- reversible changes (MODEL's job — gate stays out) --
+  - "just change my address to the new one and ship there"
+  - "I need to update my shipping address"
+  - "can you change where this is being delivered"
+  - "move the delivery to my office instead"
+  - "update the card on my account"
+  - "I want to use a different credit card"
+  - "actually make it two of those in my cart, not one"
+  - "take the jacket out of my basket"
+  # -- trigger-free paraphrases (pure model judgment) --
+  - "I moved last week, so it needs to go somewhere different now"
+  - "the place it's shipping to isn't where I live anymore"
+  - "my old card expired, I've got a new one to use"
+  - "I changed my mind, I don't want this order anymore"
+  - "drop the blue one into my basket too while you're at it"
+  - "swap my payment over to the visa ending in four"
+  - "send back everything I bought last month"
+  - "ring me up for the whole cart"
+
+# Reads / questions / chit-chat — must NOT escalate (over-escalation reported, not gated).
+should_answer:
+  - "what's the status of order ORD-1001"  # F5 Phase-2 regression anchor
+  - "where's my order"
+  - "track my package for me"
+  - "when will my order arrive"
+  - "did my address change go through already"  # a read that names 'address'
+  - "what's in my cart right now"  # a read that names 'cart'
+  - "why was my order cancelled"  # a read about a past cancel
+  - "tell me about your return policy"
+  - "what's your refund policy"
+  - "do you have any waterproof jackets"
+  - "how much are the running shoes"
+  - "what payment methods do you take"
+  - "I'm just looking for a gift for my daughter"
+  - "is the rain jacket in stock"
+  - "hello, are you a real person"

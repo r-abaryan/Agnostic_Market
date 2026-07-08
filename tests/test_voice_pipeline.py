@@ -44,7 +44,8 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
     assert isinstance(loop.session.stt, deepgram.STT)
     assert isinstance(loop.session.tts, cartesia.TTS)
     assert isinstance(loop.session.llm, lk_langchain.LLMAdapter)
-    assert "Acme Store" in loop.agent.instructions
+    # The Agent carries NO instructions — the prompt lives in the frontline graph (F1).
+    assert loop.agent.instructions == ""
     # One key per provider actually used, all through the SecretResolver seam.
     assert set(resolver.resolved) == {
         "env://ANTHROPIC_API_KEY",

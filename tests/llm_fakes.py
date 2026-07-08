@@ -62,6 +62,9 @@ class FakeChatModel(BaseChatModel):
     # None = tool-call on every tools-bound invoke (conformance-suite behavior). An int
     # bounds it so an agent LOOP (model -> tool -> model) terminates with a text answer.
     tool_call_limit: int | None = None
+    # Deterministically emit a specific tool by name (bypasses _pick_tool) — for tests that
+    # must exercise a tool the prompt wouldn't naturally name (e.g. request_handover).
+    force_tool: str | None = None
     _tool_calls_made: int = PrivateAttr(default=0)
 
     @property
@@ -88,7 +91,7 @@ class FakeChatModel(BaseChatModel):
         budget_left = self.tool_call_limit is None or self._tool_calls_made < self.tool_call_limit
         if tools and self.emit_tool_calls and budget_left:
             self._tool_calls_made += 1
-            name = self._pick_tool(tools, messages)
+            name = self.force_tool or self._pick_tool(tools, messages)
             return AIMessage(
                 content="",
                 tool_calls=[
