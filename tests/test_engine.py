@@ -9,11 +9,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from langgraph.checkpoint.memory import InMemorySaver
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents.checkout import flow as checkout_flow
-from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
@@ -43,7 +42,7 @@ def _engine(
         or FakeChatModel(force_tool="propose_order", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
         policy=PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True),
-        checkpointer=InMemorySaver(),
+        checkpointer=build_checkpointer(),
     )
     return ReasoningEngine(graph, thread_id=thread_id), store
 
@@ -194,6 +193,23 @@ async def test_kill_mid_checkout_leaves_no_ghost_order(config_root: Path) -> Non
     assert store2.placed_count == 0
     assert not engine2.pending_interrupt()
     assert any(isinstance(e, TokenEvent) for e in events)
+
+
+# --- checkpoint serde: our DTOs are registered (no 'unregistered type' warning) ----------
+
+
+async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
+    config_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # build_checkpointer's serde allowlists PendingAction/PendingRefund/HandoffRequest/
+    # ReasoningState — a checkpointed interrupt/resume (which deserializes PendingAction +
+    # HandoffRequest live) must NOT emit langgraph's "Deserializing unregistered type"
+    # warning, which is slated to become a hard block.
+    engine, _ = _engine(config_root)
+    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
+        await _pause_at_confirmation(engine)  # writes + reads PendingAction across the interrupt
+        await _events(engine, "yes")  # resume re-reads the checkpoint
+    assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
 
 
 # --- the seam's zero-LiveKit claim ------------------------------------------------------

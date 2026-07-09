@@ -22,7 +22,6 @@ a barged-over readback is not consent (§4a) — the node re-confirms.
 from __future__ import annotations
 
 import logging
-import re
 import time
 import uuid
 from collections.abc import Callable
@@ -34,6 +33,7 @@ from langchain_core.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
+from agnostic_market.agents._consent import classify_consent
 from agnostic_market.agents.checkout.prompt import compose_checkout_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.orders import OrderStore, resolve_candidates
@@ -57,45 +57,9 @@ PLACE_ORDER_POLICY = ToolConfirmationPolicy(
     min_verification_level=0,
 )
 
-# Deterministic consent/escape classification — committed transcript only, checked in
-# order: human -> no -> yes -> unclear. Negatives before positives ("no, don't do it"
-# contains "do it").
-_HUMAN_RE = re.compile(
-    r"\b(?:human|person|agent|representative|operator|somebody real)\b", re.IGNORECASE
-)
-_NO_RE = re.compile(
-    r"\b(?:no|nope|nah|don'?t|do not|cancel|stop|never ?mind|forget it|wrong)\b", re.IGNORECASE
-)
-_YES_RE = re.compile(
-    r"\b(?:yes|yeah|yep|yup|sure|correct|right|confirm|confirmed|go ahead|place it|do it|"
-    r"sounds good|please do|ok(?:ay)?)\b",
-    re.IGNORECASE,
-)
-_ABORT_RE = re.compile(
-    r"\b(?:stop|never ?mind|forget it|cancel (?:that|it|this)|no thanks|don'?t bother)\b",
-    re.IGNORECASE,
-)
-
-
-def wants_human(text: str) -> bool:
-    """§A9 no-trap escape: the caller asked for a person."""
-    return bool(_HUMAN_RE.search(text))
-
-
-def is_abort(text: str) -> bool:
-    """Explicit abort of the in-flight checkout (entry-router escape)."""
-    return bool(_ABORT_RE.search(text))
-
-
-def _classify_consent(text: str) -> str:
-    """'human' | 'no' | 'yes' | 'unclear' — deterministic, order matters."""
-    if wants_human(text):
-        return "human"
-    if _NO_RE.search(text):
-        return "no"
-    if _YES_RE.search(text):
-        return "yes"
-    return "unclear"
+# Consent/escape classification is shared across gated flows — see agents/_consent.py.
+# (`classify_consent`, `wants_human`, `is_abort` are imported above; re-exported by
+# checkout/__init__.py for the frontline entry-router + tests.)
 
 
 def _last_user_text(state: ReasoningState) -> str:
@@ -289,14 +253,14 @@ def build_checkout_nodes(
                 ],
             }
         answer = interrupt(_readback_line(pending, PLACE_ORDER_POLICY))
-        verdict = _classify_consent(str(answer.get("text", "")))
+        verdict = classify_consent(str(answer.get("text", "")))
         # §4a: consent over a barged-over readback is not consent - re-confirm once.
         if answer.get("readback_interrupted") or verdict == "unclear":
             retry = interrupt(
                 f"Sorry - just to be clear: {speak_quantity(pending.quantity, pending.name)}, "
                 f"${pending.total_usd:.2f} total. Yes or no?"
             )
-            verdict = _classify_consent(str(retry.get("text", "")))
+            verdict = classify_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
         if verdict == "human":

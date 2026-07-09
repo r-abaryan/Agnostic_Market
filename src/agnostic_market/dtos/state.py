@@ -15,6 +15,8 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 
+from agnostic_market.dtos.confirmation import RefundDestination
+
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
 # Handover destinations (tiers). Only "support"/"human" have a spoken sink in 3a; the rest
@@ -69,11 +71,39 @@ class PendingAction(BaseModel):
     created_at: float  # unix seconds; Clock-A expiry is checked against this on resume
 
 
+class PendingRefund(BaseModel):
+    """A refund awaiting step-up verification and/or HITL confirmation (AGENTS §A4b/§A10a).
+
+    Mirrors PendingAction's discipline: `idempotency_key` is per-refund-INTENT (never
+    derived from `order_id`, so a second legitimate PARTIAL refund is not silently deduped
+    as a replay); `amount_usd`/`instrument_ref` are CODE-resolved, never model arithmetic.
+    `destination` drives the required verification level in code (new instrument => L2
+    regardless of amount, §A4b — the fraud floor). `attempt_key` keys the idempotent OTP
+    dispatch (a replayed dispatch node must not re-send); `otp_tries` bounds the re-collect
+    loop deterministically (A10a rule 3). The refund `instrument_ref` is a STORED-instrument
+    reference, never a raw PAN entered by voice (PCI boundary, SECURITY §6).
+    """
+
+    model_config = _FROZEN
+
+    return_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    amount_usd: float = Field(ge=0)
+    destination: RefundDestination
+    instrument_ref: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    attempt_key: str = Field(min_length=1)
+    otp_tries: int = Field(ge=0, default=0)
+    created_at: float
+
+
 # Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
-# "left_checkout" is a TURN-SCOPED marker (reset at entry): the model left the flow this
-# turn, so a same-turn checkout re-entry is blocked — breaks the assemble->gate->handover->
-# assemble cycle structurally instead of relying on the recursion limit.
-ActiveFlow = Literal["checkout", "left_checkout"]
+# "left_*" are TURN-SCOPED markers (reset at entry): the model left the flow this turn, so
+# a same-turn re-entry is blocked — breaks the assemble->gate->handover->assemble cycle
+# structurally instead of relying on the recursion limit. Each gated flow (checkout 3b,
+# support 3c) carries its own sticky value + left-twin so the entry router knows which
+# flow's escape/stickiness rules apply.
+ActiveFlow = Literal["checkout", "left_checkout", "support", "left_support"]
 
 
 class HandoffRequest(BaseModel):
@@ -104,4 +134,5 @@ class ReasoningState(BaseModel):
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     handover: HandoffRequest | None = None
     pending_action: PendingAction | None = None
+    pending_refund: PendingRefund | None = None
     active_flow: ActiveFlow | None = None

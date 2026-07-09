@@ -42,8 +42,10 @@ from langgraph.types import Command
 from agnostic_market.agents.checkout import build_checkout_nodes, is_abort, wants_human
 from agnostic_market.agents.frontline.prompt import compose_system_prompt
 from agnostic_market.agents.gate import gate_check
+from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.orders import OrderStore
+from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import (
     HandoffDestination,
     HandoffReasonCode,
@@ -130,14 +132,24 @@ def build_frontline_graph(
     reasoning_model: BaseChatModel,
     store: OrderStore,
     policy: PolicyContext,
+    verification_store: VerificationStore | None = None,
+    otp: OtpProvider | None = None,
+    risk: RiskProvider | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
-    """Compile the reasoning graph: frontline (routing tier) + checkout flow (reasoning tier).
+    """Compile the reasoning graph: frontline (routing tier) + checkout + support flows.
 
     `read_only_tools` are already audit-wrapped (tooling.py). `checkpointer` is REQUIRED for
-    the checkout interrupt/resume path (the engine passes one per session); None keeps the
-    per-turn stateless mode the text eval uses.
+    the interrupt/resume paths (the engine passes one per session); None keeps the per-turn
+    stateless mode the text eval uses. The support flow's step-up seams
+    (`verification_store`/`otp`/`risk`) default to fresh fakes when omitted (eval/tests that
+    never enter support), so the frontline-only call sites don't have to build them.
     """
+    # Build otp first so a defaulted VerificationStore shares the SAME provider the dispatch
+    # node uses (else dispatch and verify would talk to different fakes).
+    otp = otp or OtpProvider()
+    verification_store = verification_store or VerificationStore(otp)
+    risk = risk or RiskProvider()
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
@@ -209,12 +221,23 @@ def build_frontline_graph(
                 "reason_code": handover.reason_code,
             }
         )
-        # A checkout handover ENTERS the flow (3b) instead of speaking a deferral: set the
-        # sticky flow marker, clear the handover signal, and let routing carry us into
-        # assemble in this same turn. EXCEPT when the flow was already left this turn
-        # ("left_checkout") — re-entering would cycle; fall through to the spoken deferral.
+        # A checkout/support handover ENTERS the flow (3b/3c) instead of speaking a deferral:
+        # set the sticky flow marker, clear the handover signal, and let routing carry us into
+        # the flow's assemble in this same turn. EXCEPT when that flow was already left this
+        # turn ("left_*") — re-entering would cycle; fall through to the spoken deferral.
         if handover.destination == "checkout" and state.active_flow != "left_checkout":
             return {"active_flow": "checkout", "handover": None}
+        # Support in 3c-core handles REFUNDS only. Other support-destined reason codes
+        # (cancel_order, address/payment change) are 3c-follow-up breadth — they must NOT
+        # enter the refund flow (it would run the reasoning model, fail to propose, and bail
+        # to left_support, re-tripping the gate and double-speaking). They defer honestly,
+        # exactly as pre-3c, until their flow is built. Refund enters.
+        if (
+            handover.destination == "support"
+            and handover.reason_code == "refund"
+            and state.active_flow != "left_support"
+        ):
+            return {"active_flow": "support", "handover": None}
         # The canned deferral is a FALLBACK, spoken only if nothing else will be. On the
         # gate path the model never ran → speak it. On the model path the model usually
         # narrates the handover in its own (streamed) tokens; appending the canned line
@@ -230,27 +253,36 @@ def build_frontline_graph(
         # THIS turn. (pending_action needs no such reset: while one exists the graph is
         # paused at confirm and turns arrive as resumes, never through here.)
         update: dict[str, object] = {"handover": None}
-        if state.active_flow == "left_checkout":
+        if state.active_flow in ("left_checkout", "left_support"):
             update["active_flow"] = None
         return update
 
     def route_after_entry(state: ReasoningState) -> str:
         # Escape check BEFORE the sticky flow re-engages (decision: no caller is ever
-        # trapped in checkout — AGENTS §A9). Deterministic, committed transcript only.
+        # trapped in a gated flow — AGENTS §A9). Deterministic, committed transcript only.
+        text = _last_user_text(state)
         if state.active_flow == "checkout":
-            text = _last_user_text(state)
             if wants_human(text):
                 return "checkout_escape_human"
             if is_abort(text):
                 return "checkout_abort"
             return "checkout_assemble"
+        if state.active_flow == "support":
+            if wants_human(text):
+                return "support_escape_human"
+            if is_abort(text):
+                return "support_abort"
+            return "support_assemble"
         return "gate"
 
     def route_after_handover(state: ReasoningState) -> str:
-        # Checkout destination entered the flow (handover cleared, flow set); everything
-        # else spoke its deferral and ends.
-        if state.active_flow == "checkout" and state.handover is None:
-            return "checkout_assemble"
+        # A checkout/support destination entered the flow (handover cleared, flow set);
+        # everything else spoke its deferral and ends.
+        if state.handover is None:
+            if state.active_flow == "checkout":
+                return "checkout_assemble"
+            if state.active_flow == "support":
+                return "support_assemble"
         return END
 
     def route_after_assemble(state: ReasoningState) -> str:
@@ -275,6 +307,46 @@ def build_frontline_graph(
     checkout = build_checkout_nodes(
         reasoning_model, store, policy, display_name=display_name
     )
+    support = build_support_nodes(
+        reasoning_model, store, verification_store, otp, risk, display_name=display_name
+    )
+
+    # --- support flow routers (state-only; the level-dependent branches live INSIDE the
+    #     flow, closed over the store — support.route_after_guardrail/route_after_collect) ---
+    def route_after_support_assemble(state: ReasoningState) -> str:
+        if state.active_flow == "left_support":
+            return "gate"  # model left the flow; normal pipeline answers this same turn
+        if state.pending_refund is not None:
+            return "support_guardrail"
+        return END  # clarifying question (streamed tokens already spoken)
+
+    def route_support_guardrail(state: ReasoningState) -> str:
+        # "confirm" | "stepup" (-> risk_check) | "handover" — decided by the live level.
+        decision = support.route_after_guardrail(state)
+        return {"confirm": "support_confirm", "stepup": "support_risk_check",
+                "handover": "handover"}[decision]
+
+    def route_after_support_risk(state: ReasoningState) -> str:
+        # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
+        return "handover" if state.handover is not None else "support_dispatch"
+
+    def route_after_support_collect(state: ReasoningState) -> str:
+        # "confirm" (raised to L2) | "dispatch" (re-collect) | "handover" (exhausted).
+        decision = support.route_after_collect(state)
+        return {"confirm": "support_confirm", "dispatch": "support_dispatch",
+                "handover": "handover"}[decision]
+
+    def route_after_support_confirm(state: ReasoningState) -> str:
+        if state.handover is not None:
+            return "handover"  # caller asked for a person at the confirmation
+        if state.pending_refund is not None:
+            return "support_place"  # explicit committed yes
+        return END  # declined (node spoke its line, clear-before-speak)
+
+    def route_after_support_place(state: ReasoningState) -> str:
+        # place may hand to a human on a store refusal / lapsed level; else it spoke + ends.
+        return "handover" if state.handover is not None else END
+
     tool_node = ToolNode(all_tools)
 
     graph = StateGraph(ReasoningState)
@@ -290,6 +362,15 @@ def build_frontline_graph(
     graph.add_node("checkout_place", checkout.place)
     graph.add_node("checkout_abort", checkout.abort)
     graph.add_node("checkout_escape_human", checkout.escape_human)
+    graph.add_node("support_assemble", support.assemble)
+    graph.add_node("support_guardrail", support.guardrail)
+    graph.add_node("support_risk_check", support.risk_check)
+    graph.add_node("support_dispatch", support.dispatch)
+    graph.add_node("support_collect", support.collect)
+    graph.add_node("support_confirm", support.confirm)
+    graph.add_node("support_place", support.place)
+    graph.add_node("support_abort", support.abort)
+    graph.add_node("support_escape_human", support.escape_human)
 
     def route_after_tools(state: ReasoningState) -> str:
         # request_handover's Command sets `handover` AND targets the handover node; but the
@@ -306,6 +387,9 @@ def build_frontline_graph(
             "checkout_assemble": "checkout_assemble",
             "checkout_abort": "checkout_abort",
             "checkout_escape_human": "checkout_escape_human",
+            "support_assemble": "support_assemble",
+            "support_abort": "support_abort",
+            "support_escape_human": "support_escape_human",
         },
     )
     graph.add_conditional_edges(
@@ -318,7 +402,13 @@ def build_frontline_graph(
         "tools", route_after_tools, {"handover": "handover", "model": "model"}
     )
     graph.add_conditional_edges(
-        "handover", route_after_handover, {"checkout_assemble": "checkout_assemble", END: END}
+        "handover",
+        route_after_handover,
+        {
+            "checkout_assemble": "checkout_assemble",
+            "support_assemble": "support_assemble",
+            END: END,
+        },
     )
     graph.add_conditional_edges(
         "checkout_assemble",
@@ -338,11 +428,54 @@ def build_frontline_graph(
     graph.add_edge("checkout_place", END)
     graph.add_edge("checkout_abort", END)
     graph.add_edge("checkout_escape_human", "handover")
+    graph.add_conditional_edges(
+        "support_assemble",
+        route_after_support_assemble,
+        {"gate": "gate", "support_guardrail": "support_guardrail", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_guardrail",
+        route_support_guardrail,
+        {
+            "support_confirm": "support_confirm",
+            "support_risk_check": "support_risk_check",
+            "handover": "handover",
+        },
+    )
+    graph.add_conditional_edges(
+        "support_risk_check",
+        route_after_support_risk,
+        {"support_dispatch": "support_dispatch", "handover": "handover"},
+    )
+    graph.add_edge("support_dispatch", "support_collect")
+    graph.add_conditional_edges(
+        "support_collect",
+        route_after_support_collect,
+        {
+            "support_confirm": "support_confirm",
+            "support_dispatch": "support_dispatch",
+            "handover": "handover",
+        },
+    )
+    graph.add_conditional_edges(
+        "support_confirm",
+        route_after_support_confirm,
+        {"handover": "handover", "support_place": "support_place", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_place",
+        route_after_support_place,
+        {"handover": "handover", END: END},
+    )
+    graph.add_edge("support_abort", END)
+    graph.add_edge("support_escape_human", "handover")
     graph.add_edge("finalize", END)
 
     compiled = graph.compile(checkpointer=checkpointer)
     # Stashed for tests/introspection + the engine (single source of truth for which
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
-    compiled.speakable_nodes = frozenset({"handover"}) | checkout.speakable_nodes  # type: ignore[attr-defined]
+    compiled.speakable_nodes = (  # type: ignore[attr-defined]
+        frozenset({"handover"}) | checkout.speakable_nodes | support.speakable_nodes
+    )
     return compiled

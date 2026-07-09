@@ -20,15 +20,15 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from langgraph.checkpoint.memory import InMemorySaver
 from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent
 from livekit.plugins import langchain as lk_langchain
 
-from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.dtos.state import PolicyContext
@@ -78,6 +78,12 @@ def build_voice_loop(
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
     store = OrderStore(load_orders_fixture(config_root, config.merchant_id))
+    # Per-session step-up seams (AGENTS §A4a): built once here, like OrderStore, and torn
+    # down with the session (no cross-session state — the durable/keyed form lands in Phase
+    # 4). The store shares the SAME otp the dispatch node uses (verify + dispatch agree).
+    otp = OtpProvider()
+    verification_store = VerificationStore(otp)
+    risk = RiskProvider()
     gateway = LLMGateway(credentials, secrets)
     # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
     # system prompts + few-shot (F1), so the Agent below carries NO instructions.
@@ -93,9 +99,16 @@ def build_voice_loop(
             max_order_value_usd=config.policies.max_order_value_usd,
             allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
         ),
-        # The checkout HITL interrupt needs a durable thread (in-memory for the build
-        # phase; the Redis saver is a constructor swap at deploy).
-        checkpointer=InMemorySaver(),
+        # Support step-up seams (3c): the verification level lives in verification_store and
+        # is read LIVE inside the support guardrail — never a checkpointed channel, so a
+        # replayed checkpoint can't re-grant a level (§A388).
+        verification_store=verification_store,
+        otp=otp,
+        risk=risk,
+        # The checkout/support HITL interrupts need a durable thread (in-memory for the build
+        # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
+        # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
+        checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(graph, thread_id=uuid.uuid4().hex)
     adapter = GraphVoiceAdapter(engine)
@@ -109,7 +122,7 @@ def build_voice_loop(
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    _attach_thread_reaper(session, engine)
+    _attach_thread_reaper(session, engine, verification_store)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -122,12 +135,16 @@ def build_voice_loop(
     return VoiceLoop(session=session, agent=agent, engine=engine)
 
 
-def _attach_thread_reaper(session: AgentSession, engine: ReasoningEngine) -> None:
+def _attach_thread_reaper(
+    session: AgentSession, engine: ReasoningEngine, verification_store: VerificationStore
+) -> None:
     """Clock B (AGENTS §A10 rule 4): on session close, the thread is reaped UNCONDITIONALLY
-    — a dropped call must never leave a resumable checkout. Re-entrant-safe: a double-fired
-    close deletes once and emits the abandoned event at most once. Nothing is spoken (the
-    caller is gone); expiry of a still-connected caller's pending action is Clock A, owned
-    by the graph's confirm node."""
+    — a dropped call must never leave a resumable checkout/refund. Re-entrant-safe: a
+    double-fired close deletes once and emits the abandoned event at most once. Nothing is
+    spoken (the caller is gone); expiry of a still-connected caller's pending action is
+    Clock A, owned by the graph's confirm node. The verification grant is cleared too, so a
+    reattaching session can never inherit a stale L2 (belt-and-suspenders — the per-session
+    store already dies with the session)."""
     reaped = False
 
     @session.on("close")
@@ -137,8 +154,9 @@ def _attach_thread_reaper(session: AgentSession, engine: ReasoningEngine) -> Non
             return
         reaped = True
         if engine.pending_interrupt():
-            write_event({"event": "checkout_abandoned", "reason": "session_closed"})
+            write_event({"event": "flow_abandoned", "reason": "session_closed"})
         engine.delete_thread()
+        verification_store.clear()
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:

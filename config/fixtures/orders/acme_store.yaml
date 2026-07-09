@@ -2,9 +2,9 @@
 # Replaced by the real order-SoR integration in Phase 4 (BUILD_PLAN); until then this is
 # what "what's the status of order X" answers from. Preloaded at session build.
 orders:
-  ORD-1001: { status: "shipped", summary: "2 pairs of trail running shoes", eta: "2026-07-09" }
-  ORD-1002: { status: "processing", summary: "1 waterproof rain jacket", eta: "2026-07-12" }
-  ORD-1003: { status: "delivered", summary: "3 pairs of merino hiking socks", eta: "2026-07-01" }
+  ORD-1001: { status: "shipped", summary: "2 pairs of trail running shoes", eta: "2026-07-09", total_usd: 179.98 }
+  ORD-1002: { status: "processing", summary: "1 waterproof rain jacket", eta: "2026-07-12", total_usd: 129.00 }
+  ORD-1003: { status: "delivered", summary: "3 pairs of merino hiking socks", eta: "2026-07-01", total_usd: 43.50 }
 products:
   - { sku: "SKU-RED-42", name: "trail running shoes", price_usd: 89.99 }
   - { sku: "SKU-BLU-07", name: "waterproof rain jacket", price_usd: 129.00 }

@@ -26,6 +26,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -36,6 +38,22 @@ from agnostic_market.dtos.events import (
     TurnEvent,
     TurnFacts,
 )
+from agnostic_market.dtos.state import HandoffRequest, PendingAction, PendingRefund, ReasoningState
+
+# The custom (non-message) types we checkpoint into graph state. langgraph's default
+# msgpack serde is permissive (deserializes anything with a warning), but that path is
+# slated to be BLOCKED — an explicit allowlist registers our DTOs as trusted so the
+# checkpoint roundtrip is future-proof AND stops trusting arbitrary types (the security
+# posture the warning is nudging toward). langchain messages stay covered by the built-in
+# safe types; this ADDS ours. One source of truth — pipeline + tests build via this.
+_CHECKPOINTED_DTOS = (PendingAction, PendingRefund, HandoffRequest, ReasoningState)
+
+
+def build_checkpointer() -> InMemorySaver:
+    """An InMemorySaver whose serde trusts our checkpointed DTOs (no 'unregistered type'
+    warning, and not silently permissive to arbitrary types). Redis swap at Phase 4 wires
+    the same allowlist into its serde."""
+    return InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=list(_CHECKPOINTED_DTOS)))
 
 
 class ReasoningEngine:

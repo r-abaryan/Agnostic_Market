@@ -13,7 +13,11 @@ from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
-_HANDOVER_ARGS = {"request_handover": {"destination": "support", "reason_code": "address_change"}}
+# A DEFERRING destination (planner) — these tests exercise the destination-agnostic handover
+# CONTROL mechanism (routing through Command, deferral speak, history hygiene), NOT a specific
+# flow. checkout/support destinations ENTER their flows (3b/3c) instead of deferring, so a
+# mechanism test must use a destination that still ends at the spoken deferral.
+_HANDOVER_ARGS = {"request_handover": {"destination": "planner", "reason_code": "multi_step"}}
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
 
 
@@ -61,6 +65,26 @@ async def test_gate_trip_skips_model_and_hands_over(config_root: Path) -> None:
     assert "support team" in out["messages"][-1].content
 
 
+async def test_cancel_defers_cleanly_without_entering_the_refund_flow(config_root: Path) -> None:
+    # Live 2026-07-08 bug: "cancel it" (a cancel_order handover to support) ENTERED the
+    # refund flow, whose model couldn't propose, bailed to left_support, re-tripped the gate,
+    # and double-spoke (the leaving model's narration + the canned deferral). cancel_order is
+    # 3c-follow-up breadth — support enters ONLY for refunds; other support codes defer once.
+    # A reasoning fake that WOULD run if support were (wrongly) entered — it must NOT run.
+    reasoning = FakeChatModel(
+        force_tool="leave_support", canned_args={"leave_support": {}}, tool_call_limit=1
+    )
+    graph = _graph(config_root, FakeChatModel(tool_call_limit=1), reasoning_model=reasoning)
+    out = await graph.ainvoke({"messages": [HumanMessage("actually cancel that order")]})
+    assert out.get("active_flow") is None  # never entered (nor left) the refund flow
+    assert reasoning._tool_calls_made == 0  # the refund model was never invoked
+    spoken = [
+        m for m in out["messages"] if isinstance(m, AIMessage) and (m.content or "").strip()
+    ]
+    assert len(spoken) == 1  # exactly one deferral line — no double-speak
+    assert "support team" in spoken[0].content
+
+
 async def test_read_only_turn_answers_without_handover(config_root: Path) -> None:
     fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
     graph = _graph(config_root, fake)
@@ -88,7 +112,7 @@ async def test_model_handover_routes_through_command(config_root: Path) -> None:
     assert out["handover"].source == "model"
     # Proper tool_use/tool_result pairing (G1): the executed handover tool left a ToolMessage.
     assert any(isinstance(m, ToolMessage) for m in out["messages"])
-    assert "support team" in out["messages"][-1].content
+    assert "picked up" in out["messages"][-1].content  # the planner deferral line
 
 
 async def test_model_narration_is_not_double_spoken(config_root: Path) -> None:
@@ -106,10 +130,10 @@ async def test_model_narration_is_not_double_spoken(config_root: Path) -> None:
         force_tool="request_handover", tool_call_limit=1, canned_args=_HANDOVER_ARGS
     )
     graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("send it to my work address")]})
+    out = await graph.ainvoke({"messages": [HumanMessage("plan a whole trip outfit for me")]})
     assert out["handover"].source == "model"
     # The node did NOT append its canned deferral (the model's narration is the deferral).
-    canned = "I'll make sure it reaches our support team"
+    canned = "I'll make sure it's picked up"  # the planner deferral line
     assert not any(
         isinstance(m, AIMessage) and canned in (m.content or "") for m in out["messages"]
     )

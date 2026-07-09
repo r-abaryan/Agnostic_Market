@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.checkout import build_checkout_nodes, speak_quantity
+from agnostic_market.agents.engine import build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
@@ -39,7 +39,7 @@ def _build(
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
         store=store,
         policy=_POLICY,
-        checkpointer=InMemorySaver(),
+        checkpointer=build_checkpointer(),
     )
     return graph, store
 
@@ -216,12 +216,14 @@ def test_place_node_replay_yields_the_same_single_order(config_root: Path) -> No
 
 def test_speakable_nodes_are_graph_declared(config_root: Path) -> None:
     graph, _ = _build(config_root)
-    assert graph.speakable_nodes == {
+    # Checkout's caller-facing nodes are declared speakable (support declares its own — see
+    # the support suite). The graph's set is the single source of truth the engine reads.
+    assert {
         "handover",
         "checkout_guardrail",
         "checkout_confirm",
         "checkout_place",
         "checkout_abort",
-    }
+    } <= graph.speakable_nodes
     # The structural safety set is unchanged: still no state-changing tool on the frontline.
     assert graph.frontline_read_only_tools == {"order_status", "catalog_search"}
