@@ -8,12 +8,15 @@ frontline gate trips on "refund ..." and enters the support flow.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import pytest
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
@@ -26,7 +29,13 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
-_POLICY = PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True)
+_POLICY = PolicyContext(
+    max_order_value_usd=500.0,
+    allow_ai_merchant_handoff=True,
+    refund_auto_approve_under_usd=50.0,
+    refund_require_human_above_usd=200.0,
+    pending_ttl_seconds=120.0,
+)
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
 # The reasoning fake proposes a refund of $129.00 on order key "2" (ORD-1002) to a NEW card.
@@ -41,6 +50,7 @@ def _engine(
     *,
     reasoning: FakeChatModel | None = None,
     risk_flagged: bool = False,
+    policy: PolicyContext = _POLICY,
     thread_id: str = "support-1",
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
@@ -54,7 +64,7 @@ def _engine(
         reasoning_model=reasoning
         or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
-        policy=_POLICY,
+        policy=policy,
         verification_store=verification,
         otp=otp,
         risk=RiskProvider(flagged=risk_flagged),
@@ -201,3 +211,208 @@ async def test_kill_mid_stepup_leaves_no_ghost_refund_and_no_free_level(config_r
     assert store2.refund_count == 0
     assert verification2.current_level() == 1
     assert any(isinstance(e, TokenEvent) for e in events)
+
+
+# --- Group A: refund-to-ORIGINAL (L1, no step-up) ----------------------------------------
+
+# ORD-1002 is "processing" (cancellable), $129.00 captured.
+_REFUND_ORIGINAL = {
+    "propose_refund": {"order_key": "2", "amount_usd": 50.0, "destination": "original"}
+}
+_CANCEL_PROCESSING = {"propose_cancel": {"order_key": "2"}}  # ORD-1002, processing
+_CANCEL_SHIPPED = {"propose_cancel": {"order_key": "1"}}  # ORD-1001, shipped
+
+
+def _cancel_engine(config_root, args, *, thread_id, risk_flagged=False):
+    return _engine(
+        config_root,
+        reasoning=FakeChatModel(
+            force_tool=next(iter(args)), canned_args=args, tool_call_limit=1
+        ),
+        risk_flagged=risk_flagged,
+        thread_id=thread_id,
+    )
+
+
+async def test_refund_to_original_is_l1_no_stepup(config_root: Path) -> None:
+    engine, store, verification, otp = _engine(
+        config_root,
+        reasoning=FakeChatModel(
+            force_tool="propose_refund", canned_args=_REFUND_ORIGINAL, tool_call_limit=1
+        ),
+        thread_id="ro-1",
+    )
+    events = await _events(engine, "I want a refund to my original card")
+    # NO OTP dispatched (L1 already satisfies refund-to-original) — straight to the readback.
+    assert otp.dispatch_count == 0
+    assert verification.current_level() == 1
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "$50.00" in interrupts[0].prompt
+    assert "your your" not in interrupts[0].prompt  # the double-'your' bug stays fixed
+    await _events(engine, "yes")
+    assert store.refund_count == 1
+    assert store.refunded_so_far("ORD-1002") == 50.0
+
+
+# --- Group A: cancel-order ---------------------------------------------------------------
+
+
+async def test_cancel_processing_order_voids_after_readback(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="cx-1")
+    events = await _events(engine, "cancel my rain jacket order")
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "ORD-1002" in interrupts[0].prompt and "can't be undone" in interrupts[0].prompt
+    assert store.cancel_count == 0  # nothing voided before consent
+    events = await _events(engine, "yes")
+    assert store.cancel_count == 1
+    assert store.order_status("ORD-1002") == "cancelled"
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any(e.node == "support_cancel_void" and "cancelled" in e.text.lower() for e in spoken)
+
+
+async def test_cancel_shipped_order_declines_without_voiding(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_SHIPPED, thread_id="cx-2")
+    events = await _events(engine, "cancel my shoes order")
+    # No interrupt (we don't read back a cancel we can't do), no void, one honest line.
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+    assert store.cancel_count == 0
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("already shipped" in e.text.lower() for e in spoken)
+
+
+async def test_cancel_risk_flagged_hands_to_human_without_voiding(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(
+        config_root, _CANCEL_PROCESSING, thread_id="cx-3", risk_flagged=True
+    )
+    events = await _events(engine, "cancel my rain jacket order")
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+    assert store.cancel_count == 0  # a risk-flagged session gets no silent void
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any(e.node == "handover" and "person" in e.text.lower() for e in spoken)
+
+
+async def test_cancel_no_at_readback_leaves_order_untouched(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="cx-4")
+    await _events(engine, "cancel my rain jacket order")
+    events = await _events(engine, "no, leave it")
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "processing"  # untouched
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("leave that order" in e.text.lower() for e in spoken)
+
+
+async def test_cancel_barged_readback_reconfirms_before_voiding(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="cx-5")
+    await _events(engine, "cancel my rain jacket order")
+    # "yes" over a barged-over readback is not consent (§4a) -> re-confirm, not void.
+    events = await _events(engine, "yes", TurnFacts(readback_interrupted=True))
+    assert store.cancel_count == 0
+    reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(reconfirms) == 1
+    assert "yes or no" in reconfirms[0].prompt.lower()
+    await _events(engine, "yes")  # a clean committed yes voids it
+    assert store.cancel_count == 1
+
+
+async def test_cancel_is_idempotent_across_double_resume(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="cx-6")
+    await _events(engine, "cancel my rain jacket order")
+    await _events(engine, "yes")
+    await _events(engine, "yes")  # a stray extra turn after completion must not re-void
+    assert store.cancel_count == 1
+
+
+async def test_kill_mid_cancel_leaves_no_ghost(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="cx-7")
+    await _events(engine, "cancel my rain jacket order")  # paused at the cancel readback
+    assert engine.pending_interrupt()
+    engine.delete_thread()
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "processing"  # nothing voided on the drop
+
+
+# --- F-1: refund amount gate (merchant policy, within platform bounds) --------------------
+
+
+def _refund_engine(config_root, amount, dest, *, thread_id, policy=_POLICY):
+    # ORD-1001 (key "1") is shipped but total 179.98; refunds don't need it cancellable.
+    return _engine(
+        config_root,
+        reasoning=FakeChatModel(
+            force_tool="propose_refund",
+            canned_args={
+                "propose_refund": {"order_key": "1", "amount_usd": amount, "destination": dest}
+            },
+            tool_call_limit=1,
+        ),
+        policy=policy,
+        thread_id=thread_id,
+    )
+
+
+async def test_refund_in_band_reaches_readback(config_root: Path) -> None:
+    # $150 <= require_human_above (200) -> agent processes behind the readback.
+    engine, store, _, _ = _refund_engine(config_root, 150.0, "original", thread_id="amt-1")
+    events = await _events(engine, "I want a refund to my original card")
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "$150.00" in interrupts[0].prompt
+    assert store.refund_count == 0  # not until the yes
+
+
+async def test_refund_over_human_threshold_routes_to_person_no_refund(config_root: Path) -> None:
+    # $250 > require_human_above (200) -> a person, NO readback, NO refund, specific line.
+    engine, store, _, otp = _refund_engine(config_root, 250.0, "original", thread_id="amt-2")
+    events = await _events(engine, "I want a refund to my original card")
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+    assert store.refund_count == 0
+    assert otp.dispatch_count == 0  # no step-up either — it just goes to a human
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("above what I can process" in e.text for e in spoken)
+
+
+async def test_refund_amount_gate_precedes_stepup(config_root: Path) -> None:
+    # An over-threshold refund to a NEW instrument (would need L2) must NOT enter the OTP
+    # loop — the amount gate routes to a human FIRST (no point verifying a refund a human
+    # must handle anyway).
+    engine, store, _, otp = _refund_engine(config_root, 300.0, "new_instrument", thread_id="amt-3")
+    events = await _events(engine, "refund my order to a different card")
+    assert otp.dispatch_count == 0  # amount gate fired before dispatch
+    assert store.refund_count == 0
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+
+
+# --- F-2: Clock-A TTL on the support confirm nodes (clear-before-speak) -------------------
+
+
+async def test_stale_refund_readback_expires_before_placing(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, store, _, _ = _engine(config_root)
+    await _pause_at_otp(engine)
+    await _events(engine, _VALID_OTP)  # raised to L2, now paused at the refund readback
+    # Jump the flow clock past the TTL; the resume must find the pending expired.
+    future = time.time() + 10_000
+    monkeypatch.setattr(support_flow.time, "time", lambda: future)
+    events = await _events(engine, "yes")  # a stale yes must NOT refund
+    assert store.refund_count == 0
+    assert not engine.pending_interrupt()
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("sat for a while" in e.text for e in spoken)
+
+
+async def test_stale_cancel_readback_expires_before_voiding(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="ttl-c")
+    await _events(engine, "cancel my rain jacket order")  # paused at the cancel readback
+    future = time.time() + 10_000
+    monkeypatch.setattr(support_flow.time, "time", lambda: future)
+    events = await _events(engine, "yes")  # a stale yes must NOT void
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "processing"
+    assert not engine.pending_interrupt()
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("sat for a while" in e.text for e in spoken)

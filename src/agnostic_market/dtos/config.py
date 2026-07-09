@@ -73,12 +73,21 @@ class TelephonyConfig(BaseModel):
 
 
 class RefundPolicy(BaseModel):
-    """Refund thresholds; values are merchant-set but bounded (>= 0)."""
+    """Refund thresholds; values are merchant-set but bounded. `auto_approve_under_usd` <=
+    `require_human_above_usd` (ordering) and `require_human_above_usd` <= the platform
+    ceiling are enforced in the resolver (it sees `_platform.limits`); the DTO only checks
+    the local `>= 0` floor."""
 
     model_config = _STRICT
 
     auto_approve_under_usd: float = Field(ge=0)
     require_human_above_usd: float = Field(ge=0)
+
+
+# Default caller-silence window before a paused confirmation (checkout/refund/cancel) expires
+# — a synchronous voice call, so short. Merchant may tune it within the platform max
+# (_platform.limits.pending_confirmation_ttl_max_seconds, resolver-enforced).
+_DEFAULT_PENDING_TTL_SECONDS = 120.0
 
 
 class PolicyConfig(BaseModel):
@@ -89,6 +98,11 @@ class PolicyConfig(BaseModel):
     max_order_value_usd: float = Field(ge=0)
     refunds: RefundPolicy
     allow_ai_merchant_handoff: StrictBool
+    # Optional: merchant-tunable within the platform max. Defaults so existing merchant YAMLs
+    # (which don't set it) keep the platform default; the resolver clamps the ceiling.
+    pending_confirmation_ttl_seconds: float = Field(
+        default=_DEFAULT_PENDING_TTL_SECONDS, gt=0
+    )
 
 
 class ComplianceConfig(BaseModel):

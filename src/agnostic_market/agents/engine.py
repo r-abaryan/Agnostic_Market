@@ -38,7 +38,13 @@ from agnostic_market.dtos.events import (
     TurnEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.state import HandoffRequest, PendingAction, PendingRefund, ReasoningState
+from agnostic_market.dtos.state import (
+    HandoffRequest,
+    PendingAction,
+    PendingCancel,
+    PendingRefund,
+    ReasoningState,
+)
 
 # The custom (non-message) types we checkpoint into graph state. langgraph's default
 # msgpack serde is permissive (deserializes anything with a warning), but that path is
@@ -46,7 +52,7 @@ from agnostic_market.dtos.state import HandoffRequest, PendingAction, PendingRef
 # checkpoint roundtrip is future-proof AND stops trusting arbitrary types (the security
 # posture the warning is nudging toward). langchain messages stay covered by the built-in
 # safe types; this ADDS ours. One source of truth — pipeline + tests build via this.
-_CHECKPOINTED_DTOS = (PendingAction, PendingRefund, HandoffRequest, ReasoningState)
+_CHECKPOINTED_DTOS = (PendingAction, PendingRefund, PendingCancel, HandoffRequest, ReasoningState)
 
 
 def build_checkpointer() -> InMemorySaver:

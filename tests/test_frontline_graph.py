@@ -34,7 +34,13 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
-        policy=PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True),
+        policy=PolicyContext(
+            max_order_value_usd=500.0,
+            allow_ai_merchant_handoff=True,
+            refund_auto_approve_under_usd=50.0,
+            refund_require_human_above_usd=200.0,
+            pending_ttl_seconds=120.0,
+        ),
         **kwargs,
     )
 
@@ -65,24 +71,20 @@ async def test_gate_trip_skips_model_and_hands_over(config_root: Path) -> None:
     assert "support team" in out["messages"][-1].content
 
 
-async def test_cancel_defers_cleanly_without_entering_the_refund_flow(config_root: Path) -> None:
-    # Live 2026-07-08 bug: "cancel it" (a cancel_order handover to support) ENTERED the
-    # refund flow, whose model couldn't propose, bailed to left_support, re-tripped the gate,
-    # and double-spoke (the leaving model's narration + the canned deferral). cancel_order is
-    # 3c-follow-up breadth — support enters ONLY for refunds; other support codes defer once.
-    # A reasoning fake that WOULD run if support were (wrongly) entered — it must NOT run.
+async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
+    # Group A: cancel_order is now a BUILT support capability, so a cancel_order handover
+    # ENTERS the support flow (it no longer defers — that was the 3c-only behavior). The
+    # support assemble model runs and proposes the cancel; the flow reaches its readback
+    # interrupt. (address/payment change still defer — only refund + cancel_order enter.)
     reasoning = FakeChatModel(
-        force_tool="leave_support", canned_args={"leave_support": {}}, tool_call_limit=1
+        force_tool="propose_cancel", canned_args={"propose_cancel": {"order_key": "2"}},
+        tool_call_limit=1,
     )
     graph = _graph(config_root, FakeChatModel(tool_call_limit=1), reasoning_model=reasoning)
     out = await graph.ainvoke({"messages": [HumanMessage("actually cancel that order")]})
-    assert out.get("active_flow") is None  # never entered (nor left) the refund flow
-    assert reasoning._tool_calls_made == 0  # the refund model was never invoked
-    spoken = [
-        m for m in out["messages"] if isinstance(m, AIMessage) and (m.content or "").strip()
-    ]
-    assert len(spoken) == 1  # exactly one deferral line — no double-speak
-    assert "support team" in spoken[0].content
+    assert out.get("active_flow") == "support"  # ENTERED the flow (paused at the readback)
+    assert reasoning._tool_calls_made == 1  # the support model ran and proposed a cancel
+    assert out.get("pending_cancel") is not None  # a cancel is staged, awaiting confirmation
 
 
 async def test_read_only_turn_answers_without_handover(config_root: Path) -> None:

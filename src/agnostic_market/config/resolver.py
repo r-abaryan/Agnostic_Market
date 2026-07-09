@@ -35,6 +35,11 @@ class SafetyLockViolationError(RuntimeError):
     """A template/override attempted to set a platform-safety-locked key path."""
 
 
+class PolicyBoundsViolationError(RuntimeError):
+    """A merchant policy value exceeds a platform ceiling (`_platform.limits`), i.e. tried to
+    disable a guard rather than tune it within bounds."""
+
+
 class ConfigResolutionError(RuntimeError):
     """The resolved config failed schema validation."""
 
@@ -80,6 +85,44 @@ def _assert_no_locked_keys(
             )
 
 
+def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
+    """Reject a merchant policy that exceeds a platform ceiling (the "within bounds" half of
+    policy-within-bounds; the lock-check is the "can't touch locked keys" half).
+
+    Reads `_platform.limits` from the MERGED config (before `_platform` is stripped) — this
+    is the ONE place that sees both the effective merchant policy and the locked ceilings.
+    Loud at config-load (like SafetyLockViolationError), not a silent clamp: a merchant learns
+    at onboarding that a value is out of bounds, never gets a quietly-lowered guard mid-call.
+    """
+    limits = merged.get("_platform", {}).get("limits", {})
+    policies = merged.get("policies", {})
+    refunds = policies.get("refunds", {})
+
+    require_human = refunds.get("require_human_above_usd")
+    ceiling = limits.get("refund_require_human_ceiling_usd")
+    if require_human is not None and ceiling is not None and require_human > ceiling:
+        raise PolicyBoundsViolationError(
+            f"policies.refunds.require_human_above_usd={require_human} exceeds the platform "
+            f"ceiling {ceiling} - a merchant may lower the human-review threshold, never disable it"
+        )
+
+    # Ordering sanity: auto-approve can't sit above the human-review line (would be incoherent).
+    auto = refunds.get("auto_approve_under_usd")
+    if auto is not None and require_human is not None and auto > require_human:
+        raise PolicyBoundsViolationError(
+            f"policies.refunds.auto_approve_under_usd={auto} is above "
+            f"require_human_above_usd={require_human} - auto-approve cannot exceed the human line"
+        )
+
+    ttl = policies.get("pending_confirmation_ttl_seconds")
+    ttl_max = limits.get("pending_confirmation_ttl_max_seconds")
+    if ttl is not None and ttl_max is not None and ttl > ttl_max:
+        raise PolicyBoundsViolationError(
+            f"policies.pending_confirmation_ttl_seconds={ttl} exceeds the platform ceiling "
+            f"{ttl_max} - the confirmation window may be shortened, never made unbounded"
+        )
+
+
 def resolve_merchant_config(
     base: dict[str, Any],
     template: dict[str, Any],
@@ -87,7 +130,8 @@ def resolve_merchant_config(
 ) -> MerchantConfig:
     """Resolve base -> template -> override into a validated MerchantConfig.
 
-    Raises SafetyLockViolationError if template/override touches a locked key, or
+    Raises SafetyLockViolationError if template/override touches a locked key,
+    PolicyBoundsViolationError if a merchant policy value exceeds a platform ceiling, or
     ConfigResolutionError if the merged config fails schema validation.
     """
     # The lock floor is fixed in code; base may only EXTEND it, never shrink it.
@@ -99,6 +143,8 @@ def resolve_merchant_config(
     _assert_no_locked_keys(override, locked, layer_name="override")
 
     merged = _deep_merge(_deep_merge(base, template), override)
+    # Bounds check runs on the MERGED config while `_platform.limits` is still present.
+    _assert_policy_within_bounds(merged)
     # Platform-only sections (the lock declaration + the `_platform` safety block) are
     # directives, not MerchantConfig fields — drop them before validation. The DTO forbids
     # extras, so this also keeps them out of the effective merchant config.

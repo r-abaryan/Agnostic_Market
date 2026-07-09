@@ -98,6 +98,9 @@ def build_voice_loop(
         policy=PolicyContext(
             max_order_value_usd=config.policies.max_order_value_usd,
             allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
+            refund_auto_approve_under_usd=config.policies.refunds.auto_approve_under_usd,
+            refund_require_human_above_usd=config.policies.refunds.require_human_above_usd,
+            pending_ttl_seconds=config.policies.pending_confirmation_ttl_seconds,
         ),
         # Support step-up seams (3c): the verification level lives in verification_store and
         # is read LIVE inside the support guardrail — never a checkpointed channel, so a

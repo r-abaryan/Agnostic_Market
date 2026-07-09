@@ -42,10 +42,10 @@ from agnostic_market.dtos.state import HandoffRequest, PendingAction, PolicyCont
 
 logger = logging.getLogger("agnostic_market.agents.checkout")
 
-# Clock A: a pending confirmation older than this cannot be resumed — the confirm node
-# cancels and re-confirms fresh. Platform floor (same authority model as _ALWAYS_LOCKED);
-# merchant-configurable later via policy-within-bounds.
-_PENDING_TTL_SECONDS = 120.0
+# Clock A: a pending confirmation older than `policy.pending_ttl_seconds` cannot be resumed —
+# the confirm node cancels + re-confirms fresh. The window is merchant-tunable within a
+# platform max (policy-within-bounds; the resolver clamps it). Read live from `policy` in the
+# confirm node, not a module constant.
 
 # place_order's declared confirmation contract (VOICE_PIPELINE §7a): the readback MUST
 # cover these fields at explicit_yes strength before the effect may run. Enforced below in
@@ -239,7 +239,7 @@ def build_checkout_nodes(
         """
         pending = state.pending_action
         assert pending is not None  # only reached with a minted pending action
-        if time.time() - pending.created_at > _PENDING_TTL_SECONDS:
+        if time.time() - pending.created_at > policy.pending_ttl_seconds:
             write_event({"event": "checkout_expired", "reason": "pending_ttl"})
             # Clear-before-speak: state says "no pending" in the same update as the line.
             return {

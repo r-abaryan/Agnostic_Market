@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture, resolve_candidates
+import pytest
+
+from agnostic_market.commerce.orders import (
+    CancelError,
+    OrderStore,
+    load_orders_fixture,
+    resolve_candidates,
+)
 
 
 def _store(config_root: Path) -> OrderStore:
@@ -56,3 +63,48 @@ def test_resolve_candidates_returns_full_catalog_on_miss(config_root: Path) -> N
     candidates = resolve_candidates(fixture, "zzz-nothing")
     assert len(candidates) == len(fixture.products)
     assert [c.key for c in candidates] == [str(i) for i in range(1, len(candidates) + 1)]
+
+
+# --- cancel-order (Group A): eligibility + idempotent void ------------------------------
+
+
+def test_processing_order_is_cancellable_shipped_is_not(config_root: Path) -> None:
+    store = _store(config_root)
+    assert store.is_cancellable("ORD-1002") is True  # processing
+    assert store.is_cancellable("ORD-1001") is False  # shipped
+    assert store.is_cancellable("ORD-1003") is False  # delivered
+    assert store.is_cancellable("NOPE") is False  # unknown
+
+
+def test_cancel_voids_processing_and_reads_back_cancelled(config_root: Path) -> None:
+    store = _store(config_root)
+    rec = store.cancel_order("ck-1", order_id="ORD-1002")
+    assert rec.order_id == "ORD-1002"
+    assert store.order_status("ORD-1002") == "cancelled"
+    assert "cancelled" in (store.order_summary("ORD-1002") or "")
+    assert store.is_cancellable("ORD-1002") is False  # can't cancel a cancelled order
+
+
+def test_cancel_is_idempotent_by_key(config_root: Path) -> None:
+    store = _store(config_root)
+    a = store.cancel_order("ck-1", order_id="ORD-1002")
+    b = store.cancel_order("ck-1", order_id="ORD-1002")
+    assert a is b  # the ORIGINAL cancel, not a re-void
+    assert store.cancel_count == 1
+
+
+def test_cancel_refuses_shipped_and_unknown(config_root: Path) -> None:
+    store = _store(config_root)
+    with pytest.raises(CancelError):
+        store.cancel_order("ck-1", order_id="ORD-1001")  # shipped
+    with pytest.raises(CancelError):
+        store.cancel_order("ck-2", order_id="NOPE-404")  # unknown
+    assert store.cancel_count == 0
+
+
+def test_placed_order_is_cancellable(config_root: Path) -> None:
+    store = _store(config_root)
+    placed = store.place("k1", sku="SKU-BLU-07", name="rain jacket", quantity=1, total_usd=129.0)
+    assert store.is_cancellable(placed.order_id) is True  # placed orders start processing
+    store.cancel_order("ck-1", order_id=placed.order_id)
+    assert store.order_status(placed.order_id) == "cancelled"

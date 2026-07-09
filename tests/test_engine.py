@@ -6,6 +6,7 @@ kill-mid-checkout (Clock B reap), idempotent placement, and the seam's zero-Live
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,13 @@ def _engine(
         reasoning_model=reasoning
         or FakeChatModel(force_tool="propose_order", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
-        policy=PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True),
+        policy=PolicyContext(
+            max_order_value_usd=500.0,
+            allow_ai_merchant_handoff=True,
+            refund_auto_approve_under_usd=50.0,
+            refund_require_human_above_usd=200.0,
+            pending_ttl_seconds=120.0,
+        ),
         checkpointer=build_checkpointer(),
     )
     return ReasoningEngine(graph, thread_id=thread_id), store
@@ -166,8 +173,12 @@ async def test_expired_pending_cancels_before_speaking(
 ) -> None:
     engine, store = _engine(config_root)
     await _pause_at_confirmation(engine)
-    monkeypatch.setattr(checkout_flow, "_PENDING_TTL_SECONDS", -1.0)
-    events = await _events(engine, "yes")  # a stale yes must NOT place
+    # TTL is policy-driven (default 120s); jump the flow's clock past it so the resume finds
+    # the pending expired. Capture real now FIRST (checkout_flow.time is the global module —
+    # a self-referential lambda would recurse). Clear-before-speak: a stale yes must NOT place.
+    future = time.time() + 10_000
+    monkeypatch.setattr(checkout_flow.time, "time", lambda: future)
+    events = await _events(engine, "yes")
     assert store.placed_count == 0
     assert not engine.pending_interrupt()  # cleared (clear-before-speak)
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]

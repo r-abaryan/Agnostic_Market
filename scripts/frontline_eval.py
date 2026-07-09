@@ -92,6 +92,9 @@ async def _run() -> int:
         policy=PolicyContext(
             max_order_value_usd=config.policies.max_order_value_usd,
             allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
+            refund_auto_approve_under_usd=config.policies.refunds.auto_approve_under_usd,
+            refund_require_human_above_usd=config.policies.refunds.require_human_above_usd,
+            pending_ttl_seconds=config.policies.pending_confirmation_ttl_seconds,
         ),
         # An utterance that reaches the confirm readback pauses at an interrupt, which
         # needs a checkpointer even in the text eval (fresh thread per utterance).

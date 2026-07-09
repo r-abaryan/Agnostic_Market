@@ -30,6 +30,14 @@ _platform:
     - new_address
     - new_payment_instrument_ref
     - new_contact
+  # Ceilings on merchant-tunable policy — "policy within bounds". A merchant TUNES a value
+  # in their override (e.g. require_human_above_usd), the platform CLAMPS it: the resolver
+  # REJECTS an override that exceeds a ceiling here, so a merchant can tighten a guard but
+  # never disable it (set the human-review threshold impossibly high, or the confirmation
+  # window impossibly long). Enforced in config/resolver.py; locked (inside _platform).
+  limits:
+    refund_require_human_ceiling_usd: 500       # a refund above this ALWAYS needs a human
+    pending_confirmation_ttl_max_seconds: 300    # max caller-silence before a pending expires
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"

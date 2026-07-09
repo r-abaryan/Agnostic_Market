@@ -41,7 +41,7 @@ from pydantic import BaseModel
 from agnostic_market.agents._consent import classify_consent
 from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.commerce.orders import OrderStore, RefundError
+from agnostic_market.commerce.orders import CancelError, OrderStore, RefundError
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import (
     ISSUE_REFUND_POLICY,
@@ -49,7 +49,13 @@ from agnostic_market.dtos.confirmation import (
     ToolConfirmationPolicy,
     refund_required_level,
 )
-from agnostic_market.dtos.state import HandoffRequest, PendingRefund, ReasoningState
+from agnostic_market.dtos.state import (
+    HandoffRequest,
+    PendingCancel,
+    PendingRefund,
+    PolicyContext,
+    ReasoningState,
+)
 
 logger = logging.getLogger("agnostic_market.agents.support")
 
@@ -90,10 +96,23 @@ def _readback_line(pending: PendingRefund, policy: ToolConfirmationPolicy) -> st
     )
 
 
+def _cancel_readback_line(pending: PendingCancel) -> str:
+    """The GRAPH-authored cancel readback — the `interrupt()` payload. Names the order so a
+    mis-heard reference can't void the wrong one; states irreversibility (§7a discipline)."""
+    return (
+        f"Just to confirm - cancel your order for {pending.summary} ({pending.order_id})? "
+        "This can't be undone."
+    )
+
+
 class _ProposeRefund(BaseModel):
     order_key: str
     amount_usd: float
     destination: RefundDestination
+
+
+class _ProposeCancel(BaseModel):
+    order_key: str
 
 
 @dataclass(frozen=True)
@@ -110,15 +129,23 @@ class SupportNodes:
     collect: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
+    cancel_guardrail: Callable[[ReasoningState], dict[str, object]]
+    cancel_confirm: Callable[[ReasoningState], dict[str, object]]
+    cancel_void: Callable[[ReasoningState], dict[str, object]]
     abort: Callable[[ReasoningState], dict[str, object]]
     escape_human: Callable[[ReasoningState], dict[str, object]]
-    # Branch after the guardrail depends on the LIVE verification level (in the store,
+    # After assemble: which action did the model propose? "refund" | "cancel" | "leave" | "clarify".
+    route_after_assemble: Callable[[ReasoningState], str]
+    # Branch after the refund guardrail depends on the LIVE verification level (in the store,
     # which graph.py can't see) — so the flow owns this router, closed over the store.
     # "confirm" (level sufficient) | "stepup" (needs the OTP loop) | "handover" (cleared).
     route_after_guardrail: Callable[[ReasoningState], str]
     # Branch after collect: the OTP verify may have raised to L2 (-> confirm), exhausted
     # attempts / flagged risk (-> handover), or asked for a re-collect (-> dispatch again).
     route_after_collect: Callable[[ReasoningState], str]
+    # Branch after the cancel guardrail depends on the LIVE order status + risk (store-owned).
+    # "confirm" (processing, no risk) | "handover" (shipped/delivered or risk-flagged).
+    route_after_cancel_guardrail: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
 
@@ -128,15 +155,21 @@ def build_support_nodes(
     verification_store: VerificationStore,
     otp: OtpProvider,
     risk: RiskProvider,
+    policy: PolicyContext,
     *,
     display_name: str,
 ) -> SupportNodes:
-    """Build the support flow's nodes, closed over the session's stores + providers (§A5:
-    tenant/policy/verification bound in code at build time — never carried in graph state)."""
+    """Build the support flow's nodes, closed over the session's stores + providers + policy
+    (§A5: tenant/policy/verification bound in code at build time — never carried in state)."""
 
     @tool
     def propose_refund(order_key: str, amount_usd: float, destination: str) -> str:
-        """Propose the refund: which order (option number), how much, and where it goes."""
+        """Propose a refund: which order (option number), how much, and where it goes."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    @tool
+    def propose_cancel(order_key: str) -> str:
+        """Propose cancelling an order the caller no longer wants (option number)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
@@ -144,13 +177,23 @@ def build_support_nodes(
         """Leave the support flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
-    model = reasoning_model.bind_tools([propose_refund, leave_support])
+    model = reasoning_model.bind_tools([propose_refund, propose_cancel, leave_support])
+
+    def _leave(new_messages: list, call_id: str) -> dict[str, object]:
+        new_messages.append(ToolMessage("left support", tool_call_id=call_id))
+        write_event({"event": "support_left", "reason": "left_flow"})
+        return {
+            "messages": new_messages,
+            "active_flow": "left_support",
+            "pending_refund": None,
+            "pending_cancel": None,
+        }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
-        """Model turn INSIDE support: pick an order (by key), amount, destination, or clarify,
-        or leave. Mints PendingRefund (per-intent key + attempt key) on a valid proposal —
-        A10a rule 2: the idempotency key exists in state before any interrupt/effect."""
-        orders = order_store.refundable_orders()
+        """Model turn INSIDE support: propose a REFUND (order+amount+destination) or a CANCEL
+        (order), or clarify, or leave. Mints PendingRefund/PendingCancel (per-intent key) on a
+        valid proposal — A10a rule 2: the idempotency key exists in state before any effect."""
+        orders = order_store.actionable_orders()
         by_key = {o.key: o for o in orders}
         prompt = SystemMessage(compose_support_prompt(display_name, orders))
         messages: list = [prompt, *state.messages]
@@ -162,13 +205,31 @@ def build_support_nodes(
                 return {"messages": new_messages}  # clarifying question (streamed) — stay
             call = response.tool_calls[0]
             if call["name"] == "leave_support":
-                new_messages.append(ToolMessage("left support", tool_call_id=call["id"]))
-                write_event({"event": "refund_cancelled", "reason": "left_flow"})
-                return {
-                    "messages": new_messages,
-                    "active_flow": "left_support",
-                    "pending_refund": None,
-                }
+                return _leave(new_messages, call["id"])
+
+            if call["name"] == "propose_cancel":
+                try:
+                    cancel = _ProposeCancel.model_validate(call["args"])
+                except ValueError:
+                    cancel = None
+                chosen = by_key.get(cancel.order_key) if cancel else None
+                if chosen is None:
+                    feedback = f"Invalid order. Valid order numbers: {', '.join(sorted(by_key))}."
+                    new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                new_messages.append(
+                    ToolMessage(f"proposed cancel on order {chosen.key}", tool_call_id=call["id"])
+                )
+                pending_cancel = PendingCancel(
+                    order_id=chosen.order_id,
+                    summary=chosen.summary,
+                    idempotency_key=uuid.uuid4().hex,
+                    created_at=time.time(),
+                )
+                return {"messages": new_messages, "pending_cancel": pending_cancel}
+
+            # else: propose_refund
             try:
                 proposal = _ProposeRefund.model_validate(call["args"])
             except ValueError:
@@ -199,7 +260,7 @@ def build_support_nodes(
                 instrument_ref=(
                     _NEW_INSTRUMENT_REF
                     if proposal.destination != "original"
-                    else "your original payment"
+                    else "original payment method"
                 ),
                 idempotency_key=uuid.uuid4().hex,
                 attempt_key=uuid.uuid4().hex,
@@ -207,19 +268,47 @@ def build_support_nodes(
             )
             return {"messages": new_messages, "pending_refund": pending}
         logger.warning("support assemble: two invalid proposals; leaving flow")
-        write_event({"event": "refund_cancelled", "reason": "invalid_proposals"})
+        write_event({"event": "support_left", "reason": "invalid_proposals"})
         return {
             "messages": new_messages,
             "active_flow": "left_support",
             "pending_refund": None,
+            "pending_cancel": None,
         }
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
-        """CODE-enforced policy (never the model): the destination's required level (§A4b) vs
-        the LIVE store level is evaluated by `route_after_guardrail`. This node only records
-        that the gate was reached; it takes no side effect and never mutates the level."""
+        """CODE-enforced refund policy (never the model), evaluated in tiers:
+
+        1. AMOUNT gate (merchant policy, within platform bounds): a refund above
+           `refund_require_human_above_usd` goes to a PERSON regardless of level — no point
+           doing step-up for a refund the merchant says needs a human. Industry-standard
+           tiered routing: auto-small / agent-with-readback / human-large. (The
+           `auto_approve_under_usd` threshold is not a separate agent branch here: every
+           refund already gets a HITL readback in this voice flow, so the operative gate is
+           the human line; auto_approve stays meaningful as the ordering floor + for a future
+           async review queue.)
+        2. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
+           level, decided by `route_after_guardrail`.
+
+        The amount gate authors its own decline (clear-before-speak) + handover; the level
+        gate takes no side effect here."""
         pending = state.pending_refund
         assert pending is not None  # only reached with a proposal minted
+        if pending.amount_usd > policy.refund_require_human_above_usd:
+            # Over the merchant's human-review line: speak the specific reason and END (no
+            # generic deferral over it), same one-voice pattern as the shipped-cancel decline.
+            # (No real warm transfer exists yet; the line honestly names the next step.)
+            write_event({"event": "refund_needs_human", "reason": "over_amount_threshold"})
+            return {
+                "pending_refund": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"A ${pending.amount_usd:.2f} refund is above what I can process on "
+                        "this call - our support team can handle a refund that size for you."
+                    )
+                ],
+            }
         required = refund_required_level(pending.amount_usd, pending.destination)
         if verification_store.current_level() < required:
             write_event({"event": "refund_stepup_required", "required_level": required})
@@ -281,9 +370,23 @@ def build_support_nodes(
 
     def confirm_node(state: ReasoningState) -> dict[str, object]:
         """HITL interrupt #2: the refund readback + deterministic consent. NO side effects;
-        §4a barge -> re-confirm once (a truncated 'yes' is not consent)."""
+        §4a barge -> re-confirm once (a truncated 'yes' is not consent). Clock-A TTL checked
+        FIRST (clear-before-speak) so a resume arriving after expiry cancels the stale refund
+        without consuming the answer (§A10 rule 6; same discipline as checkout)."""
         pending = state.pending_refund
         assert pending is not None
+        if time.time() - pending.created_at > policy.pending_ttl_seconds:
+            write_event({"event": "refund_expired", "reason": "pending_ttl"})
+            return {
+                "pending_refund": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "That refund confirmation sat for a while, so I haven't processed "
+                        "anything. If you'd still like it, just tell me again."
+                    )
+                ],
+            }
         answer = interrupt(_readback_line(pending, ISSUE_REFUND_POLICY))
         verdict = classify_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
@@ -372,28 +475,156 @@ def build_support_nodes(
             ],
         }
 
+    # --- cancel-order sub-path (single interrupt: guardrail -> confirm -> void) -----------
+
+    def cancel_guardrail_node(state: ReasoningState) -> dict[str, object]:
+        """CODE-enforced eligibility (never the model): read the LIVE order status + risk, and
+        on an INELIGIBLE order author the honest decline + hand to a person. On an eligible
+        one it takes no side effect (router -> confirm). Cancel is L1 (no step-up) — voiding an
+        unshipped order isn't money-movement to a new destination (§A4b's fraud vector doesn't
+        apply; §A4a doesn't tier cancel to L2), so no OTP loop. Two decline reasons:
+          - not cancellable (shipped/delivered): industry-correct — direct cancel ends at
+            shipment; the honest path is a return once it arrives (§A9 to a person; returns
+            aren't built yet);
+          - risk-flagged: a risk signal on the session doesn't get a silent void (§A4a)."""
+        pending = state.pending_cancel
+        assert pending is not None
+        if not order_store.is_cancellable(pending.order_id):
+            # Shipped/delivered: industry-correct — direct cancel ends at shipment, the path
+            # is a return once it arrives. Speak the honest line and END (no generic deferral
+            # over it; real return/transfer handling is 3c-follow-up breadth). ONE voice.
+            write_event({"event": "cancel_declined", "reason": "not_cancellable"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"That order for {pending.summary} has already shipped, so I can't "
+                        "cancel it here - the way to handle it is a return once it arrives, "
+                        "which our support team can set up for you."
+                    )
+                ],
+            }
+        if risk.check_sim_swap():
+            # A risk signal on the session doesn't get a silent void (§A4a) — hand to a
+            # person. The escape pattern: NO spoken line here; the handover node's deferral
+            # is the single voice (mirrors checkout/refund escape_human).
+            write_event({"event": "cancel_stepup_to_human", "reason": "risk_flagged"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human", reason_code="verification_required", source="gate"
+                ),
+            }
+        return {}  # eligible: router -> cancel_confirm
+
+    def cancel_confirm_node(state: ReasoningState) -> dict[str, object]:
+        """HITL interrupt: the cancel readback + deterministic consent. NO side effects; §4a
+        barge -> re-confirm once (a truncated 'yes' does not authorize an irreversible void).
+        Clock-A TTL checked FIRST (clear-before-speak) — a stale 'yes' can't void an order."""
+        pending = state.pending_cancel
+        assert pending is not None
+        if time.time() - pending.created_at > policy.pending_ttl_seconds:
+            write_event({"event": "cancel_expired", "reason": "pending_ttl"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "That sat for a while, so I haven't changed anything. If you still "
+                        "want to cancel it, just tell me again."
+                    )
+                ],
+            }
+        answer = interrupt(_cancel_readback_line(pending))
+        verdict = classify_consent(str(answer.get("text", "")))
+        if answer.get("readback_interrupted") or verdict == "unclear":
+            retry = interrupt(
+                f"Sorry - just to be clear: cancel your order for {pending.summary}? Yes or no?"
+            )
+            verdict = classify_consent(str(retry.get("text", "")))
+            if verdict != "yes":
+                verdict = "human" if verdict == "human" else "no"
+        if verdict == "human":
+            write_event({"event": "cancel_declined", "reason": "human_requested"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human", reason_code="cancel_order", source="model"
+                ),
+            }
+        if verdict == "no":
+            write_event({"event": "cancel_declined", "reason": "declined"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [AIMessage("Okay, I'll leave that order as it is - nothing changed.")],
+            }
+        return {}  # yes: pending survives; router -> void
+
+    def cancel_void_node(state: ReasoningState) -> dict[str, object]:
+        """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
+        per-intent key; the store RE-VALIDATES status (§A4c) so a proposal that went stale
+        (order shipped since assemble) can't void."""
+        pending = state.pending_cancel
+        assert pending is not None
+        try:
+            record = order_store.cancel_order(pending.idempotency_key, order_id=pending.order_id)
+        except CancelError as exc:
+            logger.warning("cancel refused by store: %s", exc)
+            write_event({"event": "cancel_denied", "reason": "store_refused"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "I wasn't able to cancel that order - it may have already shipped. "
+                        "Nothing has changed; let me get you to someone who can help."
+                    )
+                ],
+                "handover": HandoffRequest(
+                    destination="human", reason_code="cancel_order", source="gate"
+                ),
+            }
+        write_event({"event": "cancel_confirmed", "order_id": record.order_id})
+        return {
+            "pending_cancel": None,
+            "active_flow": None,
+            "messages": [
+                AIMessage(
+                    f"Done - I've cancelled your order for {record.summary}. "
+                    "You won't be charged for it."
+                )
+            ],
+        }
+
     def abort_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: explicit abort while support was in flight."""
-        write_event({"event": "refund_cancelled", "reason": "aborted"})
+        write_event({"event": "support_cancelled", "reason": "aborted"})
         return {
             "pending_refund": None,
+            "pending_cancel": None,
             "active_flow": None,
             "messages": [AIMessage("No problem - I've dropped that. Nothing has changed.")],
         }
 
     def escape_human_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: the caller asked for a person mid-support (§A9 no-trap)."""
-        write_event({"event": "refund_cancelled", "reason": "human_requested"})
+        write_event({"event": "support_cancelled", "reason": "human_requested"})
         return {
             "pending_refund": None,
+            "pending_cancel": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
 
     def route_after_guardrail(state: ReasoningState) -> str:
+        # The amount gate CLEARS pending + speaks its decline on an over-threshold refund.
         pending = state.pending_refund
-        if pending is None:  # (defensive: guardrail never clears today, but stay honest)
-            return "handover" if state.handover is not None else "confirm"
+        if pending is None:
+            return "declined"  # over-amount: the node spoke its specific line + ends
         required = refund_required_level(pending.amount_usd, pending.destination)
         return "confirm" if verification_store.current_level() >= required else "stepup"
 
@@ -406,6 +637,27 @@ def build_support_nodes(
         # Level raised to the requirement -> proceed; otherwise a re-collect was requested.
         return "confirm" if verification_store.current_level() >= required else "dispatch"
 
+    def route_after_assemble(state: ReasoningState) -> str:
+        # Which effect did assemble mint? (a valid proposal sets exactly one pending.)
+        if state.active_flow == "left_support":
+            return "leave"  # model left / two invalid proposals -> normal pipeline answers
+        if state.pending_cancel is not None:
+            return "cancel"
+        if state.pending_refund is not None:
+            return "refund"
+        return "clarify"  # a clarifying question was streamed; end the turn in-flow
+
+    def route_after_cancel_guardrail(state: ReasoningState) -> str:
+        # Three outcomes the guardrail already resolved:
+        #  - risk-flagged: cleared pending + set handover -> the human sink;
+        #  - shipped/ineligible: cleared pending, spoke its own line, NO handover -> END;
+        #  - eligible: pending survives, nothing spoken -> the readback interrupt.
+        if state.handover is not None:
+            return "handover"
+        if state.pending_cancel is None:
+            return "declined"  # ineligible: the node spoke + ended
+        return "confirm"
+
     return SupportNodes(
         assemble=assemble_node,
         guardrail=guardrail_node,
@@ -414,16 +666,25 @@ def build_support_nodes(
         collect=collect_node,
         confirm=confirm_node,
         place=place_node,
+        cancel_guardrail=cancel_guardrail_node,
+        cancel_confirm=cancel_confirm_node,
+        cancel_void=cancel_void_node,
         abort=abort_node,
         escape_human=escape_human_node,
+        route_after_assemble=route_after_assemble,
         route_after_guardrail=route_after_guardrail,
         route_after_collect=route_after_collect,
+        route_after_cancel_guardrail=route_after_cancel_guardrail,
         speakable_nodes=frozenset(
             {
+                "support_guardrail",  # authors the over-amount-threshold decline line
                 "support_risk_check",
                 "support_collect",
                 "support_confirm",
                 "support_place",
+                "support_cancel_guardrail",  # authors the shipped/ineligible decline line
+                "support_cancel_confirm",
+                "support_cancel_void",
                 "support_abort",
             }
         ),

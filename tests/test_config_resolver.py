@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agnostic_market.config.resolver import (
+    PolicyBoundsViolationError,
     SafetyLockViolationError,
     resolve_merchant_config,
 )
@@ -13,7 +14,13 @@ from agnostic_market.config.resolver import (
 def _base() -> dict:
     return {
         "_safety_locked": ["_platform", "schema_version"],
-        "_platform": {"payment": {"out_of_band_only": True}},
+        "_platform": {
+            "payment": {"out_of_band_only": True},
+            "limits": {
+                "refund_require_human_ceiling_usd": 500,
+                "pending_confirmation_ttl_max_seconds": 300,
+            },
+        },
         "schema_version": "0.2",
         "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
     }
@@ -104,3 +111,48 @@ def test_platform_block_not_leaked_into_effective_config() -> None:
     config = resolve_merchant_config(_base(), _template(), _override())
     # `_platform` / `_safety_locked` are stripped before validation; MerchantConfig forbids extras.
     assert not hasattr(config, "_platform")
+
+
+# --- policy-within-bounds: the "tune within limits, can't disable the guard" half ----------
+
+
+def test_refund_human_threshold_over_platform_ceiling_is_rejected() -> None:
+    bad = _override()
+    bad["policies"] = {"refunds": {"require_human_above_usd": 999}}  # ceiling is 500
+    with pytest.raises(PolicyBoundsViolationError, match="require_human_above_usd"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_refund_human_threshold_at_ceiling_is_allowed() -> None:
+    ok = _override()
+    ok["policies"] = {"refunds": {"require_human_above_usd": 500}}  # == ceiling, not above
+    config = resolve_merchant_config(_base(), _template(), ok)
+    assert config.policies.refunds.require_human_above_usd == 500
+
+
+def test_auto_approve_above_human_line_is_rejected() -> None:
+    bad = _override()
+    # auto 300 > human 200 (template default) — incoherent tiering
+    bad["policies"] = {"refunds": {"auto_approve_under_usd": 300}}
+    with pytest.raises(PolicyBoundsViolationError, match="auto_approve_under_usd"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_pending_ttl_over_platform_max_is_rejected() -> None:
+    bad = _override()
+    bad["policies"] = {"pending_confirmation_ttl_seconds": 9999}  # max is 300
+    with pytest.raises(PolicyBoundsViolationError, match="pending_confirmation_ttl_seconds"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_pending_ttl_within_max_resolves() -> None:
+    ok = _override()
+    ok["policies"] = {"pending_confirmation_ttl_seconds": 90}
+    config = resolve_merchant_config(_base(), _template(), ok)
+    assert config.policies.pending_confirmation_ttl_seconds == 90
+
+
+def test_pending_ttl_defaults_when_unset() -> None:
+    # No merchant sets it -> the platform default (from the DTO), still within the max.
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.policies.pending_confirmation_ttl_seconds == 120.0

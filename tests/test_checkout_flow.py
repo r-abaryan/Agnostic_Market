@@ -20,7 +20,13 @@ from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.dtos.state import PendingAction, PolicyContext, ReasoningState
 from agnostic_market.voice.tools import build_voice_tools
 
-_POLICY = PolicyContext(max_order_value_usd=500.0, allow_ai_merchant_handoff=True)
+_POLICY = PolicyContext(
+    max_order_value_usd=500.0,
+    allow_ai_merchant_handoff=True,
+    refund_auto_approve_under_usd=50.0,
+    refund_require_human_above_usd=200.0,
+    pending_ttl_seconds=120.0,
+)
 _CFG = {"configurable": {"thread_id": "t1"}}
 
 

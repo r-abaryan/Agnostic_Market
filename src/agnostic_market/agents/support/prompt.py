@@ -1,10 +1,10 @@
 """Support model-facing text: the assemble-node instructions + order rendering.
 
-PROMPT ONLY — what the support (reasoning-tier) model reads while turning a refund request
-into a `propose_refund(order_key, amount_usd, destination)`. The model picks a KEY into the
-code-narrowed order list; it never authors an order id, and it never decides verification
-level, reads a card number, or authorizes the refund. Step-up (SIM-swap check, OTP), the
-readback, consent classification, and the guardrail are CODE in flow.py, not here.
+PROMPT ONLY — what the support (reasoning-tier) model reads while turning a post-purchase
+request into a `propose_refund(...)` or `propose_cancel(order_key)`. The model picks a KEY
+into the code-narrowed order list; it never authors an order id, decides verification level,
+reads a card number, or authorizes the effect. Eligibility (can this order be cancelled?),
+step-up (SIM-swap check, OTP), the readback, consent, and the guardrail are CODE in flow.py.
 """
 
 from __future__ import annotations
@@ -12,16 +12,19 @@ from __future__ import annotations
 from agnostic_market.commerce.orders import OrderCandidate
 
 _SUPPORT_INSTRUCTIONS = (
-    "You are helping a caller with a REFUND for {display_name}. Work out WHICH past order "
-    "they mean (use only the numbered orders below), HOW MUCH to refund, and WHERE it "
-    "should go: 'original' (back to how they paid) or 'new_instrument' (a different card) "
-    "or 'new_address'. When you are certain, call propose_refund with the order number, the "
-    "amount in dollars, and the destination. NEVER ask for or repeat a card number - a "
-    "refund to a new card uses a card already on file, and the caller may have to verify "
-    "their identity first; that is handled for you. Do not announce that the refund is done "
-    "- it will be read back for confirmation. If anything is unclear, ask ONE short "
-    "question. If the caller no longer wants a refund or asks about something unrelated, "
-    "call leave_support instead of forcing it.\n"
+    "You help callers with post-purchase requests for {display_name}: REFUNDS and order "
+    "CANCELLATIONS. Work out which of the numbered orders below the caller means (use only "
+    "these), then:\n"
+    "- To CANCEL an order they no longer want: call propose_cancel with the order number. "
+    "Do NOT promise it will be cancelled and do NOT say whether it's too late - whether an "
+    "order can still be cancelled is checked for you; just propose it.\n"
+    "- To REFUND: call propose_refund with the order number, the amount in dollars, and "
+    "where it goes: 'original' (back to how they paid), 'new_instrument' (a different card), "
+    "or 'new_address'. NEVER ask for or repeat a card number - a new card uses one already "
+    "on file, and the caller may need to verify their identity first; that is handled.\n"
+    "Do not announce that a refund or cancellation is done - it is read back for "
+    "confirmation. If anything is unclear, ask ONE short question. If the caller no longer "
+    "wants either, or asks about something unrelated, call leave_support.\n"
     "Past orders:\n{orders}"
 )
 

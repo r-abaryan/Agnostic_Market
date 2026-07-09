@@ -41,14 +41,19 @@ HandoffReasonCode = Literal[
 class PolicyContext(BaseModel):
     """Loaded merchant policy/limits + flags, bound at session start, read-only per session.
 
-    Phase 0: a thin immutable carrier of the resolved policy values the tenant context needs.
-    Extend (limits/flags surface) as the guardrail node consumes it in Phase 3.
+    The resolved policy values the GRAPH reads at decision time (closed into flow nodes at
+    build, §A5) — the runtime face of `PolicyConfig`. Refund thresholds + the pending TTL are
+    carried here so the support/checkout guardrails can enforce them (they are merchant-tuned
+    within platform bounds — the resolver already clamped them).
     """
 
     model_config = _FROZEN
 
     max_order_value_usd: float = Field(ge=0)
     allow_ai_merchant_handoff: bool
+    refund_auto_approve_under_usd: float = Field(ge=0)
+    refund_require_human_above_usd: float = Field(ge=0)
+    pending_ttl_seconds: float = Field(gt=0)
 
 
 class PendingAction(BaseModel):
@@ -97,6 +102,24 @@ class PendingRefund(BaseModel):
     created_at: float
 
 
+class PendingCancel(BaseModel):
+    """An order cancellation awaiting HITL confirmation (AGENTS §A10a shape).
+
+    Mirrors PendingRefund's discipline minus money/verification: `idempotency_key` is
+    per-cancel-INTENT so a replayed void returns the SAME cancel (the OrderStore is the
+    dedup arbiter). `summary` is CODE-resolved from the order the model picked by KEY (never
+    a model-authored order id), and rendered in the graph-authored readback. Cancel is a
+    single-interrupt confirm->void (no step-up), so no attempt/tries fields are needed.
+    """
+
+    model_config = _FROZEN
+
+    order_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    created_at: float
+
+
 # Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
 # "left_*" are TURN-SCOPED markers (reset at entry): the model left the flow this turn, so
 # a same-turn re-entry is blocked — breaks the assemble->gate->handover->assemble cycle
@@ -135,4 +158,5 @@ class ReasoningState(BaseModel):
     handover: HandoffRequest | None = None
     pending_action: PendingAction | None = None
     pending_refund: PendingRefund | None = None
+    pending_cancel: PendingCancel | None = None
     active_flow: ActiveFlow | None = None

@@ -227,14 +227,13 @@ def build_frontline_graph(
         # turn ("left_*") — re-entering would cycle; fall through to the spoken deferral.
         if handover.destination == "checkout" and state.active_flow != "left_checkout":
             return {"active_flow": "checkout", "handover": None}
-        # Support in 3c-core handles REFUNDS only. Other support-destined reason codes
-        # (cancel_order, address/payment change) are 3c-follow-up breadth — they must NOT
-        # enter the refund flow (it would run the reasoning model, fail to propose, and bail
-        # to left_support, re-tripping the gate and double-speaking). They defer honestly,
-        # exactly as pre-3c, until their flow is built. Refund enters.
+        # Support handles REFUND and CANCEL_ORDER (Group A). Other support-destined reason
+        # codes (address/payment change) are still 3c-follow-up breadth — they must NOT enter
+        # the flow (it would run the reasoning model, fail to propose, bail to left_support,
+        # re-trip the gate and double-speak). They defer honestly until their flow is built.
         if (
             handover.destination == "support"
-            and handover.reason_code == "refund"
+            and handover.reason_code in ("refund", "cancel_order")
             and state.active_flow != "left_support"
         ):
             return {"active_flow": "support", "handover": None}
@@ -308,23 +307,49 @@ def build_frontline_graph(
         reasoning_model, store, policy, display_name=display_name
     )
     support = build_support_nodes(
-        reasoning_model, store, verification_store, otp, risk, display_name=display_name
+        reasoning_model, store, verification_store, otp, risk, policy, display_name=display_name
     )
 
-    # --- support flow routers (state-only; the level-dependent branches live INSIDE the
-    #     flow, closed over the store — support.route_after_guardrail/route_after_collect) ---
+    # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
+    #     the flow, closed over the store — support.route_after_* ) ---
     def route_after_support_assemble(state: ReasoningState) -> str:
-        if state.active_flow == "left_support":
-            return "gate"  # model left the flow; normal pipeline answers this same turn
-        if state.pending_refund is not None:
-            return "support_guardrail"
-        return END  # clarifying question (streamed tokens already spoken)
+        # refund | cancel | leave | clarify — the flow decides from which pending was minted.
+        decision = support.route_after_assemble(state)
+        return {
+            "refund": "support_guardrail",
+            "cancel": "support_cancel_guardrail",
+            "leave": "gate",  # model left; normal pipeline answers this same turn
+            "clarify": END,  # a clarifying question was streamed already
+        }[decision]
+
+    def route_after_support_cancel_guardrail(state: ReasoningState) -> str:
+        # confirm (eligible) | handover (risk-flagged) | declined (shipped: guardrail spoke + ends).
+        return {
+            "confirm": "support_cancel_confirm",
+            "handover": "handover",
+            "declined": END,
+        }[support.route_after_cancel_guardrail(state)]
+
+    def route_after_support_cancel_confirm(state: ReasoningState) -> str:
+        if state.handover is not None:
+            return "handover"  # caller asked for a person at the readback
+        if state.pending_cancel is not None:
+            return "support_cancel_void"  # committed yes
+        return END  # declined (node spoke its line, clear-before-speak)
+
+    def route_after_support_cancel_void(state: ReasoningState) -> str:
+        # void may hand to a human on a store refusal (order shipped since assemble); else ends.
+        return "handover" if state.handover is not None else END
 
     def route_support_guardrail(state: ReasoningState) -> str:
-        # "confirm" | "stepup" (-> risk_check) | "handover" — decided by the live level.
+        # "confirm" (level ok) | "stepup" (-> risk_check) | "declined" (over amount: guardrail
+        # spoke its line + ends). Decided by the amount gate + the live level.
         decision = support.route_after_guardrail(state)
-        return {"confirm": "support_confirm", "stepup": "support_risk_check",
-                "handover": "handover"}[decision]
+        return {
+            "confirm": "support_confirm",
+            "stepup": "support_risk_check",
+            "declined": END,
+        }[decision]
 
     def route_after_support_risk(state: ReasoningState) -> str:
         # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
@@ -369,6 +394,9 @@ def build_frontline_graph(
     graph.add_node("support_collect", support.collect)
     graph.add_node("support_confirm", support.confirm)
     graph.add_node("support_place", support.place)
+    graph.add_node("support_cancel_guardrail", support.cancel_guardrail)
+    graph.add_node("support_cancel_confirm", support.cancel_confirm)
+    graph.add_node("support_cancel_void", support.cancel_void)
     graph.add_node("support_abort", support.abort)
     graph.add_node("support_escape_human", support.escape_human)
 
@@ -431,7 +459,12 @@ def build_frontline_graph(
     graph.add_conditional_edges(
         "support_assemble",
         route_after_support_assemble,
-        {"gate": "gate", "support_guardrail": "support_guardrail", END: END},
+        {
+            "gate": "gate",
+            "support_guardrail": "support_guardrail",
+            "support_cancel_guardrail": "support_cancel_guardrail",
+            END: END,
+        },
     )
     graph.add_conditional_edges(
         "support_guardrail",
@@ -439,7 +472,7 @@ def build_frontline_graph(
         {
             "support_confirm": "support_confirm",
             "support_risk_check": "support_risk_check",
-            "handover": "handover",
+            END: END,
         },
     )
     graph.add_conditional_edges(
@@ -465,6 +498,21 @@ def build_frontline_graph(
     graph.add_conditional_edges(
         "support_place",
         route_after_support_place,
+        {"handover": "handover", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_cancel_guardrail",
+        route_after_support_cancel_guardrail,
+        {"support_cancel_confirm": "support_cancel_confirm", "handover": "handover", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_cancel_confirm",
+        route_after_support_cancel_confirm,
+        {"handover": "handover", "support_cancel_void": "support_cancel_void", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_cancel_void",
+        route_after_support_cancel_void,
         {"handover": "handover", END: END},
     )
     graph.add_edge("support_abort", END)
