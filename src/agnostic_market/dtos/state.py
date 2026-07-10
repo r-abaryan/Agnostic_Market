@@ -91,7 +91,6 @@ class PendingRefund(BaseModel):
 
     model_config = _FROZEN
 
-    return_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     amount_usd: float = Field(ge=0)
     destination: RefundDestination

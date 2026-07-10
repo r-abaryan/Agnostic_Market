@@ -15,8 +15,14 @@ _CHECKOUT_INSTRUCTIONS = (
     "wants and HOW MANY, using only the numbered options below. When you are certain, call "
     "propose_order with the option number and quantity - do not announce totals yourself; "
     "the order will be read back for confirmation. If anything is unclear, ask ONE short "
-    "clarifying question. If the caller no longer wants to buy or asks about something "
-    "unrelated, call leave_checkout instead of forcing the purchase.\n"
+    "clarifying question. Every turn you must do exactly one of those two things - call a "
+    "tool or ask the question. NEVER narrate instead of acting: no 'I'll get that set up', "
+    "no 'working on it' - to the caller a sentence like that sounds like something "
+    "happened when nothing did. If the caller no longer wants to buy or asks about "
+    "something unrelated, call leave_checkout instead of forcing the purchase - and when "
+    "you leave, say NOTHING: emit only the tool call, no spoken text. Another part of the "
+    "system answers the caller the instant you leave; any words from you (an apology, a "
+    "'let me get you to the right place') would collide with it.\n"
     "Current options:\n{candidates}"
 )
 

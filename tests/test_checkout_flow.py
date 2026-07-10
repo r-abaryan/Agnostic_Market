@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents import telemetry
@@ -138,6 +138,33 @@ async def test_unoffered_candidate_key_never_places(config_root: Path) -> None:
     )
 
 
+# --- F-4: a multi-tool-call response must not leave a dangling tool_use -------------------
+
+
+async def test_double_tool_call_response_is_fully_acked(config_root: Path) -> None:
+    # A misbehaving model emits TWO tool calls in one response. The assemble acts on the
+    # first and must ack the second — a persisted tool_use with no tool_result fails
+    # provider-side history validation on EVERY later model call in the session.
+    reasoning = FakeChatModel(
+        force_tool="propose_order",
+        tool_call_limit=1,
+        double_tool_calls=True,
+        canned_args={"propose_order": {"candidate_key": "1", "quantity": 1}},
+    )
+    graph, store = _build(config_root, reasoning=reasoning)
+    await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    state = graph.get_state(_CFG)
+    assert state.interrupts  # the flow still proceeded to the readback
+    tool_use_ids = {
+        c["id"] for m in state.values["messages"] if isinstance(m, AIMessage) for c in m.tool_calls
+    }
+    tool_result_ids = {
+        m.tool_call_id for m in state.values["messages"] if isinstance(m, ToolMessage)
+    }
+    assert tool_use_ids <= tool_result_ids  # nothing dangling in the persisted thread
+    assert store.placed_count == 0  # and the extra call minted no second proposal
+
+
 # --- stickiness + escapes (multi-turn on one thread) --------------------------------------
 
 
@@ -180,6 +207,72 @@ async def test_human_escape_breaks_stickiness_and_hands_over(config_root: Path) 
     assert any(
         isinstance(m, AIMessage) and "person" in str(m.content) for m in out["messages"]
     )
+
+
+# --- the cross-flow escape (live 2026-07-09 bug: sticky checkout swallowed a refund) -------
+
+
+async def test_refund_while_sticky_in_checkout_cross_switches_to_support(
+    config_root: Path,
+) -> None:
+    # THE live bug: sticky in checkout (assemble clarified, no tool call), the caller asks
+    # for a refund. Pre-fix, the entry router sent this to checkout_assemble (gate never
+    # consulted) and the checkout model refused/narrated. Now the gate-certain cross-flow
+    # intent deterministically abandons checkout and enters support.
+    graph, _ = _build(config_root)
+    await _clarify_turn(graph)  # active_flow == "checkout"
+    out = await graph.ainvoke(
+        {"messages": [HumanMessage("Can I get refund for this purchase?")]}, _CFG
+    )
+    assert out["active_flow"] == "support"  # switched INTO the refund flow (clarify keeps it)
+    assert out.get("pending_action") is None  # nothing from checkout lingers
+
+
+async def test_cancel_order_while_sticky_in_checkout_cross_switches(config_root: Path) -> None:
+    # "cancel my order" is NOT an abort phrasing (abort = cancel that/it/this) — it's a
+    # placed-order cancel, which the gate routes to support's cancel path.
+    graph, _ = _build(config_root)
+    await _clarify_turn(graph)
+    out = await graph.ainvoke({"messages": [HumanMessage("please cancel my order")]}, _CFG)
+    assert out["active_flow"] == "support"
+
+
+async def test_same_flow_gate_trip_stays_inside_checkout(config_root: Path) -> None:
+    # A checkout-destined utterance while already sticky in checkout must NOT switch —
+    # it falls through to assemble (already in the right flow).
+    frontline = FakeChatModel(emit_tool_calls=False)
+    graph, _ = _build(config_root, frontline=frontline)
+    await _clarify_turn(graph)
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    assert out["active_flow"] == "checkout"
+    assert frontline._tool_calls_made == 0  # frontline still bypassed
+
+
+async def test_abort_precedes_cross_switch(config_root: Path) -> None:
+    # "cancel it" matches BOTH the abort escape and the gate's cancel pattern. Mid-flow it
+    # means "abort the in-flight thing" — the abort check runs FIRST, so it aborts locally
+    # instead of cross-switching to support's placed-order cancel.
+    graph, store = _build(config_root)
+    await _clarify_turn(graph)
+    out = await graph.ainvoke({"messages": [HumanMessage("actually cancel it")]}, _CFG)
+    assert out.get("active_flow") is None  # aborted, NOT switched into support
+    assert store.cancel_count == 0  # no placed-order cancel happened
+    assert any(
+        isinstance(m, AIMessage) and "Nothing has been ordered" in str(m.content)
+        for m in out["messages"]
+    )
+
+
+async def test_checkout_request_while_sticky_in_support_cross_switches(
+    config_root: Path,
+) -> None:
+    # Symmetric: sticky in support (refund clarify), the caller pivots to buying.
+    graph, _ = _build(config_root)
+    out = await graph.ainvoke({"messages": [HumanMessage("I want a refund")]}, _CFG)
+    assert out["active_flow"] == "support"  # in the support flow, clarifying
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    assert out["active_flow"] == "checkout"  # switched into checkout
+    assert out.get("pending_refund") is None  # nothing from support lingers
 
 
 # --- A10a structure + the effect node ----------------------------------------------------

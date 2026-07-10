@@ -34,6 +34,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.checkout.prompt import compose_checkout_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.orders import OrderStore, resolve_candidates
@@ -54,7 +55,6 @@ PLACE_ORDER_POLICY = ToolConfirmationPolicy(
     tool="place_order",
     confirm_fields=frozenset({"quantity", "total_amount"}),
     strength="explicit_yes",
-    min_verification_level=0,
 )
 
 # Consent/escape classification is shared across gated flows — see agents/_consent.py.
@@ -155,6 +155,7 @@ def build_checkout_nodes(
             if not response.tool_calls:
                 # Clarifying question (streamed tokens reach the caller) — stay in flow.
                 return {"messages": new_messages}
+            ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
             if call["name"] == "leave_checkout":
                 new_messages.append(

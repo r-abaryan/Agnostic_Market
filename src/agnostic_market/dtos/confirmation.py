@@ -23,7 +23,6 @@ CRITICAL_CONFIRMATION_FIELDS: frozenset[str] = frozenset(
         "quantity",
         "total_amount",
         "order_id",
-        "return_id",
         "new_address",
         "new_payment_instrument_ref",
         "new_contact",
@@ -34,14 +33,20 @@ ConfirmationStrength = Literal["readback", "explicit_yes", "double_confirm"]
 
 
 class ToolConfirmationPolicy(BaseModel):
-    """One sensitive tool's declared confirmation contract (enforced in code, not prompt)."""
+    """One sensitive tool's declared confirmation contract (enforced in code, not prompt).
+
+    Deliberately does NOT declare a verification level: the level authority for refunds is
+    `refund_required_level` (destination-aware platform code, enforced live in the flow) —
+    a static per-tool minimum here would be a second, unenforced source of truth that
+    drifts (it did: the removed `min_verification_level=2` contradicted the L1
+    refund-to-original path the moment Group A landed).
+    """
 
     model_config = _FROZEN
 
     tool: str = Field(min_length=1)
     confirm_fields: frozenset[str] = Field(min_length=1)
     strength: ConfirmationStrength
-    min_verification_level: int = Field(ge=0, le=2)
 
     @field_validator("confirm_fields")
     @classmethod
@@ -77,11 +82,12 @@ def refund_required_level(amount_usd: float, destination: RefundDestination) -> 
 
 
 # issue_refund's declared confirmation contract (VOICE_PIPELINE §7a): the readback MUST
-# cover these critical fields at explicit_yes strength, and the flow may not fire the effect
-# below L2 (the §A4b floor for a new instrument — the only destination 3c exercises).
+# speak these critical fields at explicit_yes strength. `return_id` is deliberately NOT
+# declared — the store mints it AFTER the effect, so it cannot exist at readback time (it
+# is spoken in the outcome line instead); declaring it made the contract check theater.
+# The verification level is gated separately by `refund_required_level` (live, in-flow).
 ISSUE_REFUND_POLICY = ToolConfirmationPolicy(
     tool="issue_refund",
-    confirm_fields=frozenset({"total_amount", "return_id", "new_payment_instrument_ref"}),
+    confirm_fields=frozenset({"total_amount", "new_payment_instrument_ref"}),
     strength="explicit_yes",
-    min_verification_level=2,
 )

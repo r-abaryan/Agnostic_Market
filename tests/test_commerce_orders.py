@@ -108,3 +108,41 @@ def test_placed_order_is_cancellable(config_root: Path) -> None:
     assert store.is_cancellable(placed.order_id) is True  # placed orders start processing
     store.cancel_order("ck-1", order_id=placed.order_id)
     assert store.order_status(placed.order_id) == "cancelled"
+
+
+def test_cancel_record_carries_the_reversed_amount(config_root: Path) -> None:
+    # The spoken outcome states the money movement, so the record must know the captured
+    # total it reversed.
+    store = _store(config_root)
+    rec = store.cancel_order("ck-1", order_id="ORD-1002")
+    assert rec.total_usd == 129.00
+
+
+# --- the refund<->cancel cross-effect invariant (money may only come back ONCE) ---------
+
+
+def test_cancel_refuses_an_order_with_refunds_issued(config_root: Path) -> None:
+    # A void reverses the FULL charge; on top of a prior partial refund that returns money
+    # twice — the mixed case belongs to a person, never an automatic void.
+    store = _store(config_root)
+    store.issue_refund("r1", order_id="ORD-1002", amount_usd=50.0, destination="original")
+    with pytest.raises(CancelError):
+        store.cancel_order("ck-1", order_id="ORD-1002")
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "processing"  # untouched
+
+
+# --- actionable_orders: effective status drives remedy selection ------------------------
+
+
+def test_actionable_orders_carry_effective_status(config_root: Path) -> None:
+    store = _store(config_root)
+    placed = store.place("k1", sku="SKU-BLU-07", name="rain jacket", quantity=2, total_usd=258.0)
+    by_id = {o.order_id: o for o in store.actionable_orders()}
+    assert by_id["ORD-1001"].status == "shipped"
+    assert by_id["ORD-1002"].status == "processing"
+    assert by_id["ORD-1003"].status == "delivered"
+    assert by_id[placed.order_id].status == "processing"
+    store.cancel_order("ck-1", order_id=placed.order_id)
+    by_id = {o.order_id: o for o in store.actionable_orders()}
+    assert by_id[placed.order_id].status == "cancelled"  # the overlay wins

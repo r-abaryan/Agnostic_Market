@@ -39,9 +39,10 @@ from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.commerce.orders import CancelError, OrderStore, RefundError
+from agnostic_market.commerce.orders import CANCELLED_STATUS, CancelError, OrderStore, RefundError
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import (
     ISSUE_REFUND_POLICY,
@@ -84,7 +85,6 @@ def _readback_line(pending: PendingRefund, policy: ToolConfirmationPolicy) -> st
     """
     rendered: dict[str, str] = {
         "total_amount": f"${pending.amount_usd:.2f}",
-        "return_id": pending.return_id,
         "new_payment_instrument_ref": pending.instrument_ref,
     }
     missing = policy.confirm_fields - rendered.keys()
@@ -203,6 +203,7 @@ def build_support_nodes(
             new_messages.append(response)
             if not response.tool_calls:
                 return {"messages": new_messages}  # clarifying question (streamed) — stay
+            ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
             if call["name"] == "leave_support":
                 return _leave(new_messages, call["id"])
@@ -251,9 +252,6 @@ def build_support_nodes(
                 )
             )
             pending = PendingRefund(
-                # return_id is minted by the store at placement; a provisional id is fine for
-                # the readback and is replaced by the store's real R-id on issue.
-                return_id="pending",
                 order_id=chosen.order_id,
                 amount_usd=round(proposal.amount_usd, 2),
                 destination=proposal.destination,
@@ -279,26 +277,69 @@ def build_support_nodes(
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
         """CODE-enforced refund policy (never the model), evaluated in tiers:
 
-        1. AMOUNT gate (merchant policy, within platform bounds): a refund above
-           `refund_require_human_above_usd` goes to a PERSON regardless of level — no point
-           doing step-up for a refund the merchant says needs a human. Industry-standard
-           tiered routing: auto-small / agent-with-readback / human-large. (The
-           `auto_approve_under_usd` threshold is not a separate agent branch here: every
-           refund already gets a HITL readback in this voice flow, so the operative gate is
-           the human line; auto_approve stays meaningful as the ordering floor + for a future
-           async review queue.)
-        2. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
-           level, decided by `route_after_guardrail`.
-
-        The amount gate authors its own decline (clear-before-speak) + handover; the level
-        gate takes no side effect here."""
+        1. CANCELLED order: the void already reversed the charge — an honest "nothing to
+           refund" decline (the store would refuse anyway; this owns the caller-facing line).
+        2. REMEDY steer: full money-back to the ORIGINAL instrument on a still-cancellable
+           order IS a cancellation (industry: unshipped = cancel, not refund) — convert to a
+           PendingCancel and route to the cancel path. Deliberately BEFORE the amount gate:
+           a void is self-serve at any amount, so it must not be sent to a human by a
+           threshold that exists for post-fulfillment refund abuse (the 2026-07-10 live
+           incoherence: "$258 needs a person" ... then cancel voided the same $258).
+        3. AMOUNT gate (merchant policy, within platform bounds): a refund above
+           `refund_require_human_above_usd` goes to a PERSON regardless of level. It authors
+           its own decline (clear-before-speak) and ENDs — there is NO handover routing yet
+           (no warm-transfer target exists until Phase 4); the human intent is recorded in
+           telemetry so the transfer can be wired there without re-finding this spot.
+        4. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
+           level, decided by `route_after_guardrail`; no side effect here."""
         pending = state.pending_refund
         assert pending is not None  # only reached with a proposal minted
+        if order_store.order_status(pending.order_id) == CANCELLED_STATUS:
+            write_event({"event": "refund_denied", "reason": "order_cancelled"})
+            return {
+                "pending_refund": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "That order was already cancelled, so the charge is reversed - "
+                        "there's nothing left to refund on it."
+                    )
+                ],
+            }
+        captured = order_store.captured_total(pending.order_id)
+        if (
+            pending.destination == "original"
+            and captured is not None
+            and round(pending.amount_usd, 2) >= round(captured, 2)
+            and order_store.refunded_so_far(pending.order_id) == 0
+            and order_store.is_cancellable(pending.order_id)
+        ):
+            write_event({"event": "refund_steered_to_cancel", "order_id": pending.order_id})
+            return {
+                "pending_refund": None,
+                "pending_cancel": PendingCancel(
+                    order_id=pending.order_id,
+                    summary=order_store.order_item_summary(pending.order_id),
+                    idempotency_key=uuid.uuid4().hex,
+                    created_at=time.time(),
+                ),
+                "messages": [
+                    AIMessage(
+                        "That order hasn't shipped yet, so I can cancel it instead - the "
+                        f"full ${captured:.2f} goes back to your original payment method."
+                    )
+                ],
+            }
         if pending.amount_usd > policy.refund_require_human_above_usd:
             # Over the merchant's human-review line: speak the specific reason and END (no
             # generic deferral over it), same one-voice pattern as the shipped-cancel decline.
-            # (No real warm transfer exists yet; the line honestly names the next step.)
-            write_event({"event": "refund_needs_human", "reason": "over_amount_threshold"})
+            write_event(
+                {
+                    "event": "refund_needs_human",
+                    "reason": "over_amount_threshold",
+                    "handover_intent": "human",
+                }
+            )
             return {
                 "pending_refund": None,
                 "active_flow": None,
@@ -447,9 +488,11 @@ def build_support_nodes(
                 "pending_refund": None,
                 "active_flow": None,
                 "messages": [
+                    # Outcome only — the handover node's deferral speaks the transfer
+                    # sentence; adding one here would say it twice.
                     AIMessage(
-                        "I wasn't able to process that refund against the order - nothing has "
-                        "changed. Let me get you to someone who can look into it."
+                        "I wasn't able to process that refund against the order - "
+                        "nothing has changed."
                     )
                 ],
                 "handover": HandoffRequest(
@@ -479,20 +522,34 @@ def build_support_nodes(
 
     def cancel_guardrail_node(state: ReasoningState) -> dict[str, object]:
         """CODE-enforced eligibility (never the model): read the LIVE order status + risk, and
-        on an INELIGIBLE order author the honest decline + hand to a person. On an eligible
-        one it takes no side effect (router -> confirm). Cancel is L1 (no step-up) — voiding an
-        unshipped order isn't money-movement to a new destination (§A4b's fraud vector doesn't
-        apply; §A4a doesn't tier cancel to L2), so no OTP loop. Two decline reasons:
+        on an INELIGIBLE order author the honest decline. On an eligible one it takes no side
+        effect (router -> confirm). Cancel is L1 (no step-up) — voiding an unshipped order
+        isn't money-movement to a new destination (§A4b's fraud vector doesn't apply; §A4a
+        doesn't tier cancel to L2), so no OTP loop. Decline reasons, each with its own honest
+        line (ONE voice, clear-before-speak):
+          - already cancelled: nothing to do, say so;
           - not cancellable (shipped/delivered): industry-correct — direct cancel ends at
-            shipment; the honest path is a return once it arrives (§A9 to a person; returns
-            aren't built yet);
-          - risk-flagged: a risk signal on the session doesn't get a silent void (§A4a)."""
+            shipment; the honest path is a return once it arrives (returns aren't built yet);
+          - refunds already issued: a void reverses the FULL charge, which on top of a prior
+            partial refund returns money twice — the mixed case belongs to a person;
+          - risk-flagged: a risk signal on the session doesn't get a silent void (§A4a) —
+            hand to a person (no spoken line; the handover deferral is the single voice)."""
         pending = state.pending_cancel
         assert pending is not None
+        status = order_store.order_status(pending.order_id)
+        if status == CANCELLED_STATUS:
+            write_event({"event": "cancel_declined", "reason": "already_cancelled"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"That order for {pending.summary} is already cancelled and the "
+                        "charge reversed - there's nothing more you need to do."
+                    )
+                ],
+            }
         if not order_store.is_cancellable(pending.order_id):
-            # Shipped/delivered: industry-correct — direct cancel ends at shipment, the path
-            # is a return once it arrives. Speak the honest line and END (no generic deferral
-            # over it; real return/transfer handling is 3c-follow-up breadth). ONE voice.
             write_event({"event": "cancel_declined", "reason": "not_cancellable"})
             return {
                 "pending_cancel": None,
@@ -502,6 +559,18 @@ def build_support_nodes(
                         f"That order for {pending.summary} has already shipped, so I can't "
                         "cancel it here - the way to handle it is a return once it arrives, "
                         "which our support team can set up for you."
+                    )
+                ],
+            }
+        if order_store.refunded_so_far(pending.order_id) > 0:
+            write_event({"event": "cancel_declined", "reason": "has_refunds"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "There's already a refund on that order, so I can't cancel it on "
+                        "this call - our support team can sort out the rest for you."
                     )
                 ],
             }
@@ -579,10 +648,11 @@ def build_support_nodes(
                 "pending_cancel": None,
                 "active_flow": None,
                 "messages": [
-                    AIMessage(
-                        "I wasn't able to cancel that order - it may have already shipped. "
-                        "Nothing has changed; let me get you to someone who can help."
-                    )
+                    # Outcome only — the handover node's deferral speaks the transfer
+                    # sentence; adding one here would say it twice. No guessed reason: the
+                    # store may have refused for shipment, a prior refund, or anything a
+                    # real SoR adds later.
+                    AIMessage("I wasn't able to cancel that order - nothing has changed.")
                 ],
                 "handover": HandoffRequest(
                     destination="human", reason_code="cancel_order", source="gate"
@@ -594,8 +664,9 @@ def build_support_nodes(
             "active_flow": None,
             "messages": [
                 AIMessage(
-                    f"Done - I've cancelled your order for {record.summary}. "
-                    "You won't be charged for it."
+                    f"Done - I've cancelled your order for {record.summary}. The "
+                    f"${record.total_usd:.2f} charge goes back to your original "
+                    "payment method."
                 )
             ],
         }
@@ -621,10 +692,11 @@ def build_support_nodes(
         }
 
     def route_after_guardrail(state: ReasoningState) -> str:
-        # The amount gate CLEARS pending + speaks its decline on an over-threshold refund.
+        if state.pending_cancel is not None:
+            return "cancel"  # remedy steer: full money-back on an unshipped order is a void
         pending = state.pending_refund
         if pending is None:
-            return "declined"  # over-amount: the node spoke its specific line + ends
+            return "declined"  # over-amount/cancelled: the node spoke its own line + ends
         required = refund_required_level(pending.amount_usd, pending.destination)
         return "confirm" if verification_store.current_level() >= required else "stepup"
 

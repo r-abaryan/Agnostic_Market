@@ -77,6 +77,8 @@ class OrderCandidate(BaseModel):
 
     Same SKU-discipline stance as `Candidate`: the model never emits a raw order id; it
     picks a KEY into this bounded list and code resolves key -> order_id + captured total.
+    `status` is the EFFECTIVE status (cancelled overlay wins) — the model needs it to pick
+    the right remedy (money back on an unshipped order is a cancel, not a refund).
     """
 
     model_config = _FROZEN
@@ -85,6 +87,7 @@ class OrderCandidate(BaseModel):
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     total_usd: float = Field(ge=0)
+    status: str = Field(min_length=1)
 
 
 class PlacedOrder(BaseModel):
@@ -115,12 +118,14 @@ class RefundError(ValueError):
 
 
 class CancelRecord(BaseModel):
-    """A cancellation this store performed (the stub SoR's own record)."""
+    """A cancellation this store performed (the stub SoR's own record). `total_usd` is the
+    captured amount the void reverses — the spoken outcome states the money movement."""
 
     model_config = _FROZEN
 
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
+    total_usd: float = Field(ge=0)
 
 
 class CancelError(ValueError):
@@ -131,7 +136,8 @@ class CancelError(ValueError):
 # window; once shipped, direct cancellation ends and becomes a return). Placed orders start
 # in _PLACED_STATUS, which is included here so a just-placed order is cancellable.
 _CANCELLABLE_STATUSES = frozenset({"processing"})
-_CANCELLED_STATUS = "cancelled"
+# Public: the support flow branches its caller-facing declines on this effective status.
+CANCELLED_STATUS = "cancelled"
 
 
 def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:
@@ -185,7 +191,7 @@ class OrderStore:
         """
         normalized = order_id.strip().upper()
         if normalized in self._cancelled_ids:
-            return _CANCELLED_STATUS
+            return CANCELLED_STATUS
         entry = self.fixture.orders.get(normalized)
         if entry is not None:
             return entry.status
@@ -203,11 +209,11 @@ class OrderStore:
         cancelled = normalized in self._cancelled_ids
         entry = self.fixture.orders.get(normalized)
         if entry is not None:
-            status = _CANCELLED_STATUS if cancelled else entry.status
+            status = CANCELLED_STATUS if cancelled else entry.status
             return f"Order {normalized}: {entry.summary} - status {status}, ETA {entry.eta}."
         for placed in self._placed_by_key.values():
             if placed.order_id == normalized:
-                status = _CANCELLED_STATUS if cancelled else _PLACED_STATUS
+                status = CANCELLED_STATUS if cancelled else _PLACED_STATUS
                 return (
                     f"Order {normalized}: {placed.quantity} x {placed.name} "
                     f"(${placed.total_usd:.2f}) - status {status}, ETA {_PLACED_ETA}."
@@ -243,10 +249,12 @@ class OrderStore:
 
     def actionable_orders(self) -> list[OrderCandidate]:
         """The bounded, keyed list of orders a support action (refund OR cancel) may target
-        (fixture + placed).
+        (fixture + placed), each with its EFFECTIVE status (cancelled overlay wins).
 
         Code-side narrowing for support selection — the model picks a KEY into this, never a
         raw order id (SKU-discipline analogue). Keys are 1-based positions as strings.
+        Cancelled orders stay listed (the caller may ask about them); the status lets the
+        model — and the guardrails — answer honestly instead of proposing a dead action.
         """
         candidates: list[tuple[str, str, float]] = [
             (oid, entry.summary, entry.total_usd) for oid, entry in self.fixture.orders.items()
@@ -256,7 +264,13 @@ class OrderStore:
             for p in self._placed_by_key.values()
         ]
         return [
-            OrderCandidate(key=str(i), order_id=oid, summary=summary, total_usd=total)
+            OrderCandidate(
+                key=str(i),
+                order_id=oid,
+                summary=summary,
+                total_usd=total,
+                status=self.order_status(oid) or "unknown",
+            )
             for i, (oid, summary, total) in enumerate(candidates, start=1)
         ]
 
@@ -297,8 +311,10 @@ class OrderStore:
         like `place`). The key is per-refund-INTENT, so a SECOND legitimate partial refund
         (different intent, different key) is NOT deduped away. Enforces the cumulative cap
         in one place — the join `sum(prior refunds) + amount <= captured_total` — so two
-        partials can never over-refund an order. Refuses (RefundError) an unknown order or
-        an over-cap amount; the caller must have already gated destination -> level (§A4b).
+        partials can never over-refund an order. Refuses (RefundError) an unknown order, a
+        CANCELLED order (the void already reversed the charge — refunding on top would
+        return the money twice), or an over-cap amount; the caller must have already gated
+        destination -> level (§A4b).
         """
         existing = self._refunds_by_key.get(idempotency_key)
         if existing is not None:
@@ -306,6 +322,11 @@ class OrderStore:
         captured = self.captured_total(order_id)
         if captured is None:
             raise RefundError(f"unknown order {order_id!r} - cannot refund")
+        if self.order_status(order_id) == CANCELLED_STATUS:
+            raise RefundError(
+                f"order {order_id.strip().upper()} is cancelled - the charge is already "
+                "reversed, nothing left to refund"
+            )
         already = self.refunded_so_far(order_id)
         if round(already + amount_usd, 2) > captured:
             raise RefundError(
@@ -337,11 +358,14 @@ class OrderStore:
         """Void an order, deduplicated by per-INTENT `idempotency_key` (SoR-arbiter rule).
 
         A repeat call with a seen key returns the ORIGINAL cancel unchanged (replay-safe,
-        like `place`/`issue_refund`). Refuses (CancelError) an unknown order or one not in a
-        cancellable state — the caller (guardrail) has already checked status, but the store
-        RE-VALIDATES (§A4c server-side re-validation) so a stale proposal can't void a
-        now-shipped order. Flips the order's effective status to `cancelled` (the overlay
-        `order_status`/`order_summary` read back).
+        like `place`/`issue_refund`). Refuses (CancelError) an unknown order, one not in a
+        cancellable state, or one that already has refunds issued against it (a void
+        reverses the FULL charge — on top of a prior partial refund that returns money
+        twice; the mixed case belongs to a person). The caller (guardrail) has already
+        checked all three, but the store RE-VALIDATES (§A4c server-side re-validation) so a
+        stale proposal can't void a now-shipped or part-refunded order. Flips the order's
+        effective status to `cancelled` (the overlay `order_status`/`order_summary` read
+        back).
         """
         existing = self._cancels_by_key.get(idempotency_key)
         if existing is not None:
@@ -355,21 +379,29 @@ class OrderStore:
                 f"order {normalized} is {status!r}, not cancellable "
                 f"(only {sorted(_CANCELLABLE_STATUSES)})"
             )
-        summary = self._order_summary_text(normalized)
+        if self.refunded_so_far(normalized) > 0:
+            raise CancelError(
+                f"order {normalized} already has refunds issued - a void on top would "
+                "return funds twice"
+            )
+        captured = self.captured_total(normalized)
+        assert captured is not None  # status was known, so the order exists with a total
+        summary = self.order_item_summary(normalized)
         self._cancelled_ids.add(normalized)
-        record = CancelRecord(order_id=normalized, summary=summary)
+        record = CancelRecord(order_id=normalized, summary=summary, total_usd=captured)
         self._cancels_by_key[idempotency_key] = record
         return record
 
-    def _order_summary_text(self, order_id: str) -> str:
-        """The short item summary for an order (fixture or placed) — for the cancel readback."""
-        entry = self.fixture.orders.get(order_id)
+    def order_item_summary(self, order_id: str) -> str:
+        """The short item summary for an order (fixture or placed) — for spoken readbacks."""
+        normalized = order_id.strip().upper()
+        entry = self.fixture.orders.get(normalized)
         if entry is not None:
             return entry.summary
         for placed in self._placed_by_key.values():
-            if placed.order_id == order_id:
+            if placed.order_id == normalized:
                 return f"{placed.quantity} x {placed.name}"
-        return order_id
+        return normalized
 
     @property
     def cancel_count(self) -> int:

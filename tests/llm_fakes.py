@@ -65,6 +65,9 @@ class FakeChatModel(BaseChatModel):
     # Deterministically emit a specific tool by name (bypasses _pick_tool) — for tests that
     # must exercise a tool the prompt wouldn't naturally name (e.g. request_handover).
     force_tool: str | None = None
+    # Emit a SECOND identical tool call alongside the first (a misbehaving model) — drives
+    # the assemble nodes' extra-call ack (a dangling tool_use poisons the thread history).
+    double_tool_calls: bool = False
     _tool_calls_made: int = PrivateAttr(default=0)
 
     @property
@@ -92,17 +95,17 @@ class FakeChatModel(BaseChatModel):
         if tools and self.emit_tool_calls and budget_left:
             self._tool_calls_made += 1
             name = self.force_tool or self._pick_tool(tools, messages)
-            return AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": name,
-                        "args": self.canned_args.get(name, {}),
-                        "id": "call_1",
-                        "type": "tool_call",
-                    }
-                ],
-            )
+            calls = [
+                {
+                    "name": name,
+                    "args": self.canned_args.get(name, {}),
+                    "id": "call_1",
+                    "type": "tool_call",
+                }
+            ]
+            if self.double_tool_calls:
+                calls.append({**calls[0], "id": "call_2"})
+            return AIMessage(content="", tool_calls=calls)
         return AIMessage(content=_TEXT_RESPONSE)
 
     def _generate(

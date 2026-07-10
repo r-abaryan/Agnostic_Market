@@ -1,4 +1,4 @@
-"""The reasoning graph: frontline agent (Tier 1) + the checkout gated flow (Tier 3).
+"""The reasoning graph: frontline agent (Tier 1) + the checkout & support gated flows (Tier 3).
 
 The load-bearing safety invariant: the frontline holds NO state-changing tools. It can
 answer (read-only tools) or hand over — so a wrong judgment is at worst "answered without
@@ -9,11 +9,17 @@ acting" (recoverable), never a dangerous mutation. Handover fires two ways:
     IRREVERSIBLE requests only (cancel/refund/place-order). NOT the router; a bonus fast-path.
 Safety is STRUCTURAL (no sensitive tools), not dependent on either catcher hitting 100%.
 
-Graph shape (3b):
-    entry -> (in checkout? escape-check -> assemble : gate)
+Graph shape (3b/3c + Group A):
+    entry -> (sticky in a flow? escapes: human -> abort -> CROSS-SWITCH -> assemble : gate)
     gate  -> (trip? handover : model) ; model -> tools -> (handover? handover : model)
-    handover -> (destination checkout? assemble : spoken deferral -> END)
-    assemble -> (proposal? guardrail -> confirm[INTERRUPT] -> place : clarify/leave)
+    handover -> (checkout/support(refund|cancel)? enter flow : spoken deferral -> END)
+    checkout: assemble -> guardrail -> confirm[INTERRUPT] -> place
+    support:  assemble -> {refund: guardrail -> [step-up] -> confirm[INT] -> place |
+                           cancel: guardrail -> confirm[INT] -> void}
+The CROSS-SWITCH escape (cross_switch node): while sticky, a gate-certain intent for a
+DIFFERENT flow deterministically abandons the current one and hands over — closes the
+sticky-flow trap where e.g. a refund request while stuck in checkout reached the checkout
+model (which cannot serve it) instead of the gate.
 
 The ONLY state-changing tool in the whole graph is the checkout flow's place effect, and
 it sits strictly behind the guardrail + HITL interrupt (agents/checkout.py, AGENTS §A10a).
@@ -256,21 +262,62 @@ def build_frontline_graph(
             update["active_flow"] = None
         return update
 
+    def cross_switch_node(state: ReasoningState) -> dict[str, object]:
+        """Entry-router escape: while sticky in one gated flow, the caller voiced a
+        HIGH-CERTAINTY intent for a DIFFERENT one (the gate tripped cross-flow). The 3b
+        escape design's "hard topic switch", now code-owned for gate-certain utterances —
+        the model-owned switch (leave_checkout) proved an unreliable sole owner live
+        (2026-07-09: a refund request while sticky in checkout was refused once and
+        narrated-over once). Abandons the in-flight flow and hands the turn over; NOTHING
+        is spoken here — the receiving flow owns the voice."""
+        hit = gate_check(_last_user_text(state))
+        assert hit is not None  # only routed here when the router's own gate_check tripped
+        reason_code, destination = hit
+        write_event(
+            {
+                "event": "flow_cross_switch",
+                "from": state.active_flow,
+                "destination": destination,
+                "reason_code": reason_code,
+            }
+        )
+        return {
+            "active_flow": None,
+            "pending_action": None,
+            "pending_refund": None,
+            "pending_cancel": None,
+            "handover": HandoffRequest(
+                destination=destination, reason_code=reason_code, source="gate"
+            ),
+        }
+
     def route_after_entry(state: ReasoningState) -> str:
-        # Escape check BEFORE the sticky flow re-engages (decision: no caller is ever
+        # Escape checks BEFORE the sticky flow re-engages (decision: no caller is ever
         # trapped in a gated flow — AGENTS §A9). Deterministic, committed transcript only.
+        # ORDER MATTERS: human -> abort -> cross-switch -> assemble. Abort precedes the
+        # gate so a mid-flow "cancel that/it" aborts the IN-FLIGHT thing locally; "cancel
+        # my order" (not an abort phrasing) falls through to the gate and cross-switches
+        # to support's cancel-order path. The cross-switch closes the sticky-flow trap:
+        # without it, a gate-certain intent for ANOTHER flow (e.g. "refund me" while stuck
+        # in checkout) reaches the checkout model, which cannot serve it.
         text = _last_user_text(state)
         if state.active_flow == "checkout":
             if wants_human(text):
                 return "checkout_escape_human"
             if is_abort(text):
                 return "checkout_abort"
+            hit = gate_check(text)
+            if hit is not None and hit[1] != "checkout":
+                return "cross_switch"
             return "checkout_assemble"
         if state.active_flow == "support":
             if wants_human(text):
                 return "support_escape_human"
             if is_abort(text):
                 return "support_abort"
+            hit = gate_check(text)
+            if hit is not None and hit[1] != "support":
+                return "cross_switch"
             return "support_assemble"
         return "gate"
 
@@ -342,13 +389,15 @@ def build_frontline_graph(
         return "handover" if state.handover is not None else END
 
     def route_support_guardrail(state: ReasoningState) -> str:
-        # "confirm" (level ok) | "stepup" (-> risk_check) | "declined" (over amount: guardrail
-        # spoke its line + ends). Decided by the amount gate + the live level.
+        # "confirm" (level ok) | "stepup" (-> risk_check) | "declined" (over amount /
+        # cancelled: guardrail spoke its line + ends) | "cancel" (remedy steer: full
+        # money-back on an unshipped order converted to the cancel path).
         decision = support.route_after_guardrail(state)
         return {
             "confirm": "support_confirm",
             "stepup": "support_risk_check",
             "declined": END,
+            "cancel": "support_cancel_guardrail",
         }[decision]
 
     def route_after_support_risk(state: ReasoningState) -> str:
@@ -376,6 +425,7 @@ def build_frontline_graph(
 
     graph = StateGraph(ReasoningState)
     graph.add_node("entry", entry_node)
+    graph.add_node("cross_switch", cross_switch_node)
     graph.add_node("gate", gate_node)
     graph.add_node("model", model_node)
     graph.add_node("tools", tool_node)
@@ -412,6 +462,7 @@ def build_frontline_graph(
         route_after_entry,
         {
             "gate": "gate",
+            "cross_switch": "cross_switch",
             "checkout_assemble": "checkout_assemble",
             "checkout_abort": "checkout_abort",
             "checkout_escape_human": "checkout_escape_human",
@@ -420,6 +471,7 @@ def build_frontline_graph(
             "support_escape_human": "support_escape_human",
         },
     )
+    graph.add_edge("cross_switch", "handover")
     graph.add_conditional_edges(
         "gate", route_after_gate, {"handover": "handover", "model": "model"}
     )
@@ -472,6 +524,7 @@ def build_frontline_graph(
         {
             "support_confirm": "support_confirm",
             "support_risk_check": "support_risk_check",
+            "support_cancel_guardrail": "support_cancel_guardrail",
             END: END,
         },
     )

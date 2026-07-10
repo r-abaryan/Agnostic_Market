@@ -115,6 +115,16 @@ def test_refund_against_unknown_order_is_refused(config_root: Path) -> None:
         store.issue_refund("i1", order_id="NOPE-404", amount_usd=1.0, destination="original")
 
 
+def test_refund_against_a_cancelled_order_is_refused(config_root: Path) -> None:
+    # The void already reversed the charge — a refund on top returns the money twice
+    # (found live 2026-07-10: cancel ORD-9001, then an under-threshold refund would land).
+    store = _store(config_root)
+    store.cancel_order("ck-1", order_id="ORD-1002")
+    with pytest.raises(RefundError):
+        store.issue_refund("i1", order_id="ORD-1002", amount_usd=50.0, destination="original")
+    assert store.refund_count == 0
+
+
 def test_refund_can_target_a_just_placed_order(config_root: Path) -> None:
     store = _store(config_root)
     placed = store.place("k1", sku="SKU-BLU-07", name="rain jacket", quantity=1, total_usd=129.0)

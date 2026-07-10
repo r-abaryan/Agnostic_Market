@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
@@ -416,3 +417,138 @@ async def test_stale_cancel_readback_expires_before_voiding(
     assert not engine.pending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("sat for a while" in e.text for e in spoken)
+
+
+# --- remedy coherence: refund vs cancel (2026-07-10 live-call findings) --------------------
+
+# A FULL refund to the ORIGINAL instrument on ORD-1002 (processing, $129.00 captured):
+# money-back on an unshipped order IS a cancellation — the guardrail steers it.
+_FULL_REFUND_ORIGINAL = {
+    "propose_refund": {"order_key": "2", "amount_usd": 129.0, "destination": "original"}
+}
+
+
+def _refund_original_engine(config_root, args, *, thread_id, policy=_POLICY):
+    return _engine(
+        config_root,
+        reasoning=FakeChatModel(force_tool="propose_refund", canned_args=args, tool_call_limit=1),
+        policy=policy,
+        thread_id=thread_id,
+    )
+
+
+async def test_full_refund_on_unshipped_order_steers_to_cancel(config_root: Path) -> None:
+    engine, store, _, otp = _refund_original_engine(
+        config_root, _FULL_REFUND_ORIGINAL, thread_id="steer-1"
+    )
+    events = await _events(engine, "I want my money back for the rain jacket order")
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("hasn't shipped yet" in e.text for e in spoken)  # the remedy explained
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1  # the CANCEL readback, not the refund one
+    assert "cancel" in interrupts[0].prompt.lower()
+    assert "ORD-1002" in interrupts[0].prompt
+    assert otp.dispatch_count == 0  # a void needs no step-up
+    await _events(engine, "yes")
+    assert store.cancel_count == 1
+    assert store.refund_count == 0  # the money comes back via the void, never twice
+    assert store.order_status("ORD-1002") == "cancelled"
+
+
+async def test_steer_precedes_the_amount_gate(config_root: Path) -> None:
+    # The live incoherence (2026-07-10): a full "$258 refund" was sent to a person by the
+    # amount gate while a self-serve cancel of the same order was available. The steer must
+    # win over the threshold — a void is self-serve at any amount.
+    tight = _POLICY.model_copy(update={"refund_require_human_above_usd": 100.0})
+    engine, store, _, _ = _refund_original_engine(
+        config_root, _FULL_REFUND_ORIGINAL, thread_id="steer-2", policy=tight
+    )
+    events = await _events(engine, "I want my money back for the rain jacket order")
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert not any("above what I can process" in e.text for e in spoken)
+    assert any(isinstance(e, InterruptEvent) for e in events)  # the cancel readback
+    await _events(engine, "yes")
+    assert store.cancel_count == 1
+
+
+async def test_partial_refund_on_unshipped_order_is_not_steered(config_root: Path) -> None:
+    # A PARTIAL amount is not "undo the order" — it stays a refund (price-adjustment shape).
+    engine, store, _, _ = _refund_original_engine(
+        config_root, _REFUND_ORIGINAL, thread_id="steer-3"
+    )
+    events = await _events(engine, "refund me fifty dollars on the rain jacket order")
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "$50.00" in interrupts[0].prompt  # the REFUND readback
+    await _events(engine, "yes")
+    assert store.refund_count == 1
+    assert store.cancel_count == 0
+
+
+async def test_refund_on_a_cancelled_order_declines_honestly(config_root: Path) -> None:
+    # The live double-dip setup (2026-07-10): ORD cancelled, then an under-threshold refund
+    # request against it — must decline with the honest line, never touch money.
+    engine, store, _, _ = _refund_original_engine(
+        config_root, _REFUND_ORIGINAL, thread_id="steer-4"
+    )
+    store.cancel_order("prior-void", order_id="ORD-1002")  # voided earlier in the session
+    events = await _events(engine, "I want a refund for the rain jacket order")
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+    assert store.refund_count == 0
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("nothing left to refund" in e.text for e in spoken)
+
+
+async def test_cancel_after_a_partial_refund_declines_without_voiding(config_root: Path) -> None:
+    # The reverse double-dip: a partial refund exists, then a cancel request — a void would
+    # return the full charge ON TOP of the refund. Declines to support, order untouched.
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="steer-5")
+    store.issue_refund("prior-refund", order_id="ORD-1002", amount_usd=30.0, destination="original")
+    events = await _events(engine, "cancel my rain jacket order")
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "processing"  # nothing voided
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("already a refund" in e.text for e in spoken)
+
+
+async def test_cancelled_order_cancel_request_says_nothing_more_to_do(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="steer-6")
+    store.cancel_order("prior-void", order_id="ORD-1002")
+    events = await _events(engine, "cancel my rain jacket order")
+    assert not any(isinstance(e, InterruptEvent) for e in events)
+    assert store.cancel_count == 1  # only the prior one; no second void, no wrong 'shipped' line
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("already cancelled" in e.text for e in spoken)
+    assert not any("shipped" in e.text for e in spoken)
+
+
+# --- F-4: a multi-tool-call response must not leave a dangling tool_use -------------------
+
+
+async def test_support_double_tool_call_is_acked_in_thread_history(config_root: Path) -> None:
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=FakeChatModel(
+            force_tool="propose_cancel",
+            canned_args=_CANCEL_PROCESSING,
+            tool_call_limit=1,
+            double_tool_calls=True,
+        ),
+        thread_id="multi-1",
+    )
+    events = await _events(engine, "cancel my rain jacket order")
+    assert any(isinstance(e, InterruptEvent) for e in events)  # flow proceeded to readback
+    # Structural: EVERY persisted tool_use has a tool_result (a dangling pair fails
+    # provider-side history validation on every later model call in the session). The
+    # fakes never validate history, so this must be asserted on the thread state itself.
+    state = engine._graph.get_state({"configurable": {"thread_id": "multi-1"}})
+    tool_use_ids = {
+        c["id"] for m in state.values["messages"] if isinstance(m, AIMessage) for c in m.tool_calls
+    }
+    tool_result_ids = {
+        m.tool_call_id for m in state.values["messages"] if isinstance(m, ToolMessage)
+    }
+    assert tool_use_ids <= tool_result_ids
+    await _events(engine, "yes")
+    assert store.cancel_count == 1  # the first call was honored, exactly once
