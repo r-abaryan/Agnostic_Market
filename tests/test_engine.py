@@ -47,6 +47,7 @@ def _engine(
             allow_ai_merchant_handoff=True,
             refund_auto_approve_under_usd=50.0,
             refund_require_human_above_usd=200.0,
+            refund_returnless_under_usd=50.0,
             pending_ttl_seconds=120.0,
         ),
         checkpointer=build_checkpointer(),

@@ -82,6 +82,12 @@ class RefundPolicy(BaseModel):
 
     auto_approve_under_usd: float = Field(ge=0)
     require_human_above_usd: float = Field(ge=0)
+    # Return-first is the industry default for SHIPPED/DELIVERED orders: the refund is
+    # issued once the return exists, else the caller keeps both goods and money. A refund
+    # at or under this value may skip the return ("returnless refund" — a deliberate
+    # policy for items where return shipping costs more than the goods). Default 0 =
+    # return-first for every shipped refund; bounded by the platform ceiling.
+    returnless_under_usd: float = Field(ge=0, default=0.0)
 
 
 # Default caller-silence window before a paused confirmation (checkout/refund/cancel) expires
@@ -103,6 +109,13 @@ class PolicyConfig(BaseModel):
     pending_confirmation_ttl_seconds: float = Field(
         default=_DEFAULT_PENDING_TTL_SECONDS, gt=0
     )
+    # Optional merchant free-text policy facts that have NO enforcing field — refund
+    # TIMELINE ("5-7 business days"), return WINDOW ("30 days in original condition"). The
+    # ENFORCED policy sentences (returnless threshold, human-review line) are DERIVED from
+    # the typed values in agents/spoken_policy.py, never retyped here (drift guard). Keep
+    # this to facts nothing else in the config represents; absent => only the derived
+    # sentences are spoken. NEVER restate an enforced number here — it would drift.
+    spoken_facts_extra: str | None = None
 
 
 class ComplianceConfig(BaseModel):

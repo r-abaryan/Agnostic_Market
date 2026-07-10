@@ -39,6 +39,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
             allow_ai_merchant_handoff=True,
             refund_auto_approve_under_usd=50.0,
             refund_require_human_above_usd=200.0,
+            refund_returnless_under_usd=50.0,
             pending_ttl_seconds=120.0,
         ),
         **kwargs,
@@ -59,16 +60,17 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
 
 
 async def test_gate_trip_skips_model_and_hands_over(config_root: Path) -> None:
-    # The slim gate trips on high-certainty IRREVERSIBLE requests (here: cancel).
+    # The slim gate trips on high-certainty IRREVERSIBLE requests (here: cancel) BEFORE any
+    # generation: the frontline model is never invoked, and the turn enters the support
+    # flow directly (cancel is a BUILT capability — it no longer defers; and if support's
+    # model bounces and leaves, the gate-skip hands the answer to the frontline model
+    # rather than a canned deferral — see checkout's gate-skip test).
     fake = FakeChatModel(tool_call_limit=1)
-    graph = _graph(config_root, fake)
+    reasoning = FakeChatModel(emit_tool_calls=False)  # support clarifies; stays in flow
+    graph = _graph(config_root, fake, reasoning_model=reasoning)
     out = await graph.ainvoke({"messages": [HumanMessage("cancel my order please")]})
-    assert out["handover"].source == "gate"
-    assert out["handover"].reason_code == "cancel_order"
-    # The model was never invoked (gate is pre-generation) — no AIMessage tool call made.
-    assert fake._tool_calls_made == 0
-    # The caller hears the honest deferral, not a promise of a live connection.
-    assert "support team" in out["messages"][-1].content
+    assert out["active_flow"] == "support"  # entered by the gate, pre-generation
+    assert fake._tool_calls_made == 0  # the frontline model never ran
 
 
 async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
@@ -207,3 +209,85 @@ async def test_answered_turn_writes_telemetry_negative(config_root: Path, tmp_pa
         for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
     ]
     assert any(rec["outcome"] == "answered" and rec["utterance"] == "hi there" for rec in lines)
+
+
+# --- policy grounding: DERIVED from enforced values (no drift), + free-text extras --------
+
+
+def _policy(**over) -> PolicyContext:
+    base = {
+        "max_order_value_usd": 500.0,
+        "allow_ai_merchant_handoff": True,
+        "refund_auto_approve_under_usd": 50.0,
+        "refund_require_human_above_usd": 200.0,
+        "refund_returnless_under_usd": 50.0,
+        "pending_ttl_seconds": 120.0,
+        "spoken_policy_extra": "Refunds take 5 to 7 business days.",
+    }
+    base.update(over)
+    return PolicyContext(**base)
+
+
+def test_prompt_grounds_policy_from_enforced_values() -> None:
+    from agnostic_market.agents.frontline.prompt import compose_system_prompt
+
+    prompt = compose_system_prompt("Acme Store", _policy())
+    assert "Refunds take 5 to 7 business days." in prompt  # the free-text extra
+    assert "$50" in prompt  # the returnless threshold, DERIVED from the enforced value
+    assert "$200" in prompt  # the human-review line, DERIVED
+    assert "ONLY policy statements" in prompt
+
+
+def test_spoken_policy_tracks_the_enforced_value_no_drift() -> None:
+    # The whole point: change the ENFORCED number, the spoken sentence changes with it —
+    # they are one source, so a merchant can't state a threshold the guardrail won't honor.
+    from agnostic_market.agents.spoken_policy import compose_spoken_policy
+
+    assert "$50" in compose_spoken_policy(_policy(refund_returnless_under_usd=50.0))
+    assert "$120" in compose_spoken_policy(_policy(refund_returnless_under_usd=120.0))
+    # returnless 0 => return-first for every shipped refund (no dollar threshold spoken).
+    zero = compose_spoken_policy(_policy(refund_returnless_under_usd=0.0))
+    assert "issued once the return is arranged" in zero
+
+
+def test_prompt_speaks_derived_policy_even_without_free_text() -> None:
+    from agnostic_market.agents.frontline.prompt import compose_system_prompt
+
+    prompt = compose_system_prompt("Acme Store", _policy(spoken_policy_extra=None))
+    assert "$50" in prompt  # derived sentences exist for every merchant
+    assert "NEVER invent" in prompt
+
+
+def test_shared_context_reaches_every_agent_prompt() -> None:
+    # Knowledge must not be tier-local (live 2026-07-10: policy facts lived only in the
+    # frontline prompt, so a policy question that gate-routed into support met a model
+    # with zero policy knowledge). All three composers carry the SAME shared block:
+    # persona continuity + the DERIVED policy summary.
+    from agnostic_market.agents.checkout.prompt import compose_checkout_prompt
+    from agnostic_market.agents.frontline.prompt import compose_system_prompt
+    from agnostic_market.agents.support.prompt import compose_support_prompt
+    from agnostic_market.commerce.orders import Candidate, OrderCandidate
+
+    policy = _policy()
+    prompts = [
+        compose_system_prompt("Acme Store", policy),
+        compose_checkout_prompt(
+            "Acme Store",
+            [Candidate(key="1", sku="SKU-1", name="thing", price_usd=1.0)],
+            policy,
+        ),
+        compose_support_prompt(
+            "Acme Store",
+            [
+                OrderCandidate(
+                    key="1", order_id="ORD-1", summary="a thing", total_usd=1.0,
+                    status="processing",
+                )
+            ],
+            policy,
+        ),
+    ]
+    for prompt in prompts:
+        assert "ONE continuous assistant" in prompt
+        assert "Refunds take 5 to 7 business days." in prompt
+        assert "$50" in prompt  # the derived enforced sentence reaches every tier

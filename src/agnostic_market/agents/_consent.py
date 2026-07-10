@@ -30,6 +30,20 @@ _ABORT_RE = re.compile(
     r"\b(?:stop|never ?mind|forget it|cancel (?:that|it|this)|no thanks|don'?t bother)\b",
     re.IGNORECASE,
 )
+# Support-flow abort set: NO "cancel ..." clause. Inside support, cancellation is the
+# SUBJECT MATTER — "yeah cancel it" is the caller asking for the order cancel, not an
+# abort (live 2026-07-10: it hit the abort escape and cancelled NOTHING while sounding
+# like it had). Such utterances fall through to the model, which has the context.
+_SUPPORT_ABORT_RE = re.compile(
+    r"\b(?:stop|never ?mind|forget it|no thanks|don'?t bother)\b", re.IGNORECASE
+)
+# The cancel-action phrase, neutralized before classifying consent AT THE CANCEL READBACK:
+# "cancel" sits in _NO_RE (correct when confirming a purchase/refund — "cancel that" =
+# don't do it) but is AFFIRMATIVE when the question being answered IS "shall I cancel?".
+_CANCEL_PHRASE_RE = re.compile(
+    r"\bcancel(?:ling|led)?\b(?:\s+(?:that|it|this|the|my)\b)?(?:\s+(?:order|purchase)\b)?",
+    re.IGNORECASE,
+)
 
 Consent = Literal["human", "no", "yes", "unclear"]
 
@@ -40,8 +54,13 @@ def wants_human(text: str) -> bool:
 
 
 def is_abort(text: str) -> bool:
-    """Explicit abort of the in-flight gated action (entry-router escape)."""
+    """Explicit abort of the in-flight gated action (entry-router escape, checkout)."""
     return bool(_ABORT_RE.search(text))
+
+
+def is_support_abort(text: str) -> bool:
+    """Abort escape for the SUPPORT flow — same set minus the cancel-phrase (see above)."""
+    return bool(_SUPPORT_ABORT_RE.search(text))
 
 
 def classify_consent(text: str) -> Consent:
@@ -53,3 +72,16 @@ def classify_consent(text: str) -> Consent:
     if _YES_RE.search(text):
         return "yes"
     return "unclear"
+
+
+def classify_cancel_consent(text: str) -> Consent:
+    """`classify_consent` for the CANCEL readback, where the action word inverts polarity.
+
+    The question being answered is "shall I cancel your order?" — so "yeah, cancel it" is a
+    YES, while plain `classify_consent` would read the `cancel` as a no. Neutralize the
+    cancel-action phrase, then classify what remains: "yeah cancel it" -> "yeah" -> yes;
+    "don't cancel" -> "don't" -> no; bare "cancel it" -> "" -> unclear (the confirm node's
+    existing one re-confirm asks "yes or no?"). Negations survive the strip, so they still
+    win (§4a discipline unchanged).
+    """
+    return classify_consent(_CANCEL_PHRASE_RE.sub(" ", text))

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents import telemetry
@@ -25,6 +26,7 @@ _POLICY = PolicyContext(
     allow_ai_merchant_handoff=True,
     refund_auto_approve_under_usd=50.0,
     refund_require_human_above_usd=200.0,
+    refund_returnless_under_usd=50.0,
     pending_ttl_seconds=120.0,
 )
 _CFG = {"configurable": {"thread_id": "t1"}}
@@ -121,20 +123,86 @@ async def test_order_over_value_cap_is_denied_in_code(config_root: Path) -> None
 
 async def test_unoffered_candidate_key_never_places(config_root: Path) -> None:
     # The fake keeps proposing key "99" (not in the candidate list): one corrective
-    # re-prompt, then assemble LEAVES the flow — and the same-turn checkout re-trip is
-    # blocked by the left_checkout marker (cycle-breaker), falling back to the deferral.
+    # re-prompt, then assemble LEAVES the flow — the gate skips a re-trip back into the
+    # flow just left (see the gate-skip test below), so the FRONTLINE model answers the
+    # turn instead of a cycle or a canned deferral.
     reasoning = FakeChatModel(
         force_tool="propose_order",
         canned_args={"propose_order": {"candidate_key": "99", "quantity": 1}},
     )
-    graph, store = _build(config_root, reasoning=reasoning)
+    frontline = FakeChatModel(emit_tool_calls=False)
+    graph, store = _build(config_root, frontline=frontline, reasoning=reasoning)
     out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     assert store.placed_count == 0
     assert out.get("pending_action") is None
     assert not graph.get_state(_CFG).interrupts
-    # The cycle-breaker deferral (honest checkout copy) was spoken instead of looping.
+    assert frontline._tool_calls_made == 0  # frontline RAN (answered); no checkout re-entry
+    assert isinstance(out["messages"][-1], AIMessage) and out["messages"][-1].content
+
+
+# --- gate skip-when-just-left (2026-07-10 live: "complete the purchase" on an already-
+# ---  placed order -> model left -> gate re-tripped -> stale "I'll pass it along" line) ----
+
+
+async def test_gate_does_not_retrip_into_a_flow_the_model_just_left(config_root: Path) -> None:
+    # The checkout model LEAVES (it saw there is nothing to buy); the same gate-certain
+    # text must not bounce straight back in or end at the canned deferral — the frontline
+    # model owns the answer (it holds no write tools; safe by construction).
+    reasoning = FakeChatModel(force_tool="leave_checkout", tool_call_limit=1, canned_args={})
+    frontline = FakeChatModel(emit_tool_calls=False)
+    graph, store = _build(config_root, frontline=frontline, reasoning=reasoning)
+    out = await graph.ainvoke(
+        {"messages": [HumanMessage("go ahead and complete the purchase")]}, _CFG
+    )
+    assert store.placed_count == 0
+    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage)]
+    assert not any("pass it along" in t for t in texts)  # the stale deferral is gone
+    assert texts and texts[-1]  # the frontline model spoke the answer
+    assert reasoning._tool_calls_made == 1  # checkout ran once (the leave), no re-entry
+
+
+# --- duplicate-order disambiguation (2026-07-10 live: "complete the purchase" after the
+# ---  order was already placed silently created a second identical $387 order) ------------
+
+
+async def test_second_identical_order_readback_disambiguates(config_root: Path) -> None:
+    reasoning = FakeChatModel(
+        force_tool="propose_order",
+        tool_call_limit=2,
+        canned_args={"propose_order": {"candidate_key": "1", "quantity": 3}},
+    )
+    graph, store = _build(config_root, reasoning=reasoning)
+    await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    first = str(graph.get_state(_CFG).interrupts[0].value)
+    assert "SECOND" not in first  # the first order reads back normally
+    await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+    assert store.placed_count == 1  # ORD-9001 placed
+    # The same proposal again this session: the readback must name the existing order and
+    # make "second order" unmissable — a misread "complete the purchase" hears exactly
+    # what a yes would do.
+    await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    second = str(graph.get_state(_CFG).interrupts[0].value)
+    assert "SECOND" in second
+    assert "ORD-9001" in second
+    await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+    assert store.placed_count == 2  # an explicit yes to a second order is legitimate
+
+
+async def test_duplicate_flag_declined_places_nothing_more(config_root: Path) -> None:
+    reasoning = FakeChatModel(
+        force_tool="propose_order",
+        tool_call_limit=2,
+        canned_args={"propose_order": {"candidate_key": "1", "quantity": 3}},
+    )
+    graph, store = _build(config_root, reasoning=reasoning)
+    await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+    await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+    out = await graph.ainvoke(Command(resume={"text": "no, that was the same one"}), _CFG)
+    assert store.placed_count == 1  # the decline kept it at one
     assert any(
-        isinstance(m, AIMessage) and "pass it along" in str(m.content) for m in out["messages"]
+        isinstance(m, AIMessage) and "won't place it" in str(m.content)
+        for m in out["messages"]
     )
 
 

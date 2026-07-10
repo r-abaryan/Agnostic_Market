@@ -114,6 +114,19 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
             f"require_human_above_usd={require_human} - auto-approve cannot exceed the human line"
         )
 
+    returnless = refunds.get("returnless_under_usd")
+    returnless_ceiling = limits.get("refund_returnless_ceiling_usd")
+    if (
+        returnless is not None
+        and returnless_ceiling is not None
+        and returnless > returnless_ceiling
+    ):
+        raise PolicyBoundsViolationError(
+            f"policies.refunds.returnless_under_usd={returnless} exceeds the platform ceiling "
+            f"{returnless_ceiling} - the returnless window may be widened only up to the "
+            "platform bound; above it, shipped refunds are return-first"
+        )
+
     ttl = policies.get("pending_confirmation_ttl_seconds")
     ttl_max = limits.get("pending_confirmation_ttl_max_seconds")
     if ttl is not None and ttl_max is not None and ttl > ttl_max:

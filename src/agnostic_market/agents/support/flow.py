@@ -38,11 +38,17 @@ from langchain_core.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
-from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._consent import classify_cancel_consent, classify_consent
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.commerce.orders import CANCELLED_STATUS, CancelError, OrderStore, RefundError
+from agnostic_market.commerce.orders import (
+    CANCELLED_STATUS,
+    FULFILLED_STATUSES,
+    CancelError,
+    OrderStore,
+    RefundError,
+)
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import (
     ISSUE_REFUND_POLICY,
@@ -195,7 +201,9 @@ def build_support_nodes(
         valid proposal — A10a rule 2: the idempotency key exists in state before any effect."""
         orders = order_store.actionable_orders()
         by_key = {o.key: o for o in orders}
-        prompt = SystemMessage(compose_support_prompt(display_name, orders))
+        prompt = SystemMessage(
+            compose_support_prompt(display_name, orders, policy)
+        )
         messages: list = [prompt, *state.messages]
         new_messages: list = []
         for _attempt in range(2):  # one invalid proposal gets ONE corrective re-prompt
@@ -285,12 +293,18 @@ def build_support_nodes(
            a void is self-serve at any amount, so it must not be sent to a human by a
            threshold that exists for post-fulfillment refund abuse (the 2026-07-10 live
            incoherence: "$258 needs a person" ... then cancel voided the same $258).
-        3. AMOUNT gate (merchant policy, within platform bounds): a refund above
+        3. RETURN-FIRST gate (industry standard, live 2026-07-10: a $179.98 refund paid out
+           on shipped shoes with no return created — money back AND goods kept): a refund
+           on a SHIPPED/DELIVERED order above the merchant's `returnless_under_usd` waits
+           for the return; the honest decline names that path (returns flow = Group C).
+           At/below the threshold = a deliberate returnless refund, proceeds. BEFORE the
+           amount gate: the return is required regardless of who reviews the amount.
+        4. AMOUNT gate (merchant policy, within platform bounds): a refund above
            `refund_require_human_above_usd` goes to a PERSON regardless of level. It authors
            its own decline (clear-before-speak) and ENDs — there is NO handover routing yet
            (no warm-transfer target exists until Phase 4); the human intent is recorded in
            telemetry so the transfer can be wired there without re-finding this spot.
-        4. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
+        5. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
            level, decided by `route_after_guardrail`; no side effect here."""
         pending = state.pending_refund
         assert pending is not None  # only reached with a proposal minted
@@ -327,6 +341,25 @@ def build_support_nodes(
                     AIMessage(
                         "That order hasn't shipped yet, so I can cancel it instead - the "
                         f"full ${captured:.2f} goes back to your original payment method."
+                    )
+                ],
+            }
+        if (
+            order_store.order_status(pending.order_id) in FULFILLED_STATUSES
+            and pending.amount_usd > policy.refund_returnless_under_usd
+        ):
+            # Return-first: the goods are out; over the returnless threshold the refund
+            # waits for the return. Speak the honest path and END — the returns flow that
+            # will actually arrange it is Group C; until then a person sets it up.
+            write_event({"event": "refund_needs_return", "reason": "return_first"})
+            return {
+                "pending_refund": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"Since that order has already shipped, the ${pending.amount_usd:.2f} "
+                        "refund is issued once the return is set up - our support team can "
+                        "arrange the return for you."
                     )
                 ],
             }
@@ -606,13 +639,19 @@ def build_support_nodes(
                     )
                 ],
             }
+        # Cancel-polarity consent: the question IS "shall I cancel?", so "yeah cancel it"
+        # must read as yes (plain classify_consent reads the 'cancel' as a no — live
+        # 2026-07-10 the phrase never even reached here, but this seals the readback too).
         answer = interrupt(_cancel_readback_line(pending))
-        verdict = classify_consent(str(answer.get("text", "")))
+        verdict = classify_cancel_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
+            # The retry names the order too — the caller may have reached this branch by
+            # questioning WHICH order it is (live: "isn't my most recent ORD-1001?").
             retry = interrupt(
-                f"Sorry - just to be clear: cancel your order for {pending.summary}? Yes or no?"
+                f"Sorry - just to be clear: cancel your order for {pending.summary} "
+                f"({pending.order_id})? Yes or no?"
             )
-            verdict = classify_consent(str(retry.get("text", "")))
+            verdict = classify_cancel_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
         if verdict == "human":
@@ -672,13 +711,19 @@ def build_support_nodes(
         }
 
     def abort_node(state: ReasoningState) -> dict[str, object]:
-        """Entry-router escape: explicit abort while support was in flight."""
+        """Entry-router escape: explicit abort while support was in flight. The copy names
+        what was dropped (the REQUEST) and what wasn't touched (orders) — "I've dropped
+        that" alone let a caller believe an order was cancelled (live 2026-07-10)."""
         write_event({"event": "support_cancelled", "reason": "aborted"})
         return {
             "pending_refund": None,
             "pending_cancel": None,
             "active_flow": None,
-            "messages": [AIMessage("No problem - I've dropped that. Nothing has changed.")],
+            "messages": [
+                AIMessage(
+                    "No problem - I've dropped that request. Your orders are unchanged."
+                )
+            ],
         }
 
     def escape_human_node(state: ReasoningState) -> dict[str, object]:

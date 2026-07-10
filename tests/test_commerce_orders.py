@@ -110,6 +110,18 @@ def test_placed_order_is_cancellable(config_root: Path) -> None:
     assert store.order_status(placed.order_id) == "cancelled"
 
 
+def test_identical_order_lookup_ignores_cancelled(config_root: Path) -> None:
+    # The checkout guardrail's duplicate probe: same sku+qty this session flips the readback
+    # to the "SECOND order" form; a cancelled match must NOT count (re-ordering is normal).
+    store = _store(config_root)
+    placed = store.place("k1", sku="SKU-BLU-07", name="rain jacket", quantity=3, total_usd=387.0)
+    assert store.identical_order("SKU-BLU-07", 3) is placed
+    assert store.identical_order("SKU-BLU-07", 2) is None  # different quantity
+    assert store.identical_order("SKU-RED-42", 3) is None  # different sku
+    store.cancel_order("ck-1", order_id=placed.order_id)
+    assert store.identical_order("SKU-BLU-07", 3) is None
+
+
 def test_cancel_record_carries_the_reversed_amount(config_root: Path) -> None:
     # The spoken outcome states the money movement, so the record must know the captured
     # total it reversed.

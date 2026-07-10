@@ -38,13 +38,16 @@ _RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, HandoffDestination], ...
         "support",
     ),
     # refund / return REQUEST (NOT "what's your return policy" — a policy question).
-    # 'refund'/'money back' as a request; bare 'return' only with a request verb or object.
+    # 'refund'/'money back' as a request; bare 'return' only with a request verb or object;
+    # 'send (it/them/…) back' — the return phrasing with no return/refund token at all
+    # (live-eval miss: the model answered it with policy once policy facts existed).
     (
         re.compile(
             r"\b(?:want|need|get|give|like|request|issue|process)\b[^.?!]*\b(?:refund|money back)\b"
             r"|\b(?:refund|money back|reimburse)\b\s+(?:me|my|this|it|the order)\b"
             r"|\b(?:want|need|start|request|initiate|process|make)\b[^.?!]*\breturn\b"
-            r"|\breturn\b\s+(?:this|it|these|them|my (?:order|item|purchase))\b",
+            r"|\breturn\b\s+(?:this|it|these|them|my (?:order|item|purchase))\b"
+            r"|\bsend\s+(?:(?:it|this|these|them|everything)\s+)?back\b",
             re.IGNORECASE,
         ),
         "refund",

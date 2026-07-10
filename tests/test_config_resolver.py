@@ -19,6 +19,7 @@ def _base() -> dict:
             "limits": {
                 "refund_require_human_ceiling_usd": 500,
                 "pending_confirmation_ttl_max_seconds": 300,
+                "refund_returnless_ceiling_usd": 100,
             },
         },
         "schema_version": "0.2",
@@ -143,6 +144,23 @@ def test_pending_ttl_over_platform_max_is_rejected() -> None:
     bad["policies"] = {"pending_confirmation_ttl_seconds": 9999}  # max is 300
     with pytest.raises(PolicyBoundsViolationError, match="pending_confirmation_ttl_seconds"):
         resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_returnless_window_over_platform_ceiling_is_rejected() -> None:
+    # A merchant may widen the returnless-refund window only up to the platform bound —
+    # above it, a shipped refund is always return-first (the caller must not be able to
+    # keep goods AND money at arbitrary value).
+    bad = _override()
+    bad["policies"] = {"refunds": {"returnless_under_usd": 250}}  # ceiling is 100
+    with pytest.raises(PolicyBoundsViolationError, match="returnless_under_usd"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_returnless_window_within_ceiling_is_accepted() -> None:
+    ok = _override()
+    ok["policies"] = {"refunds": {"returnless_under_usd": 75}}  # <= 100
+    config = resolve_merchant_config(_base(), _template(), ok)
+    assert config.policies.refunds.returnless_under_usd == 75
 
 
 def test_pending_ttl_within_max_resolves() -> None:

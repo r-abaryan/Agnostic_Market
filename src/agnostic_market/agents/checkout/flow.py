@@ -89,6 +89,18 @@ def _readback_line(pending: PendingAction, policy: ToolConfirmationPolicy) -> st
     missing = policy.confirm_fields - rendered.keys()
     if missing:
         raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
+    if pending.duplicate_of is not None:
+        # An identical live order already exists this session: the readback must make
+        # "second order" unmissable — a caller who meant "complete the purchase I already
+        # made" hears exactly what saying yes would do (live 2026-07-10: without this, a
+        # misread intent silently duplicated a $387 order).
+        return (
+            f"Just to check - you already ordered "
+            f"{speak_quantity(pending.quantity, pending.name)} on this call "
+            f"({pending.duplicate_of}), and that order is placed. Do you want a SECOND "
+            f"order of {speak_quantity(pending.quantity, pending.name)} for another "
+            f"{rendered['total_amount']}?"
+        )
     return (
         f"Just to confirm: {speak_quantity(pending.quantity, pending.name)}, "
         f"{rendered['total_amount']} total. Shall I place the order?"
@@ -145,7 +157,9 @@ def build_checkout_nodes(
         the idempotency key exists in state before any interrupt/effect."""
         candidates = resolve_candidates(store.fixture, _last_user_text(state))
         by_key = {c.key: c for c in candidates}
-        prompt = SystemMessage(compose_checkout_prompt(display_name, candidates))
+        prompt = SystemMessage(
+            compose_checkout_prompt(display_name, candidates, policy)
+        )
         messages: list = [prompt, *state.messages]
         new_messages: list = []
         # Bounded proposal loop: one invalid proposal gets ONE corrective re-prompt.
@@ -208,7 +222,9 @@ def build_checkout_nodes(
         }
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
-        """CODE-enforced policy check (never the model): order value cap."""
+        """CODE-enforced policy checks (never the model): order value cap + duplicate
+        disambiguation (an identical live order this session flips the readback to the
+        explicit "SECOND order" form — deterministic containment for a misread intent)."""
         pending = state.pending_action
         assert pending is not None  # only reached with a proposal minted
         if pending.total_usd > policy.max_order_value_usd:
@@ -229,6 +245,10 @@ def build_checkout_nodes(
                     )
                 ],
             }
+        dup = store.identical_order(pending.sku, pending.quantity)
+        if dup is not None:
+            write_event({"event": "checkout_duplicate_flagged", "existing": dup.order_id})
+            return {"pending_action": pending.model_copy(update={"duplicate_of": dup.order_id})}
         return {}
 
     def confirm_node(state: ReasoningState) -> dict[str, object]:
@@ -255,10 +275,14 @@ def build_checkout_nodes(
             }
         answer = interrupt(_readback_line(pending, PLACE_ORDER_POLICY))
         verdict = classify_consent(str(answer.get("text", "")))
-        # §4a: consent over a barged-over readback is not consent - re-confirm once.
+        # §4a: consent over a barged-over readback is not consent - re-confirm once. A
+        # flagged duplicate keeps its "second order" frame here too — a barge must not
+        # wash the disambiguation out of the only line that carries it.
         if answer.get("readback_interrupted") or verdict == "unclear":
+            second = "a SECOND order of " if pending.duplicate_of is not None else ""
             retry = interrupt(
-                f"Sorry - just to be clear: {speak_quantity(pending.quantity, pending.name)}, "
+                f"Sorry - just to be clear: {second}"
+                f"{speak_quantity(pending.quantity, pending.name)}, "
                 f"${pending.total_usd:.2f} total. Yes or no?"
             )
             verdict = classify_consent(str(retry.get("text", "")))

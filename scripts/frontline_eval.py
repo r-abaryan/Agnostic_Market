@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agnostic_market.agents import telemetry
@@ -43,15 +43,25 @@ _RECALL_BAR = 0.90
 
 _THREAD_SEQ = 0
 
+# The gated flows' model-facing tools: any of these appearing in the turn's messages means
+# the turn LEFT the frontline and a flow's model ran — an escalation, even when the flow
+# then ended in a terminal decline that clears its own state (see docstring below).
+_FLOW_TOOLS = frozenset(
+    {"propose_refund", "propose_cancel", "propose_order", "leave_support", "leave_checkout"}
+)
+
 
 async def _outcome(graph, utterance: str) -> str | None:
     """How the turn left the frontline, else None (answered).
 
-    3b semantics: a checkout-destination handover no longer ends at a spoken deferral —
-    it ENTERS the checkout flow (clearing the handover signal), so escalation shows up as
-    `active_flow`/`pending_action` in the output, or as a paused confirm interrupt.
-    Returns 'gate'/'model' (handover survived in state) or 'flow' (entered checkout).
-    Each utterance runs on a fresh thread (the flow's interrupt needs a checkpointer).
+    3b semantics: a checkout/support-destination handover no longer ends at a spoken
+    deferral — it ENTERS the flow (clearing the handover signal), so escalation shows up
+    as `active_flow`/`pending_*` in the output, or as a paused confirm interrupt.
+    3c-follow-up semantics: a flow can also run to a TERMINAL decline (return-first,
+    amount gate, ineligible cancel) that clears `active_flow` before END — then the only
+    trace is the flow model's tool activity in the turn's messages, so that counts as
+    'flow' too. Returns 'gate'/'model' (handover survived in state) or 'flow' (a gated
+    flow ran). Each utterance runs on a fresh thread (interrupts need a checkpointer).
     """
     global _THREAD_SEQ
     _THREAD_SEQ += 1
@@ -66,6 +76,11 @@ async def _outcome(graph, utterance: str) -> str | None:
         or graph.get_state(config).interrupts
     ):
         return "flow"
+    for msg in out["messages"]:
+        if isinstance(msg, AIMessage) and any(
+            call["name"] in _FLOW_TOOLS for call in msg.tool_calls
+        ):
+            return "flow"
     return None
 
 
@@ -94,6 +109,7 @@ async def _run() -> int:
             allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
             refund_auto_approve_under_usd=config.policies.refunds.auto_approve_under_usd,
             refund_require_human_above_usd=config.policies.refunds.require_human_above_usd,
+            refund_returnless_under_usd=config.policies.refunds.returnless_under_usd,
             pending_ttl_seconds=config.policies.pending_confirmation_ttl_seconds,
         ),
         # An utterance that reaches the confirm readback pauses at an interrupt, which
@@ -121,7 +137,7 @@ async def _run() -> int:
     print(f"[should_escalate] recall: {escalated}/{len(escalate)} ({recall:.0%})")
     print(
         f"    gate caught {by_gate} (informational fast-path) | model caught {by_model} "
-        f"| entered checkout flow {by_flow}"
+        f"| entered a gated flow {by_flow}"
     )
     for miss in misses:
         print(f"    MISS (answered instead of escalated - triage prompt/few-shot): {miss!r}")

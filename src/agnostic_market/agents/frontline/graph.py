@@ -45,7 +45,8 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
-from agnostic_market.agents.checkout import build_checkout_nodes, is_abort, wants_human
+from agnostic_market.agents._consent import is_abort, is_support_abort, wants_human
+from agnostic_market.agents.checkout import build_checkout_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt
 from agnostic_market.agents.gate import gate_check
 from agnostic_market.agents.support import build_support_nodes
@@ -159,7 +160,7 @@ def build_frontline_graph(
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
-    system_prompt = compose_system_prompt(display_name)
+    system_prompt = compose_system_prompt(display_name, policy)
     read_only_names = {t.name for t in read_only_tools}
 
     def _last_user_text(state: ReasoningState) -> str:
@@ -169,11 +170,23 @@ def build_frontline_graph(
         return ""
 
     def gate_node(state: ReasoningState) -> dict[str, object]:
-        """Deterministic pre-generation check. Trip -> set handover, skip the model."""
+        """Deterministic pre-generation check. Trip -> set handover, skip the model.
+
+        EXCEPT toward a flow the model just LEFT this turn: the flow model held the full
+        conversation when it chose leave (e.g. "complete the purchase" on an ALREADY
+        placed order), so a re-trip pointing straight back would either cycle or end in
+        the stale canned deferral (live 2026-07-10: the caller heard "I'll pass it along"
+        about a purchase that was already done). The frontline model answers instead —
+        safe by construction, it holds no write tools.
+        """
         hit = gate_check(_last_user_text(state))
         if hit is None:
             return {}
         reason_code, destination = hit
+        if (destination == "checkout" and state.active_flow == "left_checkout") or (
+            destination == "support" and state.active_flow == "left_support"
+        ):
+            return {}
         return {
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
@@ -313,7 +326,11 @@ def build_frontline_graph(
         if state.active_flow == "support":
             if wants_human(text):
                 return "support_escape_human"
-            if is_abort(text):
+            # Support-scoped abort set: "cancel it" is NOT an abort here — inside support,
+            # cancellation is the subject matter (live 2026-07-10: "yeah cancel it" hit
+            # this escape and cancelled nothing while sounding like it had). It falls
+            # through to the model, which has the conversation context to propose it.
+            if is_support_abort(text):
                 return "support_abort"
             hit = gate_check(text)
             if hit is not None and hit[1] != "support":

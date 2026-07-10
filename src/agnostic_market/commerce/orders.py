@@ -136,8 +136,11 @@ class CancelError(ValueError):
 # window; once shipped, direct cancellation ends and becomes a return). Placed orders start
 # in _PLACED_STATUS, which is included here so a just-placed order is cancellable.
 _CANCELLABLE_STATUSES = frozenset({"processing"})
-# Public: the support flow branches its caller-facing declines on this effective status.
+# Public: the support flow branches its caller-facing declines on these effective statuses.
 CANCELLED_STATUS = "cancelled"
+# Goods are (or were) on their way: a refund on these is RETURN-FIRST above the merchant's
+# returnless threshold — without it the caller keeps both the goods and the money.
+FULFILLED_STATUSES = frozenset({"shipped", "delivered"})
 
 
 def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:
@@ -246,6 +249,24 @@ class OrderStore:
     def placed_count(self) -> int:
         """How many DISTINCT orders this store has placed (test/verification surface)."""
         return len(self._placed_by_key)
+
+    def identical_order(self, sku: str, quantity: int) -> PlacedOrder | None:
+        """A LIVE (non-cancelled) order this session already placed for the same sku+qty.
+
+        The checkout guardrail reads this to disambiguate a probable repeat: a caller
+        saying "complete the purchase" after the order already placed must hear "this
+        would be a SECOND order", not a readback identical to the first (live 2026-07-10:
+        that path silently created a duplicate $387 order). A cancelled match doesn't
+        count — re-ordering after a cancel is a normal intent.
+        """
+        for placed in self._placed_by_key.values():
+            if (
+                placed.sku == sku
+                and placed.quantity == quantity
+                and placed.order_id not in self._cancelled_ids
+            ):
+                return placed
+        return None
 
     def actionable_orders(self) -> list[OrderCandidate]:
         """The bounded, keyed list of orders a support action (refund OR cancel) may target

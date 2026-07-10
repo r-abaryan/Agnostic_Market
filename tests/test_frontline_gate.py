@@ -22,6 +22,8 @@ _IRREVERSIBLE = [
     "I need to return this",
     "start a return for my order",
     "return these shoes",
+    "I'd like to send them back",  # return intent with no 'return'/'refund' token
+    "send back everything I ordered",
     "checkout now please",
     "place my order",
     "go ahead and place the order",
@@ -53,6 +55,8 @@ _NO_TRIP = [
     "do you have running shoes",
     "how much is the jacket",
     "what payment methods do you accept",
+    "can you send me feedback on my order",  # 'send…feedback' must not read as 'send back'
+    "when will my package be sent to me",
 ]
 
 

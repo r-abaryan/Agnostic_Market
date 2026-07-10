@@ -35,6 +35,10 @@ _POLICY = PolicyContext(
     allow_ai_merchant_handoff=True,
     refund_auto_approve_under_usd=50.0,
     refund_require_human_above_usd=200.0,
+    # High on purpose: the legacy amount-gate/step-up scenarios run refunds against the
+    # SHIPPED ORD-1001 and must exercise those gates in isolation; the return-first tests
+    # tighten this via model_copy.
+    refund_returnless_under_usd=500.0,
     pending_ttl_seconds=120.0,
 )
 _FACTS = TurnFacts()
@@ -521,6 +525,149 @@ async def test_cancelled_order_cancel_request_says_nothing_more_to_do(config_roo
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("already cancelled" in e.text for e in spoken)
     assert not any("shipped" in e.text for e in spoken)
+
+
+# --- return-first: a refund on a SHIPPED/DELIVERED order above the merchant's returnless
+# ---  window waits for the return (2026-07-10 live: $179.98 paid out on shipped shoes with
+# ---  no return created — money back AND goods kept) --------------------------------------
+
+
+async def test_shipped_refund_over_returnless_window_requires_return_first(
+    config_root: Path,
+) -> None:
+    tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 50.0})
+    engine, store, _, _ = _refund_engine(
+        config_root, 150.0, "original", thread_id="ret-1", policy=tight
+    )
+    events = await _events(engine, "I want a refund to my original card")
+    assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback, no payout
+    assert store.refund_count == 0
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("once the return is set up" in e.text for e in spoken)
+
+
+async def test_shipped_refund_within_returnless_window_pays_out(config_root: Path) -> None:
+    # At/under the merchant's returnless line the payout is a DELIBERATE policy (return
+    # shipping would cost more than the goods) — proceeds to the normal readback.
+    tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 50.0})
+    engine, store, _, _ = _refund_engine(
+        config_root, 30.0, "original", thread_id="ret-2", policy=tight
+    )
+    events = await _events(engine, "I want a refund to my original card")
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "$30.00" in interrupts[0].prompt
+    await _events(engine, "yes")
+    assert store.refund_count == 1
+
+
+async def test_return_gate_precedes_the_amount_gate(config_root: Path) -> None:
+    # $250 is over BOTH lines on a shipped order; the honest primary reason is the return —
+    # it is required regardless of who reviews the amount.
+    tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 50.0})
+    engine, store, _, _ = _refund_engine(
+        config_root, 250.0, "original", thread_id="ret-3", policy=tight
+    )
+    events = await _events(engine, "I want a refund to my original card")
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("once the return is set up" in e.text for e in spoken)
+    assert not any("above what I can process" in e.text for e in spoken)
+    assert store.refund_count == 0
+
+
+async def test_delivered_order_is_return_first_too(config_root: Path) -> None:
+    tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 10.0})
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=FakeChatModel(
+            force_tool="propose_refund",
+            canned_args={
+                "propose_refund": {"order_key": "3", "amount_usd": 40.0, "destination": "original"}
+            },
+            tool_call_limit=1,
+        ),
+        policy=tight,
+        thread_id="ret-4",
+    )
+    events = await _events(engine, "I want a refund for my socks order")  # ORD-1003, delivered
+    assert store.refund_count == 0
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("once the return is set up" in e.text for e in spoken)
+
+
+# --- cancel-consent polarity (2026-07-10 live: "yeah cancel it" hit the ABORT escape,
+# ---  cancelled NOTHING, and sounded like it had) ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("yeah cancel it", "yes"),  # the live utterance — consent, not an abort/no
+        ("yes, cancel the order", "yes"),
+        ("go ahead, cancel it", "yes"),
+        ("don't cancel", "no"),  # negation survives the neutralization
+        ("no, leave it", "no"),
+        ("cancel it", "unclear"),  # bare command -> the one §4a re-confirm asks yes/no
+        ("get me a person", "human"),
+    ],
+)
+def test_classify_cancel_consent_polarity(text: str, expected: str) -> None:
+    from agnostic_market.agents._consent import classify_cancel_consent
+
+    assert classify_cancel_consent(text) == expected
+
+
+def test_support_abort_set_excludes_cancel_phrases() -> None:
+    from agnostic_market.agents._consent import is_abort, is_support_abort
+
+    assert is_support_abort("never mind, forget it") is True
+    assert is_support_abort("stop") is True
+    assert is_support_abort("yeah cancel it") is False  # subject matter, not an abort
+    assert is_abort("cancel it") is True  # checkout keeps the abort reading
+
+
+async def test_cancel_phrase_while_sticky_in_support_reaches_the_model(
+    config_root: Path,
+) -> None:
+    # THE live bug shape: the support model had asked its own question (sticky, nothing
+    # pending) and the caller's "yeah cancel it" must route to ASSEMBLE (the model has the
+    # context), never to the abort escape.
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=FakeChatModel(emit_tool_calls=False),  # clarifies every turn -> sticky
+        thread_id="pol-1",
+    )
+    await _events(engine, "I want a refund for my order")  # gate -> support, model clarifies
+    events = await _events(engine, "yeah cancel it")
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert not any("dropped that" in e.text for e in spoken)  # abort did NOT fire
+    assert any(isinstance(e, TokenEvent) for e in events)  # the model answered instead
+    assert store.cancel_count == 0  # and nothing was silently voided either
+
+
+async def test_yeah_cancel_it_at_the_cancel_readback_is_consent(config_root: Path) -> None:
+    # At the readback the question IS "shall I cancel?" — plain classify_consent would read
+    # the 'cancel' as a NO and leave the order standing while the caller believes it's gone.
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="pol-2")
+    await _events(engine, "cancel my rain jacket order")  # paused at the cancel readback
+    await _events(engine, "yeah cancel it")
+    assert store.cancel_count == 1
+    assert store.order_status("ORD-1002") == "cancelled"
+
+
+async def test_bare_cancel_it_at_readback_reconfirms_once(config_root: Path) -> None:
+    engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="pol-3")
+    await _events(engine, "cancel my rain jacket order")
+    events = await _events(engine, "cancel it")  # neutralized -> unclear -> re-confirm
+    assert store.cancel_count == 0
+    reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(reconfirms) == 1
+    assert "yes or no" in reconfirms[0].prompt.lower()
+    # The retry names the order too — the caller may be here because they questioned
+    # WHICH order it is (live: "isn't my most recent ORD-1001?").
+    assert "ORD-1002" in reconfirms[0].prompt
+    await _events(engine, "yes")
+    assert store.cancel_count == 1
 
 
 # --- F-4: a multi-tool-call response must not leave a dangling tool_use -------------------

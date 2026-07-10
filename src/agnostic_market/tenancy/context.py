@@ -32,7 +32,9 @@ def build_tenant_context(registry: ConfigRegistry, merchant_id: str) -> TenantCo
         allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
         refund_auto_approve_under_usd=config.policies.refunds.auto_approve_under_usd,
         refund_require_human_above_usd=config.policies.refunds.require_human_above_usd,
+        refund_returnless_under_usd=config.policies.refunds.returnless_under_usd,
         pending_ttl_seconds=config.policies.pending_confirmation_ttl_seconds,
+        spoken_policy_extra=config.policies.spoken_facts_extra,
     )
     return TenantContext(
         tenant_id=config.merchant_id,

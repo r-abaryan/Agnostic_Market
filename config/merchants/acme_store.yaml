@@ -21,7 +21,15 @@ policies:
   refunds:
     auto_approve_under_usd: 50
     require_human_above_usd: 200
+    returnless_under_usd: 50    # small shipped refunds skip the return; larger = return-first
   allow_ai_merchant_handoff: true
+  # Free-text policy facts with NO enforcing field ONLY (timeline, return window). The
+  # enforced sentences — the $50 returnless threshold, the $200 human-review line — are
+  # DERIVED from the values above (agents/spoken_policy.py), so they are NOT retyped here:
+  # restating a number would let it drift from what the guardrail enforces.
+  spoken_facts_extra: >-
+    Refunds go back to the original payment method and typically appear within 5 to 7
+    business days. Returns are accepted within 30 days of delivery in original condition.
 
 prompts:
   # Content-addressed, registry-resolved (Phase 3) — not a mutable path.

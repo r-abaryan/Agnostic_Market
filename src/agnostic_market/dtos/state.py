@@ -53,7 +53,15 @@ class PolicyContext(BaseModel):
     allow_ai_merchant_handoff: bool
     refund_auto_approve_under_usd: float = Field(ge=0)
     refund_require_human_above_usd: float = Field(ge=0)
+    # Return-first floor for SHIPPED/DELIVERED refunds: above this, the refund waits for
+    # the return (industry standard); at/below it may pay out returnless.
+    refund_returnless_under_usd: float = Field(ge=0)
     pending_ttl_seconds: float = Field(gt=0)
+    # Merchant free-text policy extras (config `policies.spoken_facts_extra`) — facts with
+    # NO enforcing field (refund timeline, return window). The ENFORCED sentences are
+    # DERIVED from the typed values above (agents/spoken_policy.py); this is only the
+    # free-text tail. None = no extras (the derived sentences are still spoken).
+    spoken_policy_extra: str | None = None
 
 
 class PendingAction(BaseModel):
@@ -74,6 +82,10 @@ class PendingAction(BaseModel):
     total_usd: float = Field(ge=0)
     idempotency_key: str = Field(min_length=1)
     created_at: float  # unix seconds; Clock-A expiry is checked against this on resume
+    # Set by the guardrail when a LIVE identical order already exists this session: the
+    # readback must disambiguate ("this would be a SECOND order"), never read identically
+    # to the first. Carries the existing order's id.
+    duplicate_of: str | None = None
 
 
 class PendingRefund(BaseModel):
