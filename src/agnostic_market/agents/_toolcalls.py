@@ -1,10 +1,11 @@
-"""Assemble-node tool-call hygiene, shared by the gated flows (checkout + support).
+"""Assemble-node tool-call hygiene, shared by the gated flows (cart + support).
 
-The assembles act on ONE proposal per turn (`tool_calls[0]`). A model that emits several
-calls in one response must still get a tool_result for EVERY tool_use: the assemble's new
-messages persist into the shared thread history, and a dangling tool_use/tool_result pair
-fails provider-side validation on every later model call in the session — one bad turn
-would poison the whole call.
+Control/terminal and money proposals act ONE per turn (`tool_calls[0]`); the cart flow's
+reversible mutations batch instead (its assemble answers each call itself). Either way a
+model that emits several calls in one response must get a tool_result for EVERY tool_use:
+the assemble's new messages persist into the shared thread history, and a dangling
+tool_use/tool_result pair fails provider-side validation on every later model call in the
+session — one bad turn would poison the whole call.
 """
 
 from __future__ import annotations

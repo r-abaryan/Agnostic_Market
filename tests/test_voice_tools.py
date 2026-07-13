@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from langchain_core.tools import BaseTool
 
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.voice.tools import build_voice_tools
@@ -16,8 +17,8 @@ def _store(config_root: Path) -> OrderStore:
     return OrderStore(load_orders_fixture(config_root, "acme_store"))
 
 
-def _tools_by_name(config_root: Path) -> dict[str, BaseTool]:
-    return {t.name: t for t in build_voice_tools(_store(config_root))}
+def _tools_by_name(config_root: Path, cart: CartStore | None = None) -> dict[str, BaseTool]:
+    return {t.name: t for t in build_voice_tools(_store(config_root), cart or CartStore())}
 
 
 def test_fixture_loads_and_validates(config_root: Path) -> None:
@@ -48,6 +49,17 @@ def test_catalog_search_matches_and_misses(config_root: Path) -> None:
     assert "No catalog items" in miss
     # A miss steers the model to REAL items instead of invented categories.
     assert "rain jacket" in miss
+
+
+def test_view_cart_reads_the_session_cart(config_root: Path) -> None:
+    cart = CartStore()
+    tools = _tools_by_name(config_root, cart)
+    # empty cart -> a real answer, not an escalation
+    assert "empty" in tools["view_cart"].invoke({}).lower()
+    # after a mutation, the SAME cart instance is read back (split-brain guard)
+    cart.add_item(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)
+    out = tools["view_cart"].invoke({})
+    assert "2 rain jackets" in out and "$258.00" in out
 
 
 def test_missing_fixture_fails_loudly_at_build(config_root: Path) -> None:

@@ -21,6 +21,8 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 CRITICAL_CONFIRMATION_FIELDS: frozenset[str] = frozenset(
     {
         "quantity",
+        "line_items",  # a whole-cart line summary ("2 rain jackets and 1 pair of socks") —
+        # a single `quantity` can't honestly describe N lines (Group B).
         "total_amount",
         "order_id",
         "new_address",

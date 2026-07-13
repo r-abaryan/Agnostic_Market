@@ -68,7 +68,13 @@ class FakeChatModel(BaseChatModel):
     # Emit a SECOND identical tool call alongside the first (a misbehaving model) — drives
     # the assemble nodes' extra-call ack (a dangling tool_use poisons the thread history).
     double_tool_calls: bool = False
+    # Fully scripted tool-call responses: each tools-bound invoke pops the next list of
+    # (name, args) pairs and emits them as ONE multi-call message — drives the cart flow's
+    # mutation batching ("one from each" = N calls in one response). Exhausted → normal
+    # behavior. Overrides force_tool/canned_args while entries remain.
+    scripted_calls: list[list[tuple[str, dict[str, Any]]]] | None = None
     _tool_calls_made: int = PrivateAttr(default=0)
+    _script_index: int = PrivateAttr(default=0)
 
     @property
     def _llm_type(self) -> str:
@@ -91,6 +97,17 @@ class FakeChatModel(BaseChatModel):
         if self.raise_transport:
             raise ConnectionError("fake transport failure (simulated 429/timeout)")
         tools = kwargs.get("tools") or []
+        if tools and self.scripted_calls and self._script_index < len(self.scripted_calls):
+            scripted = self.scripted_calls[self._script_index]
+            self._script_index += 1
+            self._tool_calls_made += 1
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": n, "args": a, "id": f"call_{i + 1}", "type": "tool_call"}
+                    for i, (n, a) in enumerate(scripted)
+                ],
+            )
         budget_left = self.tool_call_limit is None or self._tool_calls_made < self.tool_call_limit
         if tools and self.emit_tool_calls and budget_left:
             self._tool_calls_made += 1

@@ -54,6 +54,11 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
         "env://DEEPGRAM_API_KEY",
         "env://CARTESIA_API_KEY",
     }
+    # Preemptive generation is OFF, explicitly (live call #9 P1): LiveKit's speculative
+    # LLM run on the interim transcript would resume a HITL interrupt and fire the
+    # place/cancel effect before the turn commits. Asserted on the resolved session
+    # options so a LiveKit default change can never silently re-enable it.
+    assert loop.session.options.preemptive_generation["enabled"] is False
 
 
 async def test_engine_seam_wiring(config_root: Path) -> None:
@@ -100,19 +105,21 @@ def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
 
             return _register
 
-    class FakeVerificationStore:
+    class FakeClearable:
         def __init__(self) -> None:
             self.clears = 0
 
         def clear(self) -> None:
             self.clears += 1
 
-    session, engine, verification = FakeSession(), FakeEngine(), FakeVerificationStore()
-    _attach_thread_reaper(session, engine, verification)  # type: ignore[arg-type]
+    session, engine = FakeSession(), FakeEngine()
+    verification, cart = FakeClearable(), FakeClearable()
+    _attach_thread_reaper(session, engine, verification, cart)  # type: ignore[arg-type]
     session.handlers["close"](object())
     session.handlers["close"](object())  # double fire
     assert engine.deletes == 1  # reaped once despite the double fire
     assert verification.clears == 1  # verification grant cleared once (re-entrant-safe)
+    assert cart.clears == 1  # cart cleared once too
     lines = [
         json.loads(line)
         for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()

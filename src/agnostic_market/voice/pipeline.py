@@ -27,6 +27,7 @@ from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.config.registry import ResolvedConfig
@@ -78,6 +79,11 @@ def build_voice_loop(
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
     store = OrderStore(load_orders_fixture(config_root, config.merchant_id))
+    # The session cart (Group B): mutable working state, built once here like OrderStore and
+    # reaped with the session. The SAME instance feeds BOTH the read-only view_cart tool and
+    # the cart flow (below) — pass one instance to both, or the frontline reads a different
+    # cart than the flow mutates (split-brain).
+    cart_store = CartStore()
     # Per-session step-up seams (AGENTS §A4a): built once here, like OrderStore, and torn
     # down with the session (no cross-session state — the durable/keyed form lands in Phase
     # 4). The store shares the SAME otp the dispatch node uses (verify + dispatch agree).
@@ -87,7 +93,9 @@ def build_voice_loop(
     gateway = LLMGateway(credentials, secrets)
     # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
     # system prompts + few-shot (F1), so the Agent below carries NO instructions.
-    tools = [wrap_readonly_tool(t, config.merchant_id) for t in build_voice_tools(store)]
+    tools = [
+        wrap_readonly_tool(t, config.merchant_id) for t in build_voice_tools(store, cart_store)
+    ]
     graph = build_frontline_graph(
         chat_model=gateway.chat_model(config.llm.routing),
         read_only_tools=tools,
@@ -95,6 +103,7 @@ def build_voice_loop(
         # Checkout runs on the reasoning tier (AGENTS §A11: big model for gated flows).
         reasoning_model=gateway.chat_model(config.llm.reasoning),
         store=store,
+        cart_store=cart_store,
         policy=PolicyContext(
             max_order_value_usd=config.policies.max_order_value_usd,
             allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
@@ -124,10 +133,16 @@ def build_voice_loop(
         # lines, and the confirmation readback; never raw tool output (see graph.py).
         llm=lk_langchain.LLMAdapter(adapter),
         tts=build_tts(config.voice.tts, credentials, secrets),
+        # Preemptive generation MUST stay off (explicit, not default-reliant): LiveKit
+        # starts the LLM task on the INTERIM transcript (`schedule_speech=False` defers
+        # only TTS), and our "LLM" is the stateful graph — a speculative call resumes a
+        # HITL interrupt and fires the place/cancel EFFECT before the caller's turn is
+        # committed. A preliminary ASR hypothesis is not consent (live call #9, P1).
+        turn_handling={"preemptive_generation": {"enabled": False}},
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    _attach_thread_reaper(session, engine, verification_store)
+    _attach_thread_reaper(session, engine, verification_store, cart_store)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -141,15 +156,18 @@ def build_voice_loop(
 
 
 def _attach_thread_reaper(
-    session: AgentSession, engine: ReasoningEngine, verification_store: VerificationStore
+    session: AgentSession,
+    engine: ReasoningEngine,
+    verification_store: VerificationStore,
+    cart_store: CartStore,
 ) -> None:
     """Clock B (AGENTS §A10 rule 4): on session close, the thread is reaped UNCONDITIONALLY
-    — a dropped call must never leave a resumable checkout/refund. Re-entrant-safe: a
+    — a dropped call must never leave a resumable placement/refund. Re-entrant-safe: a
     double-fired close deletes once and emits the abandoned event at most once. Nothing is
     spoken (the caller is gone); expiry of a still-connected caller's pending action is
-    Clock A, owned by the graph's confirm node. The verification grant is cleared too, so a
-    reattaching session can never inherit a stale L2 (belt-and-suspenders — the per-session
-    store already dies with the session)."""
+    Clock A, owned by the graph's confirm node. The verification grant AND the cart are
+    cleared too, so a reattaching session can never inherit a stale L2 or a stale cart
+    (belt-and-suspenders — the per-session stores already die with the session)."""
     reaped = False
 
     @session.on("close")
@@ -162,6 +180,7 @@ def _attach_thread_reaper(
             write_event({"event": "flow_abandoned", "reason": "session_closed"})
         engine.delete_thread()
         verification_store.clear()
+        cart_store.clear()
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:

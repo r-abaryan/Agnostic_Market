@@ -1,33 +1,35 @@
-"""The reasoning graph: frontline agent (Tier 1) + the checkout & support gated flows (Tier 3).
+"""The reasoning graph: frontline agent (Tier 1) + the cart & support gated flows (Tier 3).
 
 The load-bearing safety invariant: the frontline holds NO state-changing tools. It can
-answer (read-only tools) or hand over — so a wrong judgment is at worst "answered without
-acting" (recoverable), never a dangerous mutation. Handover fires two ways:
+answer (read-only tools — incl. `view_cart`, Group B) or hand over — so a wrong judgment is
+at worst "answered without acting" (recoverable), never a dangerous mutation. Handover fires
+two ways:
   - the model's `request_handover` tool — the PRIMARY escalation decider (reads intent,
     including paraphrases; industry-consistent LLM-router stance);
   - the deterministic gate (agents/gate.py) — a slim pre-generation floor for high-certainty
     IRREVERSIBLE requests only (cancel/refund/place-order). NOT the router; a bonus fast-path.
 Safety is STRUCTURAL (no sensitive tools), not dependent on either catcher hitting 100%.
 
-Graph shape (3b/3c + Group A):
+Graph shape (Group B):
     entry -> (sticky in a flow? escapes: human -> abort -> CROSS-SWITCH -> assemble : gate)
     gate  -> (trip? handover : model) ; model -> tools -> (handover? handover : model)
-    handover -> (checkout/support(refund|cancel)? enter flow : spoken deferral -> END)
-    checkout: assemble -> guardrail -> confirm[INTERRUPT] -> place
+    handover -> (cart/support(refund|cancel)? enter flow : spoken deferral -> END)
+    cart: assemble -> {mutate: ack | place: guardrail -> confirm[INTERRUPT] -> place_cart}
     support:  assemble -> {refund: guardrail -> [step-up] -> confirm[INT] -> place |
                            cancel: guardrail -> confirm[INT] -> void}
-The CROSS-SWITCH escape (cross_switch node): while sticky, a gate-certain intent for a
-DIFFERENT flow deterministically abandons the current one and hands over — closes the
-sticky-flow trap where e.g. a refund request while stuck in checkout reached the checkout
-model (which cannot serve it) instead of the gate.
+The cart flow owns BOTH cart mutation (reversible, ack) AND the whole-cart placement tail
+(the single irreversible effect). The `checkout` handover DESTINATION (legacy name — the
+gate's cart_write and the model's cart_write) enters the cart flow; `_GATE_OWNER` maps that
+destination to the "cart" flow so the cross-switch guard compares like with like.
 
-The ONLY state-changing tool in the whole graph is the checkout flow's place effect, and
-it sits strictly behind the guardrail + HITL interrupt (agents/checkout.py, AGENTS §A10a).
+The CROSS-SWITCH escape: while sticky, a gate-certain intent for a DIFFERENT flow abandons
+the current one and hands over — closes the sticky-flow trap.
+
+The ONLY state-changing tool in the whole graph is the cart flow's place_cart effect, and it
+sits strictly behind the guardrail + HITL interrupt (agents/cart/flow.py, AGENTS §A10a).
 `request_handover` is a REAL executed tool that returns a `Command` routing to the handover
-node — proper tool_use/tool_result pairing. The model-facing prompt + few-shot live in
-`prompt.py` and are composed into the graph's model node (F1: eval and production share one
-prompt path). Node-authored caller copy (the deferral map) stays here — it is behavior, not
-a model instruction.
+node. The model-facing prompt + few-shot live in `prompt.py` (F1: eval and production share
+one prompt path). Node-authored caller copy (the deferral map) stays here — behavior.
 """
 
 from __future__ import annotations
@@ -46,14 +48,16 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
 from agnostic_market.agents._consent import is_abort, is_support_abort, wants_human
-from agnostic_market.agents.checkout import build_checkout_nodes
+from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt
 from agnostic_market.agents.gate import gate_check
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import (
+    ActiveFlow,
     HandoffDestination,
     HandoffReasonCode,
     HandoffRequest,
@@ -64,6 +68,17 @@ from agnostic_market.dtos.state import (
 logger = logging.getLogger("agnostic_market.agents.frontline")
 
 _HANDOVER_TOOL_NAME = "request_handover"
+
+# The gate speaks in DESTINATION names (its enum is the handover destination); the entry
+# router reasons in FLOW names (active_flow). They differ for the cart flow: the gate's
+# place-order rule maps to the legacy "checkout" destination, but the flow that serves it is
+# "cart". This map normalizes destination -> owning flow so the cross-switch guard ("a
+# gate-certain intent for a DIFFERENT flow") compares like with like — without it, a
+# "checkout now" utterance while sticky in cart would spuriously cross-switch into itself.
+_GATE_OWNER: dict[HandoffDestination, ActiveFlow] = {
+    "checkout": "cart",
+    "support": "support",
+}
 
 # Max read-only tool round-trips per turn before the graph ends (loop guard — the
 # hand-built graph has no framework loop protection like create_agent had).
@@ -139,24 +154,32 @@ def build_frontline_graph(
     reasoning_model: BaseChatModel,
     store: OrderStore,
     policy: PolicyContext,
+    cart_store: CartStore | None = None,
     verification_store: VerificationStore | None = None,
     otp: OtpProvider | None = None,
     risk: RiskProvider | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
-    """Compile the reasoning graph: frontline (routing tier) + checkout + support flows.
+    """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
 
     `read_only_tools` are already audit-wrapped (tooling.py). `checkpointer` is REQUIRED for
     the interrupt/resume paths (the engine passes one per session); None keeps the per-turn
     stateless mode the text eval uses. The support flow's step-up seams
     (`verification_store`/`otp`/`risk`) default to fresh fakes when omitted (eval/tests that
-    never enter support), so the frontline-only call sites don't have to build them.
+    never enter support).
+
+    `cart_store` defaults to a fresh instance for frontline-only callers, BUT production and
+    any cart+view_cart test MUST pass the SAME instance here that they passed to
+    `build_voice_tools` — otherwise the frontline's `view_cart` reads a different cart than
+    the flow mutates (split-brain). The default exists only so eval/tests that never touch
+    the cart don't have to build one.
     """
     # Build otp first so a defaulted VerificationStore shares the SAME provider the dispatch
     # node uses (else dispatch and verify would talk to different fakes).
     otp = otp or OtpProvider()
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
+    cart_store = cart_store or CartStore()
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
@@ -183,9 +206,9 @@ def build_frontline_graph(
         if hit is None:
             return {}
         reason_code, destination = hit
-        if (destination == "checkout" and state.active_flow == "left_checkout") or (
-            destination == "support" and state.active_flow == "left_support"
-        ):
+        # Skip a re-trip toward the flow just LEFT this turn (compared by OWNING flow, since
+        # the gate says "checkout" but the flow is "cart").
+        if state.active_flow == f"left_{_GATE_OWNER[destination]}":
             return {}
         return {
             "handover": HandoffRequest(
@@ -240,12 +263,14 @@ def build_frontline_graph(
                 "reason_code": handover.reason_code,
             }
         )
-        # A checkout/support handover ENTERS the flow (3b/3c) instead of speaking a deferral:
-        # set the sticky flow marker, clear the handover signal, and let routing carry us into
-        # the flow's assemble in this same turn. EXCEPT when that flow was already left this
-        # turn ("left_*") — re-entering would cycle; fall through to the spoken deferral.
-        if handover.destination == "checkout" and state.active_flow != "left_checkout":
-            return {"active_flow": "checkout", "handover": None}
+        # A cart/support handover ENTERS the flow (3b/3c/Group B) instead of speaking a
+        # deferral: set the sticky flow marker, clear the handover signal, and let routing
+        # carry us into the flow's assemble in this same turn. EXCEPT when that flow was
+        # already left this turn ("left_*") — re-entering would cycle; fall through to the
+        # deferral. The "checkout" DESTINATION (gate cart_write / model cart_write) enters
+        # the CART flow — the single-line checkout flow it replaces is gone.
+        if handover.destination == "checkout" and state.active_flow != "left_cart":
+            return {"active_flow": "cart", "handover": None}
         # Support handles REFUND and CANCEL_ORDER (Group A). Other support-destined reason
         # codes (address/payment change) are still 3c-follow-up breadth — they must NOT enter
         # the flow (it would run the reasoning model, fail to propose, bail to left_support,
@@ -266,12 +291,13 @@ def build_frontline_graph(
         return {}
 
     def entry_node(state: ReasoningState) -> dict[str, object]:
-        # Fresh-turn hygiene: with a checkpointer, LAST turn's handover signal and the
-        # turn-scoped "left_checkout" marker persist in thread state and must not affect
-        # THIS turn. (pending_action needs no such reset: while one exists the graph is
-        # paused at confirm and turns arrive as resumes, never through here.)
-        update: dict[str, object] = {"handover": None}
-        if state.active_flow in ("left_checkout", "left_support"):
+        # Fresh-turn hygiene: with a checkpointer, LAST turn's handover signal, the
+        # turn-scoped "left_*" marker, and any turn-scoped pending_ack persist in thread
+        # state and must not affect THIS turn. (pending_placement needs no such reset:
+        # while one exists the graph is paused at confirm and turns arrive as resumes,
+        # never through here.)
+        update: dict[str, object] = {"handover": None, "pending_ack": None}
+        if state.active_flow in ("left_cart", "left_support"):
             update["active_flow"] = None
         return update
 
@@ -296,9 +322,10 @@ def build_frontline_graph(
         )
         return {
             "active_flow": None,
-            "pending_action": None,
+            "pending_placement": None,
             "pending_refund": None,
             "pending_cancel": None,
+            "pending_ack": None,
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
             ),
@@ -314,15 +341,18 @@ def build_frontline_graph(
         # without it, a gate-certain intent for ANOTHER flow (e.g. "refund me" while stuck
         # in checkout) reaches the checkout model, which cannot serve it.
         text = _last_user_text(state)
-        if state.active_flow == "checkout":
+        if state.active_flow == "cart":
             if wants_human(text):
-                return "checkout_escape_human"
+                return "cart_escape_human"
             if is_abort(text):
-                return "checkout_abort"
+                return "cart_abort"
             hit = gate_check(text)
-            if hit is not None and hit[1] != "checkout":
+            # Compare by OWNING flow: the gate says "checkout" for a place-order, which this
+            # SAME cart flow serves, so that is NOT a cross-switch (O4/D4 — without the map
+            # "checkout now" while sticky in cart would spuriously self-cross-switch).
+            if hit is not None and _GATE_OWNER[hit[1]] != "cart":
                 return "cross_switch"
-            return "checkout_assemble"
+            return "cart_assemble"
         if state.active_flow == "support":
             if wants_human(text):
                 return "support_escape_human"
@@ -333,42 +363,44 @@ def build_frontline_graph(
             if is_support_abort(text):
                 return "support_abort"
             hit = gate_check(text)
-            if hit is not None and hit[1] != "support":
+            if hit is not None and _GATE_OWNER[hit[1]] != "support":
                 return "cross_switch"
             return "support_assemble"
         return "gate"
 
     def route_after_handover(state: ReasoningState) -> str:
-        # A checkout/support destination entered the flow (handover cleared, flow set);
+        # A cart/support destination entered the flow (handover cleared, flow set);
         # everything else spoke its deferral and ends.
         if state.handover is None:
-            if state.active_flow == "checkout":
-                return "checkout_assemble"
+            if state.active_flow == "cart":
+                return "cart_assemble"
             if state.active_flow == "support":
                 return "support_assemble"
         return END
 
-    def route_after_assemble(state: ReasoningState) -> str:
-        if state.active_flow == "left_checkout":
-            # Model left the flow (hard topic switch / repeated invalid proposals):
-            # the normal pipeline answers this same turn (re-entry blocked by the marker).
-            return "gate"
-        if state.pending_action is not None:
-            return "checkout_guardrail"
-        return END  # clarifying question (streamed tokens already spoken)
+    def route_after_cart_assemble(state: ReasoningState) -> str:
+        # "place" | "ack" | "leave" | "clarify" — the flow decides (route_after_assemble is
+        # closed over the stores; graph maps its decision to a node).
+        decision = cart.route_after_assemble(state)
+        return {
+            "place": "cart_guardrail",
+            "ack": "cart_ack",
+            "leave": "gate",  # model left; normal pipeline answers this same turn
+            "clarify": END,  # a clarifying question was streamed already
+        }[decision]
 
-    def route_after_guardrail(state: ReasoningState) -> str:
-        return "checkout_confirm" if state.pending_action is not None else END
+    def route_after_cart_guardrail(state: ReasoningState) -> str:
+        return "cart_confirm" if state.pending_placement is not None else END
 
-    def route_after_confirm(state: ReasoningState) -> str:
+    def route_after_cart_confirm(state: ReasoningState) -> str:
         if state.handover is not None:
             return "handover"  # caller asked for a person at the confirmation
-        if state.pending_action is not None:
-            return "checkout_place"  # explicit committed yes
+        if state.pending_placement is not None:
+            return "cart_place"  # explicit committed yes
         return END  # declined / expired (node spoke its line, clear-before-speak)
 
-    checkout = build_checkout_nodes(
-        reasoning_model, store, policy, display_name=display_name
+    cart = build_cart_nodes(
+        reasoning_model, store, cart_store, policy, display_name=display_name
     )
     support = build_support_nodes(
         reasoning_model, store, verification_store, otp, risk, policy, display_name=display_name
@@ -448,12 +480,13 @@ def build_frontline_graph(
     graph.add_node("tools", tool_node)
     graph.add_node("handover", handover_node)
     graph.add_node("finalize", finalize_node)
-    graph.add_node("checkout_assemble", checkout.assemble)
-    graph.add_node("checkout_guardrail", checkout.guardrail)
-    graph.add_node("checkout_confirm", checkout.confirm)
-    graph.add_node("checkout_place", checkout.place)
-    graph.add_node("checkout_abort", checkout.abort)
-    graph.add_node("checkout_escape_human", checkout.escape_human)
+    graph.add_node("cart_assemble", cart.assemble)
+    graph.add_node("cart_ack", cart.ack)
+    graph.add_node("cart_guardrail", cart.guardrail)
+    graph.add_node("cart_confirm", cart.confirm)
+    graph.add_node("cart_place", cart.place)
+    graph.add_node("cart_abort", cart.abort)
+    graph.add_node("cart_escape_human", cart.escape_human)
     graph.add_node("support_assemble", support.assemble)
     graph.add_node("support_guardrail", support.guardrail)
     graph.add_node("support_risk_check", support.risk_check)
@@ -480,9 +513,9 @@ def build_frontline_graph(
         {
             "gate": "gate",
             "cross_switch": "cross_switch",
-            "checkout_assemble": "checkout_assemble",
-            "checkout_abort": "checkout_abort",
-            "checkout_escape_human": "checkout_escape_human",
+            "cart_assemble": "cart_assemble",
+            "cart_abort": "cart_abort",
+            "cart_escape_human": "cart_escape_human",
             "support_assemble": "support_assemble",
             "support_abort": "support_abort",
             "support_escape_human": "support_escape_human",
@@ -502,29 +535,30 @@ def build_frontline_graph(
         "handover",
         route_after_handover,
         {
-            "checkout_assemble": "checkout_assemble",
+            "cart_assemble": "cart_assemble",
             "support_assemble": "support_assemble",
             END: END,
         },
     )
     graph.add_conditional_edges(
-        "checkout_assemble",
-        route_after_assemble,
-        {"gate": "gate", "checkout_guardrail": "checkout_guardrail", END: END},
+        "cart_assemble",
+        route_after_cart_assemble,
+        {"gate": "gate", "cart_ack": "cart_ack", "cart_guardrail": "cart_guardrail", END: END},
+    )
+    graph.add_edge("cart_ack", END)
+    graph.add_conditional_edges(
+        "cart_guardrail",
+        route_after_cart_guardrail,
+        {"cart_confirm": "cart_confirm", END: END},
     )
     graph.add_conditional_edges(
-        "checkout_guardrail",
-        route_after_guardrail,
-        {"checkout_confirm": "checkout_confirm", END: END},
+        "cart_confirm",
+        route_after_cart_confirm,
+        {"handover": "handover", "cart_place": "cart_place", END: END},
     )
-    graph.add_conditional_edges(
-        "checkout_confirm",
-        route_after_confirm,
-        {"handover": "handover", "checkout_place": "checkout_place", END: END},
-    )
-    graph.add_edge("checkout_place", END)
-    graph.add_edge("checkout_abort", END)
-    graph.add_edge("checkout_escape_human", "handover")
+    graph.add_edge("cart_place", END)
+    graph.add_edge("cart_abort", END)
+    graph.add_edge("cart_escape_human", "handover")
     graph.add_conditional_edges(
         "support_assemble",
         route_after_support_assemble,
@@ -594,6 +628,6 @@ def build_frontline_graph(
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset({"handover"}) | checkout.speakable_nodes | support.speakable_nodes
+        frozenset({"handover"}) | cart.speakable_nodes | support.speakable_nodes
     )
     return compiled

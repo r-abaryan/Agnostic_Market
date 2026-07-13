@@ -19,6 +19,7 @@ from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.events import (
@@ -59,7 +60,7 @@ def _engine(
     thread_id: str = "support-1",
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store)]
+    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, CartStore())]
     otp = OtpProvider()
     verification = VerificationStore(otp)
     graph = build_frontline_graph(
@@ -561,12 +562,31 @@ async def test_shipped_refund_within_returnless_window_pays_out(config_root: Pat
     assert store.refund_count == 1
 
 
-async def test_return_gate_precedes_the_amount_gate(config_root: Path) -> None:
-    # $250 is over BOTH lines on a shipped order; the honest primary reason is the return —
-    # it is required regardless of who reviews the amount.
+async def test_amount_gate_precedes_return_first(config_root: Path) -> None:
+    # $250 is over BOTH lines on a shipped order. The human-review line is the STRONGER gate
+    # (an authorization ceiling) and must win — a person handling the amount also arranges
+    # the return, whereas leading with "just set up a return" hides that the amount needs a
+    # person (live 2026-07-10: with returnless=50 the return line masked the $200 human line
+    # on every shipped refund over $50, so the $200 limit looked ignored).
     tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 50.0})
     engine, store, _, _ = _refund_engine(
         config_root, 250.0, "original", thread_id="ret-3", policy=tight
+    )
+    events = await _events(engine, "I want a refund to my original card")
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert any("above what I can process" in e.text for e in spoken)
+    assert not any("once the return is set up" in e.text for e in spoken)
+    assert store.refund_count == 0
+
+
+async def test_shipped_refund_between_returnless_and_human_lines_is_return_first(
+    config_root: Path,
+) -> None:
+    # $150 is over returnless (50) but under the human line (200): the agent COULD process
+    # it, so return-first is the right lead — "I can refund, but it needs a return first".
+    tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 50.0})
+    engine, store, _, _ = _refund_engine(
+        config_root, 150.0, "original", thread_id="ret-3b", policy=tight
     )
     events = await _events(engine, "I want a refund to my original card")
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]

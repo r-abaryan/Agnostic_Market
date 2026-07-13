@@ -9,6 +9,7 @@ from llm_fakes import FakeChatModel
 
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
@@ -22,7 +23,7 @@ _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"quer
 
 
 def _tools(store: OrderStore) -> list:
-    return [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store)]
+    return [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, CartStore())]
 
 
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
@@ -53,7 +54,7 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
     graph = _graph(config_root, FakeChatModel())
     # The only tools the frontline can call are the read-only ones + request_handover
     # (a control signal, not a mutation). NO cart-write / place-order / refund / profile.
-    assert graph.frontline_read_only_tools == {"order_status", "catalog_search"}
+    assert graph.frontline_read_only_tools == {"order_status", "catalog_search", "view_cart"}
 
 
 # --- routing paths -------------------------------------------------------------------
@@ -258,22 +259,36 @@ def test_prompt_speaks_derived_policy_even_without_free_text() -> None:
     assert "NEVER invent" in prompt
 
 
+def test_shared_context_carries_todays_date_and_past_eta_rule() -> None:
+    # Live call #9 P6: with no "today" in any prompt, a stored ETA of July 9 was spoken as
+    # a FUTURE arrival on July 13. The date is read at compose time (per turn).
+    from datetime import datetime
+
+    from agnostic_market.agents._shared_prompt import compose_shared_context
+
+    context = compose_shared_context("Acme Store", _policy())
+    assert f"Today's date: {datetime.now():%A %d %B %Y}" in context
+    assert "BEFORE today is in the PAST" in context
+
+
 def test_shared_context_reaches_every_agent_prompt() -> None:
     # Knowledge must not be tier-local (live 2026-07-10: policy facts lived only in the
     # frontline prompt, so a policy question that gate-routed into support met a model
     # with zero policy knowledge). All three composers carry the SAME shared block:
     # persona continuity + the DERIVED policy summary.
-    from agnostic_market.agents.checkout.prompt import compose_checkout_prompt
+    from agnostic_market.agents.cart.prompt import compose_cart_prompt
     from agnostic_market.agents.frontline.prompt import compose_system_prompt
     from agnostic_market.agents.support.prompt import compose_support_prompt
+    from agnostic_market.commerce.cart import CartStore
     from agnostic_market.commerce.orders import Candidate, OrderCandidate
 
     policy = _policy()
     prompts = [
         compose_system_prompt("Acme Store", policy),
-        compose_checkout_prompt(
+        compose_cart_prompt(
             "Acme Store",
             [Candidate(key="1", sku="SKU-1", name="thing", price_usd=1.0)],
+            CartStore(),
             policy,
         ),
         compose_support_prompt(

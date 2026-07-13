@@ -16,14 +16,21 @@ plane — perception facts (§4a readback_interrupted) are passed IN via TurnFac
 caller. That one-way dependency (voice -> engine) is what makes the engine mockable, which
 is the seam's documented purpose.
 
-Speakable filtering: the compiled graph carries `speakable_nodes` (single source of
-truth, stashed at build); node-authored AIMessages become SpokenMessageEvents only for
-those nodes — the model node's own non-streamed echo and ToolMessages never surface.
+Speakable filtering + buffer-before-speak: the compiled graph carries `speakable_nodes`
+(single source of truth, stashed at build); node-authored AIMessages become
+SpokenMessageEvents only for those nodes. Model tokens are NEVER relayed as they stream —
+they buffer per message and speak only once the completed message is known to carry no
+tool calls (`_TurnSpeech`). A tool-call message's narration is dropped outright: the
+downstream node (guardrail decline, readback, outcome line) is the one author of what the
+caller hears, so streamed narration can never contradict the validation that runs after
+it (live call #9 P2: "shall I refund?" streamed over the guardrail's return-first
+decline). ToolMessages never surface.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -39,9 +46,10 @@ from agnostic_market.dtos.events import (
     TurnFacts,
 )
 from agnostic_market.dtos.state import (
+    CartLine,
     HandoffRequest,
-    PendingAction,
     PendingCancel,
+    PendingPlacement,
     PendingRefund,
     ReasoningState,
 )
@@ -52,7 +60,16 @@ from agnostic_market.dtos.state import (
 # checkpoint roundtrip is future-proof AND stops trusting arbitrary types (the security
 # posture the warning is nudging toward). langchain messages stay covered by the built-in
 # safe types; this ADDS ours. One source of truth — pipeline + tests build via this.
-_CHECKPOINTED_DTOS = (PendingAction, PendingRefund, PendingCancel, HandoffRequest, ReasoningState)
+# PendingPlacement embeds a tuple[CartLine, ...], so CartLine must be registered too (the
+# serde allowlists by MODULE — nested custom types are checked independently).
+_CHECKPOINTED_DTOS = (
+    PendingPlacement,
+    CartLine,
+    PendingRefund,
+    PendingCancel,
+    HandoffRequest,
+    ReasoningState,
+)
 
 
 def build_checkpointer() -> InMemorySaver:
@@ -60,6 +77,72 @@ def build_checkpointer() -> InMemorySaver:
     warning, and not silently permissive to arbitrary types). Redis swap at Phase 4 wires
     the same allowlist into its serde."""
     return InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=list(_CHECKPOINTED_DTOS)))
+
+
+@dataclass
+class _MsgBuffer:
+    """Accumulated stream state for one in-flight model message."""
+
+    parts: list[str] = field(default_factory=list)
+    has_tool_calls: bool = False
+
+    @property
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+class _TurnSpeech:
+    """Buffer-before-speak (live call #9 P2). Model tokens never reach the caller as they
+    stream: chunks accumulate per message id, and text speaks only once the COMPLETED
+    message is known to carry no tool calls. A tool-call message's narration is dropped —
+    the downstream node (guardrail decline, readback, outcome line) is the one author of
+    what the caller hears, so streamed narration can never contradict the validation that
+    runs after it. Cost accepted by decision: clarify turns speak at message completion
+    instead of first token.
+
+    Node-authored AIMessages (never streamed) speak only from speakable nodes, as before.
+    `flush()` covers the defensive case of a message that streamed but never arrived as a
+    completed AIMessage: text-only buffers speak (a clarify must not be swallowed),
+    tool-call buffers stay dropped; text-level dedup guards an id change between a chunk
+    and its completed message from double-speaking.
+    """
+
+    def __init__(self, speakable: frozenset[str]) -> None:
+        self._speakable = speakable
+        self._buffers: dict[str | None, _MsgBuffer] = {}
+        self._spoken_texts: set[str] = set()
+
+    def feed(self, token: object, meta: object) -> TurnEvent | None:
+        """Consume one `messages`-mode stream item; return the event to speak, if any."""
+        if isinstance(token, AIMessageChunk):
+            buf = self._buffers.setdefault(token.id, _MsgBuffer())
+            if token.tool_call_chunks:
+                buf.has_tool_calls = True
+            if text := str(token.text):
+                buf.parts.append(text)
+            return None
+        if not isinstance(token, AIMessage):
+            return None  # ToolMessages and anything else never surface
+        buf = self._buffers.pop(token.id, None)
+        text = str(token.text)
+        node = meta.get("langgraph_node") if isinstance(meta, dict) else None
+        if node in self._speakable:
+            # Node-authored caller-facing line (deferral, readback outcome) — always spoken.
+            return SpokenMessageEvent(text=text, node=node) if text else None
+        if token.tool_calls or (buf is not None and buf.has_tool_calls):
+            return None  # tool-call message: narration dropped; the next node speaks
+        if text:
+            self._spoken_texts.add(text)
+            return TokenEvent(text=text)
+        return None
+
+    def flush(self) -> Iterator[TokenEvent]:
+        """End of turn: speak text-only buffers whose completed message never arrived."""
+        for buf in self._buffers.values():
+            text = buf.text
+            if text and not buf.has_tool_calls and text not in self._spoken_texts:
+                yield TokenEvent(text=text)
+        self._buffers.clear()
 
 
 class ReasoningEngine:
@@ -93,36 +176,18 @@ class ReasoningEngine:
             )
         else:
             payload = {"messages": [HumanMessage(user_text)]}
-        streamed_ids: set[str] = set()
-        chunk_buffer: list[str] = []
+        speech = _TurnSpeech(self._speakable)
         async for mode, item in self._graph.astream(
             payload, config=self._config, stream_mode=["messages", "updates"]
         ):
             if mode == "messages":
                 token, meta = item
-                if isinstance(token, AIMessageChunk):
-                    if token.id:
-                        streamed_ids.add(token.id)
-                    text = str(token.text)
-                    if text:
-                        chunk_buffer.append(text)
-                        yield TokenEvent(text=text)
-                elif isinstance(token, AIMessage):
-                    node = meta.get("langgraph_node") if isinstance(meta, dict) else None
-                    text = str(token.text)
-                    if not text:
-                        continue
-                    if node in self._speakable:
-                        # Node-authored caller-facing line (deferral, checkout outcome) —
-                        # never streamed, always spoken.
-                        yield SpokenMessageEvent(text=text, node=node)
-                    elif token.id not in streamed_ids and text not in "".join(chunk_buffer):
-                        # A model answer that did NOT stream (non-streaming provider or
-                        # test fake): speak it once. Already-streamed answers are echoes
-                        # (the 3a double-speak class) — deduped by id AND by text.
-                        yield TokenEvent(text=text)
+                if (event := speech.feed(token, meta)) is not None:
+                    yield event
             elif mode == "updates" and "__interrupt__" in item:
                 yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+        for flushed in speech.flush():
+            yield flushed
 
     def delete_thread(self) -> None:
         """Remove this session's thread from the checkpointer.

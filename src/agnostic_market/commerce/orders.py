@@ -19,11 +19,13 @@ prose surface to speak from, one structured surface to select from.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.dtos.state import CartLine
 
 _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
@@ -31,6 +33,32 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 # Stub-store copy for orders this store itself placed (real ETA logic = the Phase-4 SoR).
 _PLACED_STATUS = "processing"
 _PLACED_ETA = "3-5 business days"
+
+
+def speak_quantity(quantity: int, name: str) -> str:
+    """'one waterproof rain jacket' / 'two waterproof rain jackets' — not '1 x name'
+    (TTS reads the 'x' separator literally as 'ex'). Lives in commerce (next to the order
+    renderers that call it) so the plane arrow stays agents/voice -> commerce; the cart
+    readback, the view_cart tool, and the order summaries all import it from here.
+
+    Pluralization is naive-but-safe: a name that already reads plural (ends in 's', like the
+    fixture's "trail running shoes") is NOT double-pluralized ("shoess"). A real catalog
+    would carry singular/plural forms; this is the stub-fixture heuristic."""
+    plural = name if quantity == 1 or name.endswith("s") else f"{name}s"
+    return f"{quantity} {plural}"
+
+
+def speak_lines(lines: Sequence[CartLine] | Sequence[PlacedLine]) -> str:
+    """Speech-native rendering of N line items: 'a waterproof rain jacket', or '2 rain
+    jackets and 1 pair of socks' — never '2 x jacket' (TTS 'ex'). One code-authored surface
+    for every multi-line readback (placement confirm, the cancel readback, order summaries),
+    so a cart and the order it becomes always speak the same way."""
+    parts = [speak_quantity(line.quantity, line.name) for line in lines]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, and {parts[-1]}"
 
 
 class _OrderEntry(BaseModel):
@@ -90,16 +118,29 @@ class OrderCandidate(BaseModel):
     status: str = Field(min_length=1)
 
 
+class PlacedLine(BaseModel):
+    """One line of a placed multi-line order (Group B)."""
+
+    model_config = _FROZEN
+
+    sku: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    price_usd: float = Field(ge=0)
+    quantity: int = Field(ge=1)
+
+
 class PlacedOrder(BaseModel):
-    """An order this store placed (the stub SoR's own record)."""
+    """An order this store placed (the stub SoR's own record). Group B: an order is
+    MULTI-LINE (the whole cart placed as one order, one id, one total). No single-line
+    `sku`/`name`/`quantity` shim — every consumer renders ALL `lines` (a `lines[0]` shim
+    would let the cancel readback name only the first line = consent over a mis-described
+    order)."""
 
     model_config = _FROZEN
 
     order_id: str = Field(min_length=1)
-    sku: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    quantity: int = Field(ge=1)
     total_usd: float = Field(ge=0)
+    lines: tuple[PlacedLine, ...] = Field(min_length=1)
 
 
 class RefundRecord(BaseModel):
@@ -218,28 +259,33 @@ class OrderStore:
             if placed.order_id == normalized:
                 status = CANCELLED_STATUS if cancelled else _PLACED_STATUS
                 return (
-                    f"Order {normalized}: {placed.quantity} x {placed.name} "
+                    f"Order {normalized}: {speak_lines(placed.lines)} "
                     f"(${placed.total_usd:.2f}) - status {status}, ETA {_PLACED_ETA}."
                 )
         return None
 
-    def place(
-        self, idempotency_key: str, *, sku: str, name: str, quantity: int, total_usd: float
+    def place_cart(
+        self, idempotency_key: str, *, lines: Sequence[CartLine], total_usd: float
     ) -> PlacedOrder:
-        """Place an order, deduplicated by `idempotency_key` (SoR-arbiter rule).
+        """Place a WHOLE cart as ONE multi-line order, deduplicated by `idempotency_key`
+        (SoR-arbiter rule — Group B).
 
         A repeat call with a seen key returns the ORIGINAL placed order unchanged — the
-        replay/retry path can never create a second order or drift the recorded values.
+        replay/retry path can never create a second order or drift the recorded values. One
+        order id, one total, one idempotency scope for the whole cart (a caller reasons
+        about ONE order). `lines`/`total_usd` are code-computed by the flow (never model
+        arithmetic).
         """
         existing = self._placed_by_key.get(idempotency_key)
         if existing is not None:
             return existing
         placed = PlacedOrder(
             order_id=f"ORD-{self._next_seq}",
-            sku=sku,
-            name=name,
-            quantity=quantity,
             total_usd=total_usd,
+            lines=tuple(
+                PlacedLine(sku=ln.sku, name=ln.name, price_usd=ln.price_usd, quantity=ln.quantity)
+                for ln in lines
+            ),
         )
         self._next_seq += 1
         self._placed_by_key[idempotency_key] = placed
@@ -250,21 +296,22 @@ class OrderStore:
         """How many DISTINCT orders this store has placed (test/verification surface)."""
         return len(self._placed_by_key)
 
-    def identical_order(self, sku: str, quantity: int) -> PlacedOrder | None:
-        """A LIVE (non-cancelled) order this session already placed for the same sku+qty.
+    def identical_cart_order(self, lines: Sequence[CartLine]) -> PlacedOrder | None:
+        """A LIVE (non-cancelled) order this session already placed with the SAME line set
+        (sku→quantity), regardless of order (Group B).
 
-        The checkout guardrail reads this to disambiguate a probable repeat: a caller
-        saying "complete the purchase" after the order already placed must hear "this
-        would be a SECOND order", not a readback identical to the first (live 2026-07-10:
-        that path silently created a duplicate $387 order). A cancelled match doesn't
-        count — re-ordering after a cancel is a normal intent.
+        The placement guardrail reads this to disambiguate a probable repeat: a caller
+        saying "complete the purchase" after the cart already placed must hear "this would
+        be a SECOND order", not a readback identical to the first (live 2026-07-10: that
+        path silently created a duplicate $387 order). A cancelled match doesn't count —
+        re-ordering after a cancel is a normal intent.
         """
+        want = {ln.sku: ln.quantity for ln in lines}
         for placed in self._placed_by_key.values():
-            if (
-                placed.sku == sku
-                and placed.quantity == quantity
-                and placed.order_id not in self._cancelled_ids
-            ):
+            if placed.order_id in self._cancelled_ids:
+                continue
+            have = {ln.sku: ln.quantity for ln in placed.lines}
+            if have == want:
                 return placed
         return None
 
@@ -281,7 +328,7 @@ class OrderStore:
             (oid, entry.summary, entry.total_usd) for oid, entry in self.fixture.orders.items()
         ]
         candidates += [
-            (p.order_id, f"{p.quantity} x {p.name}", p.total_usd)
+            (p.order_id, speak_lines(p.lines), p.total_usd)
             for p in self._placed_by_key.values()
         ]
         return [
@@ -421,7 +468,7 @@ class OrderStore:
             return entry.summary
         for placed in self._placed_by_key.values():
             if placed.order_id == normalized:
-                return f"{placed.quantity} x {placed.name}"
+                return speak_lines(placed.lines)
         return normalized
 
     @property

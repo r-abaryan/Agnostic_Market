@@ -238,41 +238,46 @@ def build_support_nodes(
                 )
                 return {"messages": new_messages, "pending_cancel": pending_cancel}
 
-            # else: propose_refund
-            try:
-                proposal = _ProposeRefund.model_validate(call["args"])
-            except ValueError:
-                proposal = None
-            chosen = by_key.get(proposal.order_key) if proposal else None
-            if chosen is None or proposal.amount_usd <= 0:
-                feedback = (
-                    f"Invalid proposal. Valid order numbers: {', '.join(sorted(by_key))}; "
-                    "amount must be > 0."
+            if call["name"] == "propose_refund":
+                try:
+                    proposal = _ProposeRefund.model_validate(call["args"])
+                except ValueError:
+                    proposal = None
+                chosen = by_key.get(proposal.order_key) if proposal else None
+                if chosen is None or proposal.amount_usd <= 0:
+                    feedback = (
+                        f"Invalid proposal. Valid order numbers: {', '.join(sorted(by_key))}; "
+                        "amount must be > 0."
+                    )
+                    new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                new_messages.append(
+                    ToolMessage(
+                        f"proposed refund on order {chosen.key} ${proposal.amount_usd:.2f} "
+                        f"to {proposal.destination}",
+                        tool_call_id=call["id"],
+                    )
                 )
-                new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
-                messages = [prompt, *state.messages, *new_messages]
-                continue
-            new_messages.append(
-                ToolMessage(
-                    f"proposed refund on order {chosen.key} ${proposal.amount_usd:.2f} "
-                    f"to {proposal.destination}",
-                    tool_call_id=call["id"],
+                pending = PendingRefund(
+                    order_id=chosen.order_id,
+                    amount_usd=round(proposal.amount_usd, 2),
+                    destination=proposal.destination,
+                    instrument_ref=(
+                        _NEW_INSTRUMENT_REF
+                        if proposal.destination != "original"
+                        else "original payment method"
+                    ),
+                    idempotency_key=uuid.uuid4().hex,
+                    attempt_key=uuid.uuid4().hex,
+                    created_at=time.time(),
                 )
-            )
-            pending = PendingRefund(
-                order_id=chosen.order_id,
-                amount_usd=round(proposal.amount_usd, 2),
-                destination=proposal.destination,
-                instrument_ref=(
-                    _NEW_INSTRUMENT_REF
-                    if proposal.destination != "original"
-                    else "original payment method"
-                ),
-                idempotency_key=uuid.uuid4().hex,
-                attempt_key=uuid.uuid4().hex,
-                created_at=time.time(),
-            )
-            return {"messages": new_messages, "pending_refund": pending}
+                return {"messages": new_messages, "pending_refund": pending}
+
+            # Explicit terminal guard (not fall-through): every bound tool has a branch above,
+            # so an unhandled name means a NEW tool was bound without a handler — fail loud
+            # rather than silently misroute it into the last branch (a silent wrong-mutation).
+            raise ValueError(f"support assemble: unhandled tool {call['name']!r}")
         logger.warning("support assemble: two invalid proposals; leaving flow")
         write_event({"event": "support_left", "reason": "invalid_proposals"})
         return {
@@ -293,17 +298,20 @@ def build_support_nodes(
            a void is self-serve at any amount, so it must not be sent to a human by a
            threshold that exists for post-fulfillment refund abuse (the 2026-07-10 live
            incoherence: "$258 needs a person" ... then cancel voided the same $258).
-        3. RETURN-FIRST gate (industry standard, live 2026-07-10: a $179.98 refund paid out
-           on shipped shoes with no return created — money back AND goods kept): a refund
-           on a SHIPPED/DELIVERED order above the merchant's `returnless_under_usd` waits
-           for the return; the honest decline names that path (returns flow = Group C).
-           At/below the threshold = a deliberate returnless refund, proceeds. BEFORE the
-           amount gate: the return is required regardless of who reviews the amount.
-        4. AMOUNT gate (merchant policy, within platform bounds): a refund above
-           `refund_require_human_above_usd` goes to a PERSON regardless of level. It authors
-           its own decline (clear-before-speak) and ENDs — there is NO handover routing yet
-           (no warm-transfer target exists until Phase 4); the human intent is recorded in
-           telemetry so the transfer can be wired there without re-finding this spot.
+        3. AMOUNT gate (merchant policy, within platform bounds): a refund above
+           `refund_require_human_above_usd` goes to a PERSON regardless of level. This is the
+           stronger gate (an authorization/fraud ceiling), so it precedes return-first: a
+           person handling an oversized refund also arranges the return, whereas leading with
+           "just set up a return" would hide that the amount needs review (live 2026-07-10:
+           a $250 shipped refund spoke only the return line, masking the $200 human line).
+           It authors its own decline (clear-before-speak) and ENDs — there is NO handover
+           routing yet (no warm-transfer target until Phase 4); the human intent is recorded
+           in telemetry so the transfer can be wired there without re-finding this spot.
+        4. RETURN-FIRST gate (industry standard, live 2026-07-10: a $179.98 refund paid out
+           on shipped shoes with no return created — money back AND goods kept): a refund on
+           a SHIPPED/DELIVERED order above the merchant's `returnless_under_usd` (and within
+           the human line) waits for the return; the honest decline names that path (returns
+           flow = Group C). At/below the threshold = a deliberate returnless refund, proceeds.
         5. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
            level, decided by `route_after_guardrail`; no side effect here."""
         pending = state.pending_refund
@@ -344,28 +352,11 @@ def build_support_nodes(
                     )
                 ],
             }
-        if (
-            order_store.order_status(pending.order_id) in FULFILLED_STATUSES
-            and pending.amount_usd > policy.refund_returnless_under_usd
-        ):
-            # Return-first: the goods are out; over the returnless threshold the refund
-            # waits for the return. Speak the honest path and END — the returns flow that
-            # will actually arrange it is Group C; until then a person sets it up.
-            write_event({"event": "refund_needs_return", "reason": "return_first"})
-            return {
-                "pending_refund": None,
-                "active_flow": None,
-                "messages": [
-                    AIMessage(
-                        f"Since that order has already shipped, the ${pending.amount_usd:.2f} "
-                        "refund is issued once the return is set up - our support team can "
-                        "arrange the return for you."
-                    )
-                ],
-            }
         if pending.amount_usd > policy.refund_require_human_above_usd:
-            # Over the merchant's human-review line: speak the specific reason and END (no
-            # generic deferral over it), same one-voice pattern as the shipped-cancel decline.
+            # Over the merchant's human-review line: the stronger gate, checked BEFORE
+            # return-first (a person handling the amount also arranges the return). Speak the
+            # specific reason and END (no generic deferral over it), same one-voice pattern
+            # as the shipped-cancel decline.
             write_event(
                 {
                     "event": "refund_needs_human",
@@ -380,6 +371,26 @@ def build_support_nodes(
                     AIMessage(
                         f"A ${pending.amount_usd:.2f} refund is above what I can process on "
                         "this call - our support team can handle a refund that size for you."
+                    )
+                ],
+            }
+        if (
+            order_store.order_status(pending.order_id) in FULFILLED_STATUSES
+            and pending.amount_usd > policy.refund_returnless_under_usd
+        ):
+            # Return-first (within the human line): the goods are out; over the returnless
+            # threshold the refund waits for the return. Speak the honest path and END — the
+            # returns flow that will actually arrange it is Group C; until then a person sets
+            # it up.
+            write_event({"event": "refund_needs_return", "reason": "return_first"})
+            return {
+                "pending_refund": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"Since that order has already shipped, the ${pending.amount_usd:.2f} "
+                        "refund is issued once the return is set up - our support team can "
+                        "arrange the return for you."
                     )
                 ],
             }

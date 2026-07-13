@@ -10,6 +10,7 @@ import pytest
 from agnostic_market.commerce.orders import OrderStore, RefundError, load_orders_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import refund_required_level
+from agnostic_market.dtos.state import CartLine
 
 
 def _store(config_root: Path) -> OrderStore:
@@ -127,7 +128,9 @@ def test_refund_against_a_cancelled_order_is_refused(config_root: Path) -> None:
 
 def test_refund_can_target_a_just_placed_order(config_root: Path) -> None:
     store = _store(config_root)
-    placed = store.place("k1", sku="SKU-BLU-07", name="rain jacket", quantity=1, total_usd=129.0)
+    placed = store.place_cart(
+        "k1", lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
+        total_usd=129.0)
     rec = store.issue_refund(
         "i1", order_id=placed.order_id, amount_usd=129.0, destination="original"
     )

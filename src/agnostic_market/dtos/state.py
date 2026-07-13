@@ -64,21 +64,42 @@ class PolicyContext(BaseModel):
     spoken_policy_extra: str | None = None
 
 
-class PendingAction(BaseModel):
-    """A checkout awaiting HITL confirmation (AGENTS §A10) — everything the confirm
-    readback + the place effect need, minted BEFORE the interrupt (A10a rule 2).
-
-    `sku`/`total_usd` are CODE-resolved from the candidate list (never model-authored);
-    `idempotency_key` makes the place effect dedupable by the order SoR on any replay.
-    (The re-confirm loop needs no counter here: it is bounded STRUCTURALLY by the confirm
-    node's two fixed interrupt call sites — A10a rule 3.)
+class CartLine(BaseModel):
+    """One line item in the session cart (Group B). CODE-resolved from the candidate list —
+    `sku`/`name`/`price_usd` are never model-authored; the model picks a candidate KEY and
+    code resolves it. Lives here (not commerce) because it is CHECKPOINTED inside
+    `PendingPlacement`, and every checkpointed type lives in `dtos` (the base layer).
+    `line_total` is DERIVED (price times quantity), never stored — no model arithmetic.
     """
 
     model_config = _FROZEN
 
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
+    price_usd: float = Field(ge=0)
     quantity: int = Field(ge=1)
+
+    @property
+    def line_total(self) -> float:
+        return round(self.price_usd * self.quantity, 2)
+
+
+class PendingPlacement(BaseModel):
+    """A whole-cart order awaiting HITL confirmation (AGENTS §A10) — the FROZEN snapshot of
+    the cart at confirm-entry, minted BEFORE the interrupt (A10a rule 2). Replaces the
+    single-line `PendingAction` (Group B): the readback + place effect now cover N lines.
+
+    The snapshot is what the confirm/place nodes read on replay — NEVER the live cart — so
+    consent is always over exactly what was read back, even if the cart is mutated later.
+    `lines`/`total_usd` are CODE-resolved (never model arithmetic); `idempotency_key` makes
+    the place effect dedupable by the order SoR on any replay. (The re-confirm loop needs no
+    counter: it is bounded STRUCTURALLY by the confirm node's two fixed interrupt call sites
+    — A10a rule 3.)
+    """
+
+    model_config = _FROZEN
+
+    lines: tuple[CartLine, ...] = Field(min_length=1)
     total_usd: float = Field(ge=0)
     idempotency_key: str = Field(min_length=1)
     created_at: float  # unix seconds; Clock-A expiry is checked against this on resume
@@ -91,7 +112,7 @@ class PendingAction(BaseModel):
 class PendingRefund(BaseModel):
     """A refund awaiting step-up verification and/or HITL confirmation (AGENTS §A4b/§A10a).
 
-    Mirrors PendingAction's discipline: `idempotency_key` is per-refund-INTENT (never
+    Same A10a discipline as PendingPlacement: `idempotency_key` is per-refund-INTENT (never
     derived from `order_id`, so a second legitimate PARTIAL refund is not silently deduped
     as a replay); `amount_usd`/`instrument_ref` are CODE-resolved, never model arithmetic.
     `destination` drives the required verification level in code (new instrument => L2
@@ -134,10 +155,11 @@ class PendingCancel(BaseModel):
 # Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
 # "left_*" are TURN-SCOPED markers (reset at entry): the model left the flow this turn, so
 # a same-turn re-entry is blocked — breaks the assemble->gate->handover->assemble cycle
-# structurally instead of relying on the recursion limit. Each gated flow (checkout 3b,
-# support 3c) carries its own sticky value + left-twin so the entry router knows which
-# flow's escape/stickiness rules apply.
-ActiveFlow = Literal["checkout", "left_checkout", "support", "left_support"]
+# structurally instead of relying on the recursion limit. Each gated flow carries its own
+# sticky value + left-twin so the entry router knows which flow's escape/stickiness rules
+# apply. Group B: the "cart" flow owns both cart MUTATION and the whole-cart placement tail
+# (the single-line "checkout" flow it replaces is gone — direct-buy normalizes through it).
+ActiveFlow = Literal["cart", "left_cart", "support", "left_support"]
 
 
 class HandoffRequest(BaseModel):
@@ -159,7 +181,7 @@ class ReasoningState(BaseModel):
     """The reasoning graph's state (Phase 3a/3b slice of AGENTS.md §A1).
 
     `messages` uses the append reducer. `handover`, when set, routes the turn to the
-    handover sink. `pending_action` + `active_flow` carry an in-flight checkout across
+    handover sink. `pending_placement` + `active_flow` carry an in-flight placement across
     the HITL interrupt and across turns (the thread is checkpointed from 3b on).
     Every non-`messages` field MUST default: the engine feeds turns as
     `{"messages": [<new user message>]}` deltas.
@@ -167,7 +189,13 @@ class ReasoningState(BaseModel):
 
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     handover: HandoffRequest | None = None
-    pending_action: PendingAction | None = None
+    pending_placement: PendingPlacement | None = None
     pending_refund: PendingRefund | None = None
     pending_cancel: PendingCancel | None = None
     active_flow: ActiveFlow | None = None
+    # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
+    # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response). Kept
+    # OFF the assemble node because a speakable assemble double-speaks its streamed clarifies
+    # (engine speaks any texty AIMessage from a speakable node). Reset at entry_node like the
+    # left_* markers; cleared by cart_ack (clear-before-speak).
+    pending_ack: str | None = None

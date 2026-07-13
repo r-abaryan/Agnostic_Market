@@ -27,6 +27,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
@@ -47,7 +48,11 @@ _THREAD_SEQ = 0
 # the turn LEFT the frontline and a flow's model ran — an escalation, even when the flow
 # then ended in a terminal decline that clears its own state (see docstring below).
 _FLOW_TOOLS = frozenset(
-    {"propose_refund", "propose_cancel", "propose_order", "leave_support", "leave_checkout"}
+    {
+        "propose_refund", "propose_cancel", "leave_support",  # support
+        "add_to_cart", "remove_from_cart", "set_quantity", "review_cart", "buy_now",
+        "go_to_checkout", "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
+    }
 )
 
 
@@ -72,7 +77,7 @@ async def _outcome(graph, utterance: str) -> str | None:
         return handover.source
     if (
         out.get("active_flow") is not None
-        or out.get("pending_action") is not None
+        or out.get("pending_placement") is not None
         or graph.get_state(config).interrupts
     ):
         return "flow"
@@ -94,7 +99,8 @@ async def _run() -> int:
     resolved = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID)
     chat_model = LLMGateway(credentials, secrets).chat_model(resolved.config.llm.routing)
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
-    tools = [wrap_readonly_tool(t, _MERCHANT_ID) for t in build_voice_tools(store)]
+    cart_store = CartStore()
+    tools = [wrap_readonly_tool(t, _MERCHANT_ID) for t in build_voice_tools(store, cart_store)]
     config = resolved.config
     graph = build_frontline_graph(
         chat_model,
@@ -104,6 +110,7 @@ async def _run() -> int:
         # compiles as ONE shape — same construction path as production (F1 discipline).
         reasoning_model=LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
         store=store,
+        cart_store=cart_store,  # SAME instance as view_cart (no split-brain)
         policy=PolicyContext(
             max_order_value_usd=config.policies.max_order_value_usd,
             allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,

@@ -1,7 +1,8 @@
 """ReasoningEngine over the REAL graph (fake models, InMemorySaver, zero network).
 
-Covers the 3b exit behaviors: interrupt/resume, §4a re-confirm, TTL expiry (Clock A),
-kill-mid-checkout (Clock B reap), idempotent placement, and the seam's zero-LiveKit claim.
+Covers the exit behaviors: interrupt/resume, §4a re-confirm, TTL expiry (Clock A),
+kill-mid-placement (Clock B reap), idempotent placement, and the seam's zero-LiveKit claim.
+Group B: the placement path is the cart flow (buy_now → guardrail → confirm → place_cart).
 """
 
 from __future__ import annotations
@@ -10,19 +11,22 @@ import time
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from llm_fakes import FakeChatModel
 
-from agnostic_market.agents.checkout import flow as checkout_flow
-from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
+from agnostic_market.agents.cart import flow as cart_flow
+from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
-# The reasoning fake proposes option 2 (waterproof rain jacket, $129.00) x2 = $258.00.
-_PROPOSE = {"propose_order": {"candidate_key": "2", "quantity": 2}}
+# The reasoning fake buys option 2 (waterproof rain jacket, $129.00) x2 = $258.00 -> straight
+# to the placement tail via buy_now.
+_PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
 
 
@@ -34,13 +38,13 @@ def _engine(
     thread_id: str = "session-1",
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store)]
+    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, CartStore())]
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
         display_name="Acme Store",
         reasoning_model=reasoning
-        or FakeChatModel(force_tool="propose_order", canned_args=_PROPOSE, tool_call_limit=1),
+        or FakeChatModel(force_tool="buy_now", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
         policy=PolicyContext(
             max_order_value_usd=500.0,
@@ -95,7 +99,7 @@ async def test_checkout_pauses_with_graph_authored_readback(config_root: Path) -
 
 
 async def test_resume_yes_places_exactly_once(config_root: Path) -> None:
-    reasoning = FakeChatModel(force_tool="propose_order", canned_args=_PROPOSE, tool_call_limit=1)
+    reasoning = FakeChatModel(force_tool="buy_now", canned_args=_PROPOSE, tool_call_limit=1)
     engine, store = _engine(config_root, reasoning=reasoning)
     await _pause_at_confirmation(engine)
     events = await _events(engine, "yes please")
@@ -103,7 +107,7 @@ async def test_resume_yes_places_exactly_once(config_root: Path) -> None:
     assert not engine.pending_interrupt()
     # The success line is node-authored by the place node and spoken.
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any("ORD-9001" in e.text and e.node == "checkout_place" for e in spoken)
+    assert any("ORD-9001" in e.text and e.node == "cart_place" for e in spoken)
     # No NEW interrupt fires on the resume (the readback is not re-spoken - V2).
     assert not any(isinstance(e, InterruptEvent) for e in events)
     # A10a/V4: assemble did NOT re-run on resume (its model was invoked exactly once).
@@ -124,7 +128,7 @@ async def test_resume_no_cancels_without_placing(config_root: Path) -> None:
     assert store.placed_count == 0
     assert not engine.pending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any("nothing has been ordered" in e.text.lower() for e in spoken)
+    assert any("won't place it" in e.text.lower() for e in spoken)
 
 
 # --- §4a + re-confirm-once (the user-decided consent UX) --------------------------------
@@ -153,7 +157,7 @@ async def test_unclear_answer_reconfirms_once_then_cancels(config_root: Path) ->
     assert store.placed_count == 0
     assert not engine.pending_interrupt()  # cancelled, not trapped
     spoken = [e for e in second if isinstance(e, SpokenMessageEvent)]
-    assert any("nothing has been ordered" in e.text.lower() for e in spoken)
+    assert any("won't place it" in e.text.lower() for e in spoken)
 
 
 async def test_human_request_at_confirmation_escapes(config_root: Path) -> None:
@@ -178,7 +182,7 @@ async def test_expired_pending_cancels_before_speaking(
     # the pending expired. Capture real now FIRST (checkout_flow.time is the global module —
     # a self-referential lambda would recurse). Clear-before-speak: a stale yes must NOT place.
     future = time.time() + 10_000
-    monkeypatch.setattr(checkout_flow.time, "time", lambda: future)
+    monkeypatch.setattr(cart_flow.time, "time", lambda: future)
     events = await _events(engine, "yes")
     assert store.placed_count == 0
     assert not engine.pending_interrupt()  # cleared (clear-before-speak)
@@ -213,15 +217,102 @@ async def test_kill_mid_checkout_leaves_no_ghost_order(config_root: Path) -> Non
 async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
     config_root: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # build_checkpointer's serde allowlists PendingAction/PendingRefund/HandoffRequest/
-    # ReasoningState — a checkpointed interrupt/resume (which deserializes PendingAction +
-    # HandoffRequest live) must NOT emit langgraph's "Deserializing unregistered type"
-    # warning, which is slated to become a hard block.
+    # build_checkpointer's serde allowlists PendingPlacement/CartLine/PendingRefund/
+    # HandoffRequest/ReasoningState — a checkpointed interrupt/resume (which deserializes
+    # PendingPlacement + nested CartLine + HandoffRequest live) must NOT emit langgraph's
+    # "Deserializing unregistered type" warning, which is slated to become a hard block.
     engine, _ = _engine(config_root)
     with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
         await _pause_at_confirmation(engine)  # writes + reads PendingAction across the interrupt
         await _events(engine, "yes")  # resume re-reads the checkpoint
     assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
+
+
+# --- buffer-before-speak (_TurnSpeech, live call #9 P2) ----------------------------------
+# The chunk path can't be driven through the graph with non-streaming fakes, so the
+# buffering unit is tested directly with synthetic stream items.
+
+
+_SPEAKABLE = frozenset({"support_guardrail"})
+_ASSEMBLE_META = {"langgraph_node": "support_assemble"}
+
+
+def _chunk(text: str, msg_id: str, *, tool_call: bool = False) -> AIMessageChunk:
+    chunks = (
+        [{"name": "propose_refund", "args": "", "id": "tc1", "index": 0}] if tool_call else []
+    )
+    return AIMessageChunk(content=text, id=msg_id, tool_call_chunks=chunks)
+
+
+def test_streamed_clarify_speaks_once_at_message_completion() -> None:
+    speech = _TurnSpeech(_SPEAKABLE)
+    assert speech.feed(_chunk("Which ", "m1"), _ASSEMBLE_META) is None
+    assert speech.feed(_chunk("order?", "m1"), _ASSEMBLE_META) is None
+    event = speech.feed(AIMessage(content="Which order?", id="m1"), _ASSEMBLE_META)
+    assert isinstance(event, TokenEvent)
+    assert event.text == "Which order?"
+    assert list(speech.flush()) == []  # never re-spoken
+
+
+def test_toolcall_narration_never_reaches_the_caller() -> None:
+    # Live call #9 P2: "Shall I set the refund...?" streamed alongside propose_refund and
+    # was heard OVER the guardrail's return-first decline. The narration must be dropped.
+    speech = _TurnSpeech(_SPEAKABLE)
+    speech.feed(_chunk("Shall I refund?", "m1"), _ASSEMBLE_META)
+    done = AIMessage(
+        content="Shall I refund?",
+        id="m1",
+        tool_calls=[{"name": "propose_refund", "args": {}, "id": "tc1", "type": "tool_call"}],
+    )
+    assert speech.feed(done, _ASSEMBLE_META) is None
+    assert list(speech.flush()) == []  # and not resurrected at flush
+
+
+def test_toolcall_detected_from_chunks_alone_stays_dropped() -> None:
+    # The completed message never arrives (or arrives under another id): chunks that
+    # carried tool_call_chunks must stay dropped at flush.
+    speech = _TurnSpeech(_SPEAKABLE)
+    speech.feed(_chunk("Refunding now.", "m1", tool_call=True), _ASSEMBLE_META)
+    assert list(speech.flush()) == []
+
+
+def test_unstreamed_answer_speaks_once() -> None:
+    # Non-streaming provider / test fake: the answer arrives only as one full message.
+    speech = _TurnSpeech(_SPEAKABLE)
+    event = speech.feed(AIMessage(content="Hello!"), {"langgraph_node": "frontline"})
+    assert isinstance(event, TokenEvent)
+    assert event.text == "Hello!"
+
+
+def test_speakable_node_line_is_a_spoken_message() -> None:
+    speech = _TurnSpeech(_SPEAKABLE)
+    event = speech.feed(
+        AIMessage(content="Refund declined.", id="g1"), {"langgraph_node": "support_guardrail"}
+    )
+    assert isinstance(event, SpokenMessageEvent)
+    assert event.node == "support_guardrail"
+
+
+def test_orphan_streamed_clarify_flushes_exactly_once() -> None:
+    # Defensive: chunks streamed but no completed message echoed — the clarify must not be
+    # swallowed silently.
+    speech = _TurnSpeech(_SPEAKABLE)
+    speech.feed(_chunk("Which order?", "m1"), _ASSEMBLE_META)
+    assert [e.text for e in speech.flush()] == ["Which order?"]
+
+
+def test_id_change_between_chunk_and_completion_does_not_double_speak() -> None:
+    speech = _TurnSpeech(_SPEAKABLE)
+    speech.feed(_chunk("Which order?", "m1"), _ASSEMBLE_META)
+    event = speech.feed(AIMessage(content="Which order?", id="m2"), _ASSEMBLE_META)
+    assert isinstance(event, TokenEvent)  # spoken at completion under the new id
+    assert list(speech.flush()) == []  # the orphaned m1 buffer must not re-speak it
+
+
+def test_tool_messages_never_surface() -> None:
+    speech = _TurnSpeech(_SPEAKABLE)
+    assert speech.feed(ToolMessage("raw", tool_call_id="t1"), _ASSEMBLE_META) is None
+    assert list(speech.flush()) == []
 
 
 # --- the seam's zero-LiveKit claim ------------------------------------------------------

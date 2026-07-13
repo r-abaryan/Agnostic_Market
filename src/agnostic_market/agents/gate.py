@@ -53,7 +53,11 @@ _RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, HandoffDestination], ...
         "refund",
         "support",
     ),
-    # place order / checkout — self-contained purchase commands (no object needed)
+    # place order / checkout — self-contained purchase commands (no object needed). Routes to
+    # the "checkout" DESTINATION, which since Group B is served by the CART flow (the cart
+    # owns both mutation and the whole-cart placement tail; "checkout" is a legacy name kept
+    # so the handover enum stays stable). ADD-to-cart phrasings are NOT here — reversible,
+    # the model's job (request_handover), consistent with the irreversible-only stance.
     (
         re.compile(
             r"\b(?:checkout|check out|place (?:the |my )?order|buy it now|complete (?:my |the )?"
