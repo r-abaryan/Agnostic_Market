@@ -84,12 +84,59 @@ def refund_required_level(amount_usd: float, destination: RefundDestination) -> 
 
 
 # issue_refund's declared confirmation contract (VOICE_PIPELINE §7a): the readback MUST
-# speak these critical fields at explicit_yes strength. `return_id` is deliberately NOT
-# declared — the store mints it AFTER the effect, so it cannot exist at readback time (it
-# is spoken in the outcome line instead); declaring it made the contract check theater.
+# speak these critical fields at explicit_yes strength. The refund reference (`refund_id`)
+# is deliberately NOT declared — the store mints it AFTER the effect, so it cannot exist at
+# readback time (it is spoken in the outcome line instead); declaring it made the contract
+# check theater. Same rule applies to any post-effect id (e.g. a return's RMA id).
 # The verification level is gated separately by `refund_required_level` (live, in-flow).
 ISSUE_REFUND_POLICY = ToolConfirmationPolicy(
     tool="issue_refund",
     confirm_fields=frozenset({"total_amount", "new_payment_instrument_ref"}),
     strength="explicit_yes",
 )
+
+
+# --- Profile change as a first-class verification dimension (AGENTS §A4a, Group C) --------
+# Which account field a profile change targets. "contact" is the number/email the OTP factor
+# is delivered to — changing it is changing the FACTOR, which is why the step-up runs on the
+# OLD factor before the change (the ladder constraint, §A4a).
+ProfileField = Literal["address", "contact"]
+
+
+def profile_change_required_level(field: ProfileField) -> int:
+    """The minimum verification level a profile change needs — PLATFORM code, not a merchant
+    knob (same stance as `refund_required_level`).
+
+    §A4a: address/contact are the classic account-takeover levers (redirect goods; capture
+    the OTP factor), so BOTH require L2 regardless of anything merchant-tunable. Preferences
+    (L1) are not a Group-C surface; when they land, they get their own entry here — this
+    function stays the one source for the profile ladder.
+    """
+    return 2
+
+
+# create_return's declared confirmation contract: the readback speaks WHICH order goes back
+# and the refund amount that follows the return. The RMA id is post-effect (outcome line
+# only, per the rule above). No money moves at creation — the recorded refund releases at
+# the Phase-4 SoR, which re-runs `refund_required_level` at release time.
+CREATE_RETURN_POLICY = ToolConfirmationPolicy(
+    tool="create_return",
+    confirm_fields=frozenset({"order_id", "total_amount"}),
+    strength="explicit_yes",
+)
+
+# update_profile's declared contracts, per field: the readback MUST speak the new value
+# verbatim (one STT error becomes goods shipped to the wrong street / an OTP factor the
+# caller doesn't hold — exactly the critical-value class this schema exists for).
+PROFILE_CHANGE_POLICIES: dict[ProfileField, ToolConfirmationPolicy] = {
+    "address": ToolConfirmationPolicy(
+        tool="update_profile",
+        confirm_fields=frozenset({"new_address"}),
+        strength="explicit_yes",
+    ),
+    "contact": ToolConfirmationPolicy(
+        tool="update_profile",
+        confirm_fields=frozenset({"new_contact"}),
+        strength="explicit_yes",
+    ),
+}

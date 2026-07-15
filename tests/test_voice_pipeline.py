@@ -59,6 +59,10 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
     # place/cancel effect before the turn commits. Asserted on the resolved session
     # options so a LiveKit default change can never silently re-enable it.
     assert loop.session.options.preemptive_generation["enabled"] is False
+    # Endpointing max_delay trialled to 1.5s (live call #10): shorter dead pause on
+    # low-confidence turns without cutting natural multi-clause speech; min stays 0.3s.
+    assert loop.session.options.endpointing["max_delay"] == 1.5
+    assert loop.session.options.endpointing["min_delay"] == 0.3  # streaming default kept
 
 
 async def test_engine_seam_wiring(config_root: Path) -> None:
@@ -113,13 +117,14 @@ def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
             self.clears += 1
 
     session, engine = FakeSession(), FakeEngine()
-    verification, cart = FakeClearable(), FakeClearable()
-    _attach_thread_reaper(session, engine, verification, cart)  # type: ignore[arg-type]
+    verification, cart, pointer = FakeClearable(), FakeClearable(), FakeClearable()
+    _attach_thread_reaper(session, engine, verification, cart, pointer)  # type: ignore[arg-type]
     session.handlers["close"](object())
     session.handlers["close"](object())  # double fire
     assert engine.deletes == 1  # reaped once despite the double fire
     assert verification.clears == 1  # verification grant cleared once (re-entrant-safe)
     assert cart.clears == 1  # cart cleared once too
+    assert pointer.clears == 1  # the "that order" pointer cleared once too (Group C L4)
     lines = [
         json.loads(line)
         for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()

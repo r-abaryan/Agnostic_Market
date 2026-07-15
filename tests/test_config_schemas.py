@@ -47,6 +47,31 @@ def test_valid_config_validates() -> None:
     assert config.isolation.tier == "shared"
 
 
+def test_returns_policy_defaults_and_floor() -> None:
+    # No `returns` block -> platform default window; the DTO floor rejects zero/negative.
+    config = MerchantConfig.model_validate(_valid_merchant_dict())
+    assert config.policies.returns.window_days == 30
+    bad = _valid_merchant_dict()
+    bad["policies"]["returns"] = {"window_days": 0}
+    with pytest.raises(ValidationError):
+        MerchantConfig.model_validate(bad)
+
+
+def test_to_policy_context_carries_every_enforced_value() -> None:
+    # The ONE config->runtime mapping (Group C consolidation): if a field is added to
+    # PolicyContext without wiring it here, PolicyContext's no-default constructor makes
+    # THIS test fail loudly — the lockstep guard for all production construction sites.
+    config = MerchantConfig.model_validate(_valid_merchant_dict())
+    context = config.policies.to_policy_context()
+    assert context.max_order_value_usd == 100
+    assert context.refund_auto_approve_under_usd == 10
+    assert context.refund_require_human_above_usd == 50
+    assert context.refund_returnless_under_usd == 0.0  # DTO default
+    assert context.return_window_days == 30  # DTO default
+    assert context.pending_ttl_seconds == 120.0  # platform default TTL
+    assert context.spoken_policy_extra is None
+
+
 def test_negative_order_cap_rejected() -> None:
     with pytest.raises(ValidationError):
         PolicyConfig.model_validate(

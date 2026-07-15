@@ -15,11 +15,16 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from llm_fakes import FakeChatModel
 
 from agnostic_market.agents.cart import flow as cart_flow
-from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech, build_checkpointer
+from agnostic_market.agents.engine import (
+    ReasoningEngine,
+    _GraphSpans,
+    _TurnSpeech,
+    build_checkpointer,
+)
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
@@ -38,20 +43,27 @@ def _engine(
     thread_id: str = "session-1",
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, CartStore())]
+    pointer = LastOrderPointer()
+    tools = [
+        wrap_readonly_tool(t, "acme_store")
+        for t in build_voice_tools(store, CartStore(), pointer)
+    ]
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
         display_name="Acme Store",
+        tenant_id="acme_store",
         reasoning_model=reasoning
         or FakeChatModel(force_tool="buy_now", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
+        pointer=pointer,
         policy=PolicyContext(
             max_order_value_usd=500.0,
             allow_ai_merchant_handoff=True,
             refund_auto_approve_under_usd=50.0,
             refund_require_human_above_usd=200.0,
             refund_returnless_under_usd=50.0,
+            return_window_days=30,
             pending_ttl_seconds=120.0,
         ),
         checkpointer=build_checkpointer(),
@@ -313,6 +325,38 @@ def test_tool_messages_never_surface() -> None:
     speech = _TurnSpeech(_SPEAKABLE)
     assert speech.feed(ToolMessage("raw", tool_call_id="t1"), _ASSEMBLE_META) is None
     assert list(speech.flush()) == []
+
+
+# --- graph latency spans (_GraphSpans, live call #10) ------------------------------------
+
+
+def test_graph_spans_counts_tools_and_ttf_model() -> None:
+    spans = _GraphSpans()
+    spans.observe(AIMessage(content="", tool_calls=[
+        {"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}]))
+    spans.observe(ToolMessage("processing", tool_call_id="t1"))
+    spans.observe(AIMessage(content="It's processing."))
+    # A tool ran, and the second model pass (rendering the result) is timed separately.
+    assert spans._tool_count == 1
+    assert spans._ttf_model is not None
+    assert spans._tool_to_next_model is not None  # tool-result -> next model activity
+
+
+def test_graph_spans_single_pass_has_no_tool_span() -> None:
+    spans = _GraphSpans()
+    spans.observe(AIMessage(content="Hello!"))
+    assert spans._tool_count == 0
+    assert spans._ttf_model is not None
+    assert spans._tool_to_next_model is None  # no tool -> no second-pass span
+
+
+def test_graph_spans_ignores_empty_and_tool_only_for_ttf() -> None:
+    spans = _GraphSpans()
+    spans.observe(AIMessage(content=""))  # empty: not model output
+    assert spans._ttf_model is None
+    spans.observe(AIMessage(content="", tool_calls=[
+        {"name": "x", "args": {}, "id": "t1", "type": "tool_call"}]))
+    assert spans._ttf_model is not None  # a tool-call message IS model activity
 
 
 # --- the seam's zero-LiveKit claim ------------------------------------------------------

@@ -29,10 +29,12 @@ decline). ToolMessages never surface.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
@@ -50,9 +52,13 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     PendingCancel,
     PendingPlacement,
+    PendingProfileChange,
     PendingRefund,
+    PendingReturn,
     ReasoningState,
 )
+
+logger = logging.getLogger("agnostic_market.agents.engine")
 
 # The custom (non-message) types we checkpoint into graph state. langgraph's default
 # msgpack serde is permissive (deserializes anything with a warning), but that path is
@@ -67,6 +73,8 @@ _CHECKPOINTED_DTOS = (
     CartLine,
     PendingRefund,
     PendingCancel,
+    PendingReturn,
+    PendingProfileChange,
     HandoffRequest,
     ReasoningState,
 )
@@ -145,6 +153,54 @@ class _TurnSpeech:
         self._buffers.clear()
 
 
+class _GraphSpans:
+    """Graph-internal latency timeline for one turn. The voice plane's `llm_node_ttft`/
+    `e2e_latency` metrics treat the whole graph as one opaque "LLM", so they cannot say
+    whether a slow turn is model generation, a second model pass after a tool read, or
+    graph orchestration (live call #10). This measures the boundaries the graph stream
+    exposes, from turn start:
+      - `ttf_model`: to the first model output (chunk or message) — generation-start delay;
+      - `tools`: how many tool calls ran (0 = single pass; >=1 = a read/mutation loop);
+      - `tool_to_next_model`: from the last tool result to the model activity AFTER it — the
+        cost of the second reasoning pass that renders a tool result into speech;
+      - `total`: whole in-graph time.
+    Passive: it only observes the stream the engine already consumes; it authors nothing and
+    speaks nothing (the one-author rule holds). Logged at DEBUG — a telemetry backend is
+    Phase 6; this is the diagnostic the renderer-bypass decision (T2 latency pass) needs.
+    """
+
+    def __init__(self) -> None:
+        self._start = time.perf_counter()
+        self._ttf_model: float | None = None
+        self._tool_count = 0
+        self._last_tool_at: float | None = None
+        self._tool_to_next_model: float | None = None
+
+    def observe(self, token: object) -> None:
+        now = time.perf_counter()
+        if isinstance(token, ToolMessage):
+            self._tool_count += 1
+            self._last_tool_at = now
+            return
+        is_model = isinstance(token, AIMessageChunk | AIMessage) and (
+            bool(str(token.text)) or bool(getattr(token, "tool_calls", None))
+        )
+        if not is_model:
+            return
+        if self._ttf_model is None:
+            self._ttf_model = now - self._start
+        if self._last_tool_at is not None and self._tool_to_next_model is None:
+            self._tool_to_next_model = now - self._last_tool_at
+
+    def log(self) -> None:
+        parts = [f"total={time.perf_counter() - self._start:.3f}s", f"tools={self._tool_count}"]
+        if self._ttf_model is not None:
+            parts.append(f"ttf_model={self._ttf_model:.3f}s")
+        if self._tool_to_next_model is not None:
+            parts.append(f"tool_to_next_model={self._tool_to_next_model:.3f}s")
+        logger.debug("graph spans: %s", ", ".join(parts))
+
+
 class ReasoningEngine:
     """Per-session engine over a compiled, checkpointer-backed reasoning graph."""
 
@@ -177,17 +233,20 @@ class ReasoningEngine:
         else:
             payload = {"messages": [HumanMessage(user_text)]}
         speech = _TurnSpeech(self._speakable)
+        spans = _GraphSpans()
         async for mode, item in self._graph.astream(
             payload, config=self._config, stream_mode=["messages", "updates"]
         ):
             if mode == "messages":
                 token, meta = item
+                spans.observe(token)
                 if (event := speech.feed(token, meta)) is not None:
                     yield event
             elif mode == "updates" and "__interrupt__" in item:
                 yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
         for flushed in speech.flush():
             yield flushed
+        spans.log()
 
     def delete_thread(self) -> None:
         """Remove this session's thread from the checkpointer.

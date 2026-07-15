@@ -20,7 +20,12 @@ from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture, speak_quantity
+from agnostic_market.commerce.orders import (
+    LastOrderPointer,
+    OrderStore,
+    load_orders_fixture,
+    speak_quantity,
+)
 from agnostic_market.dtos.events import InterruptEvent, TurnFacts
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
@@ -31,6 +36,7 @@ _POLICY = PolicyContext(
     refund_auto_approve_under_usd=50.0,
     refund_require_human_above_usd=200.0,
     refund_returnless_under_usd=50.0,
+    return_window_days=30,
     pending_ttl_seconds=120.0,
 )
 _CFG = {"configurable": {"thread_id": "t1"}}
@@ -55,17 +61,23 @@ def _build(
     frontline: FakeChatModel | None = None,
     reasoning: FakeChatModel | None = None,
     cart: CartStore | None = None,
+    pointer: LastOrderPointer | None = None,
 ):
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     cart = cart or CartStore()
-    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, cart)]
+    pointer = pointer or LastOrderPointer()
+    tools = [
+        wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, cart, pointer)
+    ]
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
         display_name="Acme Store",
+        tenant_id="acme_store",
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
         store=store,
         cart_store=cart,  # the SAME cart the view_cart tool reads (no split-brain)
+        pointer=pointer,  # the SAME pointer order_status sets (Group C L4)
         policy=_POLICY,
         checkpointer=build_checkpointer(),
     )
@@ -416,3 +428,14 @@ async def test_unhandled_tool_fails_loud_not_silent_misroute(config_root: Path) 
     graph, _, _ = _build(config_root, reasoning=reasoning)
     with pytest.raises(ValueError, match="unhandled tool"):
         await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+
+
+async def test_place_sets_the_last_order_pointer(config_root: Path) -> None:
+    # Group C L4: a just-placed order becomes "the order most recently discussed".
+    pointer = LastOrderPointer()
+    reasoning = _tool_fake("buy_now", {"candidate_key": "2", "quantity": 1})
+    graph, _, _ = _build(config_root, reasoning=reasoning, pointer=pointer)
+    await graph.ainvoke({"messages": [HumanMessage("buy it now")]}, _CFG)
+    assert pointer.get() is None  # nothing placed yet (paused at the readback)
+    await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+    assert pointer.get() == "ORD-9001"

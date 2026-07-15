@@ -20,9 +20,10 @@ prose surface to speak from, one structured surface to select from.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.state import CartLine
@@ -70,6 +71,16 @@ class _OrderEntry(BaseModel):
     # Captured amount — the refund cumulative-cap join reads this (§A4b); a real SoR always
     # knows what it captured. Required so a refund can never run against an unknown total.
     total_usd: float = Field(ge=0)
+    # Timezone-aware ISO 8601 delivery instant (e.g. "2026-07-01T00:00:00Z") — the return
+    # window counts from here (Group C). Required for DELIVERED orders (fail-loud at fixture
+    # load); shipped-not-yet-delivered orders have none and are trivially in window.
+    delivered_at: str | None = None
+
+    @model_validator(mode="after")
+    def _delivered_requires_timestamp(self) -> _OrderEntry:
+        if self.status == "delivered" and self.delivered_at is None:
+            raise ValueError("a 'delivered' order requires delivered_at (return-window basis)")
+        return self
 
 
 class _ProductEntry(BaseModel):
@@ -144,11 +155,12 @@ class PlacedOrder(BaseModel):
 
 
 class RefundRecord(BaseModel):
-    """A refund this store issued (the stub SoR's own record)."""
+    """A refund this store issued (the stub SoR's own record). `refund_id` is the refund
+    REFERENCE ("R-7001..") — distinct from a return/RMA id (Group C's `ReturnRecord`)."""
 
     model_config = _FROZEN
 
-    return_id: str = Field(min_length=1)
+    refund_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     amount_usd: float = Field(ge=0)
     destination: str = Field(min_length=1)
@@ -173,6 +185,27 @@ class CancelError(ValueError):
     """A cancel the store refused: unknown order, or not in a cancellable (processing) state."""
 
 
+class ReturnRecord(BaseModel):
+    """A return/RMA this store created (Group C). Stub returns stay OPEN until the Phase-4
+    real SoR (nothing "receives" a package in the build phase); `refund_due_usd` is the
+    refund RECORDED on the return, released when the return is processed — that release is
+    the money-movement moment and re-runs the destination->level check there (§A4c).
+    `destination` is always "original" in v1 (a destination change at release time is its
+    own L2 interaction)."""
+
+    model_config = _FROZEN
+
+    rma_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    refund_due_usd: float = Field(ge=0)
+    destination: str = Field(min_length=1)
+
+
+class ReturnError(ValueError):
+    """A return the store refused: unknown/ineligible order, an open return already exists,
+    or the recorded refund would exceed the order's refundable balance."""
+
+
 # Fulfillment states an order can be cancelled from (§A4b / industry: only the pre-shipment
 # window; once shipped, direct cancellation ends and becomes a return). Placed orders start
 # in _PLACED_STATUS, which is included here so a just-placed order is cancellable.
@@ -182,6 +215,31 @@ CANCELLED_STATUS = "cancelled"
 # Goods are (or were) on their way: a refund on these is RETURN-FIRST above the merchant's
 # returnless threshold — without it the caller keeps both the goods and the money.
 FULFILLED_STATUSES = frozenset({"shipped", "delivered"})
+
+
+class LastOrderPointer:
+    """The session's "that order" reference — a bounded conversational pointer (Group C, L4
+    from live call #10: "one thousand one" was mis-bound to the salient ORD-9001).
+
+    The CartStore pattern: one mutable per-session object, closed into tools + flows at
+    build, dies with the session (never a checkpointed state channel — nothing for a replay
+    to resurrect, and no Command/tool-injection machinery). Set ONLY on an explicit
+    order_status lookup or a successful order effect (place/cancel/return). It is a bare
+    ID for REFERENCE RESOLUTION — never a cache of order state: any status/delivery/refund
+    claim still requires an order_status read that turn (the frontline grounding rule).
+    """
+
+    def __init__(self) -> None:
+        self._order_id: str | None = None
+
+    def set(self, order_id: str) -> None:
+        self._order_id = order_id.strip().upper()
+
+    def get(self) -> str | None:
+        return self._order_id
+
+    def clear(self) -> None:
+        self._order_id = None
 
 
 def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:
@@ -222,9 +280,11 @@ class OrderStore:
         self._placed_by_key: dict[str, PlacedOrder] = {}
         self._next_seq = 9001  # placed-order ids ORD-9001.. (disjoint from fixture ids)
         self._refunds_by_key: dict[str, RefundRecord] = {}
-        self._next_refund_seq = 7001  # return ids R-7001..
+        self._next_refund_seq = 7001  # refund references R-7001..
         self._cancels_by_key: dict[str, CancelRecord] = {}
         self._cancelled_ids: set[str] = set()  # order_ids voided (status overlay)
+        self._returns_by_key: dict[str, ReturnRecord] = {}
+        self._next_return_seq = 3001  # return ids RMA-3001.. (disjoint from ORD-/R- spaces)
 
     def order_status(self, order_id: str) -> str | None:
         """The effective fulfillment status of an order; None if unknown.
@@ -365,6 +425,41 @@ class OrderStore:
             2,
         )
 
+    def delivered_at_epoch(self, order_id: str) -> float | None:
+        """The delivery instant as a UTC epoch; None if not (yet) delivered.
+
+        The return-window basis (Group C): shipped-not-yet-delivered and just-placed orders
+        return None — their window hasn't started, so they are trivially in window. Parsed
+        as an AWARE datetime (the fixture stores tz-aware ISO 8601), compared as instants —
+        no naive-date boundary ambiguity on the window's last day.
+        """
+        entry = self.fixture.orders.get(order_id.strip().upper())
+        if entry is None or entry.delivered_at is None:
+            return None
+        return datetime.fromisoformat(entry.delivered_at).timestamp()
+
+    def return_for_order(self, order_id: str) -> ReturnRecord | None:
+        """The open return for an order, if one exists — THE open-return lookup (guards need
+        the record itself to speak its RMA id; a separate bool would be a second way)."""
+        normalized = order_id.strip().upper()
+        for record in self._returns_by_key.values():
+            if record.order_id == normalized:
+                return record
+        return None
+
+    def return_refund_due(self, order_id: str) -> float:
+        """Sum of refunds PROMISED on open returns for an order — the promise side of the
+        cumulative-cap join (refunds paid + refunds promised may never exceed captured)."""
+        normalized = order_id.strip().upper()
+        return round(
+            sum(
+                r.refund_due_usd
+                for r in self._returns_by_key.values()
+                if r.order_id == normalized
+            ),
+            2,
+        )
+
     def issue_refund(
         self,
         idempotency_key: str,
@@ -378,9 +473,11 @@ class OrderStore:
         A repeat call with a seen key returns the ORIGINAL refund unchanged (replay-safe,
         like `place`). The key is per-refund-INTENT, so a SECOND legitimate partial refund
         (different intent, different key) is NOT deduped away. Enforces the cumulative cap
-        in one place — the join `sum(prior refunds) + amount <= captured_total` — so two
-        partials can never over-refund an order. Refuses (RefundError) an unknown order, a
-        CANCELLED order (the void already reversed the charge — refunding on top would
+        in one place — the join `refunds paid + refunds PROMISED on open returns + amount
+        <= captured_total` (Group C: a return records a refund promise released at Phase 4;
+        paying a refund alongside it would double-promise the same dollars) — so partials
+        and returns can never over-refund an order. Refuses (RefundError) an unknown order,
+        a CANCELLED order (the void already reversed the charge — refunding on top would
         return the money twice), or an over-cap amount; the caller must have already gated
         destination -> level (§A4b).
         """
@@ -396,13 +493,15 @@ class OrderStore:
                 "reversed, nothing left to refund"
             )
         already = self.refunded_so_far(order_id)
-        if round(already + amount_usd, 2) > captured:
+        promised = self.return_refund_due(order_id)
+        if round(already + promised + amount_usd, 2) > captured:
             raise RefundError(
                 f"refund ${amount_usd:.2f} exceeds refundable balance on {order_id} "
-                f"(captured ${captured:.2f}, already refunded ${already:.2f})"
+                f"(captured ${captured:.2f}, already refunded ${already:.2f}, "
+                f"promised on open returns ${promised:.2f})"
             )
         record = RefundRecord(
-            return_id=f"R-{self._next_refund_seq}",
+            refund_id=f"R-{self._next_refund_seq}",
             order_id=order_id.strip().upper(),
             amount_usd=amount_usd,
             destination=destination,
@@ -415,6 +514,70 @@ class OrderStore:
     def refund_count(self) -> int:
         """How many DISTINCT refunds this store has issued (test/verification surface)."""
         return len(self._refunds_by_key)
+
+    def create_return(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        refund_due_usd: float,
+        destination: str,
+    ) -> ReturnRecord:
+        """Create a return/RMA, deduplicated by per-INTENT `idempotency_key` (SoR-arbiter
+        rule, same shape as `issue_refund`).
+
+        Re-validates at effect time (§A4c): the order must exist and be FULFILLED
+        (shipped/delivered) — which covers cancelled AND processing, and is also the
+        structural invariant that makes cancel-vs-open-return conflicts impossible (open
+        returns exist only on fulfilled orders; `cancel_order` refuses non-processing) —
+        must have no open return already, and the recorded refund promise must fit the
+        refundable balance (paid + promised <= captured, the same join `issue_refund`
+        enforces from the other side). The refund is RECORDED, not paid: release happens
+        at the Phase-4 SoR once the return is processed, re-running the destination->level
+        check there.
+        """
+        existing = self._returns_by_key.get(idempotency_key)
+        if existing is not None:
+            return existing
+        normalized = order_id.strip().upper()
+        status = self.order_status(normalized)
+        if status is None:
+            raise ReturnError(f"unknown order {order_id!r} - cannot create a return")
+        if status not in FULFILLED_STATUSES:
+            raise ReturnError(
+                f"order {normalized} is {status} - only a shipped or delivered order "
+                "can be returned"
+            )
+        open_return = self.return_for_order(normalized)
+        if open_return is not None:
+            raise ReturnError(
+                f"a return for {normalized} is already open ({open_return.rma_id})"
+            )
+        captured = self.captured_total(normalized)
+        assert captured is not None  # status resolved above, so the order is known
+        already = self.refunded_so_far(normalized)
+        # No `return_refund_due` term here: the already-open check above guarantees zero
+        # open returns for this order, so the promised side is structurally 0 (unlike
+        # issue_refund, which CAN run alongside an open return and must count it).
+        if round(already + refund_due_usd, 2) > captured:
+            raise ReturnError(
+                f"return refund ${refund_due_usd:.2f} exceeds refundable balance on "
+                f"{normalized} (captured ${captured:.2f}, already refunded ${already:.2f})"
+            )
+        record = ReturnRecord(
+            rma_id=f"RMA-{self._next_return_seq}",
+            order_id=normalized,
+            refund_due_usd=refund_due_usd,
+            destination=destination,
+        )
+        self._next_return_seq += 1
+        self._returns_by_key[idempotency_key] = record
+        return record
+
+    @property
+    def return_count(self) -> int:
+        """How many DISTINCT returns this store has created (test/verification surface)."""
+        return len(self._returns_by_key)
 
     def is_cancellable(self, order_id: str) -> bool:
         """Whether an order is currently in a cancellable (pre-shipment) state — the cancel

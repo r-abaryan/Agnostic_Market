@@ -1,0 +1,5 @@
+# Group-C profile fixture for acme_store — the stub account SoR behind the profile-change
+# flow. Replaced by the real profile SoR integration in Phase 4. contact_on_file is a
+# MASKED factor reference by design (SECURITY §6): the voice plane never holds a raw number.
+address_on_file: "12 Harbor Lane, Springfield"
+contact_on_file: "number ending 0119"

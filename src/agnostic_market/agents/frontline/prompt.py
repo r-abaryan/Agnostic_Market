@@ -40,9 +40,12 @@ _INSTRUCTIONS = (
     "never from memory of the conversation. When the caller gives an order number, call "
     "order_status with EXACTLY that number immediately - never substitute a different "
     "number you remember from earlier, and never ask for a number the caller just gave "
-    "or that is plainly the one being discussed. This rule is about READING state: a "
-    "request to CHANGE anything about an order (its delivery address, its items, cancel "
-    "it) is still a handover, even when phrased as a question.\n"
+    "or that is plainly the one being discussed. If they say 'that order' with no number "
+    "and no order has been discussed yet, ask which order they mean. Once you HAVE called "
+    "order_status, its result IS the current status - state it and stop; never promise to "
+    "'check the latest status' as a follow-up you don't then perform. This rule is about "
+    "READING state: a request to CHANGE anything about an order (its delivery address, "
+    "its items, cancel it) is still a handover, even when phrased as a question.\n"
     "If the caller's utterance is cut off mid-sentence, ask them to finish it - do not "
     "guess, and do not respond to the fragment with what you can or can't do."
 )
@@ -76,7 +79,21 @@ _FEW_SHOT: tuple[tuple[str, str], ...] = (
     ("Toss the green socks in my cart as well.", "handover cart_write/checkout, SILENT"),
     ("What's in my cart right now?", "ANSWER (speak): a cart READ - use view_cart"),
     ("I'd like to buy the blue jacket.", "handover cart_write/checkout, SILENT - no price first"),
+    (
+        "I've got a new phone number, put it on my account.",
+        "handover contact_change/support, SILENT",
+    ),
 )
+
+
+def resolved_order_line(order_id: str) -> str:
+    """Per-turn prompt suffix when the session pointer is set (Group C L4): resolves a bare
+    'that order' to the most recently discussed id. The pointer is a REFERENCE, never state
+    — the existence-vs-state rule above still requires an order_status read for any claim."""
+    return (
+        f"The order most recently discussed on this call is {order_id}. If the caller says "
+        "'that order' (or similar) without a number, use this id with order_status."
+    )
 
 
 def compose_system_prompt(display_name: str, policy: PolicyContext) -> str:

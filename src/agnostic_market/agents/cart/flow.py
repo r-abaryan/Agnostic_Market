@@ -44,7 +44,12 @@ from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.cart.prompt import compose_cart_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, resolve_candidates, speak_lines
+from agnostic_market.commerce.orders import (
+    LastOrderPointer,
+    OrderStore,
+    resolve_candidates,
+    speak_lines,
+)
 from agnostic_market.dtos.confirmation import ToolConfirmationPolicy
 from agnostic_market.dtos.state import (
     CartLine,
@@ -142,6 +147,7 @@ def build_cart_nodes(
     order_store: OrderStore,
     cart_store: CartStore,
     policy: PolicyContext,
+    pointer: LastOrderPointer,
     *,
     display_name: str,
 ) -> CartNodes:
@@ -483,6 +489,7 @@ def build_cart_nodes(
         placed = order_store.place_cart(
             pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd)
         cart_store.clear()
+        pointer.set(placed.order_id)  # the order most recently discussed (Group C L4)
         write_event({"event": "checkout_confirmed", "order_id": placed.order_id,
                      "total": placed.total_usd})
         return {

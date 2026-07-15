@@ -1,0 +1,3 @@
+# Group-C profile fixture for demo_shop — see acme_store.yaml for the shape rationale.
+address_on_file: "4 Orchard Row, Riverton"
+contact_on_file: "number ending 4471"

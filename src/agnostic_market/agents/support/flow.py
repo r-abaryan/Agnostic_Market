@@ -1,20 +1,30 @@
-"""The support gated flow (Tier 3, AGENTS §A4/§A9) — refund-to-new-instrument + the
-step-up verification loop (T3), with the A10a replay invariants in the node structure.
+"""The support gated flow (Tier 3, AGENTS §A4/§A9) — refunds + cancellations (T3/Group A),
+returns and profile changes (Group C), with the A10a replay invariants in every sub-path.
 
-The T3 shape (proven against real langgraph before this code — see the plan's task-zero
-spike). Refund to a NEW instrument requires L2 regardless of amount (§A4b); an L1 caller is
-raised mid-flow by a committed OTP, THEN the refund resumes behind a readback interrupt:
+The T3 refund shape (proven against real langgraph before this code — see the plan's
+task-zero spike). Refund to a NEW instrument requires L2 regardless of amount (§A4b); an L1
+caller is raised mid-flow by a committed OTP, THEN the refund resumes behind a readback:
 
     assemble ─▶ guardrail ─(L2 already)──────────▶ confirm[INT#2] ─▶ place
                    │                                    ▲
                    └─(L1, new instr.)─▶ risk_check ─▶ dispatch ─▶ collect[INT#1: verify+raise]
 
+Group C sub-paths (same disciplines, built on the same seams):
+    RETURNS  assemble/refund-tier-4 ─▶ return_guardrail ─▶ return_confirm[INT] ─▶ return_place
+             (single interrupt, no step-up — no money moves at creation; the recorded refund
+             releases at the Phase-4 SoR. The refund guardrail's return-first tier STEERS
+             into this path, eligibility-checked BEFORE the steer line is spoken.)
+    PROFILE  assemble ─▶ profile_guardrail ─▶ [the step-up chain] ─▶ profile_confirm[INT]
+             ─▶ profile_place  (address/contact = L2 platform floor; the OTP goes to the
+             number-on-file — changing the factor requires the OLD factor, §A4a. The chain
+             is the SAME code as the refund's, via the _stepup.py factory.)
+
 Why the decomposition (A10a): LangGraph re-runs an interrupted node from the TOP on resume,
 and does NOT commit a node's update until it RETURNS. So the two interrupts sit in SEPARATE
 nodes; `collect` verifies the OTP AFTER its own (only) interrupt and raises the store level
 on its return (committed before the readback interrupt); and every side effect is either
-post-interrupt (`place`) or idempotent-pre-interrupt (`dispatch` keyed by attempt — else a
-replay re-sends the OTP, S3).
+post-interrupt (`place`/`return_place`/`profile_place`) or idempotent-pre-interrupt
+(`dispatch` keyed by attempt — else a replay re-sends the OTP, S3).
 
 Authority discipline: `verification_level` lives ONLY in the VerificationStore (read live at
 the guardrail, written only by `collect` via a committed OTP) — never a checkpointed channel,
@@ -40,35 +50,41 @@ from pydantic import BaseModel
 
 from agnostic_market.agents._consent import classify_cancel_consent, classify_consent
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls
+from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.orders import (
     CANCELLED_STATUS,
     FULFILLED_STATUSES,
     CancelError,
+    LastOrderPointer,
     OrderStore,
     RefundError,
+    ReturnError,
 )
+from agnostic_market.commerce.profile import ProfileError, ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import (
+    CREATE_RETURN_POLICY,
     ISSUE_REFUND_POLICY,
+    PROFILE_CHANGE_POLICIES,
+    ProfileField,
     RefundDestination,
     ToolConfirmationPolicy,
+    profile_change_required_level,
     refund_required_level,
 )
 from agnostic_market.dtos.state import (
     HandoffRequest,
     PendingCancel,
+    PendingProfileChange,
     PendingRefund,
+    PendingReturn,
     PolicyContext,
     ReasoningState,
 )
 
 logger = logging.getLogger("agnostic_market.agents.support")
-
-# Max OTP collect attempts before the flow gives up and offers a human (§A9). Bounded +
-# deterministic (A10a rule 3): the collect node counts committed misses, not a loop.
-_MAX_OTP_ATTEMPTS = 2
 
 # A masked instrument reference is all voice ever handles — never a raw PAN (PCI, SECURITY
 # §6). The fixture "new card on file" for the build phase; a real stored-instrument ref later.
@@ -111,6 +127,48 @@ def _cancel_readback_line(pending: PendingCancel) -> str:
     )
 
 
+def _return_readback_line(pending: PendingReturn, policy: ToolConfirmationPolicy) -> str:
+    """The GRAPH-authored return readback — the `interrupt()` payload (Group C).
+
+    Same loud-fail contract as `_readback_line`: the rendered dict MUST carry every field
+    CREATE_RETURN_POLICY declares, even though the sentence phrases them naturally. States
+    the honest money outcome — the refund follows the PROCESSED return, to the ORIGINAL
+    payment method (a v1 constant: a steered new-instrument refund must not carry an
+    unverified payout destination onto the return, dtos/state.py PendingReturn)."""
+    rendered: dict[str, str] = {
+        "order_id": pending.order_id,
+        "total_amount": f"${pending.refund_due_usd:.2f}",
+    }
+    missing = policy.confirm_fields - rendered.keys()
+    if missing:
+        raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
+    return (
+        f"Just to confirm - set up a return for your {pending.summary} "
+        f"({rendered['order_id']})? Once the return is processed, the "
+        f"{rendered['total_amount']} refund goes back to your original payment method. "
+        "Shall I go ahead?"
+    )
+
+
+def _profile_readback_line(pending: PendingProfileChange) -> str:
+    """The GRAPH-authored profile-change readback — the `interrupt()` payload (Group C).
+
+    The new VALUE is a declared critical field (one STT error = goods to the wrong street /
+    an OTP factor the caller doesn't hold), so the loud-fail contract guarantees it is
+    literally spoken. Spoken to the caller only — never logged (PII discipline)."""
+    policy = PROFILE_CHANGE_POLICIES[pending.field]
+    key = "new_address" if pending.field == "address" else "new_contact"
+    rendered: dict[str, str] = {key: pending.new_value}
+    missing = policy.confirm_fields - rendered.keys()
+    if missing:
+        raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
+    noun = "delivery address" if pending.field == "address" else "contact number"
+    return (
+        f"Just to confirm - update the {noun} on your account to {rendered[key]}. "
+        "Shall I go ahead?"
+    )
+
+
 class _ProposeRefund(BaseModel):
     order_key: str
     amount_usd: float
@@ -119,6 +177,15 @@ class _ProposeRefund(BaseModel):
 
 class _ProposeCancel(BaseModel):
     order_key: str
+
+
+class _ProposeReturn(BaseModel):
+    order_key: str
+
+
+class _ProposeProfileChange(BaseModel):
+    field: ProfileField
+    new_value: str
 
 
 @dataclass(frozen=True)
@@ -144,7 +211,8 @@ class SupportNodes:
     route_after_assemble: Callable[[ReasoningState], str]
     # Branch after the refund guardrail depends on the LIVE verification level (in the store,
     # which graph.py can't see) — so the flow owns this router, closed over the store.
-    # "confirm" (level sufficient) | "stepup" (needs the OTP loop) | "handover" (cleared).
+    # "confirm" (level sufficient) | "stepup" (OTP loop) | "cancel" (remedy steer) |
+    # "return" (return-first steer, Group C) | "declined" (node spoke + ends).
     route_after_guardrail: Callable[[ReasoningState], str]
     # Branch after collect: the OTP verify may have raised to L2 (-> confirm), exhausted
     # attempts / flagged risk (-> handover), or asked for a re-collect (-> dispatch again).
@@ -152,6 +220,25 @@ class SupportNodes:
     # Branch after the cancel guardrail depends on the LIVE order status + risk (store-owned).
     # "confirm" (processing, no risk) | "handover" (shipped/delivered or risk-flagged).
     route_after_cancel_guardrail: Callable[[ReasoningState], str]
+    # Returns sub-path (Group C): guardrail -> confirm[interrupt] -> place[effect].
+    return_guardrail: Callable[[ReasoningState], dict[str, object]]
+    return_confirm: Callable[[ReasoningState], dict[str, object]]
+    return_place: Callable[[ReasoningState], dict[str, object]]
+    # "confirm" (eligible) | "cancel" (unshipped steer) | "declined" (guardrail spoke + ends).
+    route_after_return_guardrail: Callable[[ReasoningState], str]
+    # Profile-change sub-path (Group C): guardrail -> [step-up chain] -> confirm -> place.
+    # The step-up nodes are the FACTORY's profile instances — same bodies as the refund
+    # chain, own graph node names + confirm target (R5).
+    profile_guardrail: Callable[[ReasoningState], dict[str, object]]
+    profile_risk_check: Callable[[ReasoningState], dict[str, object]]
+    profile_dispatch: Callable[[ReasoningState], dict[str, object]]
+    profile_collect: Callable[[ReasoningState], dict[str, object]]
+    profile_confirm: Callable[[ReasoningState], dict[str, object]]
+    profile_place: Callable[[ReasoningState], dict[str, object]]
+    # "confirm" (level sufficient) | "stepup" (needs the OTP loop on the OLD factor).
+    route_after_profile_guardrail: Callable[[ReasoningState], str]
+    # "confirm" | "dispatch" (re-collect) | "handover" — the factory's decision router.
+    route_after_profile_collect: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
 
@@ -162,6 +249,8 @@ def build_support_nodes(
     otp: OtpProvider,
     risk: RiskProvider,
     policy: PolicyContext,
+    profile_store: ProfileStore,
+    pointer: LastOrderPointer,
     *,
     display_name: str,
 ) -> SupportNodes:
@@ -179,11 +268,24 @@ def build_support_nodes(
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
+    def propose_return(order_key: str) -> str:
+        """Propose sending an order back (option number) - the refund follows the return."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    @tool
+    def propose_profile_change(field: str, new_value: str) -> str:
+        """Propose updating the account's delivery address or contact number.
+        field is 'address' or 'contact'; new_value is the caller's stated new value."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    @tool
     def leave_support() -> str:
         """Leave the support flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
-    model = reasoning_model.bind_tools([propose_refund, propose_cancel, leave_support])
+    model = reasoning_model.bind_tools(
+        [propose_refund, propose_cancel, propose_return, propose_profile_change, leave_support]
+    )
 
     def _leave(new_messages: list, call_id: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left support", tool_call_id=call_id))
@@ -193,7 +295,27 @@ def build_support_nodes(
             "active_flow": "left_support",
             "pending_refund": None,
             "pending_cancel": None,
+            "pending_return": None,
+            "pending_profile_change": None,
         }
+
+    def _return_eligibility(order_id: str) -> str | None:
+        """ONE return-eligibility check, shared by the return guardrail AND the refund
+        tier-4 steer — the steer must never promise a return this would then decline (the
+        ask-then-decline class, live call #9 P2, prevented by construction). Returns a
+        closed reason slug or None (eligible). Ordering mirrors the guardrail tiers:
+        status truth first, then dedup, then the window."""
+        status = order_store.order_status(order_id)
+        if status == CANCELLED_STATUS:
+            return "order_cancelled"
+        if status not in FULFILLED_STATUSES:
+            return "not_shipped"
+        if order_store.return_for_order(order_id) is not None:
+            return "already_open"
+        delivered = order_store.delivered_at_epoch(order_id)
+        if delivered is not None and time.time() - delivered > policy.return_window_days * 86400:
+            return "out_of_window"
+        return None
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE support: propose a REFUND (order+amount+destination) or a CANCEL
@@ -202,7 +324,7 @@ def build_support_nodes(
         orders = order_store.actionable_orders()
         by_key = {o.key: o for o in orders}
         prompt = SystemMessage(
-            compose_support_prompt(display_name, orders, policy)
+            compose_support_prompt(display_name, orders, policy, pointer.get())
         )
         messages: list = [prompt, *state.messages]
         new_messages: list = []
@@ -237,6 +359,73 @@ def build_support_nodes(
                     created_at=time.time(),
                 )
                 return {"messages": new_messages, "pending_cancel": pending_cancel}
+
+            if call["name"] == "propose_return":
+                try:
+                    proposed = _ProposeReturn.model_validate(call["args"])
+                except ValueError:
+                    proposed = None
+                chosen = by_key.get(proposed.order_key) if proposed else None
+                if chosen is None:
+                    feedback = f"Invalid order. Valid order numbers: {', '.join(sorted(by_key))}."
+                    new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                new_messages.append(
+                    ToolMessage(f"proposed return on order {chosen.key}", tool_call_id=call["id"])
+                )
+                # refund_due is CODE-computed: what's still refundable on the order (captured
+                # minus refunds paid minus prior return promises) — never model arithmetic.
+                refund_due = max(
+                    0.0,
+                    round(
+                        chosen.total_usd
+                        - order_store.refunded_so_far(chosen.order_id)
+                        - order_store.return_refund_due(chosen.order_id),
+                        2,
+                    ),
+                )
+                pending_return = PendingReturn(
+                    order_id=chosen.order_id,
+                    summary=chosen.summary,
+                    refund_due_usd=refund_due,
+                    idempotency_key=uuid.uuid4().hex,
+                    created_at=time.time(),
+                )
+                return {"messages": new_messages, "pending_return": pending_return}
+
+            if call["name"] == "propose_profile_change":
+                try:
+                    change = _ProposeProfileChange.model_validate(call["args"])
+                except ValueError:
+                    change = None
+                if change is None or not change.new_value.strip():
+                    feedback = (
+                        "Invalid proposal. field must be 'address' or 'contact'; "
+                        "new_value must be the caller's stated new value."
+                    )
+                    new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                # NO value echo in the tool result (PII: thread history is model-visible
+                # context, but the persisted line must not carry the raw value a second
+                # time beyond the pending itself).
+                new_messages.append(
+                    ToolMessage(
+                        f"proposed profile change: {change.field}", tool_call_id=call["id"]
+                    )
+                )
+                pending_change = PendingProfileChange(
+                    field=change.field,
+                    new_value=change.new_value.strip(),
+                    # The MASKED on-file contact the OTP goes to — for a contact change
+                    # this is the OLD factor (change-the-factor needs the factor, §A4a).
+                    factor_ref=profile_store.contact_on_file(),
+                    idempotency_key=uuid.uuid4().hex,
+                    attempt_key=uuid.uuid4().hex,
+                    created_at=time.time(),
+                )
+                return {"messages": new_messages, "pending_profile_change": pending_change}
 
             if call["name"] == "propose_refund":
                 try:
@@ -285,6 +474,8 @@ def build_support_nodes(
             "active_flow": "left_support",
             "pending_refund": None,
             "pending_cancel": None,
+            "pending_return": None,
+            "pending_profile_change": None,
         }
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
@@ -307,11 +498,16 @@ def build_support_nodes(
            It authors its own decline (clear-before-speak) and ENDs — there is NO handover
            routing yet (no warm-transfer target until Phase 4); the human intent is recorded
            in telemetry so the transfer can be wired there without re-finding this spot.
-        4. RETURN-FIRST gate (industry standard, live 2026-07-10: a $179.98 refund paid out
-           on shipped shoes with no return created — money back AND goods kept): a refund on
-           a SHIPPED/DELIVERED order above the merchant's `returnless_under_usd` (and within
-           the human line) waits for the return; the honest decline names that path (returns
-           flow = Group C). At/below the threshold = a deliberate returnless refund, proceeds.
+        1b. OPEN RETURN (Group C, between the cancelled and steer tiers): the refund path
+           for an order with an open return IS that return — point at its RMA and end;
+           every later gate is moot (the promise was vetted at return creation).
+        4. RETURN-FIRST STEER (industry standard, live 2026-07-10: a $179.98 refund paid
+           out on shipped shoes with no return created — money back AND goods kept): a
+           refund on a SHIPPED/DELIVERED order above the merchant's `returnless_under_usd`
+           (and within the human line) waits for the return — Group C converts it INTO the
+           returns sub-path (eligibility-checked BEFORE the steer line is spoken, via the
+           shared helper; out-of-window declines honestly instead). At/below the threshold
+           = a deliberate returnless refund, proceeds.
         5. LEVEL gate (§A4b fraud floor): destination -> required level vs the LIVE store
            level, decided by `route_after_guardrail`; no side effect here."""
         pending = state.pending_refund
@@ -325,6 +521,25 @@ def build_support_nodes(
                     AIMessage(
                         "That order was already cancelled, so the charge is reversed - "
                         "there's nothing left to refund on it."
+                    )
+                ],
+            }
+        open_return = order_store.return_for_order(pending.order_id)
+        if open_return is not None:
+            # An OPEN RETURN makes every later gate moot (Group C): the refund path for this
+            # order IS the return — its promise was vetted when the return was created, so
+            # re-gating the amount here would speak a contradictory second line. Placed
+            # before the steer/amount tiers; disjoint from the cancel steer by construction
+            # (open returns exist only on fulfilled orders; the steer needs cancellable).
+            write_event({"event": "refund_denied", "reason": "return_already_open"})
+            return {
+                "pending_refund": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"A return is already set up for that order ({open_return.rma_id}) - "
+                        f"the ${open_return.refund_due_usd:.2f} refund is issued once it's "
+                        "processed."
                     )
                 ],
             }
@@ -378,19 +593,47 @@ def build_support_nodes(
             order_store.order_status(pending.order_id) in FULFILLED_STATUSES
             and pending.amount_usd > policy.refund_returnless_under_usd
         ):
-            # Return-first (within the human line): the goods are out; over the returnless
-            # threshold the refund waits for the return. Speak the honest path and END — the
-            # returns flow that will actually arrange it is Group C; until then a person sets
-            # it up.
-            write_event({"event": "refund_needs_return", "reason": "return_first"})
+            # Return-first STEER (Group C, within the human line): the goods are out; over
+            # the returnless threshold the refund waits for the return — and the returns
+            # sub-path can now ARRANGE it. Eligibility is checked BEFORE speaking (the
+            # shared helper): the steer must never promise a return the return guardrail
+            # would then decline (ask-then-decline, live call #9 P2). The only reachable
+            # ineligible reason here is out_of_window (cancelled/unshipped can't be
+            # FULFILLED; already_open was caught by the earlier tier).
+            if _return_eligibility(pending.order_id) == "out_of_window":
+                write_event({"event": "refund_needs_return", "reason": "out_of_window"})
+                return {
+                    "pending_refund": None,
+                    "active_flow": None,
+                    "messages": [
+                        AIMessage(
+                            "Since that order has already shipped, the "
+                            f"${pending.amount_usd:.2f} refund is issued once the return is "
+                            "set up - but that delivery is outside the "
+                            f"{policy.return_window_days}-day return window, so our support "
+                            "team will need to review it."
+                        )
+                    ],
+                }
+            # Eligible: convert the refund into a return (the tier-2 mint-and-route
+            # pattern). Amount/summary carried; destination deliberately NOT carried —
+            # v1 returns refund to the ORIGINAL payment method (PendingReturn docstring).
+            write_event({"event": "refund_steered_to_return", "order_id": pending.order_id})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "pending_return": PendingReturn(
+                    order_id=pending.order_id,
+                    summary=order_store.order_item_summary(pending.order_id)
+                    or pending.order_id,
+                    refund_due_usd=pending.amount_usd,
+                    idempotency_key=uuid.uuid4().hex,
+                    created_at=time.time(),
+                ),
                 "messages": [
                     AIMessage(
                         f"Since that order has already shipped, the ${pending.amount_usd:.2f} "
-                        "refund is issued once the return is set up - our support team can "
-                        "arrange the return for you."
+                        "refund is issued once the return is set up - I can arrange that "
+                        "return for you now."
                     )
                 ],
             }
@@ -399,59 +642,18 @@ def build_support_nodes(
             write_event({"event": "refund_stepup_required", "required_level": required})
         return {}
 
-    def risk_check_node(state: ReasoningState) -> dict[str, object]:
-        """SIM-swap / port-out check on the number-on-file (§A4a). Flagged -> do NOT trust an
-        OTP; escalate to a person. ANI is never the authenticator."""
-        if risk.check_sim_swap():
-            write_event({"event": "refund_stepup_failed", "reason": "sim_swap_risk"})
-            return {
-                "pending_refund": None,
-                "active_flow": None,
-                "handover": HandoffRequest(
-                    destination="human", reason_code="verification_required", source="gate"
-                ),
-            }
-        return {}
-
-    def dispatch_node(state: ReasoningState) -> dict[str, object]:
-        """Dispatch the OTP to the number-on-file — IDEMPOTENT per step-up attempt (S3: a
-        pre-interrupt effect re-runs on replay; the attempt key makes the re-send a no-op)."""
-        pending = state.pending_refund
-        assert pending is not None
-        otp.dispatch(pending.attempt_key)
-        return {}
-
-    def collect_node(state: ReasoningState) -> dict[str, object]:
-        """HITL interrupt #1: collect the committed OTP, then verify (CODE seam).
-
-        The verify sits AFTER this node's only interrupt — a replay re-runs the node from the
-        top, re-hits the interrupt, and re-verifies the freshly-collected code (harmless,
-        idempotent: verify_otp just re-checks). It does NOT precede a LATER interrupt, so it
-        is not the S3 hazard (that was a dispatch above an interrupt). On match: raise the
-        store to L2 and RETURN (commits before the readback interrupt in the next node). On
-        miss: re-collect ONCE (new attempt key -> legit re-dispatch), then human (§A9)."""
-        pending = state.pending_refund
-        assert pending is not None
-        answer = interrupt("For security, please read me the 6-digit code we just sent you.")
-        if verification_store.verify_otp(str(answer.get("text", ""))):
-            write_event({"event": "refund_stepup_ok", "raised_to": 2})
-            return {}  # level now L2 in the store; router -> confirm
-        tries = pending.otp_tries + 1
-        if tries >= _MAX_OTP_ATTEMPTS:
-            write_event({"event": "refund_stepup_failed", "reason": "otp_exhausted"})
-            return {
-                "pending_refund": None,
-                "active_flow": None,
-                "handover": HandoffRequest(
-                    destination="human", reason_code="verification_required", source="gate"
-                ),
-            }
-        # Re-collect: bump tries + a NEW attempt key so the re-dispatch is a legitimate send.
-        return {
-            "pending_refund": pending.model_copy(
-                update={"otp_tries": tries, "attempt_key": uuid.uuid4().hex}
-            )
-        }
+    # The T3 step-up chain (risk_check -> dispatch -> collect) — extracted VERBATIM to the
+    # family-parametrized factory (_stepup.py, Group C) so the profile flow runs the SAME
+    # code. Refund behavior + event names are byte-identical to the pre-factory nodes; the
+    # five T3 security tests are the regression gate for this extraction.
+    refund_stepup = build_stepup_nodes(
+        verification_store,
+        otp,
+        risk,
+        pending_field="pending_refund",
+        required_level=lambda p: refund_required_level(p.amount_usd, p.destination),
+        event_prefix="refund",
+    )
 
     def confirm_node(state: ReasoningState) -> dict[str, object]:
         """HITL interrupt #2: the refund readback + deterministic consent. NO side effects;
@@ -543,10 +745,11 @@ def build_support_nodes(
                     destination="human", reason_code="refund", source="gate"
                 ),
             }
+        pointer.set(pending.order_id)  # the order most recently discussed (Group C L4)
         write_event(
             {
                 "event": "refund_confirmed",
-                "return_id": record.return_id,
+                "refund_id": record.refund_id,
                 "amount": record.amount_usd,
                 "verification": [g.get("method") for g in verification_store.grants],
             }
@@ -557,7 +760,7 @@ def build_support_nodes(
             "messages": [
                 AIMessage(
                     f"Done - your ${record.amount_usd:.2f} refund is on its way to your "
-                    f"{pending.instrument_ref}. Your reference is {record.return_id}."
+                    f"{pending.instrument_ref}. Your reference is {record.refund_id}."
                 )
             ],
         }
@@ -708,6 +911,7 @@ def build_support_nodes(
                     destination="human", reason_code="cancel_order", source="gate"
                 ),
             }
+        pointer.set(record.order_id)  # the order most recently discussed (Group C L4)
         write_event({"event": "cancel_confirmed", "order_id": record.order_id})
         return {
             "pending_cancel": None,
@@ -721,6 +925,349 @@ def build_support_nodes(
             ],
         }
 
+    # --- returns sub-path (Group C; single interrupt: guardrail -> confirm -> place) ------
+
+    def return_guardrail_node(state: ReasoningState) -> dict[str, object]:
+        """CODE-enforced return eligibility (never the model), via the SHARED
+        `_return_eligibility` helper — the same check the refund tier-4 steer runs BEFORE
+        promising a return, so this node's declines are unreachable for steered pendings
+        (§A4c defense only) and load-bearing for DIRECT propose_return.
+
+        Tier order: status truth (cancelled / unshipped-steers-to-cancel), dedup
+        (already-open names the RMA), the WINDOW, then the amount. Window-before-amount is
+        a deliberate inversion of the refund flow's amount-before-return-first, same
+        masking lesson (the decisive gate speaks): out-of-window is an absolute eligibility
+        fact — no self-serve return exists at ANY amount, and the person reviewing the
+        window exception handles the amount too."""
+        pending = state.pending_return
+        assert pending is not None
+        reason = _return_eligibility(pending.order_id)
+        if reason == "order_cancelled":
+            write_event({"event": "return_denied", "reason": "order_cancelled"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"That order for {pending.summary} was already cancelled and the "
+                        "charge reversed - there's nothing to return."
+                    )
+                ],
+            }
+        if reason == "not_shipped":
+            # Remedy steer (the refund tier-2 class): a "return" on unshipped goods IS a
+            # cancel — nothing has been sent, so nothing can go back. Mint the cancel and
+            # route into its path; its guardrail re-validates eligibility.
+            captured = order_store.captured_total(pending.order_id)
+            write_event({"event": "return_steered_to_cancel", "order_id": pending.order_id})
+            return {
+                "pending_return": None,
+                "pending_cancel": PendingCancel(
+                    order_id=pending.order_id,
+                    summary=pending.summary,
+                    idempotency_key=uuid.uuid4().hex,
+                    created_at=time.time(),
+                ),
+                "messages": [
+                    AIMessage(
+                        "That order hasn't shipped yet, so there's nothing to send back - "
+                        f"I can cancel it instead; the full ${captured:.2f} goes back to "
+                        "your original payment method."
+                    )
+                ],
+            }
+        if reason == "already_open":
+            existing = order_store.return_for_order(pending.order_id)
+            assert existing is not None  # the eligibility helper just saw it
+            write_event({"event": "return_denied", "reason": "already_open"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"A return for that order is already set up - your reference is "
+                        f"{existing.rma_id}. The ${existing.refund_due_usd:.2f} refund is "
+                        "issued once it's processed."
+                    )
+                ],
+            }
+        if reason == "out_of_window":
+            write_event({"event": "return_denied", "reason": "out_of_window"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"That order was delivered more than {policy.return_window_days} "
+                        "days ago, which is outside the return window - our support team "
+                        "can review an exception for you."
+                    )
+                ],
+            }
+        if pending.refund_due_usd > policy.refund_require_human_above_usd:
+            # DIRECT proposals only (a steered return already passed the refund amount
+            # gate): an oversized refund promise needs a person, same authorization ceiling
+            # as the refund flow's tier 3.
+            write_event(
+                {
+                    "event": "return_needs_human",
+                    "reason": "over_amount_threshold",
+                    "handover_intent": "human",
+                }
+            )
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"A ${pending.refund_due_usd:.2f} refund is above what I can set up "
+                        "on this call - our support team can arrange that return and refund "
+                        "for you."
+                    )
+                ],
+            }
+        return {}  # eligible: router -> return_confirm
+
+    def return_confirm_node(state: ReasoningState) -> dict[str, object]:
+        """HITL interrupt: the return readback + deterministic consent. NO side effects;
+        §4a barge -> re-confirm once; Clock-A TTL FIRST (clear-before-speak). PLAIN
+        classify_consent — the question is "set up the return?", so a "cancel" correctly
+        reads as no (cancel-polarity applies only where cancelling IS the question)."""
+        pending = state.pending_return
+        assert pending is not None
+        if time.time() - pending.created_at > policy.pending_ttl_seconds:
+            write_event({"event": "return_expired", "reason": "pending_ttl"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "That return confirmation sat for a while, so I haven't set "
+                        "anything up. If you'd still like it, just tell me again."
+                    )
+                ],
+            }
+        answer = interrupt(_return_readback_line(pending, CREATE_RETURN_POLICY))
+        verdict = classify_consent(str(answer.get("text", "")))
+        if answer.get("readback_interrupted") or verdict == "unclear":
+            retry = interrupt(
+                f"Sorry - just to be clear: set up a return for {pending.summary} "
+                f"({pending.order_id})? Yes or no?"
+            )
+            verdict = classify_consent(str(retry.get("text", "")))
+            if verdict != "yes":
+                verdict = "human" if verdict == "human" else "no"
+        if verdict == "human":
+            write_event({"event": "return_cancelled", "reason": "human_requested"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human", reason_code="refund", source="model"
+                ),
+            }
+        if verdict == "no":
+            write_event({"event": "return_cancelled", "reason": "declined"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage("Okay, I won't set up a return - nothing has changed.")
+                ],
+            }
+        return {}  # yes: pending survives; router -> place
+
+    def return_place_node(state: ReasoningState) -> dict[str, object]:
+        """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the
+        store's per-intent key; the store RE-VALIDATES eligibility (§A4c) so a proposal
+        that went stale can't create a ghost return. No live level re-check: creating a
+        return is L1 (no money moves here — the recorded refund releases at the Phase-4
+        SoR, which re-runs the destination->level check at release)."""
+        pending = state.pending_return
+        assert pending is not None
+        try:
+            record = order_store.create_return(
+                pending.idempotency_key,
+                order_id=pending.order_id,
+                refund_due_usd=pending.refund_due_usd,
+                destination="original",  # v1 constant — see PendingReturn's docstring
+            )
+        except ReturnError as exc:
+            logger.warning("return refused by store: %s", exc)
+            write_event({"event": "return_denied", "reason": "store_refused"})
+            return {
+                "pending_return": None,
+                "active_flow": None,
+                "messages": [
+                    # Outcome only — the handover node's deferral speaks the transfer line.
+                    AIMessage("I wasn't able to set up that return - nothing has changed.")
+                ],
+                "handover": HandoffRequest(
+                    destination="human", reason_code="refund", source="gate"
+                ),
+            }
+        pointer.set(record.order_id)  # the order most recently discussed (Group C L4)
+        write_event(
+            {
+                "event": "return_confirmed",
+                "rma_id": record.rma_id,
+                "order_id": record.order_id,
+                "refund_due": record.refund_due_usd,
+            }
+        )
+        return {
+            "pending_return": None,
+            "active_flow": None,
+            "messages": [
+                AIMessage(
+                    f"Done - your return for {pending.summary} is set up; your reference "
+                    f"is {record.rma_id}. The ${record.refund_due_usd:.2f} refund goes "
+                    "back to your original payment method once the return is processed."
+                )
+            ],
+        }
+
+    # --- profile-change sub-path (Group C; the refund T3 shape minus money:
+    # ---  guardrail -> [risk_check -> dispatch -> collect(INT)] -> confirm(INT) -> place) --
+
+    profile_stepup = build_stepup_nodes(
+        verification_store,
+        otp,
+        risk,
+        pending_field="pending_profile_change",
+        required_level=lambda p: profile_change_required_level(p.field),
+        event_prefix="profile",
+    )
+
+    def profile_guardrail_node(state: ReasoningState) -> dict[str, object]:
+        """CODE-gate for a profile change: no merchant tiers (address/contact have no
+        merchant knobs — the L2 requirement is the §A4a platform floor), so this node only
+        records whether a step-up is needed; the router (closed over the LIVE store) decides
+        confirm vs stepup. The OTP goes to the number-on-file — for a contact change that is
+        the OLD factor: changing the factor requires the factor (the ladder constraint)."""
+        pending = state.pending_profile_change
+        assert pending is not None
+        if verification_store.current_level() < profile_change_required_level(pending.field):
+            write_event(
+                {"event": "profile_stepup_required", "required_level": 2, "field": pending.field}
+            )
+        return {}
+
+    def route_after_profile_guardrail(state: ReasoningState) -> str:
+        pending = state.pending_profile_change
+        assert pending is not None
+        required = profile_change_required_level(pending.field)
+        return "confirm" if verification_store.current_level() >= required else "stepup"
+
+    def profile_confirm_node(state: ReasoningState) -> dict[str, object]:
+        """HITL interrupt: the profile-change readback + deterministic consent. NO side
+        effects; §4a barge -> re-confirm once; Clock-A TTL FIRST (clear-before-speak).
+        PLAIN classify_consent (nothing here reads 'cancel' as the affirmative)."""
+        pending = state.pending_profile_change
+        assert pending is not None
+        if time.time() - pending.created_at > policy.pending_ttl_seconds:
+            write_event({"event": "profile_expired", "reason": "pending_ttl"})
+            return {
+                "pending_profile_change": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "That change sat for a while, so I haven't updated anything. If "
+                        "you'd still like it, just tell me again."
+                    )
+                ],
+            }
+        answer = interrupt(_profile_readback_line(pending))
+        verdict = classify_consent(str(answer.get("text", "")))
+        if answer.get("readback_interrupted") or verdict == "unclear":
+            noun = "delivery address" if pending.field == "address" else "contact number"
+            retry = interrupt(
+                f"Sorry - just to be clear: update the {noun} on your account to "
+                f"{pending.new_value}? Yes or no?"
+            )
+            verdict = classify_consent(str(retry.get("text", "")))
+            if verdict != "yes":
+                verdict = "human" if verdict == "human" else "no"
+        if verdict == "human":
+            write_event({"event": "profile_change_cancelled", "reason": "human_requested"})
+            return {
+                "pending_profile_change": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human",
+                    reason_code=(
+                        "address_change" if pending.field == "address" else "contact_change"
+                    ),
+                    source="model",
+                ),
+            }
+        if verdict == "no":
+            write_event({"event": "profile_change_cancelled", "reason": "declined"})
+            return {
+                "pending_profile_change": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage("Okay, I'll leave your details as they are - nothing has changed.")
+                ],
+            }
+        return {}  # yes: pending survives; router -> place
+
+    def profile_place_node(state: ReasoningState) -> dict[str, object]:
+        """The EFFECT node (post-interrupt, own node - A10a rule 1). Re-validates the LIVE
+        level FIRST (§A4c — the change must not apply if the L2 grant lapsed between collect
+        and here), then applies via the store's per-intent key (idempotent). Telemetry
+        carries the FIELD SLUG + grant methods only — NEVER the value (PII discipline; the
+        value is spoken to the caller, not persisted to observability)."""
+        pending = state.pending_profile_change
+        assert pending is not None
+        required = profile_change_required_level(pending.field)
+        if verification_store.current_level() < required:
+            write_event({"event": "profile_stepup_failed", "reason": "level_lapsed_at_place"})
+            return {
+                "pending_profile_change": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human", reason_code="verification_required", source="gate"
+                ),
+            }
+        try:
+            record = profile_store.update_profile(
+                pending.idempotency_key, field=pending.field, new_value=pending.new_value
+            )
+        except ProfileError as exc:
+            logger.warning("profile change refused by store: %s", type(exc).__name__)
+            write_event({"event": "profile_change_denied", "reason": "store_refused"})
+            return {
+                "pending_profile_change": None,
+                "active_flow": None,
+                "messages": [
+                    # Outcome only — the handover node's deferral speaks the transfer line.
+                    AIMessage("I wasn't able to update that - nothing has changed.")
+                ],
+                "handover": HandoffRequest(
+                    destination="human",
+                    reason_code=(
+                        "address_change" if pending.field == "address" else "contact_change"
+                    ),
+                    source="gate",
+                ),
+            }
+        write_event(
+            {
+                "event": "profile_change_confirmed",
+                "field": record.field,
+                "verification": [g.get("method") for g in verification_store.grants],
+            }
+        )
+        noun = "delivery address" if record.field == "address" else "contact number"
+        return {
+            "pending_profile_change": None,
+            "active_flow": None,
+            "messages": [
+                AIMessage(f"Done - the {noun} on your account is updated to {record.new_value}.")
+            ],
+        }
+
     def abort_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: explicit abort while support was in flight. The copy names
         what was dropped (the REQUEST) and what wasn't touched (orders) — "I've dropped
@@ -729,6 +1276,8 @@ def build_support_nodes(
         return {
             "pending_refund": None,
             "pending_cancel": None,
+            "pending_return": None,
+            "pending_profile_change": None,
             "active_flow": None,
             "messages": [
                 AIMessage(
@@ -743,6 +1292,8 @@ def build_support_nodes(
         return {
             "pending_refund": None,
             "pending_cancel": None,
+            "pending_return": None,
+            "pending_profile_change": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
@@ -750,20 +1301,13 @@ def build_support_nodes(
     def route_after_guardrail(state: ReasoningState) -> str:
         if state.pending_cancel is not None:
             return "cancel"  # remedy steer: full money-back on an unshipped order is a void
+        if state.pending_return is not None:
+            return "return"  # return-first steer: the refund converted into a return
         pending = state.pending_refund
         if pending is None:
             return "declined"  # over-amount/cancelled: the node spoke its own line + ends
         required = refund_required_level(pending.amount_usd, pending.destination)
         return "confirm" if verification_store.current_level() >= required else "stepup"
-
-    def route_after_collect(state: ReasoningState) -> str:
-        if state.handover is not None:
-            return "handover"  # attempts exhausted -> human
-        pending = state.pending_refund
-        assert pending is not None  # collect clears only via handover
-        required = refund_required_level(pending.amount_usd, pending.destination)
-        # Level raised to the requirement -> proceed; otherwise a re-collect was requested.
-        return "confirm" if verification_store.current_level() >= required else "dispatch"
 
     def route_after_assemble(state: ReasoningState) -> str:
         # Which effect did assemble mint? (a valid proposal sets exactly one pending.)
@@ -771,6 +1315,10 @@ def build_support_nodes(
             return "leave"  # model left / two invalid proposals -> normal pipeline answers
         if state.pending_cancel is not None:
             return "cancel"
+        if state.pending_return is not None:
+            return "return"
+        if state.pending_profile_change is not None:
+            return "profile"
         if state.pending_refund is not None:
             return "refund"
         return "clarify"  # a clarifying question was streamed; end the turn in-flow
@@ -786,12 +1334,21 @@ def build_support_nodes(
             return "declined"  # ineligible: the node spoke + ended
         return "confirm"
 
+    def route_after_return_guardrail(state: ReasoningState) -> str:
+        # "cancel" (unshipped steer minted a PendingCancel) | "declined" (guardrail spoke
+        # its own line + ends) | "confirm" (eligible: pending survives -> the readback).
+        if state.pending_cancel is not None:
+            return "cancel"
+        if state.pending_return is None:
+            return "declined"
+        return "confirm"
+
     return SupportNodes(
         assemble=assemble_node,
         guardrail=guardrail_node,
-        risk_check=risk_check_node,
-        dispatch=dispatch_node,
-        collect=collect_node,
+        risk_check=refund_stepup.risk_check,
+        dispatch=refund_stepup.dispatch,
+        collect=refund_stepup.collect,
         confirm=confirm_node,
         place=place_node,
         cancel_guardrail=cancel_guardrail_node,
@@ -801,8 +1358,20 @@ def build_support_nodes(
         escape_human=escape_human_node,
         route_after_assemble=route_after_assemble,
         route_after_guardrail=route_after_guardrail,
-        route_after_collect=route_after_collect,
+        route_after_collect=refund_stepup.route_after_collect,
         route_after_cancel_guardrail=route_after_cancel_guardrail,
+        return_guardrail=return_guardrail_node,
+        return_confirm=return_confirm_node,
+        return_place=return_place_node,
+        route_after_return_guardrail=route_after_return_guardrail,
+        profile_guardrail=profile_guardrail_node,
+        profile_risk_check=profile_stepup.risk_check,
+        profile_dispatch=profile_stepup.dispatch,
+        profile_collect=profile_stepup.collect,
+        profile_confirm=profile_confirm_node,
+        profile_place=profile_place_node,
+        route_after_profile_guardrail=route_after_profile_guardrail,
+        route_after_profile_collect=profile_stepup.route_after_collect,
         speakable_nodes=frozenset(
             {
                 "support_guardrail",  # authors the over-amount-threshold decline line
@@ -813,6 +1382,13 @@ def build_support_nodes(
                 "support_cancel_guardrail",  # authors the shipped/ineligible decline line
                 "support_cancel_confirm",
                 "support_cancel_void",
+                "support_return_guardrail",  # authors the ineligible-return decline lines
+                "support_return_confirm",
+                "support_return_place",
+                "support_profile_risk_check",
+                "support_profile_collect",
+                "support_profile_confirm",
+                "support_profile_place",
                 "support_abort",
             }
         ),

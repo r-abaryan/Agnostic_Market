@@ -20,6 +20,7 @@ def _base() -> dict:
                 "refund_require_human_ceiling_usd": 500,
                 "pending_confirmation_ttl_max_seconds": 300,
                 "refund_returnless_ceiling_usd": 100,
+                "return_window_max_days": 90,
             },
         },
         "schema_version": "0.2",
@@ -161,6 +162,19 @@ def test_returnless_window_within_ceiling_is_accepted() -> None:
     ok["policies"] = {"refunds": {"returnless_under_usd": 75}}  # <= 100
     config = resolve_merchant_config(_base(), _template(), ok)
     assert config.policies.refunds.returnless_under_usd == 75
+
+
+def test_return_window_over_platform_ceiling_is_rejected() -> None:
+    bad = _override()
+    bad["policies"] = {"returns": {"window_days": 365}}  # ceiling is 90
+    with pytest.raises(PolicyBoundsViolationError, match="window_days"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_return_window_defaults_when_merchant_sets_none() -> None:
+    # No merchant/template `returns` block -> the platform default (30), still bounded.
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.policies.returns.window_days == 30
 
 
 def test_pending_ttl_within_max_resolves() -> None:

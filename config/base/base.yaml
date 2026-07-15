@@ -22,11 +22,14 @@ _platform:
     out_of_band_only: true
   egress:
     default_deny: true
+  # Mirrors CRITICAL_CONFIRMATION_FIELDS in dtos/confirmation.py — THE CODE SET IS THE
+  # AUTHORITY (this list is declared posture only; nothing reads it). Kept in sync so the
+  # locked platform posture documents what the code enforces.
   critical_confirmation_fields:
     - quantity
+    - line_items
     - total_amount
     - order_id
-    - return_id
     - new_address
     - new_payment_instrument_ref
     - new_contact
@@ -39,6 +42,7 @@ _platform:
     refund_require_human_ceiling_usd: 500       # a refund above this ALWAYS needs a human
     pending_confirmation_ttl_max_seconds: 300    # max caller-silence before a pending expires
     refund_returnless_ceiling_usd: 100          # above this, a shipped refund is ALWAYS return-first
+    return_window_max_days: 90                  # widest return window a merchant may offer
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"

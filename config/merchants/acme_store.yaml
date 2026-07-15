@@ -22,14 +22,17 @@ policies:
     auto_approve_under_usd: 50
     require_human_above_usd: 200
     returnless_under_usd: 50    # small shipped refunds skip the return; larger = return-first
+  returns:
+    window_days: 30             # eligibility from DELIVERY; bounded by the platform ceiling
   allow_ai_merchant_handoff: true
-  # Free-text policy facts with NO enforcing field ONLY (timeline, return window). The
-  # enforced sentences — the $50 returnless threshold, the $200 human-review line — are
-  # DERIVED from the values above (agents/spoken_policy.py), so they are NOT retyped here:
-  # restating a number would let it drift from what the guardrail enforces.
+  # Free-text policy facts with NO enforcing field ONLY (timeline, condition clauses). The
+  # enforced sentences — the $50 returnless threshold, the 30-day return window, the $200
+  # human-review line — are DERIVED from the values above (agents/spoken_policy.py), so they
+  # are NOT retyped here: restating a number would let it drift from what the guardrail
+  # enforces. (The "30 days" prose moved out when Group C made the window enforced.)
   spoken_facts_extra: >-
     Refunds go back to the original payment method and typically appear within 5 to 7
-    business days. Returns are accepted within 30 days of delivery in original condition.
+    business days. Returned items must be in their original condition.
 
 prompts:
   # Content-addressed, registry-resolved (Phase 3) — not a mutable path.

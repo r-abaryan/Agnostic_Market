@@ -10,7 +10,7 @@ from llm_fakes import FakeChatModel
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
@@ -23,7 +23,10 @@ _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"quer
 
 
 def _tools(store: OrderStore) -> list:
-    return [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, CartStore())]
+    return [
+        wrap_readonly_tool(t, "acme_store")
+        for t in build_voice_tools(store, CartStore(), LastOrderPointer())
+    ]
 
 
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
@@ -32,6 +35,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         fake,
         _tools(store),
         display_name="Acme Store",
+        tenant_id="acme_store",
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
@@ -41,6 +45,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
             refund_auto_approve_under_usd=50.0,
             refund_require_human_above_usd=200.0,
             refund_returnless_under_usd=50.0,
+            return_window_days=30,
             pending_ttl_seconds=120.0,
         ),
         **kwargs,
@@ -78,7 +83,7 @@ async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
     # Group A: cancel_order is now a BUILT support capability, so a cancel_order handover
     # ENTERS the support flow (it no longer defers — that was the 3c-only behavior). The
     # support assemble model runs and proposes the cancel; the flow reaches its readback
-    # interrupt. (address/payment change still defer — only refund + cancel_order enter.)
+    # interrupt. (Group C: address/contact change enter too; only payment_change defers.)
     reasoning = FakeChatModel(
         force_tool="propose_cancel", canned_args={"propose_cancel": {"order_key": "2"}},
         tool_call_limit=1,
@@ -88,6 +93,40 @@ async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
     assert out.get("active_flow") == "support"  # ENTERED the flow (paused at the readback)
     assert reasoning._tool_calls_made == 1  # the support model ran and proposed a cancel
     assert out.get("pending_cancel") is not None  # a cancel is staged, awaiting confirmation
+
+
+async def test_address_change_enters_the_support_flow(config_root: Path) -> None:
+    # Group C: address_change flipped from defer -> enter (the profile flow is built).
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {"destination": "support", "reason_code": "address_change"}
+        },
+        tool_call_limit=1,
+    )
+    reasoning = FakeChatModel(emit_tool_calls=False)  # support clarifies; stays in flow
+    graph = _graph(config_root, frontline, reasoning_model=reasoning)
+    out = await graph.ainvoke({"messages": [HumanMessage("I need to update my address")]})
+    assert out.get("active_flow") == "support"  # ENTERED (no deferral line)
+    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
+    assert not any("support team" in t for t in texts)  # the old deferral is gone
+
+
+async def test_payment_change_still_defers(config_root: Path) -> None:
+    # Phase 5 boundary pin: payment_change must NOT enter (its flow doesn't exist — entering
+    # would bounce off the assemble and double-speak). The honest deferral speaks once.
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {"destination": "support", "reason_code": "payment_change"}
+        },
+        tool_call_limit=1,
+    )
+    graph = _graph(config_root, frontline)
+    out = await graph.ainvoke({"messages": [HumanMessage("put my new card on the account")]})
+    assert out.get("active_flow") is None
+    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
+    assert sum("support team" in t for t in texts) == 1  # exactly one deferral line
 
 
 async def test_read_only_turn_answers_without_handover(config_root: Path) -> None:
@@ -222,6 +261,7 @@ def _policy(**over) -> PolicyContext:
         "refund_auto_approve_under_usd": 50.0,
         "refund_require_human_above_usd": 200.0,
         "refund_returnless_under_usd": 50.0,
+        "return_window_days": 30,
         "pending_ttl_seconds": 120.0,
         "spoken_policy_extra": "Refunds take 5 to 7 business days.",
     }
@@ -249,6 +289,9 @@ def test_spoken_policy_tracks_the_enforced_value_no_drift() -> None:
     # returnless 0 => return-first for every shipped refund (no dollar threshold spoken).
     zero = compose_spoken_policy(_policy(refund_returnless_under_usd=0.0))
     assert "issued once the return is arranged" in zero
+    # The return window (Group C: enforced by the returns guardrail) is derived the same way.
+    assert "within 30 days of delivery" in compose_spoken_policy(_policy(return_window_days=30))
+    assert "within 60 days of delivery" in compose_spoken_policy(_policy(return_window_days=60))
 
 
 def test_prompt_speaks_derived_policy_even_without_free_text() -> None:

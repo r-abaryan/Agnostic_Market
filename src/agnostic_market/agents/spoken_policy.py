@@ -7,9 +7,11 @@ enforced values have one source of truth (the typed PolicyContext the guardrail 
 the spoken sentence about them is generated FROM those values here — change the number, the
 sentence changes, they cannot contradict.
 
-Free-text facts with NO enforcing field (refund timeline "5-7 business days", return window
-"30 days") have nothing to drift against; those stay merchant-authored prose in
-`policies.spoken_facts_extra` and are appended after the derived sentences.
+Free-text facts with NO enforcing field (refund timeline "5-7 business days", "items must
+be in original condition") have nothing to drift against; those stay merchant-authored
+prose in `policies.spoken_facts_extra` and are appended after the derived sentences. The
+return WINDOW moved from prose to a derived sentence when Group C made it enforced
+(`returns.window_days` gates eligibility in the returns guardrail).
 """
 
 from __future__ import annotations
@@ -42,10 +44,20 @@ def _human_review_sentence(policy: PolicyContext) -> str:
     )
 
 
+def _return_window_sentence(policy: PolicyContext) -> str:
+    """The return-eligibility window, from `return_window_days` (the same value the returns
+    guardrail enforces — one source, no drift)."""
+    return f"Returns are accepted within {policy.return_window_days} days of delivery."
+
+
 def compose_spoken_policy(policy: PolicyContext) -> str:
     """The spoken policy summary: DERIVED enforced-value sentences + the merchant's free-text
     extras. Always non-empty (the derived sentences exist for every merchant)."""
-    parts = [_returnless_sentence(policy), _human_review_sentence(policy)]
+    parts = [
+        _returnless_sentence(policy),
+        _return_window_sentence(policy),
+        _human_review_sentence(policy),
+    ]
     if policy.spoken_policy_extra:
         parts.append(policy.spoken_policy_extra.strip())
     return " ".join(parts)

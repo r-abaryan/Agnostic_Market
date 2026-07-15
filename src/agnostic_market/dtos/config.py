@@ -15,9 +15,12 @@ Strictness (Phase-0 plan, YAML-footgun defense):
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
+
+if TYPE_CHECKING:
+    from agnostic_market.dtos.state import PolicyContext
 
 # Reusable strict base: forbid unknown keys, validate on assignment.
 _STRICT = ConfigDict(extra="forbid", validate_assignment=True)
@@ -90,6 +93,19 @@ class RefundPolicy(BaseModel):
     returnless_under_usd: float = Field(ge=0, default=0.0)
 
 
+class ReturnsPolicy(BaseModel):
+    """Return-eligibility policy; merchant-set within platform bounds (Group C).
+
+    `window_days` counts from DELIVERY (a shipped-not-yet-delivered order is always in
+    window). It is ENFORCED by the returns guardrail, so its spoken sentence is DERIVED
+    from this value (agents/spoken_policy.py) — never restated in `spoken_facts_extra`.
+    Bounded by `_platform.limits.return_window_max_days` in the resolver."""
+
+    model_config = _STRICT
+
+    window_days: int = Field(ge=1, default=30)
+
+
 # Default caller-silence window before a paused confirmation (checkout/refund/cancel) expires
 # — a synchronous voice call, so short. Merchant may tune it within the platform max
 # (_platform.limits.pending_confirmation_ttl_max_seconds, resolver-enforced).
@@ -103,6 +119,8 @@ class PolicyConfig(BaseModel):
 
     max_order_value_usd: float = Field(ge=0)
     refunds: RefundPolicy
+    # Defaults so existing merchant YAMLs (which don't set it) get the platform default.
+    returns: ReturnsPolicy = Field(default_factory=ReturnsPolicy)
     allow_ai_merchant_handoff: StrictBool
     # Optional: merchant-tunable within the platform max. Defaults so existing merchant YAMLs
     # (which don't set it) keep the platform default; the resolver clamps the ceiling.
@@ -110,12 +128,32 @@ class PolicyConfig(BaseModel):
         default=_DEFAULT_PENDING_TTL_SECONDS, gt=0
     )
     # Optional merchant free-text policy facts that have NO enforcing field — refund
-    # TIMELINE ("5-7 business days"), return WINDOW ("30 days in original condition"). The
-    # ENFORCED policy sentences (returnless threshold, human-review line) are DERIVED from
-    # the typed values in agents/spoken_policy.py, never retyped here (drift guard). Keep
-    # this to facts nothing else in the config represents; absent => only the derived
-    # sentences are spoken. NEVER restate an enforced number here — it would drift.
+    # TIMELINE ("5-7 business days"), condition clauses ("original condition"). The
+    # ENFORCED policy sentences (returnless threshold, return window, human-review line)
+    # are DERIVED from the typed values in agents/spoken_policy.py, never retyped here
+    # (drift guard). Keep this to facts nothing else in the config represents; absent =>
+    # only the derived sentences are spoken. NEVER restate an enforced number here.
     spoken_facts_extra: str | None = None
+
+    def to_policy_context(self) -> PolicyContext:
+        """The ONE config->runtime mapping (Group C consolidation): every PolicyContext a
+        production path builds comes through here, so a new policy field is added in exactly
+        one place — the previous per-site field lists (pipeline + tenancy) drifted one field
+        at a time."""
+        # Local import: state.py pulls in langchain/langgraph; keeping it deferred lets the
+        # config layer (resolver/registry) stay importable without the LLM stack. Not a cycle.
+        from agnostic_market.dtos.state import PolicyContext
+
+        return PolicyContext(
+            max_order_value_usd=self.max_order_value_usd,
+            allow_ai_merchant_handoff=self.allow_ai_merchant_handoff,
+            refund_auto_approve_under_usd=self.refunds.auto_approve_under_usd,
+            refund_require_human_above_usd=self.refunds.require_human_above_usd,
+            refund_returnless_under_usd=self.refunds.returnless_under_usd,
+            return_window_days=self.returns.window_days,
+            pending_ttl_seconds=self.pending_confirmation_ttl_seconds,
+            spoken_policy_extra=self.spoken_facts_extra,
+        )
 
 
 class ComplianceConfig(BaseModel):

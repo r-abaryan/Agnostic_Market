@@ -8,7 +8,7 @@ import pytest
 from langchain_core.tools import BaseTool
 
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.voice.tools import build_voice_tools
 
@@ -18,7 +18,10 @@ def _store(config_root: Path) -> OrderStore:
 
 
 def _tools_by_name(config_root: Path, cart: CartStore | None = None) -> dict[str, BaseTool]:
-    return {t.name: t for t in build_voice_tools(_store(config_root), cart or CartStore())}
+    return {
+        t.name: t
+        for t in build_voice_tools(_store(config_root), cart or CartStore(), LastOrderPointer())
+    }
 
 
 def test_fixture_loads_and_validates(config_root: Path) -> None:
@@ -40,6 +43,19 @@ def test_order_status_is_case_insensitive_on_id(config_root: Path) -> None:
 def test_unknown_order_is_a_spoken_not_found_not_an_exception(config_root: Path) -> None:
     result = _tools_by_name(config_root)["order_status"].invoke({"order_id": "ORD-9999"})
     assert "No order found" in result
+
+
+def test_order_status_sets_the_pointer_only_on_a_found_order(config_root: Path) -> None:
+    # Group C L4: a FOUND read becomes "the order most recently discussed"; a miss must not
+    # hijack later "that order" references.
+    pointer = LastOrderPointer()
+    tools = {
+        t.name: t for t in build_voice_tools(_store(config_root), CartStore(), pointer)
+    }
+    tools["order_status"].invoke({"order_id": "ord-9999"})
+    assert pointer.get() is None  # not found -> untouched
+    tools["order_status"].invoke({"order_id": " ord-1001 "})
+    assert pointer.get() == "ORD-1001"  # found -> set, normalized
 
 
 def test_catalog_search_matches_and_misses(config_root: Path) -> None:

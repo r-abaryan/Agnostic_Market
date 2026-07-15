@@ -14,14 +14,12 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from llm_fakes import FakeChatModel
+from support_helpers import build_support_engine
 
-from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
-from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.support import flow as support_flow
-from agnostic_market.agents.tooling import wrap_readonly_tool
-from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.orders import OrderStore
+from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import (
     InterruptEvent,
     SpokenMessageEvent,
@@ -29,7 +27,6 @@ from agnostic_market.dtos.events import (
     TurnFacts,
 )
 from agnostic_market.dtos.state import PolicyContext
-from agnostic_market.voice.tools import build_voice_tools
 
 _POLICY = PolicyContext(
     max_order_value_usd=500.0,
@@ -40,6 +37,7 @@ _POLICY = PolicyContext(
     # SHIPPED ORD-1001 and must exercise those gates in isolation; the return-first tests
     # tighten this via model_copy.
     refund_returnless_under_usd=500.0,
+    return_window_days=30,
     pending_ttl_seconds=120.0,
 )
 _FACTS = TurnFacts()
@@ -59,24 +57,17 @@ def _engine(
     policy: PolicyContext = _POLICY,
     thread_id: str = "support-1",
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    tools = [wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, CartStore())]
-    otp = OtpProvider()
-    verification = VerificationStore(otp)
-    graph = build_frontline_graph(
-        FakeChatModel(emit_tool_calls=False),
-        tools,
-        display_name="Acme Store",
-        reasoning_model=reasoning
-        or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
-        store=store,
+    """Thin wrapper over the shared harness (support_helpers) preserving this file's
+    4-tuple unpacking + its propose_refund default."""
+    harness = build_support_engine(
+        config_root,
         policy=policy,
-        verification_store=verification,
-        otp=otp,
-        risk=RiskProvider(flagged=risk_flagged),
-        checkpointer=build_checkpointer(),
+        reasoning=reasoning
+        or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
+        risk_flagged=risk_flagged,
+        thread_id=thread_id,
     )
-    return ReasoningEngine(graph, thread_id=thread_id), store, verification, otp
+    return harness.engine, harness.store, harness.verification, harness.otp
 
 
 async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS) -> list:
@@ -530,10 +521,11 @@ async def test_cancelled_order_cancel_request_says_nothing_more_to_do(config_roo
 
 # --- return-first: a refund on a SHIPPED/DELIVERED order above the merchant's returnless
 # ---  window waits for the return (2026-07-10 live: $179.98 paid out on shipped shoes with
-# ---  no return created — money back AND goods kept) --------------------------------------
+# ---  no return created — money back AND goods kept). Group C: the terminal decline became
+# ---  a STEER into the returns sub-path (the refund converts into an arranged return). ----
 
 
-async def test_shipped_refund_over_returnless_window_requires_return_first(
+async def test_shipped_refund_over_returnless_window_steers_into_a_return(
     config_root: Path,
 ) -> None:
     tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 50.0})
@@ -541,10 +533,23 @@ async def test_shipped_refund_over_returnless_window_requires_return_first(
         config_root, 150.0, "original", thread_id="ret-1", policy=tight
     )
     events = await _events(engine, "I want a refund to my original card")
-    assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback, no payout
-    assert store.refund_count == 0
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any("once the return is set up" in e.text for e in spoken)
+    assert any("once the return is set up" in e.text for e in spoken)  # the steer line
+    # The steer pauses at the RETURN readback — order named, refund amount stated, original
+    # payment method promised (v1 destination constant), no money moved yet.
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "ORD-1001" in interrupts[0].prompt
+    assert "$150.00" in interrupts[0].prompt
+    assert "original payment method" in interrupts[0].prompt
+    assert store.refund_count == 0
+    assert store.return_count == 0
+    # Committed yes -> ONE return created, refund still zero (it releases at Phase 4).
+    done = await _events(engine, "yes")
+    assert store.return_count == 1
+    assert store.refund_count == 0
+    spoken = [e for e in done if isinstance(e, SpokenMessageEvent)]
+    assert any("RMA-3001" in e.text and e.node == "support_return_place" for e in spoken)
 
 
 async def test_shipped_refund_within_returnless_window_pays_out(config_root: Path) -> None:
@@ -595,7 +600,12 @@ async def test_shipped_refund_between_returnless_and_human_lines_is_return_first
     assert store.refund_count == 0
 
 
-async def test_delivered_order_is_return_first_too(config_root: Path) -> None:
+async def test_delivered_order_is_return_first_too(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ORD-1003 was DELIVERED 2026-07-01 (fixture): freeze the flow clock a few days after
+    # delivery so the window check is deterministic (fixture dates age against wall clock).
+    monkeypatch.setattr(support_flow.time, "time", lambda: 1783641600.0)  # 2026-07-10 UTC
     tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 10.0})
     engine, store, _, _ = _engine(
         config_root,
@@ -612,7 +622,7 @@ async def test_delivered_order_is_return_first_too(config_root: Path) -> None:
     events = await _events(engine, "I want a refund for my socks order")  # ORD-1003, delivered
     assert store.refund_count == 0
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any("once the return is set up" in e.text for e in spoken)
+    assert any("once the return is set up" in e.text for e in spoken)  # steered, in window
 
 
 # --- cancel-consent polarity (2026-07-10 live: "yeah cancel it" hit the ABORT escape,

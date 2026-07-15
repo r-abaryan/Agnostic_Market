@@ -88,7 +88,7 @@ def test_refund_is_idempotent_per_intent_key(config_root: Path) -> None:
     store = _store(config_root)
     r1 = store.issue_refund("i1", order_id="ORD-1002", amount_usd=50.0, destination="original")
     r2 = store.issue_refund("i1", order_id="ORD-1002", amount_usd=50.0, destination="original")
-    assert r1.return_id == r2.return_id  # a replay returns the SAME refund
+    assert r1.refund_id == r2.refund_id  # a replay returns the SAME refund
     assert store.refund_count == 1
 
 

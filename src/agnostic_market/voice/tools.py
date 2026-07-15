@@ -15,13 +15,16 @@ from __future__ import annotations
 from langchain_core.tools import BaseTool, tool
 
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, speak_lines
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, speak_lines
 
 
-def build_voice_tools(store: OrderStore, cart: CartStore) -> list[BaseTool]:
-    """The read-only tool set, closing over the session's order + cart stores. `cart` is the
-    SAME instance the cart flow mutates (pass one instance to both this and the graph, or the
-    frontline answers 'what's in my cart' from a different cart — split-brain)."""
+def build_voice_tools(
+    store: OrderStore, cart: CartStore, pointer: LastOrderPointer
+) -> list[BaseTool]:
+    """The read-only tool set, closing over the session's order + cart stores. `cart` and
+    `pointer` are the SAME instances the flows mutate (pass one instance to both this and
+    the graph, or the frontline reads different session state than the flows write —
+    split-brain)."""
 
     @tool
     def order_status(order_id: str) -> str:
@@ -31,6 +34,9 @@ def build_voice_tools(store: OrderStore, cart: CartStore) -> list[BaseTool]:
             return (
                 f"No order found with id {order_id!r}. Ask the caller to double-check the order id."
             )
+        # A FOUND order becomes "the order most recently discussed" (Group C L4) — set
+        # only on success, so a mis-heard id can't hijack later "that order" references.
+        pointer.set(order_id)
         return summary
 
     @tool

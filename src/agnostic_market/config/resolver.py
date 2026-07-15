@@ -135,6 +135,14 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
             f"{ttl_max} - the confirmation window may be shortened, never made unbounded"
         )
 
+    window = policies.get("returns", {}).get("window_days")
+    window_max = limits.get("return_window_max_days")
+    if window is not None and window_max is not None and window > window_max:
+        raise PolicyBoundsViolationError(
+            f"policies.returns.window_days={window} exceeds the platform ceiling "
+            f"{window_max} - the return window may be widened only up to the platform bound"
+        )
+
 
 def resolve_merchant_config(
     base: dict[str, Any],

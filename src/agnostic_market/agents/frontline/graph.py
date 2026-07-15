@@ -49,12 +49,13 @@ from langgraph.types import Command
 
 from agnostic_market.agents._consent import is_abort, is_support_abort, wants_human
 from agnostic_market.agents.cart import build_cart_nodes
-from agnostic_market.agents.frontline.prompt import compose_system_prompt
+from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import gate_check
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore
+from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import (
     ActiveFlow,
@@ -151,6 +152,7 @@ def build_frontline_graph(
     read_only_tools: Sequence[BaseTool],
     *,
     display_name: str,
+    tenant_id: str,
     reasoning_model: BaseChatModel,
     store: OrderStore,
     policy: PolicyContext,
@@ -158,6 +160,8 @@ def build_frontline_graph(
     verification_store: VerificationStore | None = None,
     otp: OtpProvider | None = None,
     risk: RiskProvider | None = None,
+    profile_store: ProfileStore | None = None,
+    pointer: LastOrderPointer | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
@@ -180,6 +184,11 @@ def build_frontline_graph(
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
     cart_store = cart_store or CartStore()
+    profile_store = profile_store or ProfileStore()  # default fake fixture (test/eval seam)
+    # Session "that order" pointer (Group C L4). Production + any pointer test MUST pass the
+    # SAME instance given to build_voice_tools (the order_status set-site) — the default
+    # exists only for callers that never resolve an order reference (split-brain otherwise).
+    pointer = pointer or LastOrderPointer()
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
@@ -221,7 +230,12 @@ def build_frontline_graph(
 
     def model_node(state: ReasoningState) -> dict[str, object]:
         # Prompt lives inside the graph (single source; eval == production).
-        messages = [SystemMessage(system_prompt), *state.messages]
+        prompt_text = system_prompt
+        if (last_order := pointer.get()) is not None:
+            # Per-turn suffix (the static prompt stays composed once): "that order"
+            # resolves to the session pointer (Group C L4) — a reference, never state.
+            prompt_text = f"{system_prompt}\n{resolved_order_line(last_order)}"
+        messages = [SystemMessage(prompt_text), *state.messages]
         response = model_with_tools.invoke(messages)
         return {"messages": [response]}
 
@@ -263,6 +277,25 @@ def build_frontline_graph(
                 "reason_code": handover.reason_code,
             }
         )
+        if handover.destination == "human":
+            # The warm-transfer CONTEXT PACKAGE (Group C on-ramp; real SIP transfer =
+            # Phase 5, which consumes this across a service boundary — hence the schema
+            # version). Closed slugs only, NEVER free text or a caller value (PII): the
+            # reason_code names the caller's actual intent (a profile step-up exit writes
+            # address_change/contact_change, not a generic slug). One choke point — every
+            # human path (escapes, consent "human" verdicts, risk flags, store refusals)
+            # already converges on this node.
+            write_event(
+                {
+                    "event": "human_onramp",
+                    "schema_version": 1,
+                    "tenant": tenant_id,
+                    "verification_level": verification_store.current_level(),
+                    "active_flow": state.active_flow,
+                    "reason_code": handover.reason_code,
+                    "source": handover.source,
+                }
+            )
         # A cart/support handover ENTERS the flow (3b/3c/Group B) instead of speaking a
         # deferral: set the sticky flow marker, clear the handover signal, and let routing
         # carry us into the flow's assemble in this same turn. EXCEPT when that flow was
@@ -271,13 +304,15 @@ def build_frontline_graph(
         # the CART flow — the single-line checkout flow it replaces is gone.
         if handover.destination == "checkout" and state.active_flow != "left_cart":
             return {"active_flow": "cart", "handover": None}
-        # Support handles REFUND and CANCEL_ORDER (Group A). Other support-destined reason
-        # codes (address/payment change) are still 3c-follow-up breadth — they must NOT enter
-        # the flow (it would run the reasoning model, fail to propose, bail to left_support,
-        # re-trip the gate and double-speak). They defer honestly until their flow is built.
+        # Support handles REFUND, CANCEL_ORDER (Group A), and profile changes — address +
+        # contact (Group C; contact = the OTP factor itself, stepped-up on the OLD factor).
+        # PAYMENT_CHANGE stays deferred (payments = Phase 5): entering would run the
+        # reasoning model, fail to propose, bail to left_support, re-trip the gate and
+        # double-speak — the honest deferral is correct until its flow exists.
         if (
             handover.destination == "support"
-            and handover.reason_code in ("refund", "cancel_order")
+            and handover.reason_code
+            in ("refund", "cancel_order", "address_change", "contact_change")
             and state.active_flow != "left_support"
         ):
             return {"active_flow": "support", "handover": None}
@@ -325,6 +360,8 @@ def build_frontline_graph(
             "pending_placement": None,
             "pending_refund": None,
             "pending_cancel": None,
+            "pending_return": None,
+            "pending_profile_change": None,
             "pending_ack": None,
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
@@ -400,20 +437,30 @@ def build_frontline_graph(
         return END  # declined / expired (node spoke its line, clear-before-speak)
 
     cart = build_cart_nodes(
-        reasoning_model, store, cart_store, policy, display_name=display_name
+        reasoning_model, store, cart_store, policy, pointer, display_name=display_name
     )
     support = build_support_nodes(
-        reasoning_model, store, verification_store, otp, risk, policy, display_name=display_name
+        reasoning_model,
+        store,
+        verification_store,
+        otp,
+        risk,
+        policy,
+        profile_store,
+        pointer,
+        display_name=display_name,
     )
 
     # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
     #     the flow, closed over the store — support.route_after_* ) ---
     def route_after_support_assemble(state: ReasoningState) -> str:
-        # refund | cancel | leave | clarify — the flow decides from which pending was minted.
+        # refund | cancel | return | profile | leave | clarify — from the minted pending.
         decision = support.route_after_assemble(state)
         return {
             "refund": "support_guardrail",
             "cancel": "support_cancel_guardrail",
+            "return": "support_return_guardrail",
+            "profile": "support_profile_guardrail",
             "leave": "gate",  # model left; normal pipeline answers this same turn
             "clarify": END,  # a clarifying question was streamed already
         }[decision]
@@ -439,15 +486,68 @@ def build_frontline_graph(
 
     def route_support_guardrail(state: ReasoningState) -> str:
         # "confirm" (level ok) | "stepup" (-> risk_check) | "declined" (over amount /
-        # cancelled: guardrail spoke its line + ends) | "cancel" (remedy steer: full
-        # money-back on an unshipped order converted to the cancel path).
+        # cancelled / open return: guardrail spoke its line + ends) | "cancel" (remedy
+        # steer) | "return" (return-first steer, Group C).
         decision = support.route_after_guardrail(state)
         return {
             "confirm": "support_confirm",
             "stepup": "support_risk_check",
             "declined": END,
             "cancel": "support_cancel_guardrail",
+            "return": "support_return_guardrail",
         }[decision]
+
+    def route_after_support_return_guardrail(state: ReasoningState) -> str:
+        # confirm (eligible) | cancel (unshipped steer) | declined (guardrail spoke + ends).
+        return {
+            "confirm": "support_return_confirm",
+            "cancel": "support_cancel_guardrail",
+            "declined": END,
+        }[support.route_after_return_guardrail(state)]
+
+    def route_after_support_return_confirm(state: ReasoningState) -> str:
+        if state.handover is not None:
+            return "handover"  # caller asked for a person at the readback
+        if state.pending_return is not None:
+            return "support_return_place"  # committed yes
+        return END  # declined/expired (node spoke its line, clear-before-speak)
+
+    def route_after_support_return_place(state: ReasoningState) -> str:
+        # place may hand to a human on a store refusal; else it spoke its outcome + ends.
+        return "handover" if state.handover is not None else END
+
+    def route_after_support_profile_guardrail(state: ReasoningState) -> str:
+        # "confirm" (already L2) | "stepup" (OTP on the OLD factor) — flow-owned decision
+        # (the LIVE level lives in the store, which graph.py can't see).
+        return {
+            "confirm": "support_profile_confirm",
+            "stepup": "support_profile_risk_check",
+        }[support.route_after_profile_guardrail(state)]
+
+    def route_after_support_profile_risk(state: ReasoningState) -> str:
+        # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
+        return "handover" if state.handover is not None else "support_profile_dispatch"
+
+    def route_after_support_profile_collect(state: ReasoningState) -> str:
+        # The factory's decision ("confirm" | "dispatch" | "handover") mapped to THIS
+        # family's nodes — the confirm target is per-family (R5), never shared.
+        decision = support.route_after_profile_collect(state)
+        return {
+            "confirm": "support_profile_confirm",
+            "dispatch": "support_profile_dispatch",
+            "handover": "handover",
+        }[decision]
+
+    def route_after_support_profile_confirm(state: ReasoningState) -> str:
+        if state.handover is not None:
+            return "handover"  # caller asked for a person at the readback
+        if state.pending_profile_change is not None:
+            return "support_profile_place"  # committed yes
+        return END  # declined/expired (node spoke its line, clear-before-speak)
+
+    def route_after_support_profile_place(state: ReasoningState) -> str:
+        # place may hand to a human on a lapsed level / store refusal; else it spoke + ends.
+        return "handover" if state.handover is not None else END
 
     def route_after_support_risk(state: ReasoningState) -> str:
         # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
@@ -497,6 +597,15 @@ def build_frontline_graph(
     graph.add_node("support_cancel_guardrail", support.cancel_guardrail)
     graph.add_node("support_cancel_confirm", support.cancel_confirm)
     graph.add_node("support_cancel_void", support.cancel_void)
+    graph.add_node("support_return_guardrail", support.return_guardrail)
+    graph.add_node("support_return_confirm", support.return_confirm)
+    graph.add_node("support_return_place", support.return_place)
+    graph.add_node("support_profile_guardrail", support.profile_guardrail)
+    graph.add_node("support_profile_risk_check", support.profile_risk_check)
+    graph.add_node("support_profile_dispatch", support.profile_dispatch)
+    graph.add_node("support_profile_collect", support.profile_collect)
+    graph.add_node("support_profile_confirm", support.profile_confirm)
+    graph.add_node("support_profile_place", support.profile_place)
     graph.add_node("support_abort", support.abort)
     graph.add_node("support_escape_human", support.escape_human)
 
@@ -566,6 +675,8 @@ def build_frontline_graph(
             "gate": "gate",
             "support_guardrail": "support_guardrail",
             "support_cancel_guardrail": "support_cancel_guardrail",
+            "support_return_guardrail": "support_return_guardrail",
+            "support_profile_guardrail": "support_profile_guardrail",
             END: END,
         },
     )
@@ -576,6 +687,7 @@ def build_frontline_graph(
             "support_confirm": "support_confirm",
             "support_risk_check": "support_risk_check",
             "support_cancel_guardrail": "support_cancel_guardrail",
+            "support_return_guardrail": "support_return_guardrail",
             END: END,
         },
     )
@@ -617,6 +729,58 @@ def build_frontline_graph(
     graph.add_conditional_edges(
         "support_cancel_void",
         route_after_support_cancel_void,
+        {"handover": "handover", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_return_guardrail",
+        route_after_support_return_guardrail,
+        {
+            "support_return_confirm": "support_return_confirm",
+            "support_cancel_guardrail": "support_cancel_guardrail",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "support_return_confirm",
+        route_after_support_return_confirm,
+        {"handover": "handover", "support_return_place": "support_return_place", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_return_place",
+        route_after_support_return_place,
+        {"handover": "handover", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_profile_guardrail",
+        route_after_support_profile_guardrail,
+        {
+            "support_profile_confirm": "support_profile_confirm",
+            "support_profile_risk_check": "support_profile_risk_check",
+        },
+    )
+    graph.add_conditional_edges(
+        "support_profile_risk_check",
+        route_after_support_profile_risk,
+        {"support_profile_dispatch": "support_profile_dispatch", "handover": "handover"},
+    )
+    graph.add_edge("support_profile_dispatch", "support_profile_collect")
+    graph.add_conditional_edges(
+        "support_profile_collect",
+        route_after_support_profile_collect,
+        {
+            "support_profile_confirm": "support_profile_confirm",
+            "support_profile_dispatch": "support_profile_dispatch",
+            "handover": "handover",
+        },
+    )
+    graph.add_conditional_edges(
+        "support_profile_confirm",
+        route_after_support_profile_confirm,
+        {"handover": "handover", "support_profile_place": "support_profile_place", END: END},
+    )
+    graph.add_conditional_edges(
+        "support_profile_place",
+        route_after_support_profile_place,
         {"handover": "handover", END: END},
     )
     graph.add_edge("support_abort", END)

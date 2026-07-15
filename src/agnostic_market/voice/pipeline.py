@@ -28,11 +28,11 @@ from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
-from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.voice.graph import GraphVoiceAdapter
@@ -90,35 +90,40 @@ def build_voice_loop(
     otp = OtpProvider()
     verification_store = VerificationStore(otp)
     risk = RiskProvider()
+    # Per-session profile SoR (Group C) — fixture-backed like OrderStore; the profile-change
+    # flow's effect target. Dies with the session.
+    profile_store = ProfileStore(load_profile_fixture(config_root, config.merchant_id))
+    # Session "that order" pointer (Group C L4): the SAME instance feeds the order_status
+    # tool (set on a found read) and the flows (set on place/cancel/return) — one instance
+    # to both, or references resolve against different state (split-brain, like the cart).
+    pointer = LastOrderPointer()
     gateway = LLMGateway(credentials, secrets)
     # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
     # system prompts + few-shot (F1), so the Agent below carries NO instructions.
     tools = [
-        wrap_readonly_tool(t, config.merchant_id) for t in build_voice_tools(store, cart_store)
+        wrap_readonly_tool(t, config.merchant_id)
+        for t in build_voice_tools(store, cart_store, pointer)
     ]
     graph = build_frontline_graph(
         chat_model=gateway.chat_model(config.llm.routing),
         read_only_tools=tools,
         display_name=config.display_name,
+        tenant_id=config.merchant_id,
         # Checkout runs on the reasoning tier (AGENTS §A11: big model for gated flows).
         reasoning_model=gateway.chat_model(config.llm.reasoning),
         store=store,
         cart_store=cart_store,
-        policy=PolicyContext(
-            max_order_value_usd=config.policies.max_order_value_usd,
-            allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
-            refund_auto_approve_under_usd=config.policies.refunds.auto_approve_under_usd,
-            refund_require_human_above_usd=config.policies.refunds.require_human_above_usd,
-            refund_returnless_under_usd=config.policies.refunds.returnless_under_usd,
-            pending_ttl_seconds=config.policies.pending_confirmation_ttl_seconds,
-            spoken_policy_extra=config.policies.spoken_facts_extra,
-        ),
+        # The ONE config->runtime policy mapping (dtos/config.py to_policy_context) — a new
+        # policy field lands there once, never per-site.
+        policy=config.policies.to_policy_context(),
         # Support step-up seams (3c): the verification level lives in verification_store and
         # is read LIVE inside the support guardrail — never a checkpointed channel, so a
         # replayed checkpoint can't re-grant a level (§A388).
         verification_store=verification_store,
         otp=otp,
         risk=risk,
+        profile_store=profile_store,
+        pointer=pointer,
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
@@ -138,11 +143,23 @@ def build_voice_loop(
         # only TTS), and our "LLM" is the stateful graph — a speculative call resumes a
         # HITL interrupt and fires the place/cancel EFFECT before the caller's turn is
         # committed. A preliminary ASR hypothesis is not consent (live call #9, P1).
-        turn_handling={"preemptive_generation": {"enabled": False}},
+        #
+        # Endpointing max_delay is trialled DOWN from the streaming default (2.5s): a
+        # low-confidence end-of-turn prediction waits the full max_delay before committing,
+        # which is where the multi-second dead pauses on uncertain turns came from (live
+        # call #10). 1.5s is a deliberate floor — the caller uses natural multi-clause
+        # speech ("Looks good. Let's go ahead and place the order"), so a tighter delay
+        # would cut mid-thought. min_delay stays at the streaming default (0.3s) so
+        # confident turns are still snappy. `endpointing`/`preemptive_generation` are the
+        # current knobs; the flat `min/max_endpointing_delay` kwargs are deprecated in 1.6.
+        turn_handling={
+            "preemptive_generation": {"enabled": False},
+            "endpointing": {"max_delay": 1.5},
+        },
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    _attach_thread_reaper(session, engine, verification_store, cart_store)
+    _attach_thread_reaper(session, engine, verification_store, cart_store, pointer)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -160,6 +177,7 @@ def _attach_thread_reaper(
     engine: ReasoningEngine,
     verification_store: VerificationStore,
     cart_store: CartStore,
+    pointer: LastOrderPointer,
 ) -> None:
     """Clock B (AGENTS §A10 rule 4): on session close, the thread is reaped UNCONDITIONALLY
     — a dropped call must never leave a resumable placement/refund. Re-entrant-safe: a
@@ -181,6 +199,7 @@ def _attach_thread_reaper(
         engine.delete_thread()
         verification_store.clear()
         cart_store.clear()
+        pointer.clear()
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:

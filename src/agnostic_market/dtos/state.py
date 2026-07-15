@@ -15,7 +15,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 
-from agnostic_market.dtos.confirmation import RefundDestination
+from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
@@ -28,6 +28,7 @@ HandoffDestination = Literal["support", "checkout", "planner", "human"]
 # Free-text detail, if ever needed, lives in the session payload / telemetry, not this field.
 HandoffReasonCode = Literal[
     "address_change",
+    "contact_change",  # phone/email on file — the OTP factor itself (Group C profile flow)
     "payment_change",
     "cancel_order",
     "refund",
@@ -56,9 +57,14 @@ class PolicyContext(BaseModel):
     # Return-first floor for SHIPPED/DELIVERED refunds: above this, the refund waits for
     # the return (industry standard); at/below it may pay out returnless.
     refund_returnless_under_usd: float = Field(ge=0)
+    # Return-eligibility window in days, counted from DELIVERY (Group C; shipped-not-yet-
+    # delivered is always in window). REQUIRED (no default) on purpose: PolicyContext is
+    # constructed at several sites in lockstep — a site that forgets a new field must fail
+    # loudly at build, never run with a silent default.
+    return_window_days: int = Field(ge=1)
     pending_ttl_seconds: float = Field(gt=0)
     # Merchant free-text policy extras (config `policies.spoken_facts_extra`) — facts with
-    # NO enforcing field (refund timeline, return window). The ENFORCED sentences are
+    # NO enforcing field (refund timeline, return conditions). The ENFORCED sentences are
     # DERIVED from the typed values above (agents/spoken_policy.py); this is only the
     # free-text tail. None = no extras (the derived sentences are still spoken).
     spoken_policy_extra: str | None = None
@@ -152,6 +158,58 @@ class PendingCancel(BaseModel):
     created_at: float
 
 
+class PendingReturn(BaseModel):
+    """A return/RMA awaiting HITL confirmation (Group C; PendingCancel's single-interrupt
+    shape plus the honest money outcome).
+
+    `refund_due_usd` is CODE-computed (captured minus refunds minus prior return promises —
+    never model arithmetic) and is RECORDED on the return, not paid: the refund releases at
+    the Phase-4 SoR once the return is processed, and that release is the money-movement
+    moment (§A4c re-runs the destination->level check there). Deliberately NO destination/
+    instrument fields: v1 returns always refund to the ORIGINAL payment method (industry
+    standard) — the refund guardrail's return steer fires BEFORE the level gate, so carrying
+    a caller-requested NEW instrument here would record a payout promise that skipped the
+    §A4b L2 step-up. No attempt/tries fields — single interrupt, no step-up (L1 action).
+    """
+
+    model_config = _FROZEN
+
+    order_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    refund_due_usd: float = Field(ge=0)
+    idempotency_key: str = Field(min_length=1)
+    created_at: float
+
+
+class PendingProfileChange(BaseModel):
+    """An address/contact change awaiting step-up verification + HITL confirmation (Group C;
+    PendingRefund's step-up shape minus money).
+
+    Always L2 (`profile_change_required_level`, the §A4a platform floor): address/contact
+    are the account-takeover levers. `factor_ref` RECORDS the MASKED on-file contact at
+    proposal time — for a contact change that is the OLD factor (changing the factor
+    requires the factor, the ladder constraint). It is a Phase-4 breadcrumb: the stub OTP
+    dispatches by `attempt_key` (idempotency), so nothing reads `factor_ref` yet; the
+    real SoR delivery in Phase 4 sends to this recorded factor. `new_value` is the
+    caller-stated value:
+    SPOKEN in the readback/outcome, NEVER logged/telemetered (PII discipline) — and note it
+    sits inside the CHECKPOINT, which is acceptable for the in-memory per-session saver
+    (reaped on close) but must be revisited at the Phase-4 Redis swap (encrypt or exclude).
+    `attempt_key` keys the idempotent OTP dispatch; `otp_tries` bounds the re-collect loop
+    (A10a rule 3) — same discipline as PendingRefund.
+    """
+
+    model_config = _FROZEN
+
+    field: ProfileField
+    new_value: str = Field(min_length=1)
+    factor_ref: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    attempt_key: str = Field(min_length=1)
+    otp_tries: int = Field(ge=0, default=0)
+    created_at: float
+
+
 # Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
 # "left_*" are TURN-SCOPED markers (reset at entry): the model left the flow this turn, so
 # a same-turn re-entry is blocked — breaks the assemble->gate->handover->assemble cycle
@@ -192,6 +250,8 @@ class ReasoningState(BaseModel):
     pending_placement: PendingPlacement | None = None
     pending_refund: PendingRefund | None = None
     pending_cancel: PendingCancel | None = None
+    pending_return: PendingReturn | None = None
+    pending_profile_change: PendingProfileChange | None = None
     active_flow: ActiveFlow | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
     # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response). Kept

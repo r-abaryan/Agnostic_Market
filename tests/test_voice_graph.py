@@ -124,3 +124,18 @@ async def test_4a_fact_false_when_readback_played_out() -> None:
     adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=False)]))
     await _spoken(adapter, {"messages": [HumanMessage("yes")]})
     assert engine.calls[0][1].readback_interrupted is False
+
+
+async def test_unconsumed_turn_never_reaches_the_engine() -> None:
+    # The interim-transcript discard path (live call #9 P1 family): when the voice layer
+    # creates a turn but CANCELS it before consuming any output (a superseded/discarded
+    # generation), the engine — and therefore the stateful graph and its interrupts — must
+    # not have run at all. astream is lazy: creating the iterator is not execution.
+    engine = ScriptedEngine([TokenEvent(text="never spoken")])
+    adapter = GraphVoiceAdapter(engine)
+    adapter.astream({"messages": [HumanMessage("yes")]}, None)  # created, never iterated
+    assert engine.calls == []  # nothing reached the engine
+    # The next, consumed turn runs normally against untouched state.
+    spoken = await _spoken(adapter, {"messages": [HumanMessage("no, wait")]})
+    assert engine.calls == [("no, wait", TurnFacts(readback_interrupted=False))]
+    assert spoken == ["never spoken"]

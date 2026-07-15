@@ -28,10 +28,9 @@ from agnostic_market.agents import telemetry
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.voice.tools import build_voice_tools
@@ -49,7 +48,8 @@ _THREAD_SEQ = 0
 # then ended in a terminal decline that clears its own state (see docstring below).
 _FLOW_TOOLS = frozenset(
     {
-        "propose_refund", "propose_cancel", "leave_support",  # support
+        "propose_refund", "propose_cancel", "propose_return",  # support (returns: Group C)
+        "propose_profile_change", "leave_support",  # support (profile: Group C)
         "add_to_cart", "remove_from_cart", "set_quantity", "review_cart", "buy_now",
         "go_to_checkout", "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
     }
@@ -100,25 +100,26 @@ async def _run() -> int:
     chat_model = LLMGateway(credentials, secrets).chat_model(resolved.config.llm.routing)
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
     cart_store = CartStore()
-    tools = [wrap_readonly_tool(t, _MERCHANT_ID) for t in build_voice_tools(store, cart_store)]
+    pointer = LastOrderPointer()
+    tools = [
+        wrap_readonly_tool(t, _MERCHANT_ID)
+        for t in build_voice_tools(store, cart_store, pointer)
+    ]
     config = resolved.config
     graph = build_frontline_graph(
         chat_model,
         tools,
         display_name=config.display_name,
+        tenant_id=config.merchant_id,
         # The T1 eval never enters checkout (text-only escalation probes), but the graph
         # compiles as ONE shape — same construction path as production (F1 discipline).
         reasoning_model=LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
         store=store,
         cart_store=cart_store,  # SAME instance as view_cart (no split-brain)
-        policy=PolicyContext(
-            max_order_value_usd=config.policies.max_order_value_usd,
-            allow_ai_merchant_handoff=config.policies.allow_ai_merchant_handoff,
-            refund_auto_approve_under_usd=config.policies.refunds.auto_approve_under_usd,
-            refund_require_human_above_usd=config.policies.refunds.require_human_above_usd,
-            refund_returnless_under_usd=config.policies.refunds.returnless_under_usd,
-            pending_ttl_seconds=config.policies.pending_confirmation_ttl_seconds,
-        ),
+        pointer=pointer,  # SAME instance as order_status (Group C L4)
+        # The ONE config->runtime policy mapping — identical to production (F1). The old
+        # hand-built copy here had drifted (it silently omitted spoken_policy_extra).
+        policy=config.policies.to_policy_context(),
         # An utterance that reaches the confirm readback pauses at an interrupt, which
         # needs a checkpointer even in the text eval (fresh thread per utterance).
         checkpointer=InMemorySaver(),

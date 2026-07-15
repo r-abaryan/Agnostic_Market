@@ -9,6 +9,8 @@ import pytest
 from agnostic_market.commerce.orders import (
     CancelError,
     OrderStore,
+    RefundError,
+    ReturnError,
     load_orders_fixture,
     resolve_candidates,
 )
@@ -196,3 +198,87 @@ def test_actionable_orders_carry_effective_status(config_root: Path) -> None:
     store.cancel_order("ck-1", order_id=placed.order_id)
     by_id = {o.order_id: o for o in store.actionable_orders()}
     assert by_id[placed.order_id].status == "cancelled"  # the overlay wins
+
+
+# --- returns: create_return re-validation matrix + the promise side of the cap (Group C) --
+
+
+def test_create_return_is_idempotent_by_key(config_root: Path) -> None:
+    store = _store(config_root)
+    first = store.create_return(
+        "rk-1", order_id="ORD-1001", refund_due_usd=179.98, destination="original"
+    )
+    replay = store.create_return(
+        "rk-1", order_id="ORD-1001", refund_due_usd=179.98, destination="original"
+    )
+    assert replay is first  # the ORIGINAL return, not an equal copy
+    assert first.rma_id == "RMA-3001"
+    assert store.return_count == 1
+
+
+def test_create_return_refuses_unshipped_cancelled_and_unknown(config_root: Path) -> None:
+    store = _store(config_root)
+    with pytest.raises(ReturnError, match="processing"):
+        store.create_return("rk-1", order_id="ORD-1002", refund_due_usd=10.0,
+                            destination="original")
+    store.cancel_order("ck-1", order_id="ORD-1002")
+    with pytest.raises(ReturnError, match="cancelled"):
+        store.create_return("rk-2", order_id="ORD-1002", refund_due_usd=10.0,
+                            destination="original")
+    with pytest.raises(ReturnError, match="unknown"):
+        store.create_return("rk-3", order_id="ORD-9999", refund_due_usd=10.0,
+                            destination="original")
+    assert store.return_count == 0
+
+
+def test_second_return_on_same_order_is_refused_naming_the_open_rma(config_root: Path) -> None:
+    store = _store(config_root)
+    first = store.create_return(
+        "rk-1", order_id="ORD-1001", refund_due_usd=100.0, destination="original"
+    )
+    with pytest.raises(ReturnError, match=first.rma_id):
+        store.create_return("rk-2", order_id="ORD-1001", refund_due_usd=50.0,
+                            destination="original")
+    assert store.return_count == 1
+
+
+def test_return_promise_cannot_exceed_refundable_balance(config_root: Path) -> None:
+    # $80 already refunded on the $179.98 order: a return may promise at most the remainder.
+    store = _store(config_root)
+    store.issue_refund("i1", order_id="ORD-1001", amount_usd=80.0, destination="original")
+    with pytest.raises(ReturnError, match="exceeds refundable balance"):
+        store.create_return("rk-1", order_id="ORD-1001", refund_due_usd=179.98,
+                            destination="original")
+    ok = store.create_return("rk-2", order_id="ORD-1001", refund_due_usd=99.98,
+                             destination="original")
+    assert ok.refund_due_usd == 99.98
+
+
+def test_open_return_promise_blocks_a_refund_on_the_same_dollars(config_root: Path) -> None:
+    # The store is the arbiter (§A4c): a refund paid alongside an open return's recorded
+    # promise would double-return the same money (refund now + release at Phase 4).
+    store = _store(config_root)
+    store.create_return("rk-1", order_id="ORD-1001", refund_due_usd=179.98,
+                        destination="original")
+    with pytest.raises(RefundError, match="promised on open returns"):
+        store.issue_refund("i1", order_id="ORD-1001", amount_usd=10.0, destination="original")
+    assert store.refund_count == 0
+
+
+def test_delivered_at_epoch_is_aware_and_none_before_delivery(config_root: Path) -> None:
+    from datetime import UTC, datetime
+
+    store = _store(config_root)
+    epoch = store.delivered_at_epoch("ORD-1003")
+    assert epoch == datetime(2026, 7, 1, tzinfo=UTC).timestamp()  # aware instant, no drift
+    assert store.delivered_at_epoch("ORD-1001") is None  # shipped: window not started
+    assert store.delivered_at_epoch("ORD-9999") is None  # unknown order
+
+
+def test_delivered_fixture_entry_requires_delivered_at() -> None:
+    # Fail-loud at fixture load: a delivered order without a delivery instant would make
+    # the return window silently unenforceable.
+    from agnostic_market.commerce.orders import _OrderEntry
+
+    with pytest.raises(ValueError, match="delivered_at"):
+        _OrderEntry(status="delivered", summary="x", eta="2026-07-01", total_usd=10.0)
