@@ -330,12 +330,15 @@ def test_tool_messages_never_surface() -> None:
 # --- graph latency spans (_GraphSpans, live call #10) ------------------------------------
 
 
+_MODEL = {"langgraph_node": "model"}  # the only node that runs the LLM
+
+
 def test_graph_spans_counts_tools_and_ttf_model() -> None:
     spans = _GraphSpans()
     spans.observe(AIMessage(content="", tool_calls=[
-        {"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}]))
-    spans.observe(ToolMessage("processing", tool_call_id="t1"))
-    spans.observe(AIMessage(content="It's processing."))
+        {"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}]), _MODEL)
+    spans.observe(ToolMessage("processing", tool_call_id="t1"), {"langgraph_node": "tools"})
+    spans.observe(AIMessage(content="It's processing."), _MODEL)  # a real second model pass
     # A tool ran, and the second model pass (rendering the result) is timed separately.
     assert spans._tool_count == 1
     assert spans._ttf_model is not None
@@ -344,7 +347,7 @@ def test_graph_spans_counts_tools_and_ttf_model() -> None:
 
 def test_graph_spans_single_pass_has_no_tool_span() -> None:
     spans = _GraphSpans()
-    spans.observe(AIMessage(content="Hello!"))
+    spans.observe(AIMessage(content="Hello!"), _MODEL)
     assert spans._tool_count == 0
     assert spans._ttf_model is not None
     assert spans._tool_to_next_model is None  # no tool -> no second-pass span
@@ -352,11 +355,25 @@ def test_graph_spans_single_pass_has_no_tool_span() -> None:
 
 def test_graph_spans_ignores_empty_and_tool_only_for_ttf() -> None:
     spans = _GraphSpans()
-    spans.observe(AIMessage(content=""))  # empty: not model output
+    spans.observe(AIMessage(content=""), _MODEL)  # empty: not model output
     assert spans._ttf_model is None
     spans.observe(AIMessage(content="", tool_calls=[
-        {"name": "x", "args": {}, "id": "t1", "type": "tool_call"}]))
+        {"name": "x", "args": {}, "id": "t1", "type": "tool_call"}]), _MODEL)
     assert spans._ttf_model is not None  # a tool-call message IS model activity
+
+
+def test_graph_spans_render_node_is_not_a_model_pass() -> None:
+    # L3: a deterministic read renderer (read_render node) authors the post-tool line INSTEAD
+    # of a second model pass. That node-authored AIMessage must NOT be timed as model
+    # activity, or every rendered turn shows a phantom tool_to_next_model cost.
+    spans = _GraphSpans()
+    spans.observe(AIMessage(content="", tool_calls=[
+        {"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}]), _MODEL)
+    spans.observe(ToolMessage("...", tool_call_id="t1"), {"langgraph_node": "tools"})
+    spans.observe(AIMessage(content="Your order ORD-1001 is on its way."),
+                  {"langgraph_node": "read_render"})
+    assert spans._tool_count == 1
+    assert spans._tool_to_next_model is None  # rendered, NOT a second model pass
 
 
 # --- the seam's zero-LiveKit claim ------------------------------------------------------

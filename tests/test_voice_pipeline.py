@@ -65,6 +65,21 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
     assert loop.session.options.endpointing["min_delay"] == 0.3  # streaming default kept
 
 
+async def test_background_audio_has_a_thinking_sound_and_no_ambient(config_root: Path) -> None:
+    # The thinking-sound earcon masks LLM/tool dead-air (constructed here; started in the
+    # worker entrypoint where the room lives). A call is not a storefront -> no ambient sound.
+    # Wiring only: the behavioral check (stops before speech, no readback overlap) is a live
+    # audio pass — zero-network tests can't observe playback.
+    from livekit.agents.voice.background_audio import AudioConfig
+
+    loop = await _loop(config_root, RecordingResolver())
+    thinking = loop.background_audio._thinking_sound
+    assert isinstance(thinking, AudioConfig)
+    # Points at the repo's subtle-beep asset (a file path, not a LiveKit built-in clip).
+    assert isinstance(thinking.source, str) and thinking.source.endswith("thinking_beep.wav")
+    assert loop.background_audio._ambient_sound is None
+
+
 async def test_engine_seam_wiring(config_root: Path) -> None:
     loop = await _loop(config_root, RecordingResolver())
     # LLMAdapter wraps the voice adapter, which wraps the engine (the two-layer seam) —

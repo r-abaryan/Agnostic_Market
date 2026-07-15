@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 from llm_fakes import FakeChatModel
 
+from agnostic_market.agents._copy import all_closes
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
@@ -126,7 +127,9 @@ async def test_add_to_cart_acks_and_stays_sticky(config_root: Path) -> None:
     assert graph.get_state(_CFG).values.get("pending_placement") is None
     assert cart.line_count == 1
     acks = [t for t in _ai_texts(out) if "Added" in t]
-    assert len(acks) == 1 and "anything else" in acks[-1].lower()
+    assert len(acks) == 1
+    # Ends with one of the rotating warm closes (lowercased mid-sentence after " - ").
+    assert any(acks[-1].lower().endswith(c.lower()) for c in all_closes())
 
 
 async def test_repeat_add_increments(config_root: Path) -> None:

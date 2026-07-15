@@ -282,3 +282,100 @@ def test_delivered_fixture_entry_requires_delivered_at() -> None:
 
     with pytest.raises(ValueError, match="delivered_at"):
         _OrderEntry(status="delivered", summary="x", eta="2026-07-01", total_usd=10.0)
+
+
+# --- deterministic read renderers (L3): the code-authored spoken lines that skip the second
+#     model pass. Pure functions, so most tests need no store. -----------------------------
+
+from datetime import date  # noqa: E402
+
+from agnostic_market.commerce.orders import (  # noqa: E402
+    render_cart_line,
+    render_order_status_line,
+)
+
+_TODAY = date(2026, 7, 15)
+
+
+def test_render_past_eta_frames_as_past_and_is_terminal() -> None:
+    # The live-call #9 P6 scenario: a shipped order whose ETA has passed. Must frame as PAST
+    # ("was expected by"), never "arriving" — AND must NOT promise a follow-up check (F-11.1:
+    # the model said "let me check the latest status" then ended the turn without checking).
+    line = render_order_status_line(
+        order_id="ORD-1001", status="shipped",
+        items="2 pairs of trail running shoes", eta="2026-07-09", today=_TODAY,
+    )
+    assert "was expected by" in line
+    assert "arriv" not in line.lower()  # no "arriving"/"arrive" for a past date
+    # F-11.1: terminal, no dangling promise to check.
+    assert "check" not in line.lower()
+    assert "let me" not in line.lower()
+
+
+def test_render_future_eta_frames_as_upcoming() -> None:
+    line = render_order_status_line(
+        order_id="ORD-1001", status="shipped",
+        items="2 pairs of trail running shoes", eta="2026-07-20", today=_TODAY,
+    )
+    assert "expected to arrive by" in line
+    assert "was expected" not in line
+
+
+def test_render_today_eta_frames_as_today() -> None:
+    # Midnight boundary: eta == today is NOT past.
+    line = render_order_status_line(
+        order_id="ORD-1001", status="shipped", items="shoes", eta="2026-07-15", today=_TODAY,
+    )
+    assert "today" in line.lower()
+    assert "was expected" not in line
+
+
+def test_render_duration_eta_has_no_date_logic() -> None:
+    line = render_order_status_line(
+        order_id="ORD-9001", status="processing", items="a rain jacket",
+        eta="3-5 business days", today=_TODAY,
+    )
+    assert "3 to 5 business days" in line
+    assert "expected by" not in line  # no absolute-date framing for a duration
+
+
+def test_render_malformed_eta_is_omitted_not_spoken_raw() -> None:
+    line = render_order_status_line(
+        order_id="ORD-1001", status="shipped", items="shoes", eta="soon-ish", today=_TODAY,
+    )
+    assert "soon-ish" not in line  # never speak an unparseable raw ETA
+    assert "on its way" in line  # the status still renders
+
+
+def test_render_unknown_status_fails_closed() -> None:
+    # A status not in the phrase map must NOT get an invented phrase — speak the raw word.
+    line = render_order_status_line(
+        order_id="ORD-1001", status="returned", items="shoes", eta=None, today=_TODAY,
+    )
+    assert "returned" in line
+    assert "on its way" not in line  # no wrong-status humanization
+
+
+def test_render_delivered_and_cancelled_omit_eta() -> None:
+    # An ETA is meaningless for a delivered (already arrived) or cancelled (won't arrive) order.
+    delivered = render_order_status_line(
+        order_id="ORD-1003", status="delivered", items="socks", eta="2026-07-01", today=_TODAY,
+    )
+    assert "delivered" in delivered and "expected" not in delivered
+    cancelled = render_order_status_line(
+        order_id="ORD-9001", status="cancelled", items="jacket", eta="2026-07-20", today=_TODAY,
+    )
+    assert "cancelled" in cancelled and "arrive" not in cancelled
+
+
+def test_render_cart_line() -> None:
+    line = render_cart_line([_line("SKU-1", "rain jacket", 129.0, 2)], 258.0)
+    assert "2 rain jackets" in line and "$258.00" in line
+
+
+def test_order_eta_accessor_forks_fixture_placed_and_unknown(config_root: Path) -> None:
+    store = _store(config_root)
+    assert store.order_eta("ORD-1001") == "2026-07-09"  # fixture entry.eta
+    _place1(store, "k1", "SKU-RED-42", "trail running shoes", 1, 89.99)
+    assert store.order_eta("ORD-9001") == "3-5 business days"  # placed -> _PLACED_ETA
+    assert store.order_eta("ORD-NOPE") is None  # unknown

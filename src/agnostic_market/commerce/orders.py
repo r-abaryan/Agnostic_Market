@@ -20,7 +20,7 @@ prose surface to speak from, one structured surface to select from.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -60,6 +60,97 @@ def speak_lines(lines: Sequence[CartLine] | Sequence[PlacedLine]) -> str:
     if len(parts) == 2:
         return f"{parts[0]} and {parts[1]}"
     return f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+
+# Bare fulfillment status -> a natural spoken phrase. KNOWN statuses only: an unmapped status
+# (a new fixture/SoR value) must NOT be given an invented meaning — the renderer speaks the raw
+# word instead (fail-closed). This map is the ONLY place a status becomes a human phrase, so a
+# code renderer structurally cannot say "on the way" for a `processing` order (the live-call
+# embellishment class the deterministic renderer exists to prevent).
+_STATUS_PHRASE: dict[str, str] = {
+    "shipped": "on its way",
+    "processing": "being prepared",
+    "delivered": "delivered",
+    "cancelled": "cancelled",
+}
+
+
+def _eta_clause(eta: str | None, today: date) -> str:
+    """The spoken ETA fragment, from the mixed-format `eta` (a date "2026-07-09" OR a duration
+    "3-5 business days" OR None/garbage). Returns "" when there is nothing safe to say.
+
+    A date BEFORE `today` is framed as PAST and TERMINAL — never "arriving", and never a
+    promise to "check the latest status" (that dangling promise is live-call F-11.1: the model
+    said it would check, then ended the turn without checking; a code renderer that says the
+    same and ENDs re-introduces it). The renderer states what the store holds and promises
+    nothing it won't do; a fresh check is the caller's to ask for.
+    """
+    if not eta:
+        return ""
+    try:
+        eta_date = datetime.strptime(eta, "%Y-%m-%d").date()
+    except ValueError:
+        # A duration ("3-5 business days") is safe to speak as-is with a lead-in; any other
+        # non-date free-text is omitted rather than read raw (no ISO garbage to TTS).
+        return f", expected in {eta.replace('-', ' to ')}" if _looks_like_duration(eta) else ""
+    spoken = eta_date.strftime("%A %d %B")
+    if eta_date < today:
+        return f" - that was expected by {spoken}"
+    if eta_date == today:
+        return " - expected to arrive today"
+    return f", expected to arrive by {spoken}"
+
+
+def _looks_like_duration(eta: str) -> str | bool:
+    """A duration free-text like "3-5 business days" (has a digit + a time-unit word), vs an
+    unparseable string we should drop. Deliberately narrow — the stub's only duration is
+    `_PLACED_ETA`; a real catalog would carry a typed ETA."""
+    lowered = eta.lower()
+    return any(ch.isdigit() for ch in eta) and any(
+        unit in lowered for unit in ("day", "week", "hour", "month")
+    )
+
+
+def _is_past_date_eta(eta: str | None, today: date) -> bool:
+    if not eta:
+        return False
+    try:
+        return datetime.strptime(eta, "%Y-%m-%d").date() < today
+    except ValueError:
+        return False
+
+
+def render_order_status_line(
+    *, order_id: str, status: str, items: str, eta: str | None, today: date
+) -> str:
+    """CODE-authored spoken order-status line (the deterministic read renderer). Pure — every
+    input is passed (`today` too, so it is trivially testable and never a stale build-time
+    date). Reuses the already-composed `items` string (no re-pluralization).
+
+    Humanizes KNOWN statuses via `_STATUS_PHRASE`; an unknown status speaks the raw word
+    (fail-closed, no invented meaning). The ETA is framed relative to `today` (`_eta_clause`).
+    """
+    order_id = order_id.strip().upper()
+    phrase = _STATUS_PHRASE.get(status)
+    if phrase is None:
+        # Fail-closed: don't guess a phrase for a status we don't model.
+        return f"Your order {order_id} - {items} - is {status}."
+    # A shipped order whose ETA has PASSED must not say "on its way, that was expected by X" —
+    # "on its way" (still coming) contradicts an overdue date. Speak the past-expectation as the
+    # WHOLE status instead (terminal, no dangling "let me check" — F-11.1).
+    if status == "shipped" and _is_past_date_eta(eta, today):
+        spoken = datetime.strptime(eta, "%Y-%m-%d").date().strftime("%A %d %B")
+        return f"Your order {order_id} - {items} - was expected by {spoken}."
+    # An ETA is only meaningful for an IN-FLIGHT order — a delivered order already arrived and a
+    # cancelled one won't; speaking "expected to arrive by X" for either is wrong.
+    eta_clause = _eta_clause(eta, today) if status in ("shipped", "processing") else ""
+    return f"Your order {order_id} - {items} - is {phrase}{eta_clause}."
+
+
+def render_cart_line(lines: Sequence[CartLine], total_usd: float) -> str:
+    """CODE-authored spoken cart line (the deterministic view_cart renderer). Empty cart is the
+    caller's job to detect (the node speaks the empty line); this renders a non-empty cart."""
+    return f"You've got {speak_lines(lines)} in your cart, ${total_usd:.2f} in total."
 
 
 class _OrderEntry(BaseModel):
@@ -322,6 +413,20 @@ class OrderStore:
                     f"Order {normalized}: {speak_lines(placed.lines)} "
                     f"(${placed.total_usd:.2f}) - status {status}, ETA {_PLACED_ETA}."
                 )
+        return None
+
+    def order_eta(self, order_id: str) -> str | None:
+        """The raw ETA for an order (fixture `entry.eta`, a date "2026-07-09"; or `_PLACED_ETA`
+        for a placed order, a duration "3-5 business days"); None if unknown. The public accessor
+        the deterministic read renderer reads — mirrors the fixture/placed fork in
+        `order_summary`, so the render node never touches the private `fixture.orders` dict."""
+        normalized = order_id.strip().upper()
+        entry = self.fixture.orders.get(normalized)
+        if entry is not None:
+            return entry.eta
+        for placed in self._placed_by_key.values():
+            if placed.order_id == normalized:
+                return _PLACED_ETA
         return None
 
     def place_cart(

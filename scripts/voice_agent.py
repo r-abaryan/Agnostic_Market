@@ -67,6 +67,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # The disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1)) plays via the agent's own
     # on_enter hook - structurally first, before any user turn can be answered.
     await loop.session.start(loop.agent, room=ctx.room)
+    # The thinking-sound earcon needs the room (a runtime concern); start it after the
+    # session. Auto-plays while the agent is 'thinking', stops when it speaks (no overlap with
+    # the answer or a readback). No-op/warn in console mode (LiveKit-managed).
+    await loop.background_audio.start(room=ctx.room, agent_session=loop.session)
+    # Stop the earcon's mixer on shutdown, or its background task throws
+    # "Event loop is closed" when the loop tears down (a dangling task on disconnect).
+    ctx.add_shutdown_callback(loop.background_audio.aclose)
 
 
 if __name__ == "__main__":

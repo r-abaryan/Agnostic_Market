@@ -144,8 +144,8 @@ def _return_readback_line(pending: PendingReturn, policy: ToolConfirmationPolicy
         raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
     return (
         f"Just to confirm - set up a return for your {pending.summary} "
-        f"({rendered['order_id']})? Once the return is processed, the "
-        f"{rendered['total_amount']} refund goes back to your original payment method. "
+        f"({rendered['order_id']})? You'll send the items back, and once we receive them the "
+        f"{rendered['total_amount']} refund goes to your original payment method. "
         "Shall I go ahead?"
     )
 

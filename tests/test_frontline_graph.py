@@ -22,20 +22,24 @@ _HANDOVER_ARGS = {"request_handover": {"destination": "planner", "reason_code": 
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
 
 
-def _tools(store: OrderStore) -> list:
+def _tools(store: OrderStore, cart: CartStore) -> list:
     return [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, CartStore(), LastOrderPointer())
+        for t in build_voice_tools(store, cart, LastOrderPointer())
     ]
 
 
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     store = kwargs.pop("store", None) or OrderStore(load_orders_fixture(config_root, "acme_store"))
+    # The SAME cart instance must reach build_voice_tools AND the graph, or view_cart reads a
+    # different cart than the render node (split-brain, graph docstring).
+    cart = kwargs.pop("cart_store", None) or CartStore()
     return build_frontline_graph(
         fake,
-        _tools(store),
+        _tools(store, cart),
         display_name="Acme Store",
         tenant_id="acme_store",
+        cart_store=cart,
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
@@ -225,11 +229,14 @@ async def test_plain_answer_ends_without_tools(config_root: Path) -> None:
 async def test_runaway_tool_loop_is_bounded(config_root: Path) -> None:
     # A model that never stops calling read tools must not spin forever: the hop guard
     # ends the turn after _MAX_TOOL_HOPS round-trips (no framework loop protection here).
+    # Forces catalog_search (NON-renderable — stays on the model->tools->model loop; a
+    # single renderable read like order_status would divert to read_render and END after one
+    # hop, which is a STRONGER bound, not the loop this guard protects).
     from agnostic_market.agents.frontline import _MAX_TOOL_HOPS
 
-    fake = FakeChatModel(force_tool="order_status", canned_args=_READ_ARGS)  # no limit set
+    fake = FakeChatModel(force_tool="catalog_search", canned_args=_READ_ARGS)  # no limit set
     graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
+    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
     hops = sum(1 for m in out["messages"] if isinstance(m, AIMessage) and m.tool_calls)
     assert hops == _MAX_TOOL_HOPS + 1  # the hop that crossed the bound ended the turn
 
@@ -349,3 +356,124 @@ def test_shared_context_reaches_every_agent_prompt() -> None:
         assert "ONE continuous assistant" in prompt
         assert "Refunds take 5 to 7 business days." in prompt
         assert "$50" in prompt  # the derived enforced sentence reaches every tier
+
+
+# --- L3 deterministic read renderers: a single order_status/view_cart read is rendered in
+#     CODE and ENDs, skipping the second model pass (latency + grounding win). -------------
+
+from llm_fakes import _TEXT_RESPONSE  # noqa: E402  the fake's narration text (single source)
+
+
+async def test_single_order_status_renders_in_code_and_skips_second_model_pass(
+    config_root: Path,
+) -> None:
+    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
+    final = out["messages"][-1]
+    # The final line is the CODE render (contains the order id + a store-derived status),
+    # NOT the model's narration text — proving the second model pass was skipped.
+    assert isinstance(final, AIMessage) and "ORD-1001" in final.content
+    assert _TEXT_RESPONSE not in final.content
+    # The model was invoked exactly ONCE (the tool-call turn); no narration invoke followed.
+    assert fake._tool_calls_made == 1
+
+
+async def test_render_node_is_speakable(config_root: Path) -> None:
+    graph = _graph(config_root, FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS))
+    assert "read_render" in graph.speakable_nodes
+
+
+async def test_render_appends_a_factual_close_no_product_opinion(config_root: Path) -> None:
+    # A status read ends with a warm FACTUAL close — never a product opinion ("nice
+    # choice"/"good pick"), which reads as scripted and is nonsensical after a read (live
+    # 2026-07-15: appreciative closes dropped).
+    from agnostic_market.agents._copy import all_closes
+
+    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
+    line = out["messages"][-1].content
+    assert any(line.endswith(c) for c in all_closes())
+    assert "pick" not in line.lower() and "choice" not in line.lower()  # no product opinion
+
+
+async def test_multi_intent_read_still_goes_to_the_model(config_root: Path) -> None:
+    # "status of my order AND do you have socks?" -> the model emits TWO tool calls in one
+    # response; the ==1 guard fails, so the turn does NOT divert to read_render after the
+    # tools run — it returns to the model, which composes both (its narration text). The
+    # tool_call_limit makes that post-tools model invoke return text (not loop).
+    fake = FakeChatModel(
+        scripted_calls=[[("order_status", {"order_id": "ORD-1001"}),
+                         ("catalog_search", {"query": "socks"})]],
+        tool_call_limit=0,  # after the scripted multi-call, the next invoke narrates
+    )
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke(
+        {"messages": [HumanMessage("status of ORD-1001 and do you have socks")]}
+    )
+    # The model composed the answer (its narration text), NOT a code render.
+    assert out["messages"][-1].content == _TEXT_RESPONSE
+
+
+async def test_single_catalog_search_stays_model_narrated(config_root: Path) -> None:
+    # catalog_search is NOT renderable (fuzzy discovery needs framing) — even a single call
+    # routes back to the model.
+    fake = FakeChatModel(tool_call_limit=1, force_tool="catalog_search", canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
+    assert out["messages"][-1].content == _TEXT_RESPONSE
+
+
+async def test_single_view_cart_renders_in_code(config_root: Path) -> None:
+    cart = CartStore()
+    cart.add_item(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)
+    fake = FakeChatModel(tool_call_limit=1, force_tool="view_cart", canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake, cart_store=cart)
+    out = await graph.ainvoke({"messages": [HumanMessage("what's in my cart")]})
+    final = out["messages"][-1]
+    assert "2 rain jackets" in final.content and "$258.00" in final.content
+    assert _TEXT_RESPONSE not in final.content
+
+
+async def test_render_cannot_invent_forward_state(config_root: Path) -> None:
+    # A processing order must render "being prepared", never "on the way" — the phrase is
+    # derived from the store field, so the embellishment class is structurally impossible.
+    fake = FakeChatModel(
+        tool_call_limit=1, canned_args={"order_status": {"order_id": "ORD-1002"}},
+    )
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke({"messages": [HumanMessage("status of ORD-1002")]})
+    line = out["messages"][-1].content
+    assert "being prepared" in line and "on its way" not in line
+
+
+async def test_handover_turn_never_renders(config_root: Path) -> None:
+    # A request_handover turn sets `handover`; the shared predicate excludes it, so the divert
+    # never steals a handover turn — it routes to the handover sink (spoken deferral).
+    fake = FakeChatModel(tool_call_limit=1, force_tool="request_handover",
+                         canned_args=_HANDOVER_ARGS)
+    graph = _graph(config_root, fake)
+    out = await graph.ainvoke({"messages": [HumanMessage("I need a human")]})
+    # Deferral spoken (planner destination), NOT a code render.
+    assert "picked up" in out["messages"][-1].content.lower()
+
+
+async def test_render_emits_exactly_one_answered_event(
+    config_root: Path, tmp_path: Path
+) -> None:
+    # The render path ENDs at read_render (bypassing finalize_node); it must emit exactly ONE
+    # answered-telemetry event, not zero and not a duplicate. (Telemetry is redirected to
+    # tmp_path by the autouse conftest fixture.)
+    import json
+
+    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake)
+    await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
+    sink = tmp_path / "telemetry.jsonl"
+    answered = [
+        json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()
+        if '"outcome": "answered"' in line
+    ]
+    assert len(answered) == 1
+    assert answered[0]["outcome_detail"] == "code_render"

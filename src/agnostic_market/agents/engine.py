@@ -162,7 +162,10 @@ class _GraphSpans:
       - `ttf_model`: to the first model output (chunk or message) — generation-start delay;
       - `tools`: how many tool calls ran (0 = single pass; >=1 = a read/mutation loop);
       - `tool_to_next_model`: from the last tool result to the model activity AFTER it — the
-        cost of the second reasoning pass that renders a tool result into speech;
+        cost of the second reasoning pass that renders a tool result into speech. STAYS None
+        when a deterministic read renderer (the `read_render` node) authored the post-tool
+        line INSTEAD of a second model pass (L3) — only the `model` node runs the LLM, so a
+        node-authored AIMessage is not counted as model activity;
       - `total`: whole in-graph time.
     Passive: it only observes the stream the engine already consumes; it authors nothing and
     speaks nothing (the one-author rule holds). Logged at DEBUG — a telemetry backend is
@@ -176,14 +179,20 @@ class _GraphSpans:
         self._last_tool_at: float | None = None
         self._tool_to_next_model: float | None = None
 
-    def observe(self, token: object) -> None:
+    def observe(self, token: object, meta: object) -> None:
         now = time.perf_counter()
         if isinstance(token, ToolMessage):
             self._tool_count += 1
             self._last_tool_at = now
             return
-        is_model = isinstance(token, AIMessageChunk | AIMessage) and (
-            bool(str(token.text)) or bool(getattr(token, "tool_calls", None))
+        # Only the `model` node runs the LLM; a node-authored AIMessage (a read render, a
+        # guardrail decline, a readback) is NOT a model pass and must not be timed as one —
+        # else L3's rendered turns would show a phantom second-model-pass cost.
+        node = meta.get("langgraph_node") if isinstance(meta, dict) else None
+        is_model = (
+            node == "model"
+            and isinstance(token, AIMessageChunk | AIMessage)
+            and (bool(str(token.text)) or bool(getattr(token, "tool_calls", None)))
         )
         if not is_model:
             return
@@ -239,7 +248,7 @@ class ReasoningEngine:
         ):
             if mode == "messages":
                 token, meta = item
-                spans.observe(token)
+                spans.observe(token, meta)
                 if (event := speech.feed(token, meta)) is not None:
                     yield event
             elif mode == "updates" and "__interrupt__" in item:

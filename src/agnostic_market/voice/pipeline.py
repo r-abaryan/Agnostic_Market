@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent
+from livekit.agents.voice.background_audio import AudioConfig, BackgroundAudioPlayer
 from livekit.plugins import langchain as lk_langchain
 
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
@@ -50,6 +51,12 @@ class DisclosureFirstAgent(Agent):
     answered, so disclosure-first is guaranteed by structure (COMPLIANCE §2), not by the
     worker racing to call say() after session.start(). Uninterruptible: a barged-over
     disclosure was not fully played.
+
+    Dead-air on a slow turn is covered by the non-verbal thinking-SOUND earcon
+    (BackgroundAudioPlayer, started in the worker entrypoint), NOT a verbal filler: two
+    LiveKit-native verbal approaches (say() from the LLM adapter, and this pre-reply hook)
+    were tried and neither played reliably in the live runtime — the earcon is the mechanism
+    LiveKit actually drives off the agent 'thinking' state.
     """
 
     def __init__(self, *, instructions: str, disclosure: str) -> None:
@@ -67,6 +74,34 @@ class VoiceLoop:
     session: AgentSession
     agent: DisclosureFirstAgent
     engine: ReasoningEngine
+    # Background "thinking" earcon — a subtle typing sound while the graph works, masking the
+    # LLM/tool dead-air on turns the deterministic read renderer can't shortcut (catalog
+    # search, multi-intent). CONSTRUCTED here from config; STARTED in the worker entrypoint
+    # where the room lives (`background_audio.start(room=..., agent_session=...)`).
+    background_audio: BackgroundAudioPlayer
+
+
+# The thinking earcon: a subtle double-blip (assets/audio/, reproducible via its generator
+# script). Not a LiveKit built-in — those are keyboard-typing / ambience / hold-music, none of
+# which fits a short "working on it" beat; a soft tone reads warmer under a voice call.
+_THINKING_SOUND_PATH = (
+    Path(__file__).resolve().parents[3] / "assets" / "audio" / "thinking_beep.wav"
+)
+
+
+def _build_background_audio() -> BackgroundAudioPlayer:
+    """The thinking-sound earcon (live-call dead-air fix). A subtle beep auto-plays while the
+    agent is in the 'thinking' state and stops when speech starts (LiveKit-managed) — so it
+    never overlaps the answer or a confirmation readback (§4a). Non-verbal by design: verbal
+    filler ("give me a sec") near a sensitive readback is a §4a collision risk, its own pass.
+    No ambient sound (a call is not a storefront). If the asset is missing, degrade to no
+    thinking sound rather than crash the session."""
+    thinking = (
+        AudioConfig(str(_THINKING_SOUND_PATH), volume=0.6)
+        if _THINKING_SOUND_PATH.exists()
+        else None
+    )
+    return BackgroundAudioPlayer(thinking_sound=thinking)
 
 
 def build_voice_loop(
@@ -169,7 +204,10 @@ def build_voice_loop(
             "{display_name}", config.display_name
         ),
     )
-    return VoiceLoop(session=session, agent=agent, engine=engine)
+    return VoiceLoop(
+        session=session, agent=agent, engine=engine,
+        background_audio=_build_background_audio(),
+    )
 
 
 def _attach_thread_reaper(

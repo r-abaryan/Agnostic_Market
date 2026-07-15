@@ -40,6 +40,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._copy import warm_close
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.cart.prompt import compose_cart_prompt
 from agnostic_market.agents.telemetry import write_event
@@ -340,7 +341,7 @@ def build_cart_nodes(
                     what = "one of those" if invalid == 1 else "some of those"
                     ack += f" - {what} didn't go through, could you say it again?"
                 else:
-                    ack += " - anything else?"
+                    ack += f". {warm_close()}"  # its own sentence (proper case), factual
                 return {"messages": new_messages, "pending_ack": ack}
 
             ack_extra_tool_calls(response, new_messages)
@@ -362,7 +363,7 @@ def build_cart_nodes(
                     ack = "Your cart's empty right now - what would you like to add?"
                 else:
                     ack = f"You've got {speak_lines(cart_store.view())} - " \
-                          f"that's ${cart_store.cart_total():.2f}. Anything else?"
+                          f"that's ${cart_store.cart_total():.2f}. {warm_close()}"
                 return {"messages": new_messages, "pending_ack": ack}
 
             if name == "go_to_checkout":
@@ -411,7 +412,7 @@ def build_cart_nodes(
         """Speak the code-authored in-flow line (mutation ack / review listing / empty-cart)
         and clear it. The flow stays sticky (`active_flow` unchanged). Clear-before-speak:
         `pending_ack` goes None in the same update as the spoken message."""
-        ack = state.pending_ack or "Anything else?"
+        ack = state.pending_ack or warm_close()
         return {"pending_ack": None, "messages": [AIMessage(ack)]}
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:

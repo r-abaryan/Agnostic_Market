@@ -36,12 +36,12 @@ class _FakeHistoryItem:
 class _FakeSession:
     """AgentSession double: just the history surface the adapter reads."""
 
-    def __init__(self, items: list[_FakeHistoryItem]) -> None:
+    def __init__(self, items: list[_FakeHistoryItem] | None = None) -> None:
         class _History:
             pass
 
         self.history = _History()
-        self.history.items = items
+        self.history.items = items or []
 
 
 async def _spoken(adapter: GraphVoiceAdapter, state: dict) -> list[str]:
@@ -139,3 +139,4 @@ async def test_unconsumed_turn_never_reaches_the_engine() -> None:
     spoken = await _spoken(adapter, {"messages": [HumanMessage("no, wait")]})
     assert engine.calls == [("no, wait", TurnFacts(readback_interrupted=False))]
     assert spoken == ["never spoken"]
+

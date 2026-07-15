@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Annotated
 
 from langchain_core.language_models import BaseChatModel
@@ -48,13 +49,19 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
 from agnostic_market.agents._consent import is_abort, is_support_abort, wants_human
+from agnostic_market.agents._copy import warm_close
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import gate_check
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore
+from agnostic_market.commerce.orders import (
+    LastOrderPointer,
+    OrderStore,
+    render_cart_line,
+    render_order_status_line,
+)
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import (
@@ -84,6 +91,12 @@ _GATE_OWNER: dict[HandoffDestination, ActiveFlow] = {
 # Max read-only tool round-trips per turn before the graph ends (loop guard — the
 # hand-built graph has no framework loop protection like create_agent had).
 _MAX_TOOL_HOPS = 5
+
+# Reads whose result a CODE renderer speaks directly, skipping the second model pass (L3
+# latency + grounding win). A SINGLE such call with nothing else pending is deterministic —
+# code renders it and ENDs. catalog_search is deliberately EXCLUDED: product discovery is
+# fuzzy and needs the model to frame ("we don't carry X, but we do have Y").
+_RENDERABLE_READS = frozenset({"order_status", "view_cart"})
 
 # 3a deferral copy — destination-keyed and HONEST: nothing downstream exists yet, so we do
 # NOT promise a live connection. Structure carries into 3b/3c where the promises come true.
@@ -145,6 +158,33 @@ def _model_spoke_this_turn(state: ReasoningState) -> bool:
             if isinstance(content, str) and content.strip():
                 return True
     return False
+
+
+def _single_renderable_read(state: ReasoningState) -> tuple[str, dict] | None:
+    """The ONE render-decision predicate, shared by `route_after_tools` (to divert) and
+    `read_render_node` (to render) so they can never drift (a router that diverts and a node
+    that then declines to render would strand the turn).
+
+    Returns `(tool_name, tool_args)` when THIS turn is a pure single renderable read — the
+    model's most recent AIMessage carried EXACTLY ONE tool call, it is in `_RENDERABLE_READS`,
+    and no handover is pending — else None. A multi-intent turn ("status AND do you have
+    socks?") makes the model emit ≥2 tool calls, so the `== 1` guard fails and the turn stays
+    on the model narration path. request_handover sets `handover`, so a read+handover turn is
+    excluded here and routed to the sink instead.
+    """
+    if state.handover is not None:
+        return None
+    for msg in reversed(state.messages):
+        if isinstance(msg, HumanMessage):
+            return None
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            if len(msg.tool_calls) != 1:
+                return None
+            call = msg.tool_calls[0]
+            if call["name"] in _RENDERABLE_READS:
+                return call["name"], call["args"]
+            return None
+    return None
 
 
 def build_frontline_graph(
@@ -264,6 +304,53 @@ def build_frontline_graph(
         (turns that did NOT escalate) just as much as the handover positives."""
         write_event({"utterance": _last_user_text(state), "outcome": "answered"})
         return {}
+
+    def read_render_node(state: ReasoningState) -> dict[str, object]:
+        """CODE-author the spoken line for a single renderable read (order_status/view_cart)
+        and END — skipping the second model pass (the ~2.5s `tool_to_next_model` cost, live
+        calls #9/#10/#11) AND the embellishment class it introduced (a code renderer cannot
+        say "on the way" for a processing order — the phrase is derived from the store field).
+
+        Only routed here when `_single_renderable_read` held, so the read already executed
+        (its ToolMessage is in history). The line is re-derived from the SAME store the tool
+        read — same turn, single-threaded, no concurrent writer (the frontline holds no write
+        tools), so it is deterministically identical to the audited tool result. `today` is
+        read per-turn here (never build-time — a stale date regresses the past/future ETA
+        framing across midnight, the #9 P6 failure)."""
+        renderable = _single_renderable_read(state)
+        assert renderable is not None  # router only sends us here when it held
+        name, args = renderable
+        # A warm close on a resolved answer; NOT on a not-found (a "what else?" after "I
+        # couldn't find it" is jarring — the caller needs to give the right number first).
+        close = f" {warm_close()}"
+        if name == "view_cart":
+            line = (
+                "Your cart's empty at the moment."
+                if cart_store.is_empty()
+                else render_cart_line(cart_store.view(), cart_store.cart_total()) + close
+            )
+        else:  # order_status
+            order_id = str(args.get("order_id", ""))
+            if store.order_summary(order_id) is None:
+                line = (
+                    f"I couldn't find an order with id {order_id} - could you double-check "
+                    "the number?"
+                )
+            else:
+                line = render_order_status_line(
+                    order_id=order_id,
+                    status=store.order_status(order_id) or "unknown",
+                    items=store.order_item_summary(order_id),
+                    eta=store.order_eta(order_id),
+                    today=datetime.now().date(),
+                ) + close
+        # Same answered-turn telemetry as finalize_node (this path ENDs here, bypassing it),
+        # tagged so the code-render count is measurable against the model-narration path.
+        write_event(
+            {"utterance": _last_user_text(state), "outcome": "answered",
+             "outcome_detail": "code_render", "tool": name}
+        )
+        return {"messages": [AIMessage(line)]}
 
     def handover_node(state: ReasoningState) -> dict[str, object]:
         assert state.handover is not None  # only reached with a handover set
@@ -580,6 +667,7 @@ def build_frontline_graph(
     graph.add_node("tools", tool_node)
     graph.add_node("handover", handover_node)
     graph.add_node("finalize", finalize_node)
+    graph.add_node("read_render", read_render_node)
     graph.add_node("cart_assemble", cart.assemble)
     graph.add_node("cart_ack", cart.ack)
     graph.add_node("cart_guardrail", cart.guardrail)
@@ -612,8 +700,14 @@ def build_frontline_graph(
     def route_after_tools(state: ReasoningState) -> str:
         # request_handover's Command sets `handover` AND targets the handover node; but the
         # static tools->next edge still evaluates, so guard it: if a handover was set, go
-        # there; otherwise a read-only result returns to the model.
-        return "handover" if state.handover is not None else "model"
+        # there. A pure single renderable read (order_status/view_cart, nothing else) is
+        # rendered in code and ENDs (L3 — skips the second model pass); the shared predicate
+        # already requires handover is None. Everything else returns to the model to narrate.
+        if state.handover is not None:
+            return "handover"
+        if _single_renderable_read(state) is not None:
+            return "read_render"
+        return "model"
 
     graph.add_edge(START, "entry")
     graph.add_conditional_edges(
@@ -638,7 +732,8 @@ def build_frontline_graph(
         "model", route_after_model, {"tools": "tools", "finalize": "finalize"}
     )
     graph.add_conditional_edges(
-        "tools", route_after_tools, {"handover": "handover", "model": "model"}
+        "tools", route_after_tools,
+        {"handover": "handover", "model": "model", "read_render": "read_render"},
     )
     graph.add_conditional_edges(
         "handover",
@@ -786,12 +881,13 @@ def build_frontline_graph(
     graph.add_edge("support_abort", END)
     graph.add_edge("support_escape_human", "handover")
     graph.add_edge("finalize", END)
+    graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
 
     compiled = graph.compile(checkpointer=checkpointer)
     # Stashed for tests/introspection + the engine (single source of truth for which
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset({"handover"}) | cart.speakable_nodes | support.speakable_nodes
+        frozenset({"handover", "read_render"}) | cart.speakable_nodes | support.speakable_nodes
     )
     return compiled
