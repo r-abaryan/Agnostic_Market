@@ -1120,9 +1120,9 @@ def build_support_nodes(
             "active_flow": None,
             "messages": [
                 AIMessage(
-                    f"Done - your return for {pending.summary} is set up; your reference "
-                    f"is {record.rma_id}. The ${record.refund_due_usd:.2f} refund goes "
-                    "back to your original payment method once the return is processed."
+                    f"Done - your return for {pending.summary} is set up; your reference is "
+                    f"{record.rma_id}. Send the items back, and once we receive them the "
+                    f"${record.refund_due_usd:.2f} refund goes to your original payment method."
                 )
             ],
         }

@@ -12,6 +12,11 @@ from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    load_customers_fixture,
+)
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
@@ -27,6 +32,8 @@ class SupportHarness(NamedTuple):
     otp: OtpProvider
     profile: ProfileStore
     pointer: LastOrderPointer
+    identity: CallerIdentityStore
+    customers: CustomerDirectory
 
 
 def build_support_engine(
@@ -40,17 +47,19 @@ def build_support_engine(
 ) -> SupportHarness:
     """The production graph shape behind a ReasoningEngine, with fakes + per-test stores.
 
-    The pointer instance is SHARED between the order_status tool and the graph (the
-    split-brain rule); the neutral reasoning default clarifies — suites pass their own
-    force_tool/scripted fakes.
+    The pointer and identity-store instances are SHARED between the tools and the graph
+    (the split-brain rule); the neutral reasoning default clarifies — suites pass their
+    own force_tool/scripted fakes.
     """
     from agnostic_market.voice.tools import build_voice_tools
 
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     pointer = LastOrderPointer()
+    identity = CallerIdentityStore()
+    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, CartStore(), pointer)
+        for t in build_voice_tools(store, CartStore(), pointer, identity, customers)
     ]
     otp = OtpProvider()
     verification = VerificationStore(otp)
@@ -68,8 +77,17 @@ def build_support_engine(
         risk=RiskProvider(flagged=risk_flagged),
         profile_store=profile,
         pointer=pointer,
+        identity_store=identity,
+        customers=customers,
         checkpointer=build_checkpointer(),
     )
     return SupportHarness(
-        ReasoningEngine(graph, thread_id=thread_id), store, verification, otp, profile, pointer
+        ReasoningEngine(graph, thread_id=thread_id),
+        store,
+        verification,
+        otp,
+        profile,
+        pointer,
+        identity,
+        customers,
     )

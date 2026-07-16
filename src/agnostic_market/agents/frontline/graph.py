@@ -53,13 +53,20 @@ from agnostic_market.agents._copy import warm_close
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import gate_check
+from agnostic_market.agents.identity import build_identity_nodes
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    order_read_allowed,
+)
 from agnostic_market.commerce.orders import (
     LastOrderPointer,
     OrderStore,
     render_cart_line,
+    render_order_list_line,
     render_order_status_line,
 )
 from agnostic_market.commerce.profile import ProfileStore
@@ -95,8 +102,10 @@ _MAX_TOOL_HOPS = 5
 # Reads whose result a CODE renderer speaks directly, skipping the second model pass (L3
 # latency + grounding win). A SINGLE such call with nothing else pending is deterministic —
 # code renders it and ENDs. catalog_search is deliberately EXCLUDED: product discovery is
-# fuzzy and needs the model to frame ("we don't carry X, but we do have Y").
-_RENDERABLE_READS = frozenset({"order_status", "view_cart"})
+# fuzzy and needs the model to frame ("we don't carry X, but we do have Y"). list_orders
+# renders only on a BOUND session (`_render_ready` gates it); its UNVERIFIED branch takes
+# the deterministic enumeration divert instead (below) — either way, no second model pass.
+_RENDERABLE_READS = frozenset({"order_status", "view_cart", "list_orders"})
 
 # 3a deferral copy — destination-keyed and HONEST: nothing downstream exists yet, so we do
 # NOT promise a live connection. Structure carries into 3b/3c where the promises come true.
@@ -202,6 +211,8 @@ def build_frontline_graph(
     risk: RiskProvider | None = None,
     profile_store: ProfileStore | None = None,
     pointer: LastOrderPointer | None = None,
+    identity_store: CallerIdentityStore | None = None,
+    customers: CustomerDirectory | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
@@ -229,6 +240,11 @@ def build_frontline_graph(
     # SAME instance given to build_voice_tools (the order_status set-site) — the default
     # exists only for callers that never resolve an order reference (split-brain otherwise).
     pointer = pointer or LastOrderPointer()
+    # Session authorization store + customer directory (P7). Same split-brain rule: the
+    # order_status tool GRANTS into `identity_store` and the render router READS it — pass
+    # the ONE instance to both build_voice_tools and here.
+    identity_store = identity_store or CallerIdentityStore()
+    customers = customers or CustomerDirectory()  # default fake fixture (test/eval seam)
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
@@ -305,19 +321,75 @@ def build_frontline_graph(
         write_event({"utterance": _last_user_text(state), "outcome": "answered"})
         return {}
 
+    def _render_ready(state: ReasoningState) -> tuple[str, dict] | None:
+        """`_single_renderable_read` PLUS the P7 authorization gates — the render decision
+        the router and the render node share (one function; a drifted second computation
+        would let the render path leak an order line around the tool's object-binding gate).
+
+        An order_status the session may NOT read falls back to the model, which narrates
+        the tool's ask-for-contact / combined-not-found instruction. The tool GRANTS during
+        ToolNode (before route_after_tools runs), so a just-verified read passes here.
+        list_orders renders only when an identity is BOUND (the tool returned the real
+        list); its unverified branch is the enumeration divert's job, never a render.
+        view_cart needs no authorization (the session's own cart).
+        """
+        renderable = _single_renderable_read(state)
+        if renderable is None:
+            return None
+        name, args = renderable
+        if name == "order_status" and not order_read_allowed(
+            str(args.get("order_id", "")), store=store, identity=identity_store
+        ):
+            return None
+        if name == "list_orders" and identity_store.current() is None:
+            return None
+        return renderable
+
+    def _unverified_enumeration(state: ReasoningState) -> bool:
+        """True when THIS turn is a single UNVERIFIED list_orders probe — the deterministic
+        enumeration divert (live call #13 latency + the F-12.3 class closed structurally).
+
+        The tool's unverified result dictates exactly one action (hand over to the identity
+        flow); returning to the model just to relay that costs a full model pass (~1-1.5s
+        live) AND re-opens the compliance risk the prompt patches over (call #12: the model
+        asked for the email itself). Code sets the handover instead — the model never gets
+        the turn back. EXCEPT while `left_identity` (the model deliberately left the flow
+        THIS turn): diverting straight back in would cycle; the model answers honestly.
+        """
+        if state.handover is not None or state.active_flow == "left_identity":
+            return False
+        if identity_store.current() is not None:
+            return False  # bound: the tool returned the real list (render or narrate)
+        for msg in reversed(state.messages):
+            if isinstance(msg, HumanMessage):
+                return False
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                return len(msg.tool_calls) == 1 and msg.tool_calls[0]["name"] == "list_orders"
+        return False
+
+    def enumeration_gate_node(state: ReasoningState) -> dict[str, object]:
+        """Set the list_orders handover DETERMINISTICALLY (source='gate' — code decided,
+        like cross_switch). Nothing is spoken here; the identity flow owns the voice."""
+        return {
+            "handover": HandoffRequest(
+                destination="support", reason_code="list_orders", source="gate"
+            )
+        }
+
     def read_render_node(state: ReasoningState) -> dict[str, object]:
         """CODE-author the spoken line for a single renderable read (order_status/view_cart)
         and END — skipping the second model pass (the ~2.5s `tool_to_next_model` cost, live
         calls #9/#10/#11) AND the embellishment class it introduced (a code renderer cannot
         say "on the way" for a processing order — the phrase is derived from the store field).
 
-        Only routed here when `_single_renderable_read` held, so the read already executed
+        Only routed here when `_render_ready` held (single renderable read AND, for
+        order_status, the session may read that order), so the read already executed
         (its ToolMessage is in history). The line is re-derived from the SAME store the tool
         read — same turn, single-threaded, no concurrent writer (the frontline holds no write
         tools), so it is deterministically identical to the audited tool result. `today` is
         read per-turn here (never build-time — a stale date regresses the past/future ETA
         framing across midnight, the #9 P6 failure)."""
-        renderable = _single_renderable_read(state)
+        renderable = _render_ready(state)
         assert renderable is not None  # router only sends us here when it held
         name, args = renderable
         # A warm close on a resolved answer; NOT on a not-found (a "what else?" after "I
@@ -329,6 +401,10 @@ def build_frontline_graph(
                 if cart_store.is_empty()
                 else render_cart_line(cart_store.view(), cart_store.cart_total()) + close
             )
+        elif name == "list_orders":
+            bound = identity_store.current()
+            assert bound is not None  # _render_ready only passes list_orders when bound
+            line = render_order_list_line(store.owned_orders(bound.customer_ref)) + close
         else:  # order_status
             order_id = str(args.get("order_id", ""))
             if store.order_summary(order_id) is None:
@@ -391,6 +467,16 @@ def build_frontline_graph(
         # the CART flow — the single-line checkout flow it replaces is gone.
         if handover.destination == "checkout" and state.active_flow != "left_cart":
             return {"active_flow": "cart", "handover": None}
+        # LIST_ORDERS enters the IDENTITY flow (P7 rung 2: enumeration needs an OTP-bound
+        # identity) — checked ABOVE the generic support branch since it shares the support
+        # destination. The re-ask counter resets on ENTRY: each fresh engagement gets its
+        # one bounded re-ask (a prior engagement's miss must not carry over).
+        if (
+            handover.destination == "support"
+            and handover.reason_code == "list_orders"
+            and state.active_flow != "left_identity"
+        ):
+            return {"active_flow": "identity", "handover": None, "identity_claim_misses": 0}
         # Support handles REFUND, CANCEL_ORDER (Group A), and profile changes — address +
         # contact (Group C; contact = the OTP factor itself, stepped-up on the OLD factor).
         # PAYMENT_CHANGE stays deferred (payments = Phase 5): entering would run the
@@ -419,7 +505,7 @@ def build_frontline_graph(
         # while one exists the graph is paused at confirm and turns arrive as resumes,
         # never through here.)
         update: dict[str, object] = {"handover": None, "pending_ack": None}
-        if state.active_flow in ("left_cart", "left_support"):
+        if state.active_flow in ("left_cart", "left_support", "left_identity"):
             update["active_flow"] = None
         return update
 
@@ -449,6 +535,8 @@ def build_frontline_graph(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
+            "pending_identity": None,
+            "identity_claim_misses": 0,
             "pending_ack": None,
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
@@ -490,16 +578,31 @@ def build_frontline_graph(
             if hit is not None and _GATE_OWNER[hit[1]] != "support":
                 return "cross_switch"
             return "support_assemble"
+        if state.active_flow == "identity":
+            if wants_human(text):
+                return "identity_escape_human"
+            # PLAIN is_abort: cancellation is NOT identity's subject matter (unlike
+            # support), so "cancel that" aborts locally — while "cancel my order" is no
+            # abort phrasing, falls through to the gate, and cross-switches to support.
+            if is_abort(text):
+                return "identity_abort"
+            # NO gate destination owns identity (the _GATE_OWNER comparison would be
+            # vacuous) — ANY gate-certain intent while verifying is a cross-switch.
+            if gate_check(text) is not None:
+                return "cross_switch"
+            return "identity_assemble"
         return "gate"
 
     def route_after_handover(state: ReasoningState) -> str:
-        # A cart/support destination entered the flow (handover cleared, flow set);
-        # everything else spoke its deferral and ends.
+        # A cart/support/identity destination entered the flow (handover cleared, flow
+        # set); everything else spoke its deferral and ends.
         if state.handover is None:
             if state.active_flow == "cart":
                 return "cart_assemble"
             if state.active_flow == "support":
                 return "support_assemble"
+            if state.active_flow == "identity":
+                return "identity_assemble"
         return END
 
     def route_after_cart_assemble(state: ReasoningState) -> str:
@@ -537,6 +640,56 @@ def build_frontline_graph(
         pointer,
         display_name=display_name,
     )
+    identity = build_identity_nodes(
+        reasoning_model,
+        store,
+        verification_store,
+        otp,
+        risk,
+        customers,
+        identity_store,
+        policy,
+        display_name=display_name,
+    )
+
+    # --- identity flow routers (the flow owns the store-dependent decisions; the graph
+    #     maps them to node names — same stance as the support routers below) ---
+    def route_after_identity_assemble(state: ReasoningState) -> str:
+        # leave | handover | guardrail | reask | clarify — from the assemble outcome.
+        decision = identity.route_after_assemble(state)
+        return {
+            "leave": "gate",  # model left; normal pipeline answers this same turn
+            "handover": "handover",  # terminal no-match -> the silent human path
+            "guardrail": "identity_guardrail",
+            "reask": "identity_reask",  # the ONE bounded re-ask (own speakable node)
+            "clarify": END,  # a clarifying question was streamed already
+        }[decision]
+
+    def route_after_identity_guardrail(state: ReasoningState) -> str:
+        # "confirm" (already bound to THIS customer at level) goes straight to apply —
+        # identity has no confirm interrupt (nothing irreversible happens at a re-list).
+        return {
+            "confirm": "identity_apply",
+            "stepup": "identity_risk_check",
+        }[identity.route_after_guardrail(state)]
+
+    def route_after_identity_risk(state: ReasoningState) -> str:
+        # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
+        return "handover" if state.handover is not None else "identity_dispatch"
+
+    def route_after_identity_collect(state: ReasoningState) -> str:
+        # The flow's WRAPPED factory decision (binding invariant: a stale cross-family L2
+        # "confirm" with no new grant re-collects) mapped to THIS family's nodes.
+        return {
+            "confirm": "identity_apply",
+            "dispatch": "identity_dispatch",
+            "handover": "handover",
+        }[identity.route_after_collect(state)]
+
+    def route_after_identity_apply(state: ReasoningState) -> str:
+        # apply may hand to a human on a lapsed level / unproven binding; else it spoke
+        # the scoped list + ends.
+        return "handover" if state.handover is not None else END
 
     # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
     #     the flow, closed over the store — support.route_after_* ) ---
@@ -668,6 +821,7 @@ def build_frontline_graph(
     graph.add_node("handover", handover_node)
     graph.add_node("finalize", finalize_node)
     graph.add_node("read_render", read_render_node)
+    graph.add_node("enumeration_gate", enumeration_gate_node)
     graph.add_node("cart_assemble", cart.assemble)
     graph.add_node("cart_ack", cart.ack)
     graph.add_node("cart_guardrail", cart.guardrail)
@@ -696,17 +850,30 @@ def build_frontline_graph(
     graph.add_node("support_profile_place", support.profile_place)
     graph.add_node("support_abort", support.abort)
     graph.add_node("support_escape_human", support.escape_human)
+    graph.add_node("identity_assemble", identity.assemble)
+    graph.add_node("identity_reask", identity.reask)
+    graph.add_node("identity_guardrail", identity.guardrail)
+    graph.add_node("identity_risk_check", identity.risk_check)
+    graph.add_node("identity_dispatch", identity.dispatch)
+    graph.add_node("identity_collect", identity.collect)
+    graph.add_node("identity_apply", identity.apply)
+    graph.add_node("identity_abort", identity.abort)
+    graph.add_node("identity_escape_human", identity.escape_human)
 
     def route_after_tools(state: ReasoningState) -> str:
         # request_handover's Command sets `handover` AND targets the handover node; but the
         # static tools->next edge still evaluates, so guard it: if a handover was set, go
-        # there. A pure single renderable read (order_status/view_cart, nothing else) is
-        # rendered in code and ENDs (L3 — skips the second model pass); the shared predicate
-        # already requires handover is None. Everything else returns to the model to narrate.
+        # there. A pure single renderable read (order_status/view_cart, nothing else) that
+        # the session is AUTHORIZED for is rendered in code and ENDs (L3 — skips the second
+        # model pass); `_render_ready` carries both the structural predicate and the P7
+        # order-read gate, so a declined read returns to the model to narrate the tool's
+        # ask-for-contact instruction — the render path can never leak around the gate.
         if state.handover is not None:
             return "handover"
-        if _single_renderable_read(state) is not None:
+        if _render_ready(state) is not None:
             return "read_render"
+        if _unverified_enumeration(state):
+            return "enumeration_gate"
         return "model"
 
     graph.add_edge(START, "entry")
@@ -722,6 +889,9 @@ def build_frontline_graph(
             "support_assemble": "support_assemble",
             "support_abort": "support_abort",
             "support_escape_human": "support_escape_human",
+            "identity_assemble": "identity_assemble",
+            "identity_abort": "identity_abort",
+            "identity_escape_human": "identity_escape_human",
         },
     )
     graph.add_edge("cross_switch", "handover")
@@ -733,14 +903,17 @@ def build_frontline_graph(
     )
     graph.add_conditional_edges(
         "tools", route_after_tools,
-        {"handover": "handover", "model": "model", "read_render": "read_render"},
+        {"handover": "handover", "model": "model", "read_render": "read_render",
+         "enumeration_gate": "enumeration_gate"},
     )
+    graph.add_edge("enumeration_gate", "handover")
     graph.add_conditional_edges(
         "handover",
         route_after_handover,
         {
             "cart_assemble": "cart_assemble",
             "support_assemble": "support_assemble",
+            "identity_assemble": "identity_assemble",
             END: END,
         },
     )
@@ -880,6 +1053,48 @@ def build_frontline_graph(
     )
     graph.add_edge("support_abort", END)
     graph.add_edge("support_escape_human", "handover")
+    graph.add_conditional_edges(
+        "identity_assemble",
+        route_after_identity_assemble,
+        {
+            "gate": "gate",
+            "handover": "handover",
+            "identity_guardrail": "identity_guardrail",
+            "identity_reask": "identity_reask",
+            END: END,
+        },
+    )
+    graph.add_edge("identity_reask", END)
+    graph.add_conditional_edges(
+        "identity_guardrail",
+        route_after_identity_guardrail,
+        {
+            "identity_apply": "identity_apply",
+            "identity_risk_check": "identity_risk_check",
+        },
+    )
+    graph.add_conditional_edges(
+        "identity_risk_check",
+        route_after_identity_risk,
+        {"identity_dispatch": "identity_dispatch", "handover": "handover"},
+    )
+    graph.add_edge("identity_dispatch", "identity_collect")
+    graph.add_conditional_edges(
+        "identity_collect",
+        route_after_identity_collect,
+        {
+            "identity_apply": "identity_apply",
+            "identity_dispatch": "identity_dispatch",
+            "handover": "handover",
+        },
+    )
+    graph.add_conditional_edges(
+        "identity_apply",
+        route_after_identity_apply,
+        {"handover": "handover", END: END},
+    )
+    graph.add_edge("identity_abort", END)
+    graph.add_edge("identity_escape_human", "handover")
     graph.add_edge("finalize", END)
     graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
 
@@ -888,6 +1103,9 @@ def build_frontline_graph(
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset({"handover", "read_render"}) | cart.speakable_nodes | support.speakable_nodes
+        frozenset({"handover", "read_render"})
+        | cart.speakable_nodes
+        | support.speakable_nodes
+        | identity.speakable_nodes
     )
     return compiled

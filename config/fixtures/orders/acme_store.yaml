@@ -4,10 +4,12 @@
 # delivered_at (tz-aware ISO) is the return-window basis; it AGES against wall clock, so
 # window tests must monkeypatch the flow clock (support_flow.time) — never compare these
 # fixture dates against real now().
+# customer_ref (P7): the owning customer — a closed slug into fixtures/customers/, the
+# order-read/enumeration authorization basis. Cross-checked at session build.
 orders:
-  ORD-1001: { status: "shipped", summary: "2 pairs of trail running shoes", eta: "2026-07-09", total_usd: 179.98 }
-  ORD-1002: { status: "processing", summary: "1 waterproof rain jacket", eta: "2026-07-12", total_usd: 129.00 }
-  ORD-1003: { status: "delivered", summary: "3 pairs of merino hiking socks", eta: "2026-07-01", total_usd: 43.50, delivered_at: "2026-07-01T00:00:00Z" }
+  ORD-1001: { status: "shipped", summary: "2 pairs of trail running shoes", eta: "2026-07-09", total_usd: 179.98, customer_ref: "CUST-001" }
+  ORD-1002: { status: "processing", summary: "1 waterproof rain jacket", eta: "2026-07-12", total_usd: 129.00, customer_ref: "CUST-002" }
+  ORD-1003: { status: "delivered", summary: "3 pairs of merino hiking socks", eta: "2026-07-01", total_usd: 43.50, delivered_at: "2026-07-01T00:00:00Z", customer_ref: "CUST-001" }
 products:
   - { sku: "SKU-RED-42", name: "trail running shoes", price_usd: 89.99 }
   - { sku: "SKU-BLU-07", name: "waterproof rain jacket", price_usd: 129.00 }

@@ -43,6 +43,11 @@ should_escalate:
   - "swap my payment over to the visa ending in four"
   - "send back everything I bought last month"
   - "ring me up for the whole cart"
+  # -- order enumeration (P7: list_orders probe-first -> identity flow; F-11.2 verbatim
+  #    first — the live utterance that misfired to catalog_search under the old posture) --
+  - "is there any other active purchase?"
+  - "can you run through everything I've ordered?"
+  - "what else have I got on order with you?"
 
 # Reads / questions / chit-chat — must NOT escalate (over-escalation reported, not gated).
 should_answer:

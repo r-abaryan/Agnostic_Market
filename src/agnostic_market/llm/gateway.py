@@ -56,6 +56,12 @@ class LLMGateway:
                 f"(configured providers: {known}) - add it to config/base/providers.yaml"
             )
         api_key = self._secrets.resolve(entry.api_key_ref)
+        # Transient-error retries (live call #13 F-13.1: a 529 'overloaded' mid-turn died
+        # with NO retry): the provider SDK backs off on 429/5xx up to this many attempts.
+        # One choke point for every model the platform builds; callers may still override.
+        # Retries reduce the failure rate — the engine's spoken turn-fallback is what
+        # guarantees a caller never gets silence when they're exhausted.
+        model_kwargs.setdefault("max_retries", 3)
         return init_chat_model(
             f"{selection.provider}:{selection.model}", api_key=api_key, **model_kwargs
         )

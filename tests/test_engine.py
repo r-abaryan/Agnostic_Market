@@ -24,6 +24,7 @@ from agnostic_market.agents.engine import (
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.state import PolicyContext
@@ -40,13 +41,16 @@ def _engine(
     *,
     frontline: FakeChatModel | None = None,
     reasoning: FakeChatModel | None = None,
+    identity: CallerIdentityStore | None = None,
     thread_id: str = "session-1",
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     pointer = LastOrderPointer()
+    identity = identity or CallerIdentityStore()
+    customers = CustomerDirectory()  # default fake directory (same data as the fixture)
     tools = [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, CartStore(), pointer)
+        for t in build_voice_tools(store, CartStore(), pointer, identity, customers)
     ]
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -78,6 +82,42 @@ async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS)
 async def _pause_at_confirmation(engine: ReasoningEngine) -> list:
     """Drive the graph to the readback interrupt via the gate's checkout trigger."""
     return await _events(engine, "checkout now please")
+
+
+# --- the turn-failure boundary (live call #13 F-13.1: a 529 died in SILENCE) -------------
+
+
+class _ExplodingFake(FakeChatModel):
+    """Raises once (a provider outage surviving SDK retries), then behaves normally."""
+
+    def _respond(self, messages, **kwargs):  # type: ignore[override]
+        if not getattr(self, "_exploded", False):
+            object.__setattr__(self, "_exploded", True)
+            raise RuntimeError("simulated provider 529 overloaded")
+        return super()._respond(messages, **kwargs)
+
+
+async def test_failed_turn_speaks_the_fallback_never_silence(
+    config_root: Path, tmp_path: Path
+) -> None:
+    import json
+
+    from agnostic_market.agents import telemetry
+    from agnostic_market.dtos.events import SpokenMessageEvent
+
+    engine, _ = _engine(config_root, frontline=_ExplodingFake(emit_tool_calls=False))
+    events = await _events(engine, "hi there")  # the graph dies mid-turn...
+    spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
+    assert len(spoken) == 1 and spoken[0].node == "turn_fallback"
+    assert "say that again" in spoken[0].text  # ...but the caller hears the fallback
+    lines = [
+        json.loads(line)
+        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(rec.get("event") == "turn_failed" for rec in lines)  # loud, not swallowed
+    # The session SURVIVES: the next turn runs normally on the same thread.
+    retry = await _events(engine, "hi again")
+    assert any(isinstance(e, TokenEvent) and e.text for e in retry)
 
 
 # --- plain turns -----------------------------------------------------------------------

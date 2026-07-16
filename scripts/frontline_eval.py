@@ -28,6 +28,11 @@ from agnostic_market.agents import telemetry
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    load_customers_fixture,
+)
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
@@ -52,6 +57,7 @@ _FLOW_TOOLS = frozenset(
         "propose_profile_change", "leave_support",  # support (profile: Group C)
         "add_to_cart", "remove_from_cart", "set_quantity", "review_cart", "buy_now",
         "go_to_checkout", "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
+        "propose_identity", "leave_identity",  # identity (P7; list_orders is a FRONTLINE read)
     }
 )
 
@@ -101,9 +107,11 @@ async def _run() -> int:
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
     cart_store = CartStore()
     pointer = LastOrderPointer()
+    customers = CustomerDirectory(load_customers_fixture(_CONFIG_ROOT, _MERCHANT_ID))
+    identity_store = CallerIdentityStore()
     tools = [
         wrap_readonly_tool(t, _MERCHANT_ID)
-        for t in build_voice_tools(store, cart_store, pointer)
+        for t in build_voice_tools(store, cart_store, pointer, identity_store, customers)
     ]
     config = resolved.config
     graph = build_frontline_graph(
@@ -117,6 +125,8 @@ async def _run() -> int:
         store=store,
         cart_store=cart_store,  # SAME instance as view_cart (no split-brain)
         pointer=pointer,  # SAME instance as order_status (Group C L4)
+        identity_store=identity_store,  # SAME instance as the tools' gate (P7, no split-brain)
+        customers=customers,
         # The ONE config->runtime policy mapping — identical to production (F1). The old
         # hand-built copy here had drifted (it silently omitted spoken_policy_extra).
         policy=config.policies.to_policy_context(),

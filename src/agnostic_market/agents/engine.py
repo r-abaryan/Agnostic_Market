@@ -40,6 +40,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from agnostic_market.agents.telemetry import write_event
 from agnostic_market.dtos.events import (
     InterruptEvent,
     SpokenMessageEvent,
@@ -51,6 +52,7 @@ from agnostic_market.dtos.state import (
     CartLine,
     HandoffRequest,
     PendingCancel,
+    PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
     PendingRefund,
@@ -75,9 +77,18 @@ _CHECKPOINTED_DTOS = (
     PendingCancel,
     PendingReturn,
     PendingProfileChange,
+    PendingIdentity,
     HandoffRequest,
     ReasoningState,
 )
+
+
+# The turn-failure fallback (F-13.1). EXCEPTION to the one-author rule (the graph authors
+# all caller-facing text): when the GRAPH ITSELF is what died, there is no graph author —
+# a fixed platform failure line is the only alternative to dead air. Honest (admits the
+# hiccup, asks to repeat), promises nothing.
+_TURN_FALLBACK_LINE = "Sorry - I hit a snag on my end just now. Could you say that again?"
+_TURN_FALLBACK_NODE = "turn_fallback"  # not a graph node; names the author in the event
 
 
 def build_checkpointer() -> InMemorySaver:
@@ -233,7 +244,15 @@ class ReasoningEngine:
         return bool(self._graph.get_state(self._config).interrupts)
 
     async def stream_turn(self, user_text: str, facts: TurnFacts) -> AsyncIterator[TurnEvent]:
-        """Run one committed user turn; yield the caller-audible events it produces."""
+        """Run one committed user turn; yield the caller-audible events it produces.
+
+        A turn that DIES mid-graph (provider outage, a bug) must never leave the caller in
+        silence (live call #13 F-13.1: an Anthropic 529 survived the SDK retries, the turn
+        errored into a log line, and the caller sat in dead air until they re-asked). The
+        failure boundary here logs + telemeters loudly, then speaks ONE fixed fallback line
+        and ends the turn cleanly — the thread stays usable (nothing mid-node was
+        committed; a pending interrupt stays paused and the next turn resumes it).
+        """
         if self.pending_interrupt():
             # The graph's confirm node classifies consent; the engine only relays facts.
             payload: object = Command(
@@ -243,16 +262,26 @@ class ReasoningEngine:
             payload = {"messages": [HumanMessage(user_text)]}
         speech = _TurnSpeech(self._speakable)
         spans = _GraphSpans()
-        async for mode, item in self._graph.astream(
-            payload, config=self._config, stream_mode=["messages", "updates"]
-        ):
-            if mode == "messages":
-                token, meta = item
-                spans.observe(token, meta)
-                if (event := speech.feed(token, meta)) is not None:
-                    yield event
-            elif mode == "updates" and "__interrupt__" in item:
-                yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+        try:
+            async for mode, item in self._graph.astream(
+                payload, config=self._config, stream_mode=["messages", "updates"]
+            ):
+                if mode == "messages":
+                    token, meta = item
+                    spans.observe(token, meta)
+                    if (event := speech.feed(token, meta)) is not None:
+                        yield event
+                elif mode == "updates" and "__interrupt__" in item:
+                    yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+        except Exception:
+            # The degradation boundary, not error-swallowing: the full traceback is logged
+            # and the event telemetered (exception CLASS only — provider error messages are
+            # free text, not for telemetry); the caller hears the fallback instead of
+            # nothing. CancelledError is BaseException and passes through untouched.
+            logger.exception("turn failed mid-graph; speaking the fallback line")
+            write_event({"event": "turn_failed", "reason": "graph_exception"})
+            yield SpokenMessageEvent(text=_TURN_FALLBACK_LINE, node=_TURN_FALLBACK_NODE)
+            return
         for flushed in speech.flush():
             yield flushed
         spans.log()

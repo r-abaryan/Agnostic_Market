@@ -153,12 +153,36 @@ def render_cart_line(lines: Sequence[CartLine], total_usd: float) -> str:
     return f"You've got {speak_lines(lines)} in your cart, ${total_usd:.2f} in total."
 
 
+def render_order_list_line(candidates: Sequence[OrderCandidate]) -> str:
+    """CODE-authored spoken order list (P7 enumeration — the identity flow's apply node and
+    the verified `list_orders` tool both speak from THIS). Id + summary + humanized status
+    ONLY — no addresses, no contact, no totals (not needed to answer "what orders do I
+    have", and short lines TTS better). Statuses humanize via `_STATUS_PHRASE`, fail-closed
+    (an unknown status speaks the raw word, never an invented phrase)."""
+    if not candidates:
+        return "I don't see any orders on your account."
+    parts = [
+        f"{c.order_id}, {c.summary}, {_STATUS_PHRASE.get(c.status, c.status)}"
+        for c in candidates
+    ]
+    if len(parts) == 1:
+        return f"You've got 1 order: {parts[0]}."
+    listed = "; ".join(parts[:-1]) + f"; and {parts[-1]}"
+    return f"You've got {len(parts)} orders: {listed}."
+
+
 class _OrderEntry(BaseModel):
     model_config = _STRICT
 
     status: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     eta: str = Field(min_length=1)
+    # The owning customer (a closed slug into the customers fixture, e.g. "CUST-001") — the
+    # P7 order-read/enumeration authorization basis. REQUIRED (no default) on purpose: an
+    # order without an owner would be silently unreadable under object binding; the fixture
+    # must fail loudly at load. Cross-checked against the customers fixture at session build
+    # (identity.assert_orders_have_customers).
+    customer_ref: str = Field(min_length=1)
     # Captured amount — the refund cumulative-cap join reads this (§A4b); a real SoR always
     # knows what it captured. Required so a refund can never run against an unknown total.
     total_usd: float = Field(ge=0)
@@ -414,6 +438,45 @@ class OrderStore:
                     f"(${placed.total_usd:.2f}) - status {status}, ETA {_PLACED_ETA}."
                 )
         return None
+
+    def order_owner(self, order_id: str) -> str | None:
+        """The owning customer_ref of a FIXTURE order; None for unknown AND for session-placed
+        orders (those are owned by "this session's caller" — `is_session_placed` is that
+        check; a placed order joins a customer's durable account at the Phase-4 real SoR)."""
+        entry = self.fixture.orders.get(order_id.strip().upper())
+        return entry.customer_ref if entry is not None else None
+
+    def is_session_placed(self, order_id: str) -> bool:
+        """True when THIS session's store placed the order (the caller placed it on this
+        call — readable by them without any further verification, P7 rung 1)."""
+        normalized = order_id.strip().upper()
+        return any(p.order_id == normalized for p in self._placed_by_key.values())
+
+    def owned_orders(self, customer_ref: str) -> list[OrderCandidate]:
+        """The bounded, keyed list of orders the IDENTIFIED caller may hear enumerated (P7
+        rung 2): fixture orders owned by `customer_ref` + everything placed THIS session
+        (placed-by-this-caller by construction). Effective status (cancelled overlay wins).
+        Same OrderCandidate shape as `actionable_orders` — which stays deliberately unscoped
+        for support selection (the NAMED follow-up gap, SECURITY §7d)."""
+        candidates: list[tuple[str, str, float]] = [
+            (oid, entry.summary, entry.total_usd)
+            for oid, entry in self.fixture.orders.items()
+            if entry.customer_ref == customer_ref
+        ]
+        candidates += [
+            (p.order_id, speak_lines(p.lines), p.total_usd)
+            for p in self._placed_by_key.values()
+        ]
+        return [
+            OrderCandidate(
+                key=str(i),
+                order_id=oid,
+                summary=summary,
+                total_usd=total,
+                status=self.order_status(oid) or "unknown",
+            )
+            for i, (oid, summary, total) in enumerate(candidates, start=1)
+        ]
 
     def order_eta(self, order_id: str) -> str | None:
         """The raw ETA for an order (fixture `entry.eta`, a date "2026-07-09"; or `_PLACED_ETA`

@@ -10,6 +10,7 @@ from llm_fakes import FakeChatModel
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
@@ -22,24 +23,38 @@ _HANDOVER_ARGS = {"request_handover": {"destination": "planner", "reason_code": 
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
 
 
-def _tools(store: OrderStore, cart: CartStore) -> list:
+def _granted(*order_ids: str) -> CallerIdentityStore:
+    """A session identity store with rung-1 grants — for tests exercising what happens
+    AFTER an authorized order read (the L3 render path), not the gate itself."""
+    identity = CallerIdentityStore()
+    for oid in order_ids:
+        identity.grant_order(oid)
+    return identity
+
+
+def _tools(
+    store: OrderStore, cart: CartStore, identity: CallerIdentityStore
+) -> list:
     return [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, LastOrderPointer())
+        for t in build_voice_tools(store, cart, LastOrderPointer(), identity, CustomerDirectory())
     ]
 
 
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     store = kwargs.pop("store", None) or OrderStore(load_orders_fixture(config_root, "acme_store"))
     # The SAME cart instance must reach build_voice_tools AND the graph, or view_cart reads a
-    # different cart than the render node (split-brain, graph docstring).
+    # different cart than the render node (split-brain, graph docstring). Same for the
+    # identity store (P7): the tool grants into it, the render router reads it.
     cart = kwargs.pop("cart_store", None) or CartStore()
+    identity = kwargs.pop("identity", None) or CallerIdentityStore()
     return build_frontline_graph(
         fake,
-        _tools(store, cart),
+        _tools(store, cart, identity),
         display_name="Acme Store",
         tenant_id="acme_store",
         cart_store=cart,
+        identity_store=identity,
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
@@ -63,7 +78,12 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
     graph = _graph(config_root, FakeChatModel())
     # The only tools the frontline can call are the read-only ones + request_handover
     # (a control signal, not a mutation). NO cart-write / place-order / refund / profile.
-    assert graph.frontline_read_only_tools == {"order_status", "catalog_search", "view_cart"}
+    assert graph.frontline_read_only_tools == {
+        "order_status",
+        "list_orders",
+        "catalog_search",
+        "view_cart",
+    }
 
 
 # --- routing paths -------------------------------------------------------------------
@@ -135,7 +155,7 @@ async def test_payment_change_still_defers(config_root: Path) -> None:
 
 async def test_read_only_turn_answers_without_handover(config_root: Path) -> None:
     fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)
+    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
     out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
     assert out.get("handover") is None
     assert [type(m).__name__ for m in out["messages"]] == [
@@ -368,7 +388,9 @@ async def test_single_order_status_renders_in_code_and_skips_second_model_pass(
     config_root: Path,
 ) -> None:
     fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)
+    # An AUTHORIZED read (P7): render tests exercise the L3 path, not the object-binding
+    # gate — the gate's own pins live below and in test_voice_tools.py.
+    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
     out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
     final = out["messages"][-1]
     # The final line is the CODE render (contains the order id + a store-derived status),
@@ -391,7 +413,7 @@ async def test_render_appends_a_factual_close_no_product_opinion(config_root: Pa
     from agnostic_market.agents._copy import all_closes
 
     fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)
+    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
     out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
     line = out["messages"][-1].content
     assert any(line.endswith(c) for c in all_closes())
@@ -442,7 +464,7 @@ async def test_render_cannot_invent_forward_state(config_root: Path) -> None:
     fake = FakeChatModel(
         tool_call_limit=1, canned_args={"order_status": {"order_id": "ORD-1002"}},
     )
-    graph = _graph(config_root, fake)
+    graph = _graph(config_root, fake, identity=_granted("ORD-1002"))
     out = await graph.ainvoke({"messages": [HumanMessage("status of ORD-1002")]})
     line = out["messages"][-1].content
     assert "being prepared" in line and "on its way" not in line
@@ -459,6 +481,83 @@ async def test_handover_turn_never_renders(config_root: Path) -> None:
     assert "picked up" in out["messages"][-1].content.lower()
 
 
+async def test_unauthorized_order_read_never_renders(config_root: Path) -> None:
+    # THE P7 render-gate pin: read_render re-derives the line from the STORE, so a declined
+    # order_status followed by the render divert would LEAK the order around the tool's
+    # object-binding gate. `_render_ready` requires authorization — an unverified single
+    # order_status falls back to the model, which narrates the tool's ask-for-contact
+    # instruction (the fake's text), and NO store-derived order line is ever spoken.
+    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake)  # identity store fresh: unverified session
+    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
+    final = out["messages"][-1]
+    assert final.content == _TEXT_RESPONSE  # model narration, NOT a code render
+    spoken = [
+        str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content
+    ]
+    assert not any("trail running shoes" in t for t in spoken)  # no order data leaked
+
+
+async def test_list_orders_handover_enters_the_identity_flow(config_root: Path) -> None:
+    # P7 rung 2: a list_orders handover ENTERS the identity flow (no deferral); the identity
+    # model runs and asks for the contact on the account (clarify -> stays sticky).
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {"destination": "support", "reason_code": "list_orders"}
+        },
+        tool_call_limit=1,
+    )
+    reasoning = FakeChatModel(emit_tool_calls=False)  # identity model asks its ONE question
+    graph = _graph(config_root, frontline, reasoning_model=reasoning)
+    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    assert out.get("active_flow") == "identity"  # ENTERED (sticky, awaiting the claim)
+    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
+    assert not any("support team" in t for t in texts)  # no stale deferral
+
+
+async def test_identity_apply_is_speakable(config_root: Path) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    assert "identity_apply" in graph.speakable_nodes
+    assert "identity_reask" in graph.speakable_nodes
+    assert "identity_assemble" not in graph.speakable_nodes  # double-speak (cart_ack lesson)
+
+
+async def test_unverified_enumeration_diverts_without_a_relay_pass(config_root: Path) -> None:
+    # THE deterministic enumeration divert (call #13 latency + F-12.3 closed structurally):
+    # a single unverified list_orders probe routes STRAIGHT to the identity flow in code —
+    # the frontline model is invoked exactly ONCE (never gets the turn back to relay the
+    # tool's instruction, ask for the email itself, or narrate).
+    frontline = FakeChatModel(force_tool="list_orders", tool_call_limit=1)
+    reasoning = FakeChatModel(emit_tool_calls=False)  # identity model asks its ONE question
+    graph = _graph(config_root, frontline, reasoning_model=reasoning)
+    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    assert out.get("active_flow") == "identity"  # entered via the code-set handover
+    assert frontline._tool_calls_made == 1  # ONE frontline pass — the relay pass is gone
+    spoken = [
+        str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content
+    ]
+    assert not any("email or phone" in t and "verification" in t for t in spoken)
+
+
+async def test_bound_enumeration_renders_the_list_in_code(config_root: Path) -> None:
+    # A BOUND session's list_orders is a renderable read: the scoped list is code-authored
+    # (read_render) and the turn ENDs — no second model pass on the answering turn either.
+    from agnostic_market.commerce.identity import BoundIdentity
+
+    identity = CallerIdentityStore()
+    identity.bind(
+        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
+    )
+    fake = FakeChatModel(force_tool="list_orders", tool_call_limit=1)
+    graph = _graph(config_root, fake, identity=identity)
+    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    final = out["messages"][-1]
+    assert "ORD-1002" in final.content and "ORD-1001" not in final.content  # scoped
+    assert _TEXT_RESPONSE not in final.content  # code render, not model narration
+    assert fake._tool_calls_made == 1  # model invoked once
+
+
 async def test_render_emits_exactly_one_answered_event(
     config_root: Path, tmp_path: Path
 ) -> None:
@@ -468,7 +567,7 @@ async def test_render_emits_exactly_one_answered_event(
     import json
 
     fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)
+    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
     await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
     sink = tmp_path / "telemetry.jsonl"
     answered = [

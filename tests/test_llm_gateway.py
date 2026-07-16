@@ -52,6 +52,13 @@ def test_model_kwargs_pass_through() -> None:
     assert model.max_retries == 5
 
 
+def test_transient_retries_default_on(  # F-13.1: a live 529 died with no retry
+) -> None:
+    gateway = LLMGateway(_credentials(), RecordingResolver())
+    model = gateway.chat_model(ProviderModel(provider="anthropic", model="claude-haiku-4-5"))
+    assert model.max_retries == 3  # the gateway default (callers may still override)
+
+
 def test_unknown_provider_rejected_loudly() -> None:
     gateway = LLMGateway(_credentials(), RecordingResolver())
     with pytest.raises(GatewayError, match="no credentials configured for provider 'google'"):

@@ -51,6 +51,23 @@ def test_level_starts_at_l1_and_rises_only_on_correct_committed_otp() -> None:
     assert store.grants == [{"method": "otp", "raised_to": 2}]
 
 
+def test_spoken_digit_code_verifies() -> None:
+    # Live call #12 F-12.2: the CORRECT code arrived as words ("four eight two nine one
+    # three"), failed the literal compare, and exhausted a legitimate caller to a human.
+    # verify_otp digit-normalizes the committed spoken answer; the compare stays EXACT.
+    store = VerificationStore(OtpProvider())
+    assert store.verify_otp("It should be four eight two nine one three.") is True
+    assert store.current_level() == 2
+
+
+def test_spoken_digit_code_stays_exact_no_overmatch() -> None:
+    store = VerificationStore(OtpProvider())
+    assert store.verify_otp("one two three four five six") is False  # wrong code, spoken
+    assert store.verify_otp("four eight two nine one") is False  # too short
+    assert store.verify_otp("oh four eight two nine one three") is False  # extra digit
+    assert store.current_level() == 1  # nothing above raised anything
+
+
 def test_clear_resets_the_grant() -> None:
     store = VerificationStore(OtpProvider())
     store.verify_otp("482913")

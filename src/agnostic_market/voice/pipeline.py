@@ -29,6 +29,12 @@ from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    assert_orders_have_customers,
+    load_customers_fixture,
+)
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
@@ -132,12 +138,20 @@ def build_voice_loop(
     # tool (set on a found read) and the flows (set on place/cancel/return) — one instance
     # to both, or references resolve against different state (split-brain, like the cart).
     pointer = LastOrderPointer()
+    # Per-session authorization state + the customer directory (P7): the order_status tool
+    # GRANTS into identity_store (rung 1) and the identity flow BINDS it (rung 2); the graph
+    # reads the SAME instance (the render router's order-read gate) — split-brain otherwise.
+    # The build-time cross-check fails loudly on an order whose customer_ref names nobody.
+    customers_fixture = load_customers_fixture(config_root, config.merchant_id)
+    assert_orders_have_customers(store.fixture, customers_fixture)
+    customers = CustomerDirectory(customers_fixture)
+    identity_store = CallerIdentityStore()
     gateway = LLMGateway(credentials, secrets)
     # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
     # system prompts + few-shot (F1), so the Agent below carries NO instructions.
     tools = [
         wrap_readonly_tool(t, config.merchant_id)
-        for t in build_voice_tools(store, cart_store, pointer)
+        for t in build_voice_tools(store, cart_store, pointer, identity_store, customers)
     ]
     graph = build_frontline_graph(
         chat_model=gateway.chat_model(config.llm.routing),
@@ -159,6 +173,8 @@ def build_voice_loop(
         risk=risk,
         profile_store=profile_store,
         pointer=pointer,
+        identity_store=identity_store,
+        customers=customers,
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
@@ -194,7 +210,7 @@ def build_voice_loop(
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    _attach_thread_reaper(session, engine, verification_store, cart_store, pointer)
+    _attach_thread_reaper(session, engine, verification_store, cart_store, pointer, identity_store)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -216,13 +232,15 @@ def _attach_thread_reaper(
     verification_store: VerificationStore,
     cart_store: CartStore,
     pointer: LastOrderPointer,
+    identity_store: CallerIdentityStore,
 ) -> None:
     """Clock B (AGENTS §A10 rule 4): on session close, the thread is reaped UNCONDITIONALLY
     — a dropped call must never leave a resumable placement/refund. Re-entrant-safe: a
     double-fired close deletes once and emits the abandoned event at most once. Nothing is
     spoken (the caller is gone); expiry of a still-connected caller's pending action is
-    Clock A, owned by the graph's confirm node. The verification grant AND the cart are
-    cleared too, so a reattaching session can never inherit a stale L2 or a stale cart
+    Clock A, owned by the graph's confirm node. The verification grant, the cart, AND the
+    identity binding/order grants (P7) are cleared too, so a reattaching session can never
+    inherit a stale L2, a stale cart, or someone else's verified identity
     (belt-and-suspenders — the per-session stores already die with the session)."""
     reaped = False
 
@@ -238,6 +256,7 @@ def _attach_thread_reaper(
         verification_store.clear()
         cart_store.clear()
         pointer.clear()
+        identity_store.clear()
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:

@@ -281,7 +281,10 @@ def test_delivered_fixture_entry_requires_delivered_at() -> None:
     from agnostic_market.commerce.orders import _OrderEntry
 
     with pytest.raises(ValueError, match="delivered_at"):
-        _OrderEntry(status="delivered", summary="x", eta="2026-07-01", total_usd=10.0)
+        _OrderEntry(
+            status="delivered", summary="x", eta="2026-07-01", total_usd=10.0,
+            customer_ref="CUST-001",
+        )
 
 
 # --- deterministic read renderers (L3): the code-authored spoken lines that skip the second
@@ -379,3 +382,76 @@ def test_order_eta_accessor_forks_fixture_placed_and_unknown(config_root: Path) 
     _place1(store, "k1", "SKU-RED-42", "trail running shoes", 1, 89.99)
     assert store.order_eta("ORD-9001") == "3-5 business days"  # placed -> _PLACED_ETA
     assert store.order_eta("ORD-NOPE") is None  # unknown
+
+
+# --- P7: order ownership + the enumeration renderer -----------------------------------------
+
+from agnostic_market.commerce.orders import render_order_list_line  # noqa: E402
+
+
+def test_order_owner_and_is_session_placed_fork(config_root: Path) -> None:
+    store = _store(config_root)
+    assert store.order_owner("ord-1001") == "CUST-001"  # fixture, normalized
+    assert store.order_owner("ORD-9999") is None  # unknown
+    _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    assert store.order_owner("ORD-9001") is None  # placed: session-owned, no fixture ref
+    assert store.is_session_placed("ord-9001")
+    assert not store.is_session_placed("ORD-1001")
+
+
+def test_owned_orders_filters_by_ref_and_includes_placed(config_root: Path) -> None:
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    owned = store.owned_orders("CUST-001")
+    ids = [c.order_id for c in owned]
+    assert "ORD-1001" in ids and "ORD-1003" in ids  # theirs
+    assert "ORD-1002" not in ids  # CUST-002's, never listed
+    assert "ORD-9001" in ids  # placed THIS session = the caller's
+
+
+def test_owned_orders_carries_the_effective_status(config_root: Path) -> None:
+    # The cancelled overlay wins — an identified caller must hear the truth about a voided
+    # order, not the stale fixture status.
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    store.cancel_order("c1", order_id="ORD-9001")
+    placed = next(c for c in store.owned_orders("CUST-001") if c.order_id == "ORD-9001")
+    assert placed.status == "cancelled"
+
+
+def test_order_entry_requires_customer_ref() -> None:
+    # REQUIRED, no default: an order without an owner would be silently unreadable under
+    # object binding — the fixture must fail loudly at load.
+    from agnostic_market.commerce.orders import _OrderEntry
+
+    with pytest.raises(ValueError, match="customer_ref"):
+        _OrderEntry(status="shipped", summary="x", eta="2026-07-09", total_usd=10.0)
+
+
+def test_render_order_list_line_speaks_ids_items_status_only() -> None:
+    from agnostic_market.commerce.orders import OrderCandidate
+
+    line = render_order_list_line(
+        [
+            OrderCandidate(key="1", order_id="ORD-1001", summary="2 pairs of shoes",
+                           total_usd=179.98, status="shipped"),
+            OrderCandidate(key="2", order_id="ORD-1003", summary="3 pairs of socks",
+                           total_usd=43.50, status="delivered"),
+        ]
+    )
+    assert "You've got 2 orders" in line
+    assert "ORD-1001" in line and "on its way" in line  # humanized via _STATUS_PHRASE
+    assert "ORD-1003" in line and "delivered" in line
+    assert "$" not in line  # no totals, no addresses, no contact — ids + items + status only
+
+
+def test_render_order_list_line_empty_and_unknown_status() -> None:
+    from agnostic_market.commerce.orders import OrderCandidate
+
+    assert render_order_list_line([]) == "I don't see any orders on your account."
+    line = render_order_list_line(
+        [OrderCandidate(key="1", order_id="ORD-1", summary="a thing",
+                        total_usd=1.0, status="returned")]
+    )
+    assert "You've got 1 order" in line
+    assert "returned" in line  # fail-closed: the raw status word, no invented phrase

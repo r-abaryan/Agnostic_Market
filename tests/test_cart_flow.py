@@ -21,6 +21,7 @@ from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.orders import (
     LastOrderPointer,
     OrderStore,
@@ -67,8 +68,11 @@ def _build(
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     cart = cart or CartStore()
     pointer = pointer or LastOrderPointer()
+    identity = CallerIdentityStore()
+    customers = CustomerDirectory()  # default fake directory (same data as the fixture)
     tools = [
-        wrap_readonly_tool(t, "acme_store") for t in build_voice_tools(store, cart, pointer)
+        wrap_readonly_tool(t, "acme_store")
+        for t in build_voice_tools(store, cart, pointer, identity, customers)
     ]
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -79,6 +83,8 @@ def _build(
         store=store,
         cart_store=cart,  # the SAME cart the view_cart tool reads (no split-brain)
         pointer=pointer,  # the SAME pointer order_status sets (Group C L4)
+        identity_store=identity,  # the SAME store the order_status gate grants into (P7)
+        customers=customers,
         policy=_POLICY,
         checkpointer=build_checkpointer(),
     )
@@ -419,7 +425,9 @@ async def test_speakable_nodes_and_read_only_tools(config_root: Path) -> None:
     graph, _, _ = _build(config_root)
     assert {"handover", "cart_ack", "cart_guardrail", "cart_confirm", "cart_place",
             "cart_abort"} <= graph.speakable_nodes
-    assert graph.frontline_read_only_tools == {"order_status", "catalog_search", "view_cart"}
+    assert graph.frontline_read_only_tools == {
+        "order_status", "list_orders", "catalog_search", "view_cart",
+    }
 
 
 async def test_unhandled_tool_fails_loud_not_silent_misroute(config_root: Path) -> None:

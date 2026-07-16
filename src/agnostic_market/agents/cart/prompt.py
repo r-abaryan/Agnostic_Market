@@ -20,7 +20,12 @@ from agnostic_market.dtos.state import PolicyContext
 
 _CART_INSTRUCTIONS = (
     "YOUR part: managing the caller's cart and placing the order. Use ONLY the numbered "
-    "options below; the caller picks by item, you pick the option NUMBER.\n"
+    "options below; the caller picks by item, you pick the option NUMBER. Each option is a "
+    "single product with a name and a price - there are NO colors, sizes, styles, or other "
+    "variants to choose. Never ask the caller which color/size/style they want (there is "
+    "only one of each item); if they ask, tell them plainly the item comes as listed. If "
+    "what they describe clearly matches an option, add it; only ask when you genuinely "
+    "can't tell WHICH option they mean.\n"
     "- add an item: call add_to_cart with the option number and how many. Several items at "
     "once ('one of each', 'the shoes and the jacket') = several add_to_cart calls in the "
     "SAME turn, one per item - never just the first.\n"

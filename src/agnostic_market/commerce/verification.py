@@ -26,11 +26,18 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from agnostic_market.commerce.spoken import spoken_digits
+
 logger = logging.getLogger("agnostic_market.commerce.verification")
 
 # Verification levels (AGENTS §A4a): 0 none · 1 possession-lite · 2 strong (possession
 # factor + risk signals). A session starts at L1 in 3c (a connected, greeted caller);
 # L2 is earned only by a committed OTP match behind a clear risk check.
+# This ladder is the PLATFORM's own vocabulary — it is NOT a NIST AAL mapping: a
+# contact-delivered OTP is a single possession factor, not AAL2 (two distinct factors).
+# Never present L2 as "NIST AAL2" in UX or compliance material (SECURITY §7d).
+# NOTE (P7): L2 is a LEVEL, not an identity — binding a session to a customer additionally
+# requires the identity flow's own OTP chain (see PendingIdentity.grants_at_mint).
 _INITIAL_LEVEL = 1
 
 
@@ -58,8 +65,16 @@ class VerificationStore:
 
         Consent/commit discipline (only committed transcript reaches here) is the caller's
         responsibility (VOICE_PIPELINE §0) — this store trusts that `code` is committed.
+
+        The spoken answer is DIGIT-NORMALIZED here (live call #12 F-12.2: the CORRECT code
+        arrived as "four eight two nine one three", failed the literal compare, and
+        exhausted a legitimate caller to a human). Normalizing at THIS seam keeps the
+        provider contract digits-in (a real OTP service verifies a digit string) and fixes
+        every step-up family at once; the compare stays EXACT equality, so word noise
+        around the value fails closed (a re-collect, never a match).
         """
-        if self._otp.verify(code):
+        spoken = spoken_digits(code)
+        if self._otp.verify(spoken or code):
             self._level = 2
             self.grants.append({"method": "otp", "raised_to": 2})
             return True

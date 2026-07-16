@@ -18,3 +18,4 @@ dist/
 # OS / editor
 .DS_Store
 assets/audio/generate_thinking_beep.py
+config/fixtures/

@@ -33,6 +33,7 @@ HandoffReasonCode = Literal[
     "cancel_order",
     "refund",
     "cart_write",
+    "list_orders",  # account-wide order enumeration — needs OTP-bound identity (P7)
     "multi_step",
     "verification_required",
     "other",
@@ -210,6 +211,33 @@ class PendingProfileChange(BaseModel):
     created_at: float
 
 
+class PendingIdentity(BaseModel):
+    """An identity verification awaiting step-up (P7 — the third `_stepup.py` family).
+
+    Minted by the identity flow's assemble AFTER the caller's contact claim code-matched a
+    customer. Carries the MASKED contact only (the factor_ref analogue) — the raw spoken
+    claim never enters the checkpoint. `grants_at_mint` snapshots
+    `len(verification_store.grants)` at mint: THE binding invariant. A stale cross-family L2
+    (e.g. an earlier profile-flow OTP) satisfies the factory's level-only confirm check even
+    when THIS chain's OTP failed — the flow's collect router and apply node require a NEW
+    grant since mint (this chain's OTP actually succeeded) before binding a customer.
+
+    Deliberately NO `idempotency_key` (the bind effect is a session-local set — naturally
+    idempotent, no SoR effect to dedup) and NO `created_at` (identity has no confirm
+    interrupt to TTL-check; its only interrupt is the factory's OTP collect, which no family
+    TTL-checks — a stale-but-correct OTP is still the correct OTP, and abandonment is the
+    Clock-B reaper's job).
+    """
+
+    model_config = _FROZEN
+
+    customer_ref: str = Field(min_length=1)
+    masked_contact: str = Field(min_length=1)
+    attempt_key: str = Field(min_length=1)
+    otp_tries: int = Field(ge=0, default=0)
+    grants_at_mint: int = Field(ge=0)
+
+
 # Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
 # "left_*" are TURN-SCOPED markers (reset at entry): the model left the flow this turn, so
 # a same-turn re-entry is blocked — breaks the assemble->gate->handover->assemble cycle
@@ -217,7 +245,7 @@ class PendingProfileChange(BaseModel):
 # sticky value + left-twin so the entry router knows which flow's escape/stickiness rules
 # apply. Group B: the "cart" flow owns both cart MUTATION and the whole-cart placement tail
 # (the single-line "checkout" flow it replaces is gone — direct-buy normalizes through it).
-ActiveFlow = Literal["cart", "left_cart", "support", "left_support"]
+ActiveFlow = Literal["cart", "left_cart", "support", "left_support", "identity", "left_identity"]
 
 
 class HandoffRequest(BaseModel):
@@ -252,6 +280,12 @@ class ReasoningState(BaseModel):
     pending_cancel: PendingCancel | None = None
     pending_return: PendingReturn | None = None
     pending_profile_change: PendingProfileChange | None = None
+    pending_identity: PendingIdentity | None = None
+    # Bounded re-ask counter for the identity flow's contact claim (P7 decision 4: ONE
+    # softened re-ask on a no-match — STT mishears emails constantly — then a silent human
+    # handover). Spans turns WITHIN the sticky flow; cleared on every flow exit (apply,
+    # abort, escape, leave, cross-switch, terminal handover).
+    identity_claim_misses: int = 0
     active_flow: ActiveFlow | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
     # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response). Kept
