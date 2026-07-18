@@ -10,6 +10,7 @@
 _safety_locked:
   - _platform            # the whole platform safety block is immutable
   - schema_version       # structural — merchant may not fork the schema version
+  - policies.cancel_batch_max   # safety bound (fits the LangGraph step budget), not a merchant knob
 
 _platform:
   # Guardrails / verification / PCI / egress — enforced in code; declared here as the locked
@@ -52,6 +53,11 @@ _platform:
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"
+
+# Platform-owned structural policy values. This partial block deep-merges with the category
+# template and merchant override; the safety lock above prevents either later layer changing it.
+policies:
+  cancel_batch_max: 10
 
 # Call-start AI disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1), applies 2 Aug 2026).
 # WORDING is merchant-overridable (brand/voice/locale); WHETHER it plays is code

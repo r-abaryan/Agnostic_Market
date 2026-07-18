@@ -207,6 +207,9 @@ class CallerIdentityStore:
     def __init__(self) -> None:
         self._bound: BoundIdentity | None = None
         self._granted_orders: set[str] = set()
+        # TEST-ONLY rung-2 grants (see `grant_mutation_for_test`). Empty in production — no
+        # production writer exists, so `order_mutation_allowed`'s check of it is inert at runtime.
+        self._mutation_granted_for_test: set[str] = set()
 
     def bind(self, identity: BoundIdentity) -> None:
         self._bound = identity
@@ -220,9 +223,23 @@ class CallerIdentityStore:
     def order_granted(self, order_id: str) -> bool:
         return order_id.strip().upper() in self._granted_orders
 
+    def grant_mutation_for_test(self, order_id: str) -> None:
+        """TEST SEAM ONLY — pretend this session is rung-2-authorized to MUTATE that order,
+        without a real OTP bind. Exists so the money-logic suites can pin post-authorization
+        cancel/refund/return math without re-driving the identity flow (and without binding,
+        which can't span the two customers the fixture orders belong to). NEVER call this from
+        production code: a real mutation authority comes only from a session-placed order or an
+        OTP-bound identity (`order_mutation_allowed`). Enforced by grep in CI review — the only
+        callers are `tests/support_helpers.py:authorize_fixture_orders` and scoping-suite pins."""
+        self._mutation_granted_for_test.add(order_id.strip().upper())
+
+    def mutation_granted_for_test(self, order_id: str) -> bool:
+        return order_id.strip().upper() in self._mutation_granted_for_test
+
     def clear(self) -> None:
         self._bound = None
         self._granted_orders.clear()
+        self._mutation_granted_for_test.clear()
 
 
 def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIdentityStore) -> bool:
@@ -244,6 +261,31 @@ def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIden
         owner = store.order_owner(order_id)
         return owner is not None and owner == bound.customer_ref
     return False
+
+
+def order_mutation_allowed(
+    order_id: str, *, store: OrderStore, identity: CallerIdentityStore
+) -> bool:
+    """May this session ACT irreversibly on that order (cancel/refund/return)? The rung-2
+    authorization check — deliberately STRICTER than `order_read_allowed`: a rung-1
+    contact-match grant (`identity.order_granted`, earned via `try_grant_by_contact`)
+    authorizes a READ but NOT a mutation. The account contact is guessable/leaked, so
+    contact-matching one order must never let one caller cancel another's; a mutation requires
+    that the caller either placed the order THIS session (per-session store — no cross-caller
+    path) or is OTP-BOUND to the customer that owns it (SECURITY §7d). An unbound caller who
+    fails this is routed into the identity OTP flow, not granted (support/flow.py)."""
+    if store.is_session_placed(order_id):
+        return True
+    # Test seam (inert in production — no prod writer, see `grant_mutation_for_test`): lets the
+    # money-logic suites pin post-authorization math without an OTP bind that can't span the
+    # fixture's two customers.
+    if identity.mutation_granted_for_test(order_id):
+        return True
+    bound = identity.current()
+    if bound is None:
+        return False
+    owner = store.order_owner(order_id)
+    return owner is not None and owner == bound.customer_ref
 
 
 def try_grant_by_contact(

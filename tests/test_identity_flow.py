@@ -100,9 +100,7 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(config_root: Pat
 async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) -> None:
     # THE live-call-#12 replay: the claim arrives as STT's spoken email form (no '@') and
     # the code as digit words — both must verify (F-12.1 + F-12.2 together, engine level).
-    h = _identity_harness(
-        config_root, claim="casey at example dot com", thread_id="ident-spoken-1"
-    )
+    h = _identity_harness(config_root, claim="casey at example dot com", thread_id="ident-spoken-1")
     await _events(h.engine, _REQUEST)
     assert h.otp.dispatch_count == 1  # the spoken email MATCHED (no re-ask, straight to OTP)
     events = await _events(h.engine, "It should be four eight two nine one three.")
@@ -132,10 +130,10 @@ async def test_already_bound_reask_lists_without_a_second_otp(config_root: Path)
     await _events(h.engine, _REQUEST)
     await _events(h.engine, _VALID_OTP)
     assert h.otp.dispatch_count == 1
-    # A misrouted SECOND enumeration handover re-lists from the binding — no model call in
-    # assemble, no re-claim, no second OTP.
+    # A SECOND enumeration request re-lists directly from the existing binding — no Identity
+    # re-entry, no re-claim, and no second OTP.
     events = await _events(h.engine, "tell me my orders again please")
-    line = next(e for e in _spoken(events) if e.node == "identity_apply")
+    line = next(e for e in _spoken(events) if e.node == "handover")
     assert "ORD-1001" in line.text
     assert h.otp.dispatch_count == 1  # unchanged
 

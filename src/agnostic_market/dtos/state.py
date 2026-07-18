@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 
@@ -73,6 +73,11 @@ class PolicyContext(BaseModel):
     contact_reask_max: int = Field(ge=0)
     auth_denials_before_human_offer: int = Field(ge=1)
     max_tool_hops: int = Field(ge=1)
+    # Max orders in one cancel batch — a SAFETY bound (a big batch must fit the LangGraph
+    # recursion/step budget), NOT a merchant knob: it is `_safety_locked` in config, so no
+    # tenant can touch it. Over-cap asks the caller to narrow, never silently takes the first
+    # N. REQUIRED (lockstep, like the security knobs above).
+    cancel_batch_max: int = Field(ge=1)
     # Merchant free-text policy extras (config `policies.spoken_facts_extra`) — facts with
     # NO enforcing field (refund timeline, return conditions). The ENFORCED sentences are
     # DERIVED from the typed values above (agents/spoken_policy.py); this is only the
@@ -150,22 +155,102 @@ class PendingRefund(BaseModel):
     created_at: float
 
 
-class PendingCancel(BaseModel):
-    """An order cancellation awaiting HITL confirmation (AGENTS §A10a shape).
+# --- the cancel lifecycle (F-16.2 batch-aware cancel) --------------------------------------
+# ONE lifecycle for one-or-many order cancellations (a single cancel is a one-target batch —
+# no scalar/batch fork for a future planner to bridge). Two phases, a discriminated union:
+#   CancelSelection   — PRE-auth: a SEMANTIC scope ("all/both my cancellable orders") the
+#                       caller stated with no ids, retained across an identity detour (the
+#                       unbound "cancel all" case, Milestone B). Carries NO ids/keys/contact.
+#   PendingCancelBatch — POST-resolve: the FROZEN, authorized, preflighted target set the
+#                       readback + serialized void operate on.
 
-    Mirrors PendingRefund's discipline minus money/verification: `idempotency_key` is
-    per-cancel-INTENT so a replayed void returns the SAME cancel (the OrderStore is the
-    dedup arbiter). `summary` is CODE-resolved from the order the model picked by KEY (never
-    a model-authored order id), and rendered in the graph-authored readback. Cancel is a
-    single-interrupt confirm->void (no step-up), so no attempt/tries fields are needed.
-    """
+# The per-target cancel result — a CLOSED enum (checkpoint/planner-facing state follows the
+# closed-slug rule; free prose here would be a PII echo channel like HandoffReasonCode).
+CancelOutcomeCode = Literal[
+    "cancelled",  # the store voided it (an amount is present, from the CancelRecord)
+    "already_cancelled",  # preflight: the order was already cancelled
+    "not_cancellable",  # preflight: shipped/delivered — no self-serve void (a return instead)
+    "has_refunds",  # preflight: a refund already exists — a void would double-return; a person
+    "store_refused",  # effect-time refusal (stale since preflight); CancelError carries no
+    # typed reason, so a rare effect-time refusal collapses to this generic honest code
+]
+
+CancelScope = Literal["all_cancellable", "both_cancellable"]
+
+
+class BatchCancelOutcome(BaseModel):
+    """One target's cancel result — the STRUCTURED per-order fact the final line is rendered
+    from (INV-25: never inferred from pending intent). Lives here (not commerce) because it is
+    CHECKPOINTED inside PendingCancelBatch and every checkpointed type is a dtos base-layer
+    type; commerce/orders.py imports it (as it already imports CartLine)."""
+
+    model_config = _FROZEN
+
+    order_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    outcome: CancelOutcomeCode
+    # Present ONLY for a "cancelled" outcome (the CancelRecord's reversed total) — a refusal
+    # returns no record, so no amount. Optional by construction, not laziness.
+    amount_usd: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def amount_matches_outcome(self) -> BatchCancelOutcome:
+        if self.outcome == "cancelled" and self.amount_usd is None:
+            raise ValueError("a cancelled outcome requires amount_usd from the CancelRecord")
+        if self.outcome != "cancelled" and self.amount_usd is not None:
+            raise ValueError("only a cancelled outcome may carry amount_usd")
+        return self
+
+
+class CancelTarget(BaseModel):
+    """One order in a cancel batch. `summary` is CODE-resolved from the order the model picked
+    by KEY (never a model-authored id); `idempotency_key` is per-TARGET-INTENT so a replayed
+    void returns the SAME cancel per order (the OrderStore is the dedup arbiter) and a batch
+    of N produces exactly N effects, never N+1."""
 
     model_config = _FROZEN
 
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+class CancelSelection(BaseModel):
+    """PRE-auth cancel selector (Milestone B): a SEMANTIC scope the caller stated without ids,
+    retained across the identity detour when an unbound caller says "cancel all/both my
+    orders". Deliberately carries NO order ids, NO numeric candidate keys (a pre-bind key is
+    meaningless — the visible candidate set changes after binding), NO contact/customer_ref.
+    No `created_at`/TTL: a selector is consumed immediately on the post-bind turn (the batch it
+    resolves into carries the Clock-A TTL); a timestamp here would be dead state."""
+
+    model_config = _FROZEN
+
+    kind: Literal["selection"] = "selection"
+    scope: CancelScope
+
+
+class PendingCancelBatch(BaseModel):
+    """POST-resolve cancel batch awaiting HITL confirmation then serialized void (AGENTS
+    §A10a). The FROZEN authorized+preflighted target set: `targets` is the ELIGIBLE subset the
+    readback names and the void walks (one effect per node completion, checkpointed BETWEEN
+    writes); `ineligible` are the preflight declines stated at the readback; `outcomes`
+    accumulates completed per-target results (replay-safe progress — a kill mid-batch resumes
+    with the still-pending targets, the done ones already recorded). `created_at` drives the
+    Clock-A TTL. A single-order cancel is a one-target batch (`targets` length 1)."""
+
+    model_config = _FROZEN
+
+    kind: Literal["batch"] = "batch"
+    targets: tuple[CancelTarget, ...] = Field(min_length=1)
+    ineligible: tuple[BatchCancelOutcome, ...] = ()
+    outcomes: tuple[BatchCancelOutcome, ...] = ()
     created_at: float
+
+
+# The pending_cancel channel is a discriminated union over the two phases (single = batch).
+PendingCancel = Annotated[
+    CancelSelection | PendingCancelBatch, Field(discriminator="kind")
+]
 
 
 class PendingReturn(BaseModel):
@@ -296,6 +381,13 @@ class ReasoningState(BaseModel):
     # abort, escape, leave, cross-switch, terminal handover).
     identity_claim_misses: int = 0
     active_flow: ActiveFlow | None = None
+    # Where to resume after an identity BIND that support triggered to authorize a mutation
+    # (Fix 2, rung-2): an UNBOUND caller's cancel/refund/return detours into the identity OTP
+    # flow, and on a successful bind `identity_apply` routes back to `support_assemble` (the
+    # model re-proposes from history, now authorized as the bound owner). Ids-free by design
+    # (like CancelSelection) — a pure resume pointer carrying NO order authority. Cleared on the
+    # bind-resume AND on every identity exit (a FAILED verification leaves ZERO resume intent).
+    identity_resume: Literal["support_assemble"] | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
     # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response). Kept
     # OFF the assemble node because a speakable assemble double-speaks its streamed clarifies

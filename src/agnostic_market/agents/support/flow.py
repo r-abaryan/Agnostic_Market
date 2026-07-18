@@ -46,7 +46,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from agnostic_market.agents._consent import classify_cancel_consent, classify_consent
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls
@@ -55,9 +55,8 @@ from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
-    CustomerDirectory,
+    order_mutation_allowed,
     order_read_allowed,
-    try_grant_by_contact,
 )
 from agnostic_market.commerce.orders import (
     CANCELLED_STATUS,
@@ -68,6 +67,7 @@ from agnostic_market.commerce.orders import (
     OrderStore,
     RefundError,
     ReturnError,
+    render_batch_cancel_outcome,
 )
 from agnostic_market.commerce.profile import ProfileError, ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
@@ -82,8 +82,12 @@ from agnostic_market.dtos.confirmation import (
     refund_required_level,
 )
 from agnostic_market.dtos.state import (
+    BatchCancelOutcome,
+    CancelScope,
+    CancelSelection,
+    CancelTarget,
     HandoffRequest,
-    PendingCancel,
+    PendingCancelBatch,
     PendingProfileChange,
     PendingRefund,
     PendingReturn,
@@ -97,18 +101,17 @@ logger = logging.getLogger("agnostic_market.agents.support")
 # §6). The fixture "new card on file" for the build phase; a real stored-instrument ref later.
 _NEW_INSTRUMENT_REF = "card ending 4471"
 
-# Support-action authorization strings (SECURITY §7d support-selection scoping) — the
-# model-facing corrective ToolMessages the assemble gate answers a propose call with.
-# Fail-closed wording adapted from the order_status tool: never confirm an order exists,
-# never say which detail failed, never read details. The STOP clause keeps the model from
-# re-proposing in the same turn (no contact exists yet — the caller hasn't answered) and
-# burning the assemble loop's second attempt.
-_SUPPORT_ASK_CONTACT = (
-    "Not verified for that order. Do not say whether the order exists or read any details. "
-    "Ask the caller ONE short question - the email or phone number on the account - and "
-    "STOP: do not call any tool this turn. When the caller answers, propose the SAME "
-    "action again with account_contact filled in."
-)
+# Sentinel: the mutation authorization needs the caller to verify their identity (OTP) first.
+# An UNBOUND caller's mutation can never authorize this turn (a rung-1 contact grant is
+# READ-only, Fix 2) — the assemble branch routes into the identity flow instead of granting or
+# revealing anything. Distinct from a corrective LINE (which is spoken); this one is CONTROL flow.
+_NEEDS_IDENTITY = "<needs-identity>"
+
+# Support-action not-found strings (SECURITY §7d) — the model-facing corrective ToolMessages
+# the assemble gate answers a propose call with when a BOUND caller targets an order that is not
+# theirs / doesn't resolve. Fail-closed wording adapted from the order_status tool: never confirm
+# an order exists, never say which detail failed, never read details. (The UNBOUND guest path no
+# longer asks for a contact — it detours to identity verification; see `_NEEDS_IDENTITY`.)
 _SUPPORT_COMBINED_NOT_FOUND = (
     "No order matches those details. Do not say which detail failed. Tell the caller: "
     '"I couldn\'t find an order matching those details - could you double-check the order '
@@ -118,13 +121,6 @@ _SUPPORT_NOT_FOUND_OFFER_HUMAN = (
     "No order matches those details. Do not say which detail failed. Tell the caller you "
     "couldn't find an order matching those details, and OFFER to connect them with a "
     "person who can verify them another way."
-)
-_SUPPORT_ASK_ORDER_AND_CONTACT = (
-    "That reference doesn't resolve to a verified order. Do not say whether any order "
-    "exists or read any details. Ask the caller ONE short question for their ORDER NUMBER "
-    "(like ORD-1234) - and STOP: do not call any tool this turn. When they answer, propose "
-    "the SAME action again with that order number as order_key (and account_contact, if a "
-    "result asks to verify them)."
 )
 # The denial counter's bucket for references that never resolved to a store order — one
 # bounded key, never the caller's free text (an attacker probing random ids must not grow
@@ -159,13 +155,59 @@ def _readback_line(pending: PendingRefund, policy: ToolConfirmationPolicy) -> st
     )
 
 
-def _cancel_readback_line(pending: PendingCancel) -> str:
-    """The GRAPH-authored cancel readback — the `interrupt()` payload. Names the order so a
-    mis-heard reference can't void the wrong one; states irreversibility (§7a discipline)."""
-    return (
-        f"Just to confirm - cancel your order for {pending.summary} ({pending.order_id})? "
-        "This can't be undone."
+def _mint_cancel_batch(targets: list[tuple[str, str]]) -> PendingCancelBatch:
+    """The ONE place a PendingCancelBatch is minted (direct multi-cancel AND the single-order
+    remedy steers, which pass one target). Each `(order_id, summary)` gets its own per-INTENT
+    idempotency key (A10a rule 2: the key exists in state before any effect; a batch of N
+    yields exactly N effects). A single cancel is a one-target batch."""
+    return PendingCancelBatch(
+        targets=tuple(
+            CancelTarget(order_id=oid, summary=summary, idempotency_key=uuid.uuid4().hex)
+            for oid, summary in targets
+        ),
+        created_at=time.time(),
     )
+
+
+def _cancel_target_phrase(target: CancelTarget) -> str:
+    return f"your order for {target.summary} ({target.order_id})"
+
+
+def _ineligible_clause(o: BatchCancelOutcome) -> str:
+    """The pre-consent honest note about a target the preflight can't cancel — amount-free,
+    stated so the caller hears the whole truth before the readback question."""
+    if o.outcome == "already_cancelled":
+        return f"your order for {o.summary} ({o.order_id}) is already cancelled"
+    if o.outcome == "has_refunds":
+        return (
+            f"your order for {o.summary} ({o.order_id}) already has a refund, so that one needs "
+            "our support team"
+        )
+    # not_cancellable (shipped/delivered)
+    return (
+        f"your order for {o.summary} ({o.order_id}) has already shipped, so that one needs a "
+        "return instead"
+    )
+
+
+def _cancel_readback_line(pending: PendingCancelBatch) -> str:
+    """The GRAPH-authored cancel readback — the `interrupt()` payload. Names the EXACT eligible
+    target(s) so a mis-heard reference can't void the wrong one, STATES any ineligible ones
+    (whole truth before consent), states irreversibility (§7a). Amount-free: single-cancel
+    speech stays byte-identical; amounts appear only in the final store-backed result. A
+    one-target batch reads exactly like the old single-cancel readback."""
+    targets = pending.targets
+    if len(targets) == 1:
+        eligible = f"cancel {_cancel_target_phrase(targets[0])}"
+    else:
+        phrases = [_cancel_target_phrase(t) for t in targets]
+        eligible = "cancel " + "; ".join(phrases[:-1]) + f"; and {phrases[-1]}"
+    prefix = ""
+    if pending.ineligible:
+        notes = [_ineligible_clause(o) for o in pending.ineligible]
+        joined = "; ".join(notes[:-1]) + (f"; and {notes[-1]}" if len(notes) > 1 else notes[0])
+        prefix = joined[0].upper() + joined[1:] + ". "
+    return f"{prefix}Just to confirm - {eligible}? This can't be undone."
 
 
 def _return_readback_line(pending: PendingReturn, policy: ToolConfirmationPolicy) -> str:
@@ -214,17 +256,33 @@ class _ProposeRefund(BaseModel):
     order_key: str
     amount_usd: float
     destination: RefundDestination
-    account_contact: str = ""
 
 
 class _ProposeCancel(BaseModel):
-    order_key: str
-    account_contact: str = ""
+    # Batch-capable (F-16.2): one call carries EVERY order the caller named ("cancel both").
+    # A single cancel is a one-element list. `scope` carries a semantic "all/both" selector
+    # when the caller named no ids (resolved against the authorized candidate set).
+    model_config = ConfigDict(extra="forbid")
+
+    order_keys: list[str] | None = None
+    scope: CancelScope | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_selector(self) -> _ProposeCancel:
+        """Reject malformed/stale calls instead of widening them to account scope."""
+        normalized = [key.strip() for key in (self.order_keys or [])]
+        if any(not key for key in normalized):
+            raise ValueError("order_keys must contain only non-empty references")
+        has_keys = bool(normalized)
+        has_scope = self.scope is not None
+        if has_keys == has_scope:
+            raise ValueError("provide exactly one of order_keys or scope")
+        self.order_keys = normalized
+        return self
 
 
 class _ProposeReturn(BaseModel):
     order_key: str
-    account_contact: str = ""
 
 
 class _ProposeProfileChange(BaseModel):
@@ -249,10 +307,18 @@ class SupportNodes:
     cancel_guardrail: Callable[[ReasoningState], dict[str, object]]
     cancel_confirm: Callable[[ReasoningState], dict[str, object]]
     cancel_void: Callable[[ReasoningState], dict[str, object]]
+    # Resolve a retained CancelSelection into a batch AFTER an identity bind (Milestone B): the
+    # account-wide "cancel all" continuation. Reached from identity_apply (selection retained)
+    # or directly from assemble (an ALREADY-bound caller's scope), never speaks a list.
+    resolve: Callable[[ReasoningState], dict[str, object]]
     abort: Callable[[ReasoningState], dict[str, object]]
     escape_human: Callable[[ReasoningState], dict[str, object]]
-    # After assemble: which action did the model propose? "refund" | "cancel" | "leave" | "clarify".
+    # After assemble: "refund" | "cancel" | "return" | "profile" | "resolve" (bound scope) |
+    # "needs_identity" (unbound scope -> verify first) | "leave" | "clarify".
     route_after_assemble: Callable[[ReasoningState], str]
+    # After resolve: "confirm" (batch frozen -> cancel guardrail) | "clarify" (>2 for 'both',
+    # or nothing cancellable: the node spoke + ends).
+    route_after_resolve: Callable[[ReasoningState], str]
     # Branch after the refund guardrail depends on the LIVE verification level (in the store,
     # which graph.py can't see) — so the flow owns this router, closed over the store.
     # "confirm" (level sufficient) | "stepup" (OTP loop) | "cancel" (remedy steer) |
@@ -297,35 +363,36 @@ def build_support_nodes(
     pointer: LastOrderPointer,
     *,
     identity_store: CallerIdentityStore,
-    customers: CustomerDirectory,
     display_name: str,
 ) -> SupportNodes:
     """Build the support flow's nodes, closed over the session's stores + providers + policy
     (§A5: tenant/policy/verification bound in code at build time — never carried in state).
-    `identity_store`/`customers` MUST be the same instances the voice tools + identity flow
-    use (split-brain rule) — the assemble gate reads and writes rung-1 grants through them."""
+    `identity_store` MUST be the same instance the voice tools + identity flow use (split-brain
+    rule) — the assemble gate reads rung-2 binding through it. No `customers` here: the support
+    gate no longer grants by contact (rung-1 contact grants are READ-only, Fix 2); guest
+    mutations detour into the identity flow, which owns the contact match."""
 
     @tool
-    def propose_refund(
-        order_key: str, amount_usd: float, destination: str, account_contact: str = ""
+    def propose_refund(order_key: str, amount_usd: float, destination: str) -> str:
+        """Propose a refund: which order (option number), how much, and where it goes."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    @tool
+    def propose_cancel(
+        order_keys: list[str] | None = None,
+        scope: CancelScope | None = None,
     ) -> str:
-        """Propose a refund: which order (option number), how much, and where it goes.
-        account_contact: the email or phone on the account - include it ONLY when a
-        previous result asked to verify the caller for that order."""
+        """Propose cancelling one or MORE orders the caller no longer wants.
+        order_keys: the option number(s) - list EVERY order the caller named in ONE call
+        (e.g. "cancel both" -> both option numbers). Do NOT cancel them one at a time across
+        turns. For ONE order, pass a single-element list.
+        scope: use "all_cancellable" (or "both_cancellable") ONLY when the caller says "cancel
+        all/both my orders" without naming option numbers and you have no candidates to list."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
-    def propose_cancel(order_key: str, account_contact: str = "") -> str:
-        """Propose cancelling an order the caller no longer wants (option number).
-        account_contact: the email or phone on the account - include it ONLY when a
-        previous result asked to verify the caller for that order."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
-    def propose_return(order_key: str, account_contact: str = "") -> str:
-        """Propose sending an order back (option number) - the refund follows the return.
-        account_contact: the email or phone on the account - include it ONLY when a
-        previous result asked to verify the caller for that order."""
+    def propose_return(order_key: str) -> str:
+        """Propose sending an order back (option number) - the refund follows the return."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
@@ -355,6 +422,20 @@ def build_support_nodes(
             "pending_profile_change": None,
         }
 
+    def _enter_identity_for_action(new_messages: list) -> dict[str, object]:
+        """An UNBOUND caller proposed a mutation on an explicit order (Fix 2, rung-2): enter the
+        identity OTP flow to BIND, then resume at support_assemble (the model re-proposes from
+        history, now authorized as the bound owner). Mints NO pending — the "no pending before
+        auth" invariant holds; only the ids-free `identity_resume` marker rides across the detour.
+        Mirrors the scope-path detour (a `CancelSelection` resumes at the resolver instead)."""
+        write_event({"event": "support_action_needs_identity"})
+        return {
+            "messages": new_messages,
+            "active_flow": "identity",
+            "identity_resume": "support_assemble",
+            "identity_claim_misses": 0,
+        }
+
     def _return_eligibility(order_id: str) -> str | None:
         """ONE return-eligibility check, shared by the return guardrail AND the refund
         tier-4 steer — the steer must never promise a return this would then decline (the
@@ -378,71 +459,75 @@ def build_support_nodes(
     # one that offers a person (the posture's "verification can't complete -> escalate").
     _auth_denials: dict[str, int] = {}
 
-    def _authorize_action(
-        order_ref: str, claim: str, call_id: str, new_messages: list, *, order_known: bool
-    ) -> bool:
-        """The support-selection gate (SECURITY §7d): may THIS caller act on THAT order?
+    def _authorize_target(order_ref: str, *, order_known: bool) -> str | None:
+        """The support-selection AUTHORIZATION DECISION (SECURITY §7d): may THIS caller act on
+        THAT order? A mutation (cancel/refund/return) requires RUNG-2 — the target is
+        session-placed OR owned by the OTP-bound identity (`order_mutation_allowed`). A rung-1
+        contact-match grant authorizes READS only; the account contact is guessable, so it must
+        never let one caller mutate another's order. Three closed outcomes (no ToolMessage
+        appended here, so a batch from ONE propose call aggregates every target into ONE
+        ToolMessage — several against one id would malform history, F-4):
 
-        Sits at the assemble seam, strictly upstream of every mint — an unauthorized order
-        never reaches a guardrail steer line, a readback, or an effect. Rung-1 guest lookup
-        lifted from the order_status tool body: the contact claim is CODE-matched, never
-        model-judged, and a match grants exactly THAT order for the session. Fail-closed:
-        the corrective ToolMessage IS the answer to the propose call (no dangling
-        tool_use), and a mismatch gets ONE combined not-found (existence-oracle
-        discipline — the gate never confirms which detail failed, and an unresolved
-        reference gets the same treatment as a wrong pair, so an id probe learns nothing).
+          - None                 — authorized (rung-2 holds).
+          - _NEEDS_IDENTITY      — the caller is UNBOUND: route into the identity OTP flow to
+                                   bind, then resume the action (support/flow.py detour). No
+                                   order authority is spoken or granted; existence is never
+                                   revealed (the caller simply verifies themselves).
+          - a corrective LINE    — the caller is BOUND but the order isn't theirs / doesn't
+                                   resolve: the ONE combined not-found (existence-oracle; never
+                                   which detail failed), escalating to a human offer after the
+                                   policy denial threshold.
 
-        `order_known=True` means `order_ref` resolved to a store order (a closed slug,
-        safe to telemeter); False means the caller's stated reference resolved to nothing —
-        events then carry only `order_id_known: False`, NEVER the raw text. The raw claim
-        is never telemetered and never echoed into a ToolMessage.
+        `order_known` no longer drives a grant (the contact claim is not a mutation credential —
+        it is not even read here); `order_known=False` events carry only `order_id_known: False`,
+        never the raw text.
         """
-        if order_known and order_read_allowed(
+        if order_known and order_mutation_allowed(
             order_ref, store=order_store, identity=identity_store
         ):
             write_event(
                 {"event": "support_action_authorized", "order_id": order_ref.strip().upper()}
             )
-            return True
-        claim = claim.strip()
+            return None
         known_fields: dict[str, object] = {"order_id_known": order_known}
         if order_known:
             known_fields["order_id"] = order_ref.strip().upper()
-        if not claim:
-            write_event({"event": "support_auth_required", **known_fields})
-            line = _SUPPORT_ASK_CONTACT if order_known else _SUPPORT_ASK_ORDER_AND_CONTACT
-            new_messages.append(ToolMessage(line, tool_call_id=call_id))
-            return False
-        # An unresolved reference never resolves an owner, so the shared verdict returns
-        # "mismatch" for it (owner is None) — the `order_known` split survives only in the
-        # telemetry bucket + counter key below, never in the grant decision.
-        verdict = try_grant_by_contact(
-            order_ref, claim, store=order_store, customers=customers, identity=identity_store
+        # Unbound: no rung-2 authority is possible this turn — bind first (OTP), never grant.
+        # This is the guest path; it reveals nothing about the order (an unresolved and a real
+        # but unowned reference are indistinguishable to the caller — both just "verify you").
+        if identity_store.current() is None:
+            write_event({"event": "support_auth_needs_identity", **known_fields})
+            return _NEEDS_IDENTITY
+        # Bound, but the order is not this identity's (or doesn't resolve): fail closed with the
+        # combined not-found (existence-oracle) — never reveal that another account owns it.
+        counter_key = order_ref.strip().upper() if order_known else _UNRESOLVED_ORDER
+        attempt = _auth_denials[counter_key] = _auth_denials.get(counter_key, 0) + 1
+        write_event({"event": "support_auth_denied", **known_fields, "attempt": attempt})
+        return (
+            _SUPPORT_NOT_FOUND_OFFER_HUMAN
+            if attempt >= policy.auth_denials_before_human_offer
+            else _SUPPORT_COMBINED_NOT_FOUND
         )
-        if verdict == "mismatch":
-            counter_key = order_ref.strip().upper() if order_known else _UNRESOLVED_ORDER
-            attempt = _auth_denials[counter_key] = _auth_denials.get(counter_key, 0) + 1
-            write_event({"event": "support_auth_denied", **known_fields, "attempt": attempt})
-            line = (
-                _SUPPORT_NOT_FOUND_OFFER_HUMAN
-                if attempt >= policy.auth_denials_before_human_offer
-                else _SUPPORT_COMBINED_NOT_FOUND
-            )
-            new_messages.append(ToolMessage(line, tool_call_id=call_id))
-            return False
-        write_event(
-            {
-                "event": "support_order_granted",
-                "order_id": order_ref.strip().upper(),
-                "method": "contact_match",
-            }
-        )
-        return True
+
+    def _authorize_action(
+        order_ref: str, call_id: str, new_messages: list, *, order_known: bool
+    ) -> str | None:
+        """The single-target authorization wrapper (refund/return paths): runs the decision and,
+        on a bound-mismatch, appends the corrective ToolMessage that answers the propose call
+        (no dangling tool_use). Returns None if authorized, `_NEEDS_IDENTITY` if the caller must
+        verify first (the branch enters the identity detour — no corrective appended), or the
+        (already-appended) LINE constant so the caller re-prompts."""
+        verdict = _authorize_target(order_ref, order_known=order_known)
+        if verdict is None or verdict is _NEEDS_IDENTITY:
+            return verdict
+        new_messages.append(ToolMessage(verdict, tool_call_id=call_id))
+        return verdict
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE support: propose a REFUND (order+amount+destination) or a CANCEL
-        (order), or clarify, or leave. Mints PendingRefund/PendingCancel (per-intent key) on a
-        valid proposal — A10a rule 2: the idempotency key exists in state before any effect.
+        (one/many explicit orders or a semantic account scope), or clarify, or leave. Mints
+        PendingRefund/PendingCancel (per-intent keys) on a valid proposal — A10a rule 2: every
+        idempotency key exists in state before any effect.
 
         The candidate list the model SEES is scoped to AUTHORIZED orders (live call #15: the
         assemble model's clarify question recited the unscoped list — ids, items, totals — to
@@ -485,32 +570,86 @@ def build_support_nodes(
                     cancel = _ProposeCancel.model_validate(call["args"])
                 except ValueError:
                     cancel = None
-                chosen = _resolve(cancel.order_key) if cancel else None
                 if cancel is None:
-                    feedback = f"Invalid order. Valid order numbers: {', '.join(sorted(by_key))}."
+                    feedback = (
+                        "Invalid cancellation selection. Use either a non-empty order_keys "
+                        "list or one supported scope, never both. Do not guess order numbers."
+                    )
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
-                if not _authorize_action(
-                    chosen.order_id if chosen else cancel.order_key,
-                    cancel.account_contact,
-                    call["id"],
-                    new_messages,
-                    order_known=chosen is not None,
-                ):
+                # A bare account-wide `scope` (no keys): "cancel all/both my orders" with no
+                # option numbers (Milestone B). A BOUND caller resolves immediately (the
+                # resolve node reads their cancellable orders); an UNBOUND caller must verify
+                # first — mint a CancelSelection (semantic scope only, no ids) that rides
+                # pending_cancel across the identity detour, then re-enter the resolver.
+                if not cancel.order_keys:
+                    assert cancel.scope is not None  # enforced by _ProposeCancel
+                    new_messages.append(
+                        ToolMessage(
+                            f"proposed cancel of {cancel.scope}", tool_call_id=call["id"]
+                        )
+                    )
+                    selection = CancelSelection(scope=cancel.scope)
+                    if identity_store.current() is not None:
+                        # Already verified: resolve now (route_after_assemble -> resolve).
+                        return {"messages": new_messages, "pending_cancel": selection}
+                    # Unverified: retain the selection + enter identity (verify, then resolve).
+                    return {
+                        "messages": new_messages,
+                        "pending_cancel": selection,
+                        "active_flow": "identity",
+                        "identity_claim_misses": 0,
+                    }
+                # Resolve + AUTHORIZE every stated key, aggregating the outcome into EXACTLY ONE
+                # ToolMessage for this single tool_call_id (never one per target — F-4). An
+                # unresolved key is NOT an "invalid proposal" (that would enumerate keys): it is
+                # a guest reference the authorization gate handles with order_known=False (the
+                # existence-oracle-safe corrective). ANY denial fails the whole proposal closed
+                # (no partial batch reaches a readback unauthorized). Dedup by order_id so
+                # "cancel both" listing one order twice mints a single target.
+                # Resolve + deduplicate BEFORE authorization so aliases (an option key and
+                # its ORD-id) cannot consume multiple denial attempts or create repeated
+                # authorization work for one object.
+                unique: list[tuple[str, OrderCandidate | None]] = []
+                seen_refs: set[str] = set()
+                for raw_key in cancel.order_keys:
+                    hit = _resolve(raw_key)
+                    ref = hit.order_id if hit is not None else raw_key.strip().upper()
+                    if ref not in seen_refs:
+                        seen_refs.add(ref)
+                        unique.append((ref, hit))
+
+                resolved: list[OrderCandidate] = []
+                verdict: str | None = None
+                for ref, hit in unique:
+                    verdict = _authorize_target(
+                        hit.order_id if hit else ref, order_known=hit is not None
+                    )
+                    if verdict is not None:
+                        break  # _NEEDS_IDENTITY (detour) or a combined-not-found LINE
+                    assert hit is not None  # unresolved never authorizes (no owner, no grant)
+                    resolved.append(hit)
+                if verdict is _NEEDS_IDENTITY:
+                    # Unbound caller: bind first, then resume this cancel (no pending minted).
+                    new_messages.append(
+                        ToolMessage("verification needed", tool_call_id=call["id"])
+                    )
+                    return _enter_identity_for_action(new_messages)
+                if verdict is not None:
+                    # Bound-mismatch: fail closed with the combined not-found + re-prompt.
+                    new_messages.append(ToolMessage(verdict, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
-                assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
-                    ToolMessage(f"proposed cancel on order {chosen.key}", tool_call_id=call["id"])
+                    ToolMessage(
+                        f"proposed cancel on {len(resolved)} order(s)", tool_call_id=call["id"]
+                    )
                 )
-                pending_cancel = PendingCancel(
-                    order_id=chosen.order_id,
-                    summary=chosen.summary,
-                    idempotency_key=uuid.uuid4().hex,
-                    created_at=time.time(),
+                pending_batch = _mint_cancel_batch(
+                    [(c.order_id, c.summary) for c in resolved]
                 )
-                return {"messages": new_messages, "pending_cancel": pending_cancel}
+                return {"messages": new_messages, "pending_cancel": pending_batch}
 
             if call["name"] == "propose_return":
                 try:
@@ -523,13 +662,18 @@ def build_support_nodes(
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
-                if not _authorize_action(
+                verdict = _authorize_action(
                     chosen.order_id if chosen else proposed.order_key,
-                    proposed.account_contact,
                     call["id"],
                     new_messages,
                     order_known=chosen is not None,
-                ):
+                )
+                if verdict is _NEEDS_IDENTITY:
+                    new_messages.append(
+                        ToolMessage("verification needed", tool_call_id=call["id"])
+                    )
+                    return _enter_identity_for_action(new_messages)
+                if verdict is not None:  # bound-mismatch: corrective already appended, re-prompt
                     messages = [prompt, *state.messages, *new_messages]
                     continue
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
@@ -603,13 +747,18 @@ def build_support_nodes(
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
-                if not _authorize_action(
+                verdict = _authorize_action(
                     chosen.order_id if chosen else proposal.order_key,
-                    proposal.account_contact,
                     call["id"],
                     new_messages,
                     order_known=chosen is not None,
-                ):
+                )
+                if verdict is _NEEDS_IDENTITY:
+                    new_messages.append(
+                        ToolMessage("verification needed", tool_call_id=call["id"])
+                    )
+                    return _enter_identity_for_action(new_messages)
+                if verdict is not None:  # bound-mismatch: corrective already appended, re-prompt
                     messages = [prompt, *state.messages, *new_messages]
                     continue
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
@@ -726,11 +875,9 @@ def build_support_nodes(
             write_event({"event": "refund_steered_to_cancel", "order_id": pending.order_id})
             return {
                 "pending_refund": None,
-                "pending_cancel": PendingCancel(
-                    order_id=pending.order_id,
-                    summary=order_store.order_item_summary(pending.order_id),
-                    idempotency_key=uuid.uuid4().hex,
-                    created_at=time.time(),
+                # Remedy steer mints through the ONE batch helper (a one-target batch).
+                "pending_cancel": _mint_cancel_batch(
+                    [(pending.order_id, order_store.order_item_summary(pending.order_id))]
                 ),
                 "messages": [
                     AIMessage(
@@ -938,66 +1085,43 @@ def build_support_nodes(
             ],
         }
 
-    # --- cancel-order sub-path (single interrupt: guardrail -> confirm -> void) -----------
+    # --- cancel sub-path (F-16.2 batch; single = batch-of-one: guardrail -> confirm -> void)
+
+    def _preflight_target(target: CancelTarget) -> BatchCancelOutcome | None:
+        """Per-target eligibility, the SAME ladder as the pre-batch single guardrail (LIVE
+        store reads, never the model). Returns an ineligible outcome (closed code) or None if
+        the target is cancellable. Risk is NOT here — it is a session-level signal handled
+        once by the guardrail (a per-order loop can't re-decide a session flag)."""
+        status = order_store.order_status(target.order_id)
+        if status == CANCELLED_STATUS:
+            return BatchCancelOutcome(
+                order_id=target.order_id, summary=target.summary, outcome="already_cancelled"
+            )
+        if not order_store.is_cancellable(target.order_id):
+            return BatchCancelOutcome(
+                order_id=target.order_id, summary=target.summary, outcome="not_cancellable"
+            )
+        if order_store.refunded_so_far(target.order_id) > 0:
+            return BatchCancelOutcome(
+                order_id=target.order_id, summary=target.summary, outcome="has_refunds"
+            )
+        return None
 
     def cancel_guardrail_node(state: ReasoningState) -> dict[str, object]:
-        """CODE-enforced eligibility (never the model): read the LIVE order status + risk, and
-        on an INELIGIBLE order author the honest decline. On an eligible one it takes no side
-        effect (router -> confirm). Cancel is L1 (no step-up) — voiding an unshipped order
-        isn't money-movement to a new destination (§A4b's fraud vector doesn't apply; §A4a
-        doesn't tier cancel to L2), so no OTP loop. Decline reasons, each with its own honest
-        line (ONE voice, clear-before-speak):
-          - already cancelled: nothing to do, say so;
-          - not cancellable (shipped/delivered): industry-correct — direct cancel ends at
-            shipment; the honest path is a return once it arrives (returns aren't built yet);
-          - refunds already issued: a void reverses the FULL charge, which on top of a prior
-            partial refund returns money twice — the mixed case belongs to a person;
-          - risk-flagged: a risk signal on the session doesn't get a silent void (§A4a) —
-            hand to a person (no spoken line; the handover deferral is the single voice)."""
+        """CODE-enforced batch eligibility (never the model). Partitions the targets into the
+        ELIGIBLE subset (survives to the readback) and the INELIGIBLE ones (stated at the
+        readback so the caller hears the whole truth), each via `_preflight_target`'s live
+        reads. Cancel is L1 (no step-up). Special cases:
+          - RISK-flagged session: no silent void (§A4a) — clear + hand to a person (no spoken
+            line; the handover deferral is the single voice). Batch-level, checked once.
+          - ZERO eligible: author the honest all-ineligible line + END (no readback).
+          - OVER the batch cap: a big batch can't fit the step budget — clear + ask the caller
+            to narrow (never silently take the first N).
+        The pending is REWRITTEN to carry only the eligible `targets` + the `ineligible`
+        outcomes; on an eligible subset it takes no other side effect (router -> confirm)."""
         pending = state.pending_cancel
-        assert pending is not None
-        status = order_store.order_status(pending.order_id)
-        if status == CANCELLED_STATUS:
-            write_event({"event": "cancel_declined", "reason": "already_cancelled"})
-            return {
-                "pending_cancel": None,
-                "active_flow": None,
-                "messages": [
-                    AIMessage(
-                        f"That order for {pending.summary} is already cancelled and the "
-                        "charge reversed - there's nothing more you need to do."
-                    )
-                ],
-            }
-        if not order_store.is_cancellable(pending.order_id):
-            write_event({"event": "cancel_declined", "reason": "not_cancellable"})
-            return {
-                "pending_cancel": None,
-                "active_flow": None,
-                "messages": [
-                    AIMessage(
-                        f"That order for {pending.summary} has already shipped, so I can't "
-                        "cancel it here - the way to handle it is a return once it arrives, "
-                        "which our support team can set up for you."
-                    )
-                ],
-            }
-        if order_store.refunded_so_far(pending.order_id) > 0:
-            write_event({"event": "cancel_declined", "reason": "has_refunds"})
-            return {
-                "pending_cancel": None,
-                "active_flow": None,
-                "messages": [
-                    AIMessage(
-                        "There's already a refund on that order, so I can't cancel it on "
-                        "this call - our support team can sort out the rest for you."
-                    )
-                ],
-            }
+        assert isinstance(pending, PendingCancelBatch)
         if risk.check_sim_swap():
-            # A risk signal on the session doesn't get a silent void (§A4a) — hand to a
-            # person. The escape pattern: NO spoken line here; the handover node's deferral
-            # is the single voice (mirrors checkout/refund escape_human).
             write_event({"event": "cancel_stepup_to_human", "reason": "risk_flagged"})
             return {
                 "pending_cancel": None,
@@ -1006,14 +1130,51 @@ def build_support_nodes(
                     destination="human", reason_code="verification_required", source="gate"
                 ),
             }
-        return {}  # eligible: router -> cancel_confirm
+        if len(pending.targets) > policy.cancel_batch_max:
+            write_event(
+                {"event": "cancel_batch_over_cap", "count": len(pending.targets)}
+            )
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"That's more orders than I can cancel in one go - I can do up to "
+                        f"{policy.cancel_batch_max} at a time. Which ones would you like me to "
+                        "start with?"
+                    )
+                ],
+            }
+        eligible: list[CancelTarget] = []
+        ineligible: list[BatchCancelOutcome] = []
+        for target in pending.targets:
+            verdict = _preflight_target(target)
+            if verdict is None:
+                eligible.append(target)
+            else:
+                ineligible.append(verdict)
+        if not eligible:
+            write_event(
+                {"event": "cancel_declined", "reason": "batch_none_eligible",
+                 "count": len(ineligible)}
+            )
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [AIMessage(render_batch_cancel_outcome(ineligible))],
+            }
+        return {
+            "pending_cancel": pending.model_copy(
+                update={"targets": tuple(eligible), "ineligible": tuple(ineligible)}
+            )
+        }
 
     def cancel_confirm_node(state: ReasoningState) -> dict[str, object]:
-        """HITL interrupt: the cancel readback + deterministic consent. NO side effects; §4a
-        barge -> re-confirm once (a truncated 'yes' does not authorize an irreversible void).
-        Clock-A TTL checked FIRST (clear-before-speak) — a stale 'yes' can't void an order."""
+        """HITL interrupt: the batch cancel readback + deterministic consent. NO side effects;
+        §4a barge -> re-confirm once (a truncated 'yes' does not authorize an irreversible
+        void). Clock-A TTL FIRST (clear-before-speak) — a stale 'yes' can't void."""
         pending = state.pending_cancel
-        assert pending is not None
+        assert isinstance(pending, PendingCancelBatch)
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
             write_event({"event": "cancel_expired", "reason": "pending_ttl"})
             return {
@@ -1026,18 +1187,13 @@ def build_support_nodes(
                     )
                 ],
             }
-        # Cancel-polarity consent: the question IS "shall I cancel?", so "yeah cancel it"
-        # must read as yes (plain classify_consent reads the 'cancel' as a no — live
-        # 2026-07-10 the phrase never even reached here, but this seals the readback too).
+        # Cancel-polarity consent: the question IS "shall I cancel?", so "yeah cancel them"
+        # must read as yes (plain classify_consent reads the 'cancel' as a no).
         answer = interrupt(_cancel_readback_line(pending))
         verdict = classify_cancel_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
-            # The retry names the order too — the caller may have reached this branch by
-            # questioning WHICH order it is (live: "isn't my most recent ORD-1001?").
-            retry = interrupt(
-                f"Sorry - just to be clear: cancel your order for {pending.summary} "
-                f"({pending.order_id})? Yes or no?"
-            )
+            phrases = "; ".join(_cancel_target_phrase(t) for t in pending.targets)
+            retry = interrupt(f"Sorry - just to be clear: cancel {phrases}? Yes or no?")
             verdict = classify_cancel_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
@@ -1052,51 +1208,170 @@ def build_support_nodes(
             }
         if verdict == "no":
             write_event({"event": "cancel_declined", "reason": "declined"})
-            return {
-                "pending_cancel": None,
-                "active_flow": None,
-                "messages": [AIMessage("Okay, I'll leave that order as it is - nothing changed.")],
-            }
-        return {}  # yes: pending survives; router -> void
-
-    def cancel_void_node(state: ReasoningState) -> dict[str, object]:
-        """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
-        per-intent key; the store RE-VALIDATES status (§A4c) so a proposal that went stale
-        (order shipped since assemble) can't void."""
-        pending = state.pending_cancel
-        assert pending is not None
-        try:
-            record = order_store.cancel_order(pending.idempotency_key, order_id=pending.order_id)
-        except CancelError as exc:
-            logger.warning("cancel refused by store: %s", exc)
-            write_event({"event": "cancel_denied", "reason": "store_refused"})
+            decline_line = (
+                "Okay, I'll leave that order as it is - nothing changed."
+                if len(pending.targets) == 1
+                else "Okay, I'll leave those orders as they are - nothing changed."
+            )
             return {
                 "pending_cancel": None,
                 "active_flow": None,
                 "messages": [
-                    # Outcome only — the handover node's deferral speaks the transfer
-                    # sentence; adding one here would say it twice. No guessed reason: the
-                    # store may have refused for shipment, a prior refund, or anything a
-                    # real SoR adds later.
-                    AIMessage("I wasn't able to cancel that order - nothing has changed.")
+                    AIMessage(decline_line)
                 ],
-                "handover": HandoffRequest(
-                    destination="human", reason_code="cancel_order", source="gate"
-                ),
             }
-        pointer.set(record.order_id)  # the order most recently discussed (Group C L4)
-        write_event({"event": "cancel_confirmed", "order_id": record.order_id})
+        return {}  # yes: pending survives; router -> void
+
+    def cancel_void_node(state: ReasoningState) -> dict[str, object]:
+        """The EFFECT node (post-interrupt, own node - A10a rule 1). Voids ONE eligible target
+        per node completion, recording its outcome, then returns — the router loops back here
+        while targets remain, so progress is CHECKPOINTED BETWEEN writes (a kill after target
+        N leaves N cancelled, the rest pending; replay with the same per-target key returns the
+        SAME CancelRecord — exactly N effects, never N+1). Each spoken clause comes from a
+        CancelRecord or the preflight outcome (INV-25) — NO confirming re-read. An effect-time
+        CancelError (stale since preflight) becomes a generic `store_refused` outcome; one
+        stale target never sinks the batch. When the last target is done, renders the whole
+        per-target result and ends."""
+        pending = state.pending_cancel
+        assert isinstance(pending, PendingCancelBatch)
+        done = len(pending.outcomes)
+        target = pending.targets[done]
+        try:
+            record = order_store.cancel_order(target.idempotency_key, order_id=target.order_id)
+            outcome = BatchCancelOutcome(
+                order_id=record.order_id,
+                summary=record.summary,
+                outcome="cancelled",
+                amount_usd=record.total_usd,
+            )
+            pointer.set(record.order_id)  # most recently discussed (Group C L4)
+            write_event({"event": "cancel_confirmed", "order_id": record.order_id})
+        except CancelError as exc:
+            # No typed reason on CancelError, and parsing its text is forbidden — a rare
+            # effect-time (stale-since-preflight) refusal is the honest generic store_refused.
+            logger.warning("cancel refused by store: %s", exc)
+            write_event({"event": "cancel_denied", "reason": "store_refused",
+                         "order_id": target.order_id})
+            outcome = BatchCancelOutcome(
+                order_id=target.order_id, summary=target.summary, outcome="store_refused"
+            )
+        outcomes = (*pending.outcomes, outcome)
+        if done + 1 < len(pending.targets):
+            # More targets remain: checkpoint progress, loop back (router -> void).
+            return {"pending_cancel": pending.model_copy(update={"outcomes": outcomes})}
+        # Last target done: speak the whole truth from the collected records (+ any ineligible
+        # ones stated at the readback) and end.
+        all_outcomes = [*pending.ineligible, *outcomes]
         return {
             "pending_cancel": None,
             "active_flow": None,
-            "messages": [
-                AIMessage(
-                    f"Done - I've cancelled your order for {record.summary}. The "
-                    f"${record.total_usd:.2f} charge goes back to your original "
-                    "payment method."
-                )
-            ],
+            "messages": [AIMessage(render_batch_cancel_outcome(all_outcomes))],
         }
+
+    def resolve_node(state: ReasoningState) -> dict[str, object]:
+        """Resolve a retained CancelSelection into a batch AFTER the account is bound (Milestone
+        B — the "cancel all my orders" continuation). This is TRANSACTION AUTHORIZATION, not
+        authentication: it reads the LIVE binding and the caller's CURRENT cancellable orders
+        (never a set computed before the OTP, which could have gone stale). No contact claim,
+        no grant — the bind already granted account-wide access, so `owned_cancellable_orders`
+        is the authorized universe. Freezes the exact PendingCancelBatch and routes into the
+        SAME cancel guardrail/readback/void the explicit path uses. Speaks NO order list.
+
+        Terminal (spoke + ends) cases: not actually bound (belt-and-suspenders — a resolver
+        reached unbound clears + defers), nothing cancellable, or a 'both' scope that resolves
+        to more than two candidates (ambiguous — ask which)."""
+        selection = state.pending_cancel
+        assert isinstance(selection, CancelSelection)
+        bound = identity_store.current()
+        if bound is None:
+            # Unreachable in the happy path (resolve is only routed to post-bind); fail closed.
+            write_event({"event": "cancel_resolve_declined", "reason": "not_bound"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage("I couldn't confirm your account, so I haven't changed anything.")
+                ],
+            }
+        candidates, has_more = order_store.owned_cancellable_orders(
+            bound.customer_ref, limit=policy.cancel_batch_max + 1
+        )
+        unauthorized = [
+            candidate.order_id
+            for candidate in candidates
+            if not order_read_allowed(
+                candidate.order_id, store=order_store, identity=identity_store
+            )
+        ]
+        if unauthorized:
+            # The query narrows candidates; it is not an authorization authority. Reject
+            # the whole semantic scope when even one result falls outside the live binding.
+            write_event(
+                {
+                    "event": "cancel_resolve_declined",
+                    "reason": "authorization_mismatch",
+                    "count": len(unauthorized),
+                }
+            )
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "I couldn't safely match those orders to your account, so I haven't "
+                        "changed anything."
+                    )
+                ],
+            }
+        if not candidates:
+            write_event({"event": "cancel_resolve_declined", "reason": "none_cancellable"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage("None of your orders can be cancelled right now - nothing to do.")
+                ],
+            }
+        if selection.scope == "both_cancellable" and len(candidates) != 2:
+            # "both" is only unambiguous with exactly two cancellable orders. Keep the
+            # response truthful on either side of two.
+            write_event(
+                {"event": "cancel_resolve_declined", "reason": "both_ambiguous",
+                 "count": len(candidates)}
+            )
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        "I found only one order that can be cancelled, so I need you to tell "
+                        "me which orders you meant."
+                        if len(candidates) == 1
+                        else "You've got more than two orders that can be cancelled - which "
+                        "ones would you like me to cancel?"
+                    )
+                ],
+            }
+        if len(candidates) > policy.cancel_batch_max or has_more:
+            # Over the batch cap: ask to narrow, never silently take the first N (mirrors the
+            # guardrail's over-cap line; here the caller never named specifics).
+            write_event({"event": "cancel_resolve_over_cap"})
+            return {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage(
+                        f"You've got more orders than I can cancel in one go - I can do up to "
+                        f"{policy.cancel_batch_max} at a time. Which would you like to start with?"
+                    )
+                ],
+            }
+        batch = _mint_cancel_batch([(c.order_id, c.summary) for c in candidates])
+        write_event(
+            {"event": "cancel_resolved_from_scope", "scope": selection.scope,
+             "count": len(candidates)}
+        )
+        return {"pending_cancel": batch, "active_flow": "support"}
 
     # --- returns sub-path (Group C; single interrupt: guardrail -> confirm -> place) ------
 
@@ -1135,12 +1410,8 @@ def build_support_nodes(
             write_event({"event": "return_steered_to_cancel", "order_id": pending.order_id})
             return {
                 "pending_return": None,
-                "pending_cancel": PendingCancel(
-                    order_id=pending.order_id,
-                    summary=pending.summary,
-                    idempotency_key=uuid.uuid4().hex,
-                    created_at=time.time(),
-                ),
+                # Remedy steer mints through the ONE batch helper (a one-target batch).
+                "pending_cancel": _mint_cancel_batch([(pending.order_id, pending.summary)]),
                 "messages": [
                     AIMessage(
                         "That order hasn't shipped yet, so there's nothing to send back - "
@@ -1487,7 +1758,11 @@ def build_support_nodes(
         # Which effect did assemble mint? (a valid proposal sets exactly one pending.)
         if state.active_flow == "left_support":
             return "leave"  # model left / two invalid proposals -> normal pipeline answers
-        if state.pending_cancel is not None:
+        if state.active_flow == "identity":
+            return "needs_identity"  # unbound "cancel all" — verify first, then resolve
+        if isinstance(state.pending_cancel, CancelSelection):
+            return "resolve"  # a BOUND caller's scope resolves immediately
+        if state.pending_cancel is not None:  # a PendingCancelBatch
             return "cancel"
         if state.pending_return is not None:
             return "return"
@@ -1496,6 +1771,11 @@ def build_support_nodes(
         if state.pending_refund is not None:
             return "refund"
         return "clarify"  # a clarifying question was streamed; end the turn in-flow
+
+    def route_after_resolve(state: ReasoningState) -> str:
+        # "confirm" (a batch was frozen -> the cancel guardrail/readback/void) | "clarify"
+        # (nothing cancellable / >2 for 'both' / over-cap: the node spoke its line + ends).
+        return "confirm" if isinstance(state.pending_cancel, PendingCancelBatch) else "clarify"
 
     def route_after_cancel_guardrail(state: ReasoningState) -> str:
         # Three outcomes the guardrail already resolved:
@@ -1528,9 +1808,11 @@ def build_support_nodes(
         cancel_guardrail=cancel_guardrail_node,
         cancel_confirm=cancel_confirm_node,
         cancel_void=cancel_void_node,
+        resolve=resolve_node,
         abort=abort_node,
         escape_human=escape_human_node,
         route_after_assemble=route_after_assemble,
+        route_after_resolve=route_after_resolve,
         route_after_guardrail=route_after_guardrail,
         route_after_collect=refund_stepup.route_after_collect,
         route_after_cancel_guardrail=route_after_cancel_guardrail,
@@ -1556,6 +1838,8 @@ def build_support_nodes(
                 "support_cancel_guardrail",  # authors the shipped/ineligible decline line
                 "support_cancel_confirm",
                 "support_cancel_void",
+                "support_resolve",  # authors the none-cancellable / ambiguous-scope decline
+
                 "support_return_guardrail",  # authors the ineligible-return decline lines
                 "support_return_confirm",
                 "support_return_place",

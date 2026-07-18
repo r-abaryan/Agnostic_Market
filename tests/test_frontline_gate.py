@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from agnostic_market.agents.gate import gate_check, status_check
+from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 
 # Irreversible-action REQUESTS the slim gate must catch.
 _IRREVERSIBLE = [
@@ -41,6 +41,12 @@ _MODEL_OWNS = [
     "add two of those to my cart",
     "take the jacket out of my basket",
     "I moved recently, make sure it goes to the right place",
+    # Batch/collective cancel phrasings belong to the MODEL, not the gate (F-16.2): a widening
+    # to catch "cancel both my orders" also false-tripped the non-imperatives in _NO_TRIP
+    # below, so it was reverted. The model routes these via request_handover.
+    "cancel both of my orders",
+    "cancel all my orders",
+    "cancel them",
 ]
 
 # Reads / questions / policy asks — MUST NOT false-trip (the gate's precision guarantee).
@@ -57,6 +63,11 @@ _NO_TRIP = [
     "what payment methods do you accept",
     "can you send me feedback on my order",  # 'send…feedback' must not read as 'send back'
     "when will my package be sent to me",
+    # F-16.2 regression guard: a plural-cancel widening false-tripped these non-imperatives
+    # (a question, a past-tense report, an abandoned intention). The gate must defer them.
+    "did you cancel both orders",
+    "I did not cancel them",
+    "I was going to cancel them but changed my mind",
 ]
 
 
@@ -85,6 +96,39 @@ def test_trip_returns_reason_and_destination() -> None:
 def test_empty_transcript_does_not_trip() -> None:
     assert gate_check("") is None
     assert gate_check("   ") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "what orders do I have",
+        "tell me what orders are available",
+        "first, tell me what order numbers are available",
+        "show me my purchases",
+        "are there any other orders",
+        "what else is on my account",
+    ],
+)
+def test_account_enumeration_asks_are_detected(text: str) -> None:
+    assert enumeration_check(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "what is available to order",
+        "what is the status of my order",
+        "which order should I cancel",
+        "tell me which order should I cancel",
+        "tell me what order is cancelled",
+        "cancel all my orders",
+        "are both orders cancelled",
+        "show me the order I cancelled",
+        "show me the waterproof jacket",
+    ],
+)
+def test_non_enumeration_turns_stay_out_of_identity_divert(text: str) -> None:
+    assert not enumeration_check(text)
 
 
 @pytest.mark.parametrize(

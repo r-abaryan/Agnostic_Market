@@ -8,6 +8,7 @@ from agnostic_market.commerce.identity import (
     CustomersFixture,
     assert_orders_have_customers,
     load_customers_fixture,
+    order_mutation_allowed,
     order_read_allowed,
 )
 from agnostic_market.commerce.orders import (
@@ -34,6 +35,7 @@ __all__ = [
     "assert_orders_have_customers",
     "load_customers_fixture",
     "load_orders_fixture",
+    "order_mutation_allowed",
     "order_read_allowed",
     "resolve_candidates",
     "speak_lines",

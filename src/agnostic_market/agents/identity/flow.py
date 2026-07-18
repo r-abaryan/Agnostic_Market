@@ -55,6 +55,7 @@ from agnostic_market.commerce.orders import OrderStore, render_order_list_line
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import identity_required_level
 from agnostic_market.dtos.state import (
+    CancelSelection,
     HandoffRequest,
     PendingIdentity,
     PolicyContext,
@@ -100,8 +101,19 @@ class IdentityNodes:
 
 
 def _flow_exit(update: dict[str, object]) -> dict[str, object]:
-    """Every identity-flow exit clears the pending + the re-ask counter."""
-    return {"pending_identity": None, "identity_claim_misses": 0, **update}
+    """Every identity-flow exit clears the pending + the re-ask counter — AND any retained
+    CancelSelection (Milestone B) or `identity_resume` marker (Fix 2): a "cancel all" scope OR
+    an explicit-order mutation that entered identity to verify must leave ZERO action intent
+    behind on ANY failure/leave/abort/human path (a live selector/marker surviving a FAILED
+    verification is the security hazard). The success paths that resume support (bind -> resolve,
+    bind -> support_assemble) return their own update and do NOT go through here."""
+    return {
+        "pending_identity": None,
+        "identity_claim_misses": 0,
+        "pending_cancel": None,
+        "identity_resume": None,
+        **update,
+    }
 
 
 def build_identity_nodes(
@@ -286,11 +298,19 @@ def build_identity_nodes(
         return decision
 
     def apply_node(state: ReasoningState) -> dict[str, object]:
-        """Bind the session to the verified customer + speak THEIR orders (flow-terminal —
-        this answers the actual ask). Re-validates BOTH invariant legs live before a NEW
-        bind (§A4c, triad leg 3): the level, and a grant NEWER than the pending's mint
-        snapshot (this chain's OTP really succeeded). An already-bound same-customer pass
-        (the misrouted-handover shortcut) re-lists without re-proving."""
+        """Bind the session to the verified customer (authentication), then branch on WHY
+        identity was entered. Re-validates BOTH invariant legs live before a NEW bind (§A4c,
+        triad leg 3): the level, and a grant NEWER than the pending's mint snapshot (this
+        chain's OTP really succeeded). An already-bound same-customer pass (the misrouted-
+        handover shortcut) proceeds without re-proving.
+
+        Two continuations (the Milestone B split):
+          - a RETAINED CancelSelection (a "cancel all my orders" that came here to verify):
+            hand back to the support RESOLVER — keep the selection, set active_flow="support",
+            speak NO order list (the resolver reads the live binding + current cancellable
+            orders and freezes the batch). Does NOT go through `_flow_exit` (which would clear
+            the selection); it clears `pending_identity`/misses itself.
+          - otherwise (plain list_orders): speak the order list + exit (the enumeration ask)."""
         pending = state.pending_identity
         assert pending is not None
         bound = identity_store.current()
@@ -314,6 +334,30 @@ def build_identity_nodes(
                     "verification": [g.get("method") for g in verification_store.grants],
                 }
             )
+        if isinstance(state.pending_cancel, CancelSelection):
+            # Cancel-SCOPE continuation ("cancel all"): bound, hand to the resolver (NOT
+            # _flow_exit — keep the selection). Clear only identity's own turn-scoped state here.
+            write_event(
+                {"event": "identity_bound_for_cancel", "customer_ref": pending.customer_ref}
+            )
+            return {
+                "pending_identity": None,
+                "identity_claim_misses": 0,
+                "active_flow": "support",
+            }
+        if state.identity_resume == "support_assemble":
+            # Explicit-order mutation continuation (Fix 2): bound, hand back to support_assemble
+            # so the model re-proposes the cancel/refund/return from history — now authorized as
+            # the bound owner (`order_mutation_allowed`). Clears the marker; speaks NO list.
+            write_event(
+                {"event": "identity_bound_for_action", "customer_ref": pending.customer_ref}
+            )
+            return {
+                "pending_identity": None,
+                "identity_claim_misses": 0,
+                "identity_resume": None,
+                "active_flow": "support",
+            }
         line = render_order_list_line(order_store.owned_orders(pending.customer_ref))
         return _flow_exit({"messages": [AIMessage(line)], "active_flow": None})
 
@@ -361,13 +405,31 @@ def build_identity_nodes(
                 break
         return "clarify"  # the model's question streamed already; end the turn in-flow
 
+    def _clear_selection_on_handover(
+        node: Callable[[ReasoningState], dict[str, object]],
+    ) -> Callable[[ReasoningState], dict[str, object]]:
+        """Wrap a factory step-up node (risk_check/collect) so ANY handover it emits (SIM-swap
+        risk, OTP exhaustion) also drops a retained CancelSelection (Milestone B) AND the
+        `identity_resume` marker (Fix 2) — a FAILED verification must leave ZERO action intent,
+        so neither the scope selector nor the explicit-order resume survives to a later turn.
+        The factory clears only `pending_identity`; both live in channels the shared factory
+        must not know about — so the clear is HERE, not in _stepup.py."""
+
+        def wrapped(state: ReasoningState) -> dict[str, object]:
+            update = node(state)
+            if update.get("handover") is not None:
+                update = {**update, "pending_cancel": None, "identity_resume": None}
+            return update
+
+        return wrapped
+
     return IdentityNodes(
         assemble=assemble_node,
         reask=reask_node,
         guardrail=guardrail_node,
-        risk_check=stepup.risk_check,
+        risk_check=_clear_selection_on_handover(stepup.risk_check),
         dispatch=stepup.dispatch,
-        collect=stepup.collect,
+        collect=_clear_selection_on_handover(stepup.collect),
         apply=apply_node,
         abort=abort_node,
         escape_human=escape_human_node,

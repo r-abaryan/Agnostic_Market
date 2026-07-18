@@ -8,6 +8,7 @@ frontline gate trips on "refund ..." and enters the support flow.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -230,8 +231,8 @@ async def test_kill_mid_stepup_leaves_no_ghost_refund_and_no_free_level(config_r
 _REFUND_ORIGINAL = {
     "propose_refund": {"order_key": "2", "amount_usd": 50.0, "destination": "original"}
 }
-_CANCEL_PROCESSING = {"propose_cancel": {"order_key": "2"}}  # ORD-1002, processing
-_CANCEL_SHIPPED = {"propose_cancel": {"order_key": "1"}}  # ORD-1001, shipped
+_CANCEL_PROCESSING = {"propose_cancel": {"order_keys": ["2"]}}  # ORD-1002, processing
+_CANCEL_SHIPPED = {"propose_cancel": {"order_keys": ["1"]}}  # ORD-1001, shipped
 
 
 def _cancel_engine(config_root, args, *, thread_id, risk_flagged=False):
@@ -342,6 +343,481 @@ async def test_kill_mid_cancel_leaves_no_ghost(config_root: Path) -> None:
     engine.delete_thread()
     assert store.cancel_count == 0
     assert store.order_status("ORD-1002") == "processing"  # nothing voided on the drop
+
+
+# --- F-16.2 batch cancel (single = batch-of-one; the above single-cancel tests still pass) -
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {},
+        {"order_keys": []},
+        {"order_keys": [" "]},
+        {"scope": "everything"},
+        {"order_keys": ["2"], "scope": "all_cancellable"},
+        {"order_key": "2"},  # stale scalar schema must not be silently ignored
+    ],
+)
+def test_cancel_proposal_rejects_invalid_or_ambiguous_selectors(args: dict) -> None:
+    with pytest.raises(ValueError):
+        support_flow._ProposeCancel.model_validate(args)
+
+
+def test_cancel_proposal_accepts_exactly_one_normalized_selector() -> None:
+    explicit = support_flow._ProposeCancel.model_validate({"order_keys": [" 2 "]})
+    scoped = support_flow._ProposeCancel.model_validate(
+        {"order_keys": None, "scope": "both_cancellable"}
+    )
+    assert explicit.order_keys == ["2"] and explicit.scope is None
+    assert scoped.order_keys == [] and scoped.scope == "both_cancellable"
+
+
+async def test_stale_scalar_cancel_call_cannot_widen_to_account_scope(
+    config_root: Path,
+) -> None:
+    from agnostic_market.commerce.identity import BoundIdentity
+
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {
+                "destination": "support",
+                "reason_code": "cancel_order",
+            }
+        },
+        tool_call_limit=1,
+    )
+    harness = build_support_engine(
+        config_root,
+        policy=_POLICY,
+        frontline=frontline,
+        reasoning=FakeChatModel(
+            force_tool="propose_cancel",
+            canned_args={"propose_cancel": {"order_key": "2"}},
+            tool_call_limit=1,
+        ),
+        thread_id="batch-stale-scalar",
+    )
+    harness.identity.bind(
+        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
+    )
+    _place_second_cancellable(harness.store)
+
+    events = await _events(harness.engine, "cancel my order")
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert harness.store.cancel_count == 0
+    assert _pending_cancel(harness, "batch-stale-scalar") is None
+
+
+def _place_second_cancellable(store: OrderStore) -> str:
+    """Place a session cart order (ORD-9001, 'processing' => cancellable, session-authorized
+    with no grant needed) so a batch has TWO cancellable targets. Its candidate KEY is '4'
+    (after the three fixture orders in actionable_orders). Returns the order id."""
+    from agnostic_market.dtos.state import CartLine
+
+    placed = store.place_cart(
+        "seed-batch",
+        lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=60.0, quantity=1)],
+        total_usd=60.0,
+    )
+    return placed.order_id
+
+
+def _place_second_cancellable_extra(store: OrderStore) -> str:
+    """A THIRD cancellable session order (ORD-9002) — for the 'both' >2 clarify test."""
+    from agnostic_market.dtos.state import CartLine
+
+    placed = store.place_cart(
+        "seed-batch-2",
+        lines=[CartLine(sku="SKU-GRN-15", name="socks", price_usd=14.5, quantity=1)],
+        total_usd=14.5,
+    )
+    return placed.order_id
+
+
+def _batch_engine(config_root, keys, *, thread_id, policy=_POLICY, place_second=False):
+    """Support engine that enters support the PRODUCTION way — the frontline model hands over
+    (request_handover -> cancel_order/support), NOT the deterministic gate (which deliberately
+    does not own plural/collective 'cancel both' phrasings — F-16.2). The reasoning fake then
+    forces ONE propose_cancel(order_keys=keys). Optionally seeds a second cancellable order."""
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={"request_handover": {"destination": "support", "reason_code": "cancel_order"}},
+        tool_call_limit=1,
+    )
+    args = {"propose_cancel": {"order_keys": keys}}
+    harness = authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=policy,
+            frontline=frontline,
+            reasoning=FakeChatModel(
+                force_tool="propose_cancel", canned_args=args, tool_call_limit=1
+            ),
+            thread_id=thread_id,
+        )
+    )
+    if place_second:
+        _place_second_cancellable(harness.store)
+    return harness.engine, harness.store
+
+
+async def test_cancel_both_voids_both_in_one_flow(config_root: Path) -> None:
+    # THE F-16.2 pin: "cancel both" stages BOTH orders in ONE confirmation and voids both in
+    # ONE flow — no "and the other one" turn for the model to fabricate a completion into.
+    engine, store = _batch_engine(config_root, ["2", "4"], thread_id="batch-1", place_second=True)
+    events = await _events(engine, "cancel both of my orders")
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1  # ONE readback covers both
+    assert "ORD-1002" in interrupts[0].prompt and "ORD-9001" in interrupts[0].prompt
+    assert store.cancel_count == 0  # nothing voided before consent (INV-25)
+    events = await _events(engine, "yes")
+    assert store.cancel_count == 2  # BOTH voided
+    assert store.order_status("ORD-1002") == "cancelled"
+    assert store.order_status("ORD-9001") == "cancelled"
+    spoken = " ".join(e.text for e in events if isinstance(e, SpokenMessageEvent))
+    assert "ORD-1002" in spoken and "ORD-9001" in spoken  # each named in the result
+
+
+async def test_batch_cancel_mixes_eligible_and_shipped(config_root: Path) -> None:
+    # Mixed batch: ORD-1002 processing + ORD-1001 shipped. The readback names ONLY the
+    # eligible one, states the shipped one needs a return; yes voids only the eligible one.
+    engine, store = _batch_engine(config_root, ["2", "1"], thread_id="batch-2")
+    events = await _events(engine, "cancel both")
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "ORD-1002" in interrupts[0].prompt
+    assert "already shipped" in interrupts[0].prompt.lower()  # the ineligible one stated
+    events = await _events(engine, "yes")
+    assert store.cancel_count == 1
+    assert store.order_status("ORD-1002") == "cancelled"
+    assert store.order_status("ORD-1001") == "shipped"  # untouched
+    spoken = " ".join(e.text for e in events if isinstance(e, SpokenMessageEvent))
+    assert "ORD-1002" in spoken and "already shipped" in spoken.lower()
+
+
+async def test_batch_cancel_all_ineligible_declines_without_readback(config_root: Path) -> None:
+    # Both shipped/delivered: the guardrail speaks the whole-truth decline + ends, NO readback.
+    engine, store = _batch_engine(config_root, ["1", "3"], thread_id="batch-3")  # shipped+delivered
+    events = await _events(engine, "cancel both")
+    assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback
+    assert store.cancel_count == 0
+    spoken = " ".join(e.text for e in events if isinstance(e, SpokenMessageEvent))
+    assert "already shipped" in spoken.lower()
+
+
+async def test_batch_cancel_dedups_repeated_key(config_root: Path) -> None:
+    # "cancel both" that lists the SAME order twice mints ONE target -> ONE void.
+    engine, store = _batch_engine(config_root, ["2", "2"], thread_id="batch-4")
+    await _events(engine, "cancel it and also cancel it")
+    await _events(engine, "yes")
+    assert store.cancel_count == 1
+
+
+async def test_batch_cancel_over_cap_asks_to_narrow(config_root: Path) -> None:
+    # cancel_batch_max=1, a two-order batch: no void, ask the caller to narrow (never first-N).
+    engine, store = _batch_engine(
+        config_root, ["2", "4"], thread_id="batch-5",
+        policy=make_policy(cancel_batch_max=1), place_second=True,
+    )
+    events = await _events(engine, "cancel both of my orders")
+    assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback
+    assert store.cancel_count == 0  # never silently takes the first N
+    spoken = " ".join(e.text for e in events if isinstance(e, SpokenMessageEvent))
+    assert "up to 1" in spoken
+
+
+async def test_batch_cancel_idempotent_across_double_resume(config_root: Path) -> None:
+    # A stray extra turn after a two-order batch completes must not re-void either target.
+    engine, store = _batch_engine(config_root, ["2", "4"], thread_id="batch-6", place_second=True)
+    await _events(engine, "cancel both")
+    await _events(engine, "yes")
+    await _events(engine, "yes")  # stray extra turn after completion
+    assert store.cancel_count == 2  # exactly N, never N+1
+
+
+async def test_batch_cancel_checkpoints_between_voids_without_serde_warning(
+    config_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The void self-loop serializes PendingCancelBatch + nested CancelTarget/BatchCancelOutcome
+    # BETWEEN each void (replay-safe progress). Those types must be serde-registered — no
+    # langgraph "unregistered type" warning (slated to become a hard block).
+    engine, store = _batch_engine(config_root, ["2", "4"], thread_id="batch-7", place_second=True)
+    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
+        await _events(engine, "cancel both")
+        await _events(engine, "yes")  # drives the void self-loop across both targets
+    assert store.cancel_count == 2
+    assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
+
+
+async def test_cancel_effect_revalidates_status_changed_after_readback(
+    config_root: Path,
+) -> None:
+    engine, store = _batch_engine(config_root, ["2"], thread_id="batch-stale-status")
+    await _events(engine, "cancel my order")
+    store.fixture.orders["ORD-1002"].status = "shipped"
+
+    events = await _events(engine, "yes")
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "shipped"
+    spoken = " ".join(
+        event.text for event in events if isinstance(event, SpokenMessageEvent)
+    ).lower()
+    assert "couldn't cancel" in spoken and "nothing changed" in spoken
+
+
+async def test_engine_recovers_cancel_after_write_before_checkpoint(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, store = _batch_engine(config_root, ["2"], thread_id="batch-crash-replay")
+    await _events(engine, "cancel my order")
+    original = store.cancel_order
+    crashed = False
+
+    def write_then_crash(idempotency_key: str, *, order_id: str):
+        nonlocal crashed
+        record = original(idempotency_key, order_id=order_id)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash after the store committed")
+        return record
+
+    monkeypatch.setattr(store, "cancel_order", write_then_crash)
+    failed = await _events(engine, "yes")
+    assert store.cancel_count == 1
+    assert any(
+        isinstance(event, SpokenMessageEvent) and event.node == "turn_fallback"
+        for event in failed
+    )
+
+    recovered = await _events(engine, "please try that again")
+    assert store.cancel_count == 1
+    result_lines = [
+        event
+        for event in recovered
+        if isinstance(event, SpokenMessageEvent) and event.node == "support_cancel_void"
+    ]
+    assert len(result_lines) == 1 and "cancelled" in result_lines[0].text.lower()
+
+
+async def test_concurrent_double_resume_has_n_effects_and_one_result_line(
+    config_root: Path,
+) -> None:
+    engine, store = _batch_engine(
+        config_root, ["2", "4"], thread_id="batch-concurrent", place_second=True
+    )
+    await _events(engine, "cancel both")
+    first, second = await asyncio.gather(
+        _events(engine, "yes"),
+        _events(engine, "yes"),
+    )
+    assert store.cancel_count == 2
+    result_lines = [
+        event
+        for event in [*first, *second]
+        if isinstance(event, SpokenMessageEvent) and event.node == "support_cancel_void"
+    ]
+    assert len(result_lines) == 1
+
+
+# --- F-16.2 Milestone B: unbound "cancel all my orders" -> identity -> resolve -> batch ----
+
+
+def _scope_engine(
+    config_root,
+    *,
+    scope="all_cancellable",
+    thread_id,
+    bound=False,
+    otp_max=2,
+    cancel_batch_max=10,
+    risk_flagged=False,
+):
+    """Engine for a 'cancel all/both my orders' scope. The frontline hands over to
+    support/cancel_order; ONE reasoning fake serves BOTH support (propose_cancel scope) and
+    identity (a turn-1 clarify, then propose_identity when the caller gives their contact).
+    A second cancellable order (key '4') is seeded so a resolve yields two targets. If `bound`,
+    the session is pre-verified so the scope resolves WITHOUT an identity detour."""
+    from support_helpers import TEST_OTP  # noqa: F401  (the valid code the OtpProvider holds)
+
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={"request_handover": {"destination": "support", "reason_code": "cancel_order"}},
+        tool_call_limit=1,
+    )
+    scripted = [
+        [("propose_cancel", {"order_keys": [], "scope": scope})],  # support assemble
+        [],  # identity clarify on turn 1 (caller hasn't given a contact yet)
+        [("propose_identity", {"contact_claim": "casey@example.com"})],  # identity assemble turn 2
+    ]
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(
+            otp_max_attempts=otp_max, cancel_batch_max=cancel_batch_max
+        ),
+        frontline=frontline,
+        reasoning=FakeChatModel(scripted_calls=scripted),
+        risk_flagged=risk_flagged,
+        thread_id=thread_id,
+    )
+    _place_second_cancellable(harness.store)  # ORD-9001, session-owned, cancellable
+    if bound:
+        from agnostic_market.commerce.identity import BoundIdentity
+
+        harness.identity.bind(
+            BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
+        )
+    return harness
+
+
+def _pending_cancel(harness, thread_id):
+    snap = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
+    return snap.values.get("pending_cancel")
+
+
+async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root: Path) -> None:
+    # THE Milestone B pin: unverified "cancel all my orders" -> OTP -> NO order-list speech ->
+    # the resolver freezes a batch over the caller's cancellable orders -> one confirmation ->
+    # both voided. Identity establishes the binding; support re-resolves + authorizes live.
+    h = _scope_engine(config_root, thread_id="mb-1")
+    await _events(h.engine, "cancel all my orders")  # -> identity (asks for contact)
+    e1 = await _events(h.engine, "casey@example.com")  # -> OTP dispatched
+    assert any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in e1)
+    e2 = await _events(h.engine, "482913")  # OTP -> bind -> resolve -> readback
+    # NO order-list line spoken on the continuation (the list-speech branch is skipped).
+    spoken2 = [e for e in e2 if isinstance(e, SpokenMessageEvent)]
+    assert not any("you've got" in e.text.lower() for e in spoken2)
+    interrupts = [e for e in e2 if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "ORD-1002" in interrupts[0].prompt and "ORD-9001" in interrupts[0].prompt
+    assert h.store.cancel_count == 0  # nothing voided before consent
+    await _events(h.engine, "yes")
+    assert h.store.cancel_count == 2
+    assert h.store.order_status("ORD-1002") == "cancelled"
+    assert h.store.order_status("ORD-9001") == "cancelled"
+
+
+async def test_bound_cancel_all_skips_identity(config_root: Path) -> None:
+    # An ALREADY-verified caller's "cancel all" resolves immediately — no OTP, straight to the
+    # batch readback on the SAME turn.
+    h = _scope_engine(config_root, thread_id="mb-2", bound=True)
+    events = await _events(h.engine, "cancel all my orders")
+    assert not any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in events)
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1 and "ORD-1002" in interrupts[0].prompt
+    await _events(h.engine, "yes")
+    assert h.store.cancel_count == 2
+
+
+async def test_failed_otp_clears_the_retained_cancel_selection(config_root: Path) -> None:
+    # SECURITY: a FAILED verification during a "cancel all" detour must leave ZERO cancel
+    # intent — the retained CancelSelection is cleared on OTP exhaustion, nothing voided.
+    h = _scope_engine(config_root, thread_id="mb-3", otp_max=2)
+    await _events(h.engine, "cancel all my orders")
+    await _events(h.engine, "casey@example.com")
+    await _events(h.engine, "000000")  # wrong OTP 1 -> re-collect
+    await _events(h.engine, "111111")  # wrong OTP 2 -> exhausted -> human
+    assert _pending_cancel(h, "mb-3") is None  # selector dropped
+    assert h.store.cancel_count == 0
+    assert h.identity.current() is None  # never bound
+
+
+async def test_cancel_both_scope_with_more_than_two_asks_to_narrow(config_root: Path) -> None:
+    # "cancel both" is only unambiguous with exactly two cancellable orders. With three
+    # (ORD-1002 + two placed), the resolver asks which — no readback, nothing voided.
+    h = _scope_engine(config_root, scope="both_cancellable", thread_id="mb-4", bound=True)
+    _place_second_cancellable_extra(h.store)  # a THIRD cancellable order
+    events = await _events(h.engine, "cancel both of my orders")
+    assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback
+    assert h.store.cancel_count == 0
+    spoken = " ".join(e.text for e in events if isinstance(e, SpokenMessageEvent))
+    assert "which" in spoken.lower()
+
+
+async def test_cancel_both_scope_with_one_candidate_is_truthful(config_root: Path) -> None:
+    h = _scope_engine(
+        config_root, scope="both_cancellable", thread_id="mb-one", bound=True
+    )
+    h.store.cancel_order("already-done", order_id="ORD-1002")
+    events = await _events(h.engine, "cancel both of my orders")
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    spoken = " ".join(
+        event.text for event in events if isinstance(event, SpokenMessageEvent)
+    ).lower()
+    assert "only one" in spoken
+    assert "more than two" not in spoken
+    assert h.store.cancel_count == 1
+
+
+async def test_cancel_all_exactly_cap_plus_one_never_truncates(config_root: Path) -> None:
+    h = _scope_engine(
+        config_root, thread_id="mb-cap-plus-one", bound=True, cancel_batch_max=1
+    )
+    events = await _events(h.engine, "cancel all my orders")
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    spoken = " ".join(
+        event.text for event in events if isinstance(event, SpokenMessageEvent)
+    )
+    assert "up to 1" in spoken
+    assert h.store.cancel_count == 0
+    assert _pending_cancel(h, "mb-cap-plus-one") is None
+
+
+async def test_scope_resolver_reauthorizes_every_query_result(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agnostic_market.commerce.orders import OrderCandidate
+
+    h = _scope_engine(config_root, thread_id="mb-cross-owner", bound=True)
+    foreign = OrderCandidate(
+        key="1",
+        order_id="ORD-1001",
+        summary="trail running shoes",
+        total_usd=179.98,
+        status="processing",
+    )
+    monkeypatch.setattr(
+        h.store, "owned_cancellable_orders", lambda *_args, **_kwargs: ([foreign], False)
+    )
+    events = await _events(h.engine, "cancel all my orders")
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    spoken = " ".join(
+        event.text for event in events if isinstance(event, SpokenMessageEvent)
+    ).lower()
+    assert "safely match" in spoken and "haven't changed" in spoken
+    assert h.store.cancel_count == 0
+    assert _pending_cancel(h, "mb-cross-owner") is None
+
+
+async def test_risk_after_identity_clears_scope_without_voiding(config_root: Path) -> None:
+    h = _scope_engine(config_root, thread_id="mb-risk", risk_flagged=True)
+    await _events(h.engine, "cancel all my orders")
+    await _events(h.engine, "casey@example.com")
+    events = await _events(h.engine, "482913")
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert _pending_cancel(h, "mb-risk") is None
+    assert h.store.cancel_count == 0
+
+
+@pytest.mark.parametrize(
+    ("utterance", "thread_id"),
+    [
+        ("never mind, forget it", "mb-abort"),
+        ("I want a person", "mb-human"),
+        ("checkout now please", "mb-cross-switch"),
+    ],
+)
+async def test_identity_exit_paths_clear_retained_cancel_scope(
+    config_root: Path, utterance: str, thread_id: str
+) -> None:
+    h = _scope_engine(config_root, thread_id=thread_id)
+    await _events(h.engine, "cancel all my orders")
+    assert _pending_cancel(h, thread_id) is not None
+
+    await _events(h.engine, utterance)
+    assert _pending_cancel(h, thread_id) is None
+    assert h.store.cancel_count == 0
 
 
 # --- F-1: refund amount gate (merchant policy, within platform bounds) --------------------
@@ -519,7 +995,7 @@ async def test_cancel_after_a_partial_refund_declines_without_voiding(config_roo
     assert store.cancel_count == 0
     assert store.order_status("ORD-1002") == "processing"  # nothing voided
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any("already a refund" in e.text for e in spoken)
+    assert any("already has a refund" in e.text for e in spoken)
 
 
 async def test_cancelled_order_cancel_request_says_nothing_more_to_do(config_root: Path) -> None:

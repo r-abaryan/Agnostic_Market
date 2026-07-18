@@ -25,6 +25,7 @@ _DEFAULTS: dict[str, object] = {
     "contact_reask_max": 1,
     "auth_denials_before_human_offer": 2,
     "max_tool_hops": 5,
+    "cancel_batch_max": 10,
 }
 
 

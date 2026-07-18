@@ -19,14 +19,14 @@ prose surface to speak from, one structured surface to select from.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
-from agnostic_market.dtos.state import CartLine
+from agnostic_market.dtos.state import BatchCancelOutcome, CartLine
 
 _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
@@ -169,6 +169,59 @@ def render_order_list_line(candidates: Sequence[OrderCandidate]) -> str:
         return f"You've got 1 order: {parts[0]}."
     listed = "; ".join(parts[:-1]) + f"; and {parts[-1]}"
     return f"You've got {len(parts)} orders: {listed}."
+
+
+def _cancel_outcome_clause(o: BatchCancelOutcome) -> str:
+    """One target's truthful spoken clause, rendered from its STRUCTURED outcome (INV-25 —
+    never from pending intent). A `cancelled` outcome states the reversed amount; the honest
+    declines name the reason without inventing one."""
+    if o.outcome == "cancelled":
+        assert o.amount_usd is not None  # BatchCancelOutcome enforces the discriminant
+        amount = f"${o.amount_usd:.2f}"
+        return (
+            f"your order for {o.summary} ({o.order_id}) is cancelled and {amount} goes back "
+            "to your original payment method"
+        )
+    if o.outcome == "already_cancelled":
+        return f"your order for {o.summary} ({o.order_id}) was already cancelled"
+    if o.outcome == "not_cancellable":
+        return (
+            f"your order for {o.summary} ({o.order_id}) has already shipped, so that one "
+            "needs a return instead"
+        )
+    if o.outcome == "has_refunds":
+        return (
+            f"your order for {o.summary} ({o.order_id}) already has a refund, so our support "
+            "team needs to sort out the rest"
+        )
+    # store_refused — an effect-time refusal with no typed reason; honest, promises nothing.
+    return f"I couldn't cancel your order for {o.summary} ({o.order_id}) - nothing changed on it"
+
+
+def render_batch_cancel_outcome(outcomes: Sequence[BatchCancelOutcome]) -> str:
+    """CODE-authored spoken result of a cancel batch — the ONLY speakable, composed from the
+    per-target OUTCOMES (INV-25). A batch of ONE cancelled order reads byte-identical to the
+    single-cancel void line (single = batch-of-one, no speech regression). Multiple targets
+    join speech-natively; mixed success/decline states each truthfully."""
+    if not outcomes:
+        # Never reached in the flow (a batch always has >=1 target), but fail honest.
+        return "Nothing to cancel - nothing has changed."
+    if len(outcomes) == 1:
+        only = outcomes[0]
+        if only.outcome == "cancelled":
+            # The exact single-cancel void phrasing (kept identical on purpose).
+            assert only.amount_usd is not None  # BatchCancelOutcome enforces the discriminant
+            amount = f"${only.amount_usd:.2f}"
+            return (
+                f"Done - I've cancelled your order for {only.summary}. The {amount} charge "
+                "goes back to your original payment method."
+            )
+        # A one-target decline: the clause carried by a leading capital, no "Done".
+        clause = _cancel_outcome_clause(only)
+        return clause[0].upper() + clause[1:] + "."
+    clauses = [_cancel_outcome_clause(o) for o in outcomes]
+    joined = "; ".join(clauses[:-1]) + f"; and {clauses[-1]}"
+    return joined[0].upper() + joined[1:] + "."
 
 
 class _OrderEntry(BaseModel):
@@ -454,31 +507,57 @@ class OrderStore:
         normalized = order_id.strip().upper()
         return any(p.order_id == normalized for p in self._placed_by_key.values())
 
+    def _iter_owned_orders(self, customer_ref: str) -> Iterator[OrderCandidate]:
+        """Yield the account/session order view without materializing full history."""
+        index = 1
+        for order_id, entry in self.fixture.orders.items():
+            if entry.customer_ref != customer_ref:
+                continue
+            yield OrderCandidate(
+                key=str(index),
+                order_id=order_id,
+                summary=entry.summary,
+                total_usd=entry.total_usd,
+                status=self.order_status(order_id) or "unknown",
+            )
+            index += 1
+        for record in self._placed_by_key.values():
+            yield OrderCandidate(
+                key=str(index),
+                order_id=record.order_id,
+                summary=speak_lines(record.lines),
+                total_usd=record.total_usd,
+                status=self.order_status(record.order_id) or "unknown",
+            )
+            index += 1
+
     def owned_orders(self, customer_ref: str) -> list[OrderCandidate]:
         """The bounded, keyed list of orders the IDENTIFIED caller may hear enumerated (P7
         rung 2): fixture orders owned by `customer_ref` + everything placed THIS session
         (placed-by-this-caller by construction). Effective status (cancelled overlay wins).
         Same OrderCandidate shape as `actionable_orders` — whose MODEL-VISIBLE subset the
         support assemble scopes through `order_read_allowed` (SECURITY §7d, call #15)."""
-        candidates: list[tuple[str, str, float]] = [
-            (oid, entry.summary, entry.total_usd)
-            for oid, entry in self.fixture.orders.items()
-            if entry.customer_ref == customer_ref
-        ]
-        candidates += [
-            (p.order_id, speak_lines(p.lines), p.total_usd)
-            for p in self._placed_by_key.values()
-        ]
-        return [
-            OrderCandidate(
-                key=str(i),
-                order_id=oid,
-                summary=summary,
-                total_usd=total,
-                status=self.order_status(oid) or "unknown",
-            )
-            for i, (oid, summary, total) in enumerate(candidates, start=1)
-        ]
+        return list(self._iter_owned_orders(customer_ref))
+
+    def owned_cancellable_orders(
+        self, customer_ref: str, *, limit: int
+    ) -> tuple[list[OrderCandidate], bool]:
+        """The bounded set of the caller's orders that are CURRENTLY cancellable (F-16.2
+        Milestone B) — the resolver's target universe for a "cancel all my orders" scope.
+        Returns at most `limit` candidates plus a `has_more` overflow flag (queried with
+        `limit = cap + 1` so overflow is detected WITHOUT loading full history or silently
+        truncating). Bounded by construction so a real account's history can't blow the batch.
+        Only `is_cancellable` orders — a scope names nothing about shipped/delivered history."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        cancellable: list[OrderCandidate] = []
+        for candidate in self._iter_owned_orders(customer_ref):
+            if not self.is_cancellable(candidate.order_id):
+                continue
+            if len(cancellable) == limit:
+                return cancellable, True
+            cancellable.append(candidate)
+        return cancellable, False
 
     def order_eta(self, order_id: str) -> str | None:
         """The raw ETA for an order (fixture `entry.eta`, a date "2026-07-09"; or `_PLACED_ETA`

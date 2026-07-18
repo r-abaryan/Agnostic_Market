@@ -159,6 +159,10 @@ class PolicyConfig(BaseModel):
     # Attempt-budget security knobs (default_factory so existing merchant YAMLs, which don't
     # set it, keep the platform defaults; the resolver clamps each against its ceiling).
     security: SecurityPolicy = Field(default_factory=SecurityPolicy)
+    # Max orders in one cancel batch (F-16.2). The required value comes from base.yaml and its
+    # path is safety-locked, so template/override layers cannot tune it. Keeping this REQUIRED
+    # prevents a second, silent source-code default from drifting away from the base layer.
+    cancel_batch_max: int = Field(ge=1)
     # Optional merchant free-text policy facts that have NO enforcing field — refund
     # TIMELINE ("5-7 business days"), condition clauses ("original condition"). The
     # ENFORCED policy sentences (returnless threshold, return window, human-review line)
@@ -189,6 +193,7 @@ class PolicyConfig(BaseModel):
             contact_reask_max=self.security.contact_reask_max,
             auth_denials_before_human_offer=self.security.auth_denials_before_human_offer,
             max_tool_hops=self.security.max_tool_hops,
+            cancel_batch_max=self.cancel_batch_max,
         )
 
 

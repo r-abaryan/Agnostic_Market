@@ -1,8 +1,9 @@
 """Support model-facing text: the assemble-node instructions + order rendering.
 
 PROMPT ONLY — what the support (reasoning-tier) model reads while turning a post-purchase
-request into a `propose_refund(...)`, `propose_cancel(order_key)`, `propose_return(order_key)`
-or `propose_profile_change(field, new_value)`. The model picks a KEY into the code-narrowed
+request into a `propose_refund(...)`, `propose_cancel(order_keys|scope)`,
+`propose_return(order_key)` or `propose_profile_change(field, new_value)`. The model picks
+a KEY into the code-narrowed
 order list — scoped to the caller's AUTHORIZED orders (live call #15: an unscoped list was
 recited to an unverified caller by a clarify question; the model can't speak what it never
 saw) — or, for an order NOT listed, relays the caller's STATED order number (the guest
@@ -24,7 +25,8 @@ _SUPPORT_INSTRUCTIONS = (
     "VERIFIED for this caller so far - work out which one they mean using only that list. "
     "If the order they mean is NOT listed (or nothing is listed), do NOT guess and NEVER "
     "say which orders exist, don't exist, or how many there are: ask ONE short question "
-    "for the ORDER NUMBER (like ORD-1234) and propose with that number as order_key - "
+    "for the ORDER NUMBER (like ORD-1234) and propose cancel with that number in order_keys "
+    "(refund/return still use order_key) - "
     "verification is then handled for you; follow any tool result exactly. Each listed "
     "order shows its status - use it to pick the RIGHT remedy:\n"
     "- 'processing' (not yet shipped): if the caller wants their money back, doesn't want "
@@ -65,14 +67,17 @@ _SUPPORT_INSTRUCTIONS = (
     "you do exactly ONE thing: a tool call WITH NO spoken text alongside it (the "
     "confirmation that follows is the voice - words like 'I'll set that up' collide with "
     "it), OR one spoken fact-question - never narrate instead of acting.\n"
-    "MULTIPLE orders in one request ('cancel both', 'return all three'): still ONE order per "
-    "turn - propose the first, let its readback and confirmation complete, and on the NEXT "
-    "turn propose the next one. A follow-up like 'and the other one' or 'the second one too' "
-    "is a NEW proposal for the next order (use the statuses in the list to see which are "
-    "already done - a 'cancelled' order needs nothing more). NEVER report an order as done "
-    "from memory: each 'Done' line is spoken by the system only after that order's own "
-    "confirmation, so do not say an order is cancelled/returned/refunded until you have "
-    "actually proposed it and it was confirmed this call.\n"
+    "MULTIPLE orders to CANCEL in one request ('cancel both', 'cancel all three'): call "
+    "propose_cancel ONCE with ALL their option numbers in order_keys (e.g. ['1','2']) - do "
+    "NOT cancel them one at a time across turns. One readback covers them together; the "
+    "system checks each order's eligibility and states any it can't cancel. If the caller "
+    "names several orders WITHOUT option numbers ('cancel all my orders') and you have no "
+    "list to pick from, call propose_cancel with scope 'all_cancellable' (or scope "
+    "'both_cancellable' when they specifically said both). NEVER report an "
+    "order as done from memory: each result line is spoken by the system only after the "
+    "confirmation, so do not say an order is cancelled/returned/refunded until it was "
+    "actually proposed and confirmed this call. (Refunds and returns are still one order per "
+    "turn - propose one, let its readback complete, then propose the next.)\n"
     "If the caller no "
     "longer wants any of this, or asks about something unrelated, call leave_support - and "
     "when you leave, say NOTHING: emit only the tool call, no spoken text. Another part "

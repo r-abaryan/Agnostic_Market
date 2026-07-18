@@ -29,6 +29,7 @@ def _valid_merchant_dict() -> dict:
             "max_order_value_usd": 100,
             "refunds": {"auto_approve_under_usd": 10, "require_human_above_usd": 50},
             "allow_ai_merchant_handoff": True,
+            "cancel_batch_max": 10,
         },
         "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
         "integration": {
@@ -75,6 +76,7 @@ def test_to_policy_context_carries_every_enforced_value() -> None:
     assert context.contact_reask_max == 1
     assert context.auth_denials_before_human_offer == 2
     assert context.max_tool_hops == 5
+    assert context.cancel_batch_max == 10
 
 
 def test_security_policy_defaults() -> None:
@@ -97,8 +99,16 @@ def test_negative_order_cap_rejected() -> None:
                 "max_order_value_usd": -1,
                 "refunds": {"auto_approve_under_usd": 0, "require_human_above_usd": 0},
                 "allow_ai_merchant_handoff": True,
+                "cancel_batch_max": 10,
             }
         )
+
+
+def test_cancel_batch_max_is_required_without_a_source_default() -> None:
+    bad = _valid_merchant_dict()
+    del bad["policies"]["cancel_batch_max"]
+    with pytest.raises(ValidationError, match="cancel_batch_max"):
+        MerchantConfig.model_validate(bad)
 
 
 def test_unknown_key_rejected() -> None:

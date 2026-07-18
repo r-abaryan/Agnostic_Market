@@ -29,6 +29,7 @@ decline). ToolMessages never surface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -49,9 +50,12 @@ from agnostic_market.dtos.events import (
     TurnFacts,
 )
 from agnostic_market.dtos.state import (
+    BatchCancelOutcome,
+    CancelSelection,
+    CancelTarget,
     CartLine,
     HandoffRequest,
-    PendingCancel,
+    PendingCancelBatch,
     PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
@@ -74,7 +78,13 @@ _CHECKPOINTED_DTOS = (
     PendingPlacement,
     CartLine,
     PendingRefund,
-    PendingCancel,
+    # The cancel lifecycle (F-16.2): the batch + its nested targets/outcomes are each checked
+    # independently by the serde allowlist (like CartLine inside PendingPlacement), and the
+    # pre-auth selector is its own checkpointed type.
+    CancelSelection,
+    PendingCancelBatch,
+    CancelTarget,
+    BatchCancelOutcome,
     PendingReturn,
     PendingProfileChange,
     PendingIdentity,
@@ -234,6 +244,9 @@ class ReasoningEngine:
         self._thread_id = thread_id
         self._config = {"configurable": {"thread_id": thread_id}}
         self._speakable: frozenset[str] = getattr(graph, "speakable_nodes", frozenset())
+        # A session is a serial conversation. A waiter re-checks the checkpoint so two
+        # concurrent deliveries of one resume cannot both produce final result speech.
+        self._turn_lock = asyncio.Lock()
 
     @property
     def thread_id(self) -> str:
@@ -253,38 +266,54 @@ class ReasoningEngine:
         and ends the turn cleanly — the thread stays usable (nothing mid-node was
         committed; a pending interrupt stays paused and the next turn resumes it).
         """
-        if self.pending_interrupt():
-            # The graph's confirm node classifies consent; the engine only relays facts.
-            payload: object = Command(
-                resume={"text": user_text, "readback_interrupted": facts.readback_interrupted}
-            )
-        else:
-            payload = {"messages": [HumanMessage(user_text)]}
-        speech = _TurnSpeech(self._speakable)
-        spans = _GraphSpans()
-        try:
-            async for mode, item in self._graph.astream(
-                payload, config=self._config, stream_mode=["messages", "updates"]
-            ):
-                if mode == "messages":
-                    token, meta = item
-                    spans.observe(token, meta)
-                    if (event := speech.feed(token, meta)) is not None:
-                        yield event
-                elif mode == "updates" and "__interrupt__" in item:
-                    yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
-        except Exception:
-            # The degradation boundary, not error-swallowing: the full traceback is logged
-            # and the event telemetered (exception CLASS only — provider error messages are
-            # free text, not for telemetry); the caller hears the fallback instead of
-            # nothing. CancelledError is BaseException and passes through untouched.
-            logger.exception("turn failed mid-graph; speaking the fallback line")
-            write_event({"event": "turn_failed", "reason": "graph_exception"})
-            yield SpokenMessageEvent(text=_TURN_FALLBACK_LINE, node=_TURN_FALLBACK_NODE)
-            return
-        for flushed in speech.flush():
-            yield flushed
-        spans.log()
+        arrived = self._graph.get_state(self._config)
+        arrived_during_continuation = bool(arrived.interrupts or arrived.next)
+        async with self._turn_lock:
+            snapshot = self._graph.get_state(self._config)
+            if arrived_during_continuation and not (snapshot.interrupts or snapshot.next):
+                write_event({"event": "duplicate_turn_ignored", "reason": "continuation_done"})
+                return
+            if snapshot.interrupts:
+                # The graph's confirm node classifies consent; the engine only relays facts.
+                payload: object = Command(
+                    resume={
+                        "text": user_text,
+                        "readback_interrupted": facts.readback_interrupted,
+                    }
+                )
+            elif snapshot.next:
+                # A prior attempt died after a checkpointed step, potentially after an
+                # idempotent write. Continue that task with no new message; treating the
+                # caller's repeat as a fresh turn would strand or duplicate the old intent.
+                payload = None
+                write_event({"event": "turn_recovering", "reason": "unfinished_checkpoint"})
+            else:
+                payload = {"messages": [HumanMessage(user_text)]}
+            speech = _TurnSpeech(self._speakable)
+            spans = _GraphSpans()
+            try:
+                async for mode, item in self._graph.astream(
+                    payload, config=self._config, stream_mode=["messages", "updates"]
+                ):
+                    if mode == "messages":
+                        token, meta = item
+                        spans.observe(token, meta)
+                        if (event := speech.feed(token, meta)) is not None:
+                            yield event
+                    elif mode == "updates" and "__interrupt__" in item:
+                        yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+            except Exception:
+                # The degradation boundary, not error-swallowing: the full traceback is logged
+                # and the event telemetered (exception CLASS only — provider error messages are
+                # free text, not for telemetry); the caller hears the fallback instead of
+                # nothing. CancelledError is BaseException and passes through untouched.
+                logger.exception("turn failed mid-graph; speaking the fallback line")
+                write_event({"event": "turn_failed", "reason": "graph_exception"})
+                yield SpokenMessageEvent(text=_TURN_FALLBACK_LINE, node=_TURN_FALLBACK_NODE)
+                return
+            for flushed in speech.flush():
+                yield flushed
+            spans.log()
 
     def delete_thread(self) -> None:
         """Remove this session's thread from the checkpointer.

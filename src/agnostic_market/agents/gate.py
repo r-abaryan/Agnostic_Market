@@ -29,7 +29,14 @@ from agnostic_market.dtos.state import HandoffDestination, HandoffReasonCode
 # Irreversible-action triggers ONLY. High precision: each is a request to DO the
 # irreversible thing, guarded against the read/question phrasings that would collide.
 _RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, HandoffDestination], ...] = (
-    # cancel an order (NOT "why was my order cancelled" — a read about a past cancel)
+    # cancel an order (NOT "why was my order cancelled" — a read about a past cancel).
+    # Deliberately SINGULAR/high-certainty only: plural and collective phrasings ("cancel both
+    # my orders", "cancel them") were tried here and REVERTED — weak objects like them/both/all
+    # false-trip non-imperatives the guard can't catch ("did you cancel both?", "I did not
+    # cancel them", "was going to cancel them but changed my mind"), breaking the gate's one
+    # precision guarantee. Batch cancels are the MODEL's job (the primary escalation decider) —
+    # it routes them via request_handover; the gate stays a narrow floor for imperatives it can
+    # own with confidence (F-16.2 decision: do not grow the regex gate toward paraphrases).
     (
         re.compile(
             r"\bcancel\b(?:(?!\b(?:why|was|been|already)\b).)*\b(?:order|purchase|it|this)\b",
@@ -86,6 +93,34 @@ def gate_check(text: str) -> tuple[HandoffReasonCode, HandoffDestination] | None
         if pattern.search(stripped):
             return reason_code, destination
     return None
+
+
+# --- account-enumeration reads (identity divert; live call #17 sticky-support gap) --------
+#
+# This is separate from the irreversible gate above: it never authorizes an action and never
+# names an order. A high-confidence account-list ask routes to the existing identity flow,
+# which owns verification and scoped enumeration. The detector is deliberately narrow so a
+# catalog question ("what is available to order?") or one-order status ask stays with the model.
+_ENUMERATION_RULES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:what|which)\s+(?:orders?|order\s+numbers?|purchases)\s+"
+        r"(?:do\s+i\s+have|are\s+(?:available|there|on\s+(?:my|the)\s+account))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:list|show)\s+(?:me\s+)?(?:my\s+|the\s+)?"
+        r"(?:orders|order\s+numbers?|purchases)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:any|what)\s+other\s+(?:orders?|purchases)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+else\s+is\s+on\s+my\s+account\b", re.IGNORECASE),
+)
+
+
+def enumeration_check(text: str) -> bool:
+    """True only for a high-confidence request to list the caller's orders."""
+    stripped = text.strip()
+    return bool(stripped) and any(rule.search(stripped) for rule in _ENUMERATION_RULES)
 
 
 # --- state-VERIFICATION questions (forced-read detector; live call #16 F-16.1) ------------

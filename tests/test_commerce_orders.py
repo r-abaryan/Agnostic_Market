@@ -293,11 +293,55 @@ def test_delivered_fixture_entry_requires_delivered_at() -> None:
 from datetime import date  # noqa: E402
 
 from agnostic_market.commerce.orders import (  # noqa: E402
+    render_batch_cancel_outcome,
     render_cart_line,
     render_order_status_line,
 )
+from agnostic_market.dtos.state import BatchCancelOutcome  # noqa: E402
 
 _TODAY = date(2026, 7, 15)
+
+
+def test_render_batch_cancel_single_matches_legacy_single_cancel_line() -> None:
+    # A batch-of-one cancelled order reads byte-identical to the retired single-cancel void
+    # line (single = batch-of-one; no speech regression).
+    out = [
+        BatchCancelOutcome(
+            order_id="ORD-1002", summary="the rain jacket", outcome="cancelled", amount_usd=129.0
+        )
+    ]
+    assert render_batch_cancel_outcome(out) == (
+        "Done - I've cancelled your order for the rain jacket. The $129.00 charge goes back "
+        "to your original payment method."
+    )
+
+
+def test_render_batch_cancel_states_each_target_from_its_outcome() -> None:
+    # INV-25: each clause comes from the STRUCTURED per-target outcome (amount only for a
+    # cancelled one; the declines name the honest reason, never a fabricated completion).
+    out = [
+        BatchCancelOutcome(
+            order_id="ORD-1002", summary="the rain jacket", outcome="cancelled", amount_usd=129.0
+        ),
+        BatchCancelOutcome(order_id="ORD-1001", summary="the shoes", outcome="not_cancellable"),
+        BatchCancelOutcome(order_id="ORD-9", summary="the boots", outcome="store_refused"),
+    ]
+    line = render_batch_cancel_outcome(out)
+    assert "ORD-1002" in line and "$129.00" in line
+    assert "ORD-1001" in line and "already shipped" in line.lower()
+    assert "ORD-9" in line and "couldn't cancel" in line.lower()
+
+
+def test_batch_cancel_outcome_requires_amount_exactly_for_cancelled() -> None:
+    with pytest.raises(ValueError, match="requires amount_usd"):
+        BatchCancelOutcome(order_id="ORD-1", summary="one item", outcome="cancelled")
+    with pytest.raises(ValueError, match="only a cancelled outcome"):
+        BatchCancelOutcome(
+            order_id="ORD-1",
+            summary="one item",
+            outcome="store_refused",
+            amount_usd=10.0,
+        )
 
 
 def test_render_past_eta_frames_as_past_and_is_terminal() -> None:
@@ -417,6 +461,48 @@ def test_owned_orders_carries_the_effective_status(config_root: Path) -> None:
     store.cancel_order("c1", order_id="ORD-9001")
     placed = next(c for c in store.owned_orders("CUST-001") if c.order_id == "ORD-9001")
     assert placed.status == "cancelled"
+
+
+def test_owned_cancellable_orders_filters_to_cancellable_and_is_bounded(config_root: Path) -> None:
+    # F-16.2 Milestone B: the "cancel all" target universe — only CANCELLABLE orders, bounded.
+    # CUST-001's fixture orders are shipped (ORD-1001) + delivered (ORD-1003), neither
+    # cancellable; a placed session order IS. So exactly one cancellable, no overflow at limit 5.
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)  # ORD-9001, processing
+    items, has_more = store.owned_cancellable_orders("CUST-001", limit=5)
+    assert [c.order_id for c in items] == ["ORD-9001"]  # the shipped/delivered ones excluded
+    assert has_more is False
+
+
+def test_owned_cancellable_orders_flags_overflow_without_truncating_silently(
+    config_root: Path,
+) -> None:
+    # limit = cap; a third cancellable order trips has_more (the resolver asks to narrow).
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)  # ORD-9001
+    _place1(store, "k2", "SKU-BLU-07", "jacket", 1, 60.0)  # ORD-9002
+    items, has_more = store.owned_cancellable_orders("CUST-001", limit=1)
+    assert len(items) == 1 and has_more is True
+
+
+def test_owned_cancellable_orders_does_not_materialize_owned_orders(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)
+
+    def forbidden(_customer_ref: str) -> list:
+        raise AssertionError("bounded query must not build the full owned_orders list")
+
+    monkeypatch.setattr(store, "owned_orders", forbidden)
+    items, has_more = store.owned_cancellable_orders("CUST-001", limit=1)
+    assert [item.order_id for item in items] == ["ORD-9001"]
+    assert has_more is False
+
+
+def test_owned_cancellable_orders_rejects_non_positive_limit(config_root: Path) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        _store(config_root).owned_cancellable_orders("CUST-001", limit=0)
 
 
 def test_order_entry_requires_customer_ref() -> None:

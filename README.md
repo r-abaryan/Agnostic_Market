@@ -12,7 +12,11 @@ Phase 5.
 
 Completed hardening in the current build: fixture-validated temporary OTP configuration (no
 source-code default), deterministic live status re-checks for “is it cancelled?” follow-ups,
-code-rendered order status, and an exact `max_tool_hops` ceiling with no dangling tool calls.
+code-rendered order status, an exact `max_tool_hops` ceiling with no dangling tool calls, and
+batch-aware cancellation. A cancel request can freeze one or many authorized targets under one
+readback; an unbound “cancel all” survives identity verification as a semantic selector and is
+resolved only after binding. Effects are serialized, idempotent, server-revalidated, and resumed
+from unfinished checkpoints rather than being reinterpreted as a fresh turn.
 
 Built foundations:
 

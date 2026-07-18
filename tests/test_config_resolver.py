@@ -13,7 +13,7 @@ from agnostic_market.config.resolver import (
 
 def _base() -> dict:
     return {
-        "_safety_locked": ["_platform", "schema_version"],
+        "_safety_locked": ["_platform", "schema_version", "policies.cancel_batch_max"],
         "_platform": {
             "payment": {"out_of_band_only": True},
             "limits": {
@@ -29,6 +29,7 @@ def _base() -> dict:
         },
         "schema_version": "0.2",
         "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
+        "policies": {"cancel_batch_max": 10},
     }
 
 
@@ -111,6 +112,21 @@ def test_template_cannot_touch_locked_key_either() -> None:
     bad_template["schema_version"] = "9.9"  # locked structural key
     with pytest.raises(SafetyLockViolationError, match="schema_version"):
         resolve_merchant_config(_base(), bad_template, _override())
+
+
+def test_cancel_batch_max_is_safety_locked_from_merchant_override() -> None:
+    # F-16.2: the cancel batch cap is a SAFETY bound (fits the LangGraph step budget), not a
+    # merchant knob — a base that declares it locked rejects an override that raises it.
+    base = _base()
+    bad = _override()
+    bad["policies"] = {"cancel_batch_max": 999}  # attempt to blow the step-budget bound open
+    with pytest.raises(SafetyLockViolationError, match="cancel_batch_max"):
+        resolve_merchant_config(base, _template(), bad)
+
+
+def test_cancel_batch_max_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.policies.cancel_batch_max == 10
 
 
 def test_platform_block_not_leaked_into_effective_config() -> None:

@@ -29,8 +29,9 @@ secrets_ref: "vault://m1"
 """
 
 _BASE_BODY = (
-    '_safety_locked: []\nschema_version: "0.2"\n'
+    '_safety_locked: [policies.cancel_batch_max]\nschema_version: "0.2"\n'
     'compliance: { call_start_disclosure: "Hi, this is an AI assistant." }\n'
+    'policies: { cancel_batch_max: 10 }\n'
 )
 
 _TEMPLATE_BODY = """\

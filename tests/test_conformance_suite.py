@@ -183,11 +183,12 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
             },
             "telephony": {"provider": "telnyx", "inbound_number": "+15550000000"},
             "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
-            "policies": {
-                "max_order_value_usd": 1500,
-                "refunds": {"auto_approve_under_usd": 50, "require_human_above_usd": 200},
-                "allow_ai_merchant_handoff": True,
-            },
+                "policies": {
+                    "max_order_value_usd": 1500,
+                    "refunds": {"auto_approve_under_usd": 50, "require_human_above_usd": 200},
+                    "allow_ai_merchant_handoff": True,
+                    "cancel_batch_max": 10,
+                },
             "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
             "integration": {
                 "order_sor": {"type": "api", "ref": "vault://m1/order", "idempotency": "supported"},
