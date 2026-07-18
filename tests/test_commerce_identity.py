@@ -152,3 +152,16 @@ def test_unknown_customer_ref_fails_loud_at_build(config_root: Path) -> None:
     )
     with pytest.raises(ConfigError, match="ORD-1002 -> CUST-002"):
         assert_orders_have_customers(orders, only_one)
+
+
+def test_duplicate_customer_contact_fails_fixture_load() -> None:
+    # `match_contact` is first-match — a shared contact would silently deny the later-listed
+    # owner, so the stub directory rejects it at load. Uniqueness is checked on the MATCH
+    # key (last-10 digits), so two spellings of one number still collide.
+    with pytest.raises(ValueError, match="share a contact"):
+        CustomersFixture(
+            customers={
+                "CUST-001": CustomerEntry(contact="+1 555 010 0119", masked_contact="m1"),
+                "CUST-003": CustomerEntry(contact="555 010 0119", masked_contact="m3"),
+            }
+        )

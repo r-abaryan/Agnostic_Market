@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from llm_fakes import FakeChatModel
+from policy_helpers import make_policy
 
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
@@ -26,14 +27,15 @@ from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.verification import OtpProvider
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
-from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
 # The reasoning fake buys option 2 (waterproof rain jacket, $129.00) x2 = $258.00 -> straight
 # to the placement tail via buy_now.
 _PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
+_TEST_OTP = "482913"
 
 
 def _engine(
@@ -60,16 +62,9 @@ def _engine(
         reasoning_model=reasoning
         or FakeChatModel(force_tool="buy_now", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
+        otp=OtpProvider(valid_code=_TEST_OTP),
         pointer=pointer,
-        policy=PolicyContext(
-            max_order_value_usd=500.0,
-            allow_ai_merchant_handoff=True,
-            refund_auto_approve_under_usd=50.0,
-            refund_require_human_above_usd=200.0,
-            refund_returnless_under_usd=50.0,
-            return_window_days=30,
-            pending_ttl_seconds=120.0,
-        ),
+        policy=make_policy(refund_returnless_under_usd=50.0),
         checkpointer=build_checkpointer(),
     )
     return ReasoningEngine(graph, thread_id=thread_id), store

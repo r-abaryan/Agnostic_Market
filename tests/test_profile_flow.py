@@ -9,22 +9,14 @@ from pathlib import Path
 
 import pytest
 from llm_fakes import FakeChatModel
+from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileError, ProfileStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
-from agnostic_market.dtos.state import PolicyContext
 
-_POLICY = PolicyContext(
-    max_order_value_usd=500.0,
-    allow_ai_merchant_handoff=True,
-    refund_auto_approve_under_usd=50.0,
-    refund_require_human_above_usd=200.0,
-    refund_returnless_under_usd=50.0,
-    return_window_days=30,
-    pending_ttl_seconds=120.0,
-)
+_POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
 _NEW_ADDRESS = "7 Elm Street, Dover"

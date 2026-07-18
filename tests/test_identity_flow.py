@@ -7,20 +7,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from llm_fakes import FakeChatModel
+from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
-from agnostic_market.dtos.state import PolicyContext
 
-_POLICY = PolicyContext(
-    max_order_value_usd=500.0,
-    allow_ai_merchant_handoff=True,
-    refund_auto_approve_under_usd=50.0,
-    refund_require_human_above_usd=200.0,
-    refund_returnless_under_usd=50.0,
-    return_window_days=30,
-    pending_ttl_seconds=120.0,
-)
+_POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
 _CUST1_PHONE = "+1 555 010 0119"  # CUST-001 on file: owns ORD-1001 + ORD-1003
@@ -36,10 +28,11 @@ def _identity_harness(
     risk_flagged: bool = False,
     thread_id: str = "ident-1",
     propose_limit: int = 99,
+    policy=_POLICY,
 ) -> SupportHarness:
     return build_support_engine(
         config_root,
-        policy=_POLICY,
+        policy=policy,
         frontline=FakeChatModel(
             force_tool="request_handover",
             canned_args={
@@ -249,6 +242,36 @@ async def test_no_match_second_claim_hands_to_human_silently(
     telemetry = _telemetry(tmp_path)
     assert "no_match" in telemetry
     assert _UNKNOWN_CLAIM not in telemetry
+
+
+async def test_contact_reask_budget_tracks_the_policy_knob(config_root: Path) -> None:
+    # contact_reask_max is config-driven: a merchant that raised it to 2 gets a SECOND
+    # softened re-ask where the default (1) would already have handed to a human.
+    h = _identity_harness(
+        config_root,
+        claim=_UNKNOWN_CLAIM,
+        thread_id="ident-reask2",
+        policy=_POLICY.model_copy(update={"contact_reask_max": 2}),
+    )
+    await _events(h.engine, _REQUEST)  # miss #1 -> re-ask #1
+    events = await _events(h.engine, "still the wrong one")  # miss #2 -> re-ask #2 (budget 2)
+    reasks = [e for e in _spoken(events) if e.node == "identity_reask"]
+    assert len(reasks) == 1  # a re-ask this turn, not a handover
+    assert h.identity.current() is None
+
+
+async def test_contact_reask_zero_hands_over_on_first_miss(config_root: Path) -> None:
+    # contact_reask_max=0: no re-ask at all — the first no-match hands to a human.
+    h = _identity_harness(
+        config_root,
+        claim=_UNKNOWN_CLAIM,
+        thread_id="ident-reask0",
+        policy=_POLICY.model_copy(update={"contact_reask_max": 0}),
+    )
+    events = await _events(h.engine, _REQUEST)
+    spoken = _spoken(events)
+    assert not any(e.node == "identity_reask" for e in spoken)  # no re-ask
+    assert any(e.node == "handover" for e in spoken)  # straight to a person
 
 
 # --- escapes + crossover isolation ----------------------------------------------------------

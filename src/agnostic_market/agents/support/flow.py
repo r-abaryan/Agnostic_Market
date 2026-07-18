@@ -53,11 +53,18 @@ from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    order_read_allowed,
+    try_grant_by_contact,
+)
 from agnostic_market.commerce.orders import (
     CANCELLED_STATUS,
     FULFILLED_STATUSES,
     CancelError,
     LastOrderPointer,
+    OrderCandidate,
     OrderStore,
     RefundError,
     ReturnError,
@@ -89,6 +96,40 @@ logger = logging.getLogger("agnostic_market.agents.support")
 # A masked instrument reference is all voice ever handles — never a raw PAN (PCI, SECURITY
 # §6). The fixture "new card on file" for the build phase; a real stored-instrument ref later.
 _NEW_INSTRUMENT_REF = "card ending 4471"
+
+# Support-action authorization strings (SECURITY §7d support-selection scoping) — the
+# model-facing corrective ToolMessages the assemble gate answers a propose call with.
+# Fail-closed wording adapted from the order_status tool: never confirm an order exists,
+# never say which detail failed, never read details. The STOP clause keeps the model from
+# re-proposing in the same turn (no contact exists yet — the caller hasn't answered) and
+# burning the assemble loop's second attempt.
+_SUPPORT_ASK_CONTACT = (
+    "Not verified for that order. Do not say whether the order exists or read any details. "
+    "Ask the caller ONE short question - the email or phone number on the account - and "
+    "STOP: do not call any tool this turn. When the caller answers, propose the SAME "
+    "action again with account_contact filled in."
+)
+_SUPPORT_COMBINED_NOT_FOUND = (
+    "No order matches those details. Do not say which detail failed. Tell the caller: "
+    '"I couldn\'t find an order matching those details - could you double-check the order '
+    'number and the email or phone on the account?"'
+)
+_SUPPORT_NOT_FOUND_OFFER_HUMAN = (
+    "No order matches those details. Do not say which detail failed. Tell the caller you "
+    "couldn't find an order matching those details, and OFFER to connect them with a "
+    "person who can verify them another way."
+)
+_SUPPORT_ASK_ORDER_AND_CONTACT = (
+    "That reference doesn't resolve to a verified order. Do not say whether any order "
+    "exists or read any details. Ask the caller ONE short question for their ORDER NUMBER "
+    "(like ORD-1234) - and STOP: do not call any tool this turn. When they answer, propose "
+    "the SAME action again with that order number as order_key (and account_contact, if a "
+    "result asks to verify them)."
+)
+# The denial counter's bucket for references that never resolved to a store order — one
+# bounded key, never the caller's free text (an attacker probing random ids must not grow
+# an unbounded dict of their own strings).
+_UNRESOLVED_ORDER = "<unresolved>"
 
 
 def _last_user_text(state: ReasoningState) -> str:
@@ -173,14 +214,17 @@ class _ProposeRefund(BaseModel):
     order_key: str
     amount_usd: float
     destination: RefundDestination
+    account_contact: str = ""
 
 
 class _ProposeCancel(BaseModel):
     order_key: str
+    account_contact: str = ""
 
 
 class _ProposeReturn(BaseModel):
     order_key: str
+    account_contact: str = ""
 
 
 class _ProposeProfileChange(BaseModel):
@@ -252,24 +296,36 @@ def build_support_nodes(
     profile_store: ProfileStore,
     pointer: LastOrderPointer,
     *,
+    identity_store: CallerIdentityStore,
+    customers: CustomerDirectory,
     display_name: str,
 ) -> SupportNodes:
     """Build the support flow's nodes, closed over the session's stores + providers + policy
-    (§A5: tenant/policy/verification bound in code at build time — never carried in state)."""
+    (§A5: tenant/policy/verification bound in code at build time — never carried in state).
+    `identity_store`/`customers` MUST be the same instances the voice tools + identity flow
+    use (split-brain rule) — the assemble gate reads and writes rung-1 grants through them."""
 
     @tool
-    def propose_refund(order_key: str, amount_usd: float, destination: str) -> str:
-        """Propose a refund: which order (option number), how much, and where it goes."""
+    def propose_refund(
+        order_key: str, amount_usd: float, destination: str, account_contact: str = ""
+    ) -> str:
+        """Propose a refund: which order (option number), how much, and where it goes.
+        account_contact: the email or phone on the account - include it ONLY when a
+        previous result asked to verify the caller for that order."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
-    def propose_cancel(order_key: str) -> str:
-        """Propose cancelling an order the caller no longer wants (option number)."""
+    def propose_cancel(order_key: str, account_contact: str = "") -> str:
+        """Propose cancelling an order the caller no longer wants (option number).
+        account_contact: the email or phone on the account - include it ONLY when a
+        previous result asked to verify the caller for that order."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
-    def propose_return(order_key: str) -> str:
-        """Propose sending an order back (option number) - the refund follows the return."""
+    def propose_return(order_key: str, account_contact: str = "") -> str:
+        """Propose sending an order back (option number) - the refund follows the return.
+        account_contact: the email or phone on the account - include it ONLY when a
+        previous result asked to verify the caller for that order."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
@@ -317,12 +373,98 @@ def build_support_nodes(
             return "out_of_window"
         return None
 
+    # Failed-match count per order, this session only (nodes are built per session). NOT a
+    # throttle — it never blocks an attempt; the 2nd+ denial switches the corrective line to
+    # one that offers a person (the posture's "verification can't complete -> escalate").
+    _auth_denials: dict[str, int] = {}
+
+    def _authorize_action(
+        order_ref: str, claim: str, call_id: str, new_messages: list, *, order_known: bool
+    ) -> bool:
+        """The support-selection gate (SECURITY §7d): may THIS caller act on THAT order?
+
+        Sits at the assemble seam, strictly upstream of every mint — an unauthorized order
+        never reaches a guardrail steer line, a readback, or an effect. Rung-1 guest lookup
+        lifted from the order_status tool body: the contact claim is CODE-matched, never
+        model-judged, and a match grants exactly THAT order for the session. Fail-closed:
+        the corrective ToolMessage IS the answer to the propose call (no dangling
+        tool_use), and a mismatch gets ONE combined not-found (existence-oracle
+        discipline — the gate never confirms which detail failed, and an unresolved
+        reference gets the same treatment as a wrong pair, so an id probe learns nothing).
+
+        `order_known=True` means `order_ref` resolved to a store order (a closed slug,
+        safe to telemeter); False means the caller's stated reference resolved to nothing —
+        events then carry only `order_id_known: False`, NEVER the raw text. The raw claim
+        is never telemetered and never echoed into a ToolMessage.
+        """
+        if order_known and order_read_allowed(
+            order_ref, store=order_store, identity=identity_store
+        ):
+            write_event(
+                {"event": "support_action_authorized", "order_id": order_ref.strip().upper()}
+            )
+            return True
+        claim = claim.strip()
+        known_fields: dict[str, object] = {"order_id_known": order_known}
+        if order_known:
+            known_fields["order_id"] = order_ref.strip().upper()
+        if not claim:
+            write_event({"event": "support_auth_required", **known_fields})
+            line = _SUPPORT_ASK_CONTACT if order_known else _SUPPORT_ASK_ORDER_AND_CONTACT
+            new_messages.append(ToolMessage(line, tool_call_id=call_id))
+            return False
+        # An unresolved reference never resolves an owner, so the shared verdict returns
+        # "mismatch" for it (owner is None) — the `order_known` split survives only in the
+        # telemetry bucket + counter key below, never in the grant decision.
+        verdict = try_grant_by_contact(
+            order_ref, claim, store=order_store, customers=customers, identity=identity_store
+        )
+        if verdict == "mismatch":
+            counter_key = order_ref.strip().upper() if order_known else _UNRESOLVED_ORDER
+            attempt = _auth_denials[counter_key] = _auth_denials.get(counter_key, 0) + 1
+            write_event({"event": "support_auth_denied", **known_fields, "attempt": attempt})
+            line = (
+                _SUPPORT_NOT_FOUND_OFFER_HUMAN
+                if attempt >= policy.auth_denials_before_human_offer
+                else _SUPPORT_COMBINED_NOT_FOUND
+            )
+            new_messages.append(ToolMessage(line, tool_call_id=call_id))
+            return False
+        write_event(
+            {
+                "event": "support_order_granted",
+                "order_id": order_ref.strip().upper(),
+                "method": "contact_match",
+            }
+        )
+        return True
+
     def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE support: propose a REFUND (order+amount+destination) or a CANCEL
         (order), or clarify, or leave. Mints PendingRefund/PendingCancel (per-intent key) on a
-        valid proposal — A10a rule 2: the idempotency key exists in state before any effect."""
-        orders = order_store.actionable_orders()
+        valid proposal — A10a rule 2: the idempotency key exists in state before any effect.
+
+        The candidate list the model SEES is scoped to AUTHORIZED orders (live call #15: the
+        assemble model's clarify question recited the unscoped list — ids, items, totals — to
+        an unverified caller who had just failed OTP; the model can't speak what it never
+        saw, same structural stance as the buffer-before-speak fix). Keys keep their
+        full-list positions, so a key stays stable across the session as grants accumulate.
+        `by_id` is CODE-side only (never rendered): it resolves a caller-STATED order number
+        for the guest path — the model relays the caller's id exactly as `order_status`
+        already does; it still never AUTHORS one.
+        """
+        full = order_store.actionable_orders()
+        by_id = {o.order_id: o for o in full}
+        orders = [
+            o
+            for o in full
+            if order_read_allowed(o.order_id, store=order_store, identity=identity_store)
+        ]
         by_key = {o.key: o for o in orders}
+
+        def _resolve(stated: str) -> OrderCandidate | None:
+            return by_key.get(stated) or by_id.get(stated.strip().upper())
+
         prompt = SystemMessage(
             compose_support_prompt(display_name, orders, policy, pointer.get())
         )
@@ -343,12 +485,22 @@ def build_support_nodes(
                     cancel = _ProposeCancel.model_validate(call["args"])
                 except ValueError:
                     cancel = None
-                chosen = by_key.get(cancel.order_key) if cancel else None
-                if chosen is None:
+                chosen = _resolve(cancel.order_key) if cancel else None
+                if cancel is None:
                     feedback = f"Invalid order. Valid order numbers: {', '.join(sorted(by_key))}."
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
+                if not _authorize_action(
+                    chosen.order_id if chosen else cancel.order_key,
+                    cancel.account_contact,
+                    call["id"],
+                    new_messages,
+                    order_known=chosen is not None,
+                ):
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(f"proposed cancel on order {chosen.key}", tool_call_id=call["id"])
                 )
@@ -365,12 +517,22 @@ def build_support_nodes(
                     proposed = _ProposeReturn.model_validate(call["args"])
                 except ValueError:
                     proposed = None
-                chosen = by_key.get(proposed.order_key) if proposed else None
-                if chosen is None:
+                chosen = _resolve(proposed.order_key) if proposed else None
+                if proposed is None:
                     feedback = f"Invalid order. Valid order numbers: {', '.join(sorted(by_key))}."
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
+                if not _authorize_action(
+                    chosen.order_id if chosen else proposed.order_key,
+                    proposed.account_contact,
+                    call["id"],
+                    new_messages,
+                    order_known=chosen is not None,
+                ):
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(f"proposed return on order {chosen.key}", tool_call_id=call["id"])
                 )
@@ -432,8 +594,8 @@ def build_support_nodes(
                     proposal = _ProposeRefund.model_validate(call["args"])
                 except ValueError:
                     proposal = None
-                chosen = by_key.get(proposal.order_key) if proposal else None
-                if chosen is None or proposal.amount_usd <= 0:
+                chosen = _resolve(proposal.order_key) if proposal else None
+                if proposal is None or proposal.amount_usd <= 0:
                     feedback = (
                         f"Invalid proposal. Valid order numbers: {', '.join(sorted(by_key))}; "
                         "amount must be > 0."
@@ -441,6 +603,16 @@ def build_support_nodes(
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
+                if not _authorize_action(
+                    chosen.order_id if chosen else proposal.order_key,
+                    proposal.account_contact,
+                    call["id"],
+                    new_messages,
+                    order_known=chosen is not None,
+                ):
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(
                         f"proposed refund on order {chosen.key} ${proposal.amount_usd:.2f} "
@@ -653,6 +825,7 @@ def build_support_nodes(
         pending_field="pending_refund",
         required_level=lambda p: refund_required_level(p.amount_usd, p.destination),
         event_prefix="refund",
+        max_otp_attempts=policy.otp_max_attempts,
     )
 
     def confirm_node(state: ReasoningState) -> dict[str, object]:
@@ -1137,6 +1310,7 @@ def build_support_nodes(
         pending_field="pending_profile_change",
         required_level=lambda p: profile_change_required_level(p.field),
         event_prefix="profile",
+        max_otp_attempts=policy.otp_max_attempts,
     )
 
     def profile_guardrail_node(state: ReasoningState) -> dict[str, object]:

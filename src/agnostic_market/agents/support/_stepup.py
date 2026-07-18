@@ -29,10 +29,6 @@ from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import HandoffRequest, ReasoningState
 
-# Max OTP collect attempts before the flow gives up and offers a human (§A9). Bounded +
-# deterministic (A10a rule 3): the collect node counts committed misses, not a loop.
-_MAX_OTP_ATTEMPTS = 2
-
 
 class _SteppablePending(Protocol):
     """What the chain needs from a pending: the idempotent-dispatch key + the try counter."""
@@ -62,6 +58,7 @@ def build_stepup_nodes(
     pending_field: str,
     required_level: Callable[[object], int],
     event_prefix: str,
+    max_otp_attempts: int,
 ) -> StepupNodes:
     """Build one family's chain, closed over the stores + the family's state field.
 
@@ -69,6 +66,8 @@ def build_stepup_nodes(
     ("pending_refund" | "pending_profile_change"); `required_level` computes the level the
     pending demands (the platform floor functions); `event_prefix` keys the telemetry
     family (f"{event_prefix}_stepup_*" — refund events stay byte-identical to pre-factory).
+    `max_otp_attempts` is the committed-miss budget before the human handover (§A9,
+    merchant-tuned within the platform ceiling — was the hardcoded `_MAX_OTP_ATTEMPTS`).
     """
 
     def _pending(state: ReasoningState) -> _SteppablePending | None:
@@ -104,7 +103,8 @@ def build_stepup_nodes(
         idempotent: verify_otp just re-checks). It does NOT precede a LATER interrupt, so it
         is not the S3 hazard (that was a dispatch above an interrupt). On match: raise the
         store to L2 and RETURN (commits before the readback interrupt in the next node). On
-        miss: re-collect ONCE (new attempt key -> legit re-dispatch), then human (§A9)."""
+        miss: re-collect until `max_otp_attempts` is spent (each retry a new attempt key ->
+        legit re-dispatch), then human (§A9)."""
         pending = _pending(state)
         assert pending is not None
         answer = interrupt("For security, please read me the 6-digit code we just sent you.")
@@ -112,7 +112,7 @@ def build_stepup_nodes(
             write_event({"event": f"{event_prefix}_stepup_ok", "raised_to": 2})
             return {}  # level now L2 in the store; router -> confirm
         tries = pending.otp_tries + 1
-        if tries >= _MAX_OTP_ATTEMPTS:
+        if tries >= max_otp_attempts:
             write_event({"event": f"{event_prefix}_stepup_failed", "reason": "otp_exhausted"})
             return {
                 pending_field: None,

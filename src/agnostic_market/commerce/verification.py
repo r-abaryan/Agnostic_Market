@@ -24,9 +24,14 @@ injectable-real shape (same stance as the fixture `OrderStore`). They are SECURI
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agnostic_market.commerce.spoken import spoken_digits
+from agnostic_market.config.loader import ConfigError, load_yaml_layer
 
 logger = logging.getLogger("agnostic_market.commerce.verification")
 
@@ -39,6 +44,24 @@ logger = logging.getLogger("agnostic_market.commerce.verification")
 # NOTE (P7): L2 is a LEVEL, not an identity — binding a session to a customer additionally
 # requires the identity flow's own OTP chain (see PendingIdentity.grants_at_mint).
 _INITIAL_LEVEL = 1
+_STRICT = ConfigDict(extra="forbid", frozen=True)
+
+
+class VerificationFixture(BaseModel):
+    """Validated build-phase verification settings for one merchant."""
+
+    model_config = _STRICT
+
+    otp_code: str = Field(pattern=r"^\d{6}$")
+
+
+def load_verification_fixture(config_root: Path, merchant_id: str) -> VerificationFixture:
+    """Load the temporary fake-verification fixture, failing loudly at session build."""
+    path = config_root / "fixtures" / "verification" / f"{merchant_id}.yaml"
+    try:
+        return VerificationFixture.model_validate(load_yaml_layer(path))
+    except ValidationError as exc:
+        raise ConfigError(f"verification fixture {path} failed validation:\n{exc}") from exc
 
 
 class VerificationStore:
@@ -95,8 +118,12 @@ class OtpProvider:
     uses a NEW attempt_key, which legitimately sends a fresh code.
     """
 
-    valid_code: str = "482913"
+    valid_code: str
     _dispatched: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"\d{6}", self.valid_code) is None:
+            raise ValueError("fake OTP code must contain exactly 6 digits")
 
     def dispatch(self, attempt_key: str) -> None:
         if attempt_key in self._dispatched:

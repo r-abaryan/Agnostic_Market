@@ -15,6 +15,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 from llm_fakes import FakeChatModel
+from policy_helpers import make_policy
 
 from agnostic_market.agents._copy import all_closes
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
@@ -28,20 +29,13 @@ from agnostic_market.commerce.orders import (
     load_orders_fixture,
     speak_quantity,
 )
+from agnostic_market.commerce.verification import OtpProvider
 from agnostic_market.dtos.events import InterruptEvent, TurnFacts
-from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
-_POLICY = PolicyContext(
-    max_order_value_usd=500.0,
-    allow_ai_merchant_handoff=True,
-    refund_auto_approve_under_usd=50.0,
-    refund_require_human_above_usd=200.0,
-    refund_returnless_under_usd=50.0,
-    return_window_days=30,
-    pending_ttl_seconds=120.0,
-)
+_POLICY = make_policy(refund_returnless_under_usd=50.0)
 _CFG = {"configurable": {"thread_id": "t1"}}
+_TEST_OTP = "482913"
 
 
 def _tool_fake(name: str, args: dict, *, limit: int = 1) -> FakeChatModel:
@@ -82,6 +76,7 @@ def _build(
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
         store=store,
         cart_store=cart,  # the SAME cart the view_cart tool reads (no split-brain)
+        otp=OtpProvider(valid_code=_TEST_OTP),
         pointer=pointer,  # the SAME pointer order_status sets (Group C L4)
         identity_store=identity,  # the SAME store the order_status gate grants into (P7)
         customers=customers,

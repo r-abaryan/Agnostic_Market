@@ -60,7 +60,7 @@ def load_profile_fixture(config_root: Path, merchant_id: str) -> ProfileFixture:
 
 
 # The injectable-fake seam for builders that never enter the profile flow (eval/tests) —
-# same stance as OtpProvider's canned code. EXCEPTION: hardcoded fake on-file values,
+# same fixture-backed test seam as OtpProvider. EXCEPTION: hardcoded fake on-file values,
 # because this IS the test seam; production loads a merchant fixture.
 _DEFAULT_FIXTURE = ProfileFixture(
     address_on_file="12 Harbor Lane, Springfield",

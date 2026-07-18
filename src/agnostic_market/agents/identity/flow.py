@@ -6,8 +6,8 @@ pair (voice/tools.py order_status), but "what orders do I have?" requires an OTP
 identity. The chain is the SAME `_stepup.py` factory the refund/profile flows run:
 
     assemble ─(claim code-matched, pending minted)─▶ guardrail
-        │ no match, first miss  ─▶ reask (ONE softened re-ask; never asserts not-on-file)
-        │ no match, second miss ─▶ human (SILENT — the handover deferral is the voice)
+        │ no match, within budget ─▶ reask (softened re-ask; never asserts not-on-file)
+        │ no match, budget spent  ─▶ human (SILENT — the handover deferral is the voice)
         ▼
     guardrail ─(already bound to this customer)─▶ apply
         └─(unbound)─▶ risk_check ─▶ dispatch ─▶ collect[INT: OTP] ─▶ apply
@@ -204,12 +204,17 @@ def build_identity_nodes(
                         grants_at_mint=len(verification_store.grants),
                     )
                     return {"messages": new_messages, "pending_identity": pending}
-                if state.identity_claim_misses == 0:
-                    # ONE bounded re-ask (decision 4) — spoken by the reask node, not here
-                    # (a speakable assemble double-speaks its streamed clarifies).
+                if state.identity_claim_misses < policy.contact_reask_max:
+                    # Bounded re-ask (decision 4; budget = policy.contact_reask_max, was a
+                    # hardcoded ONE) — spoken by the reask node, not here (a speakable
+                    # assemble double-speaks its streamed clarifies). contact_reask_max=0
+                    # skips this entirely: the first miss hands over.
                     write_event({"event": "identity_reask", "reason": "no_match"})
-                    return {"messages": new_messages, "identity_claim_misses": 1}
-                # Second miss: SILENT human handover — the handover deferral is the single
+                    return {
+                        "messages": new_messages,
+                        "identity_claim_misses": state.identity_claim_misses + 1,
+                    }
+                # Budget exhausted: SILENT human handover — the handover deferral is the single
                 # voice (the cancel-risk pattern); no flow-authored line to distinguish
                 # outcomes for a probing caller.
                 write_event({"event": "identity_stepup_failed", "reason": "no_match"})
@@ -262,13 +267,14 @@ def build_identity_nodes(
         pending_field="pending_identity",
         required_level=lambda p: identity_required_level(),
         event_prefix="identity",
+        max_otp_attempts=policy.otp_max_attempts,
     )
 
     def route_after_collect(state: ReasoningState) -> str:
         """The factory decision, WRAPPED with the binding invariant: the factory confirms
         on level alone, but a bind requires THIS chain's OTP to have succeeded — a stale
         cross-family L2 with no NEW grant since mint re-collects instead (the factory's
-        tries counter still bounds the loop: two committed misses -> human)."""
+        tries counter still bounds the loop: `max_otp_attempts` committed misses -> human)."""
         decision = stepup.route_after_collect(state)
         if decision == "confirm":
             pending = state.pending_identity

@@ -36,6 +36,20 @@ class SupportHarness(NamedTuple):
     customers: CustomerDirectory
 
 
+_FIXTURE_ORDERS = ("ORD-1001", "ORD-1002", "ORD-1003")
+TEST_OTP = "482913"
+
+
+def authorize_fixture_orders(harness: SupportHarness) -> SupportHarness:
+    """Pre-grant rung-1 on the fixture orders, as if the caller had already verified each
+    via the guest-lookup pair. Suites pinning post-authorization money logic call this so
+    every scenario isn't re-testing the support-selection gate; the gate's OWN tests build
+    unauthorized harnesses and never call it."""
+    for order_id in _FIXTURE_ORDERS:
+        harness.identity.grant_order(order_id)
+    return harness
+
+
 def build_support_engine(
     config_root: Path,
     *,
@@ -61,7 +75,7 @@ def build_support_engine(
         wrap_readonly_tool(t, "acme_store")
         for t in build_voice_tools(store, CartStore(), pointer, identity, customers)
     ]
-    otp = OtpProvider()
+    otp = OtpProvider(valid_code=TEST_OTP)
     verification = VerificationStore(otp)
     profile = ProfileStore()
     graph = build_frontline_graph(

@@ -229,10 +229,12 @@ class Candidate(BaseModel):
 class OrderCandidate(BaseModel):
     """One code-narrowed order option the support model may pick (by key, never order_id).
 
-    Same SKU-discipline stance as `Candidate`: the model never emits a raw order id; it
+    Same SKU-discipline stance as `Candidate`: the model never AUTHORS a raw order id; it
     picks a KEY into this bounded list and code resolves key -> order_id + captured total.
-    `status` is the EFFECTIVE status (cancelled overlay wins) — the model needs it to pick
-    the right remedy (money back on an unshipped order is a cancel, not a refund).
+    (It MAY relay a caller-STATED order number for the guest path — code resolves that
+    fail-closed, exactly as the `order_status` tool already accepts one.) `status` is the
+    EFFECTIVE status (cancelled overlay wins) — the model needs it to pick the right
+    remedy (money back on an unshipped order is a cancel, not a refund).
     """
 
     model_config = _FROZEN
@@ -456,8 +458,8 @@ class OrderStore:
         """The bounded, keyed list of orders the IDENTIFIED caller may hear enumerated (P7
         rung 2): fixture orders owned by `customer_ref` + everything placed THIS session
         (placed-by-this-caller by construction). Effective status (cancelled overlay wins).
-        Same OrderCandidate shape as `actionable_orders` — which stays deliberately unscoped
-        for support selection (the NAMED follow-up gap, SECURITY §7d)."""
+        Same OrderCandidate shape as `actionable_orders` — whose MODEL-VISIBLE subset the
+        support assemble scopes through `order_read_allowed` (SECURITY §7d, call #15)."""
         candidates: list[tuple[str, str, float]] = [
             (oid, entry.summary, entry.total_usd)
             for oid, entry in self.fixture.orders.items()
@@ -548,9 +550,12 @@ class OrderStore:
         (fixture + placed), each with its EFFECTIVE status (cancelled overlay wins).
 
         Code-side narrowing for support selection — the model picks a KEY into this, never a
-        raw order id (SKU-discipline analogue). Keys are 1-based positions as strings.
-        Cancelled orders stay listed (the caller may ask about them); the status lets the
-        model — and the guardrails — answer honestly instead of proposing a dead action.
+        raw order id (SKU-discipline analogue). Keys are 1-based positions as strings over
+        the FULL list, so a key is stable while the assemble node filters the MODEL-VISIBLE
+        subset to authorized orders (SECURITY §7d, call #15 — the full list feeds only the
+        code-side id resolution for the guest path, never the prompt). Cancelled orders stay
+        listed (the caller may ask about them); the status lets the model — and the
+        guardrails — answer honestly instead of proposing a dead action.
         """
         candidates: list[tuple[str, str, float]] = [
             (oid, entry.summary, entry.total_usd) for oid, entry in self.fixture.orders.items()

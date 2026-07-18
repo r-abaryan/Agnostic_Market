@@ -21,6 +21,10 @@ def _base() -> dict:
                 "pending_confirmation_ttl_max_seconds": 300,
                 "refund_returnless_ceiling_usd": 100,
                 "return_window_max_days": 90,
+                "otp_max_attempts_ceiling": 3,
+                "contact_reask_ceiling": 2,
+                "auth_denials_ceiling": 3,
+                "tool_hops_ceiling": 8,
             },
         },
         "schema_version": "0.2",
@@ -188,3 +192,45 @@ def test_pending_ttl_defaults_when_unset() -> None:
     # No merchant sets it -> the platform default (from the DTO), still within the max.
     config = resolve_merchant_config(_base(), _template(), _override())
     assert config.policies.pending_confirmation_ttl_seconds == 120.0
+
+
+# --- security attempt-budget ceilings (D1) — a LARGER value weakens; the ceiling caps it ---
+
+
+@pytest.mark.parametrize(
+    ("field", "over_value"),
+    [
+        ("otp_max_attempts", 4),  # ceiling 3
+        ("contact_reask_max", 3),  # ceiling 2
+        ("auth_denials_before_human_offer", 4),  # ceiling 3
+        ("max_tool_hops", 9),  # ceiling 8
+    ],
+)
+def test_security_knob_over_ceiling_is_rejected(field: str, over_value: int) -> None:
+    bad = _override()
+    bad["policies"] = {"security": {field: over_value}}
+    with pytest.raises(PolicyBoundsViolationError, match=field):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_security_knobs_at_ceiling_are_allowed() -> None:
+    ok = _override()
+    ok["policies"] = {
+        "security": {
+            "otp_max_attempts": 3,
+            "contact_reask_max": 2,
+            "auth_denials_before_human_offer": 3,
+            "max_tool_hops": 8,
+        }
+    }
+    config = resolve_merchant_config(_base(), _template(), ok)
+    assert config.policies.security.otp_max_attempts == 3
+    assert config.policies.security.max_tool_hops == 8
+
+
+def test_security_knobs_default_when_unset() -> None:
+    # No merchant/template `security` block -> the platform defaults (2/1/2/5), still bounded.
+    config = resolve_merchant_config(_base(), _template(), _override())
+    sec = config.policies.security
+    assert (sec.otp_max_attempts, sec.contact_reask_max) == (2, 1)
+    assert (sec.auth_denials_before_human_offer, sec.max_tool_hops) == (2, 5)

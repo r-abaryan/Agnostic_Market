@@ -8,13 +8,34 @@ from pathlib import Path
 import pytest
 
 from agnostic_market.commerce.orders import OrderStore, RefundError, load_orders_fixture
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import (
+    OtpProvider,
+    RiskProvider,
+    VerificationStore,
+    load_verification_fixture,
+)
+from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.confirmation import refund_required_level
 from agnostic_market.dtos.state import CartLine
+
+_TEST_OTP = "482913"
 
 
 def _store(config_root: Path) -> OrderStore:
     return OrderStore(load_orders_fixture(config_root, "acme_store"))
+
+
+def test_verification_fixture_loads_the_temporary_merchant_code(config_root: Path) -> None:
+    fixture = load_verification_fixture(config_root, "acme_store")
+    assert fixture.otp_code == _TEST_OTP
+
+
+def test_verification_fixture_rejects_a_non_six_digit_code(tmp_path: Path) -> None:
+    fixture_dir = tmp_path / "fixtures" / "verification"
+    fixture_dir.mkdir(parents=True)
+    (fixture_dir / "broken.yaml").write_text('otp_code: "12345"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="failed validation"):
+        load_verification_fixture(tmp_path, "broken")
 
 
 # --- the destination -> level FLOOR (§A4b) ---------------------------------------------
@@ -40,12 +61,12 @@ def test_refund_required_level_is_destination_first(
 
 
 def test_level_starts_at_l1_and_rises_only_on_correct_committed_otp() -> None:
-    otp = OtpProvider()
+    otp = OtpProvider(valid_code=_TEST_OTP)
     store = VerificationStore(otp)
     assert store.current_level() == 1
     assert store.verify_otp("000000") is False
     assert store.current_level() == 1  # a wrong code NEVER raises the level
-    assert store.verify_otp("482913") is True
+    assert store.verify_otp(_TEST_OTP) is True
     assert store.current_level() == 2
     # the grant is recorded for dispute defense (§A4a) — method only, no PII/code value
     assert store.grants == [{"method": "otp", "raised_to": 2}]
@@ -55,13 +76,13 @@ def test_spoken_digit_code_verifies() -> None:
     # Live call #12 F-12.2: the CORRECT code arrived as words ("four eight two nine one
     # three"), failed the literal compare, and exhausted a legitimate caller to a human.
     # verify_otp digit-normalizes the committed spoken answer; the compare stays EXACT.
-    store = VerificationStore(OtpProvider())
+    store = VerificationStore(OtpProvider(valid_code=_TEST_OTP))
     assert store.verify_otp("It should be four eight two nine one three.") is True
     assert store.current_level() == 2
 
 
 def test_spoken_digit_code_stays_exact_no_overmatch() -> None:
-    store = VerificationStore(OtpProvider())
+    store = VerificationStore(OtpProvider(valid_code=_TEST_OTP))
     assert store.verify_otp("one two three four five six") is False  # wrong code, spoken
     assert store.verify_otp("four eight two nine one") is False  # too short
     assert store.verify_otp("oh four eight two nine one three") is False  # extra digit
@@ -69,8 +90,8 @@ def test_spoken_digit_code_stays_exact_no_overmatch() -> None:
 
 
 def test_clear_resets_the_grant() -> None:
-    store = VerificationStore(OtpProvider())
-    store.verify_otp("482913")
+    store = VerificationStore(OtpProvider(valid_code=_TEST_OTP))
+    store.verify_otp(_TEST_OTP)
     assert store.current_level() == 2
     store.clear()
     assert store.current_level() == 1
@@ -81,7 +102,7 @@ def test_clear_resets_the_grant() -> None:
 
 
 def test_otp_dispatch_is_idempotent_per_attempt() -> None:
-    otp = OtpProvider()
+    otp = OtpProvider(valid_code=_TEST_OTP)
     otp.dispatch("attempt-1")
     otp.dispatch("attempt-1")  # a replayed dispatch node
     otp.dispatch("attempt-1")

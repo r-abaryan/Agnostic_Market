@@ -16,13 +16,19 @@ checkpoint cannot resurrect a grant), cleared by the thread reaper on session cl
 
 PII discipline (SECURITY §6): `CustomerEntry.contact` is the stub MATCHING value only — it
 is never spoken, never logged, never telemetered; `masked_contact` is the only speakable
-form. `match_contact` takes the caller's spoken claim and returns a verdict — the claim is
-never persisted or logged here or anywhere downstream (telemetry carries closed slugs only).
+form. `match_contact` takes the caller's spoken claim and returns a verdict — the claim
+VALUE is never logged or telemetered by any identity/gate path (events carry closed slugs
+only). The frontline answered-turn utterance dataset (which DOES record raw text) is
+contact-redacted at the `write_event` chokepoint (`redact_contact`, telemetry.py) — the
+gap SECURITY §7d named is closed there. Honest residual: the claim still exists where the
+caller put it — the transcript (HumanMessage) and the model's tool-call args — neither of
+which is the persisted telemetry dataset.
 
 ACCEPTED, DOCUMENTED GAP (P7 decision 5 — throttle deferred): claim matching and the
 order+contact pair check are UNTHROTTLED across sessions. Within one session the identity
-flow bounds claim attempts (one re-ask, then a human) and OTP attempts (two, then a human),
-but an attacker can redial for fresh attempts — cross-session probing of contact claims and
+flow bounds claim attempts (`contact_reask_max`, then a human) and OTP attempts
+(`otp_max_attempts`, then a human) — both merchant-tunable within platform ceilings — but an
+attacker can redial for fresh attempts — cross-session probing of contact claims and
 order/contact pairs is unbounded in the build phase. Mitigations today: fail-closed tools
 (no data on decline), ONE combined not-found response (order existence is never confirmed),
 and the softened re-ask (never asserts a contact is not on file). The fix is NOT a per-flow
@@ -35,8 +41,9 @@ constraint that makes neutral "dispatch anyway" flows unsafe today.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.commerce.orders import OrdersFixture, OrderStore
 from agnostic_market.commerce.spoken import spoken_digits, spoken_email
@@ -44,6 +51,20 @@ from agnostic_market.config.loader import ConfigError, load_yaml_layer
 
 _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
+
+
+def _digits(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _match_key(contact: str) -> str:
+    """The normalized form `match_contact` compares on — emails lowercased/joined, phones
+    last-10 digits (country-code tolerance). Uniqueness must be checked on THIS key, not the
+    raw value, or two differently-written contacts could still collide at match time."""
+    if "@" in contact:
+        return "".join(contact.lower().split())
+    digits = _digits(contact)
+    return digits[-10:] if len(digits) >= 10 else digits
 
 
 class CustomerEntry(BaseModel):
@@ -62,6 +83,23 @@ class CustomersFixture(BaseModel):
     model_config = _STRICT
 
     customers: dict[str, CustomerEntry] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _contacts_unique(self) -> CustomersFixture:
+        """`match_contact` is first-match over this dict — a shared contact would silently
+        deny every later-listed owner, so the stub directory cannot REPRESENT one. Fail
+        loudly at load (same stance as `assert_orders_have_customers`); Phase 4's real SoR
+        owns genuine shared-contact semantics."""
+        seen: dict[str, str] = {}
+        for ref, entry in self.customers.items():
+            key = _match_key(entry.contact)
+            if key in seen:
+                raise ValueError(
+                    f"customers {seen[key]} and {ref} share a contact - the stub directory "
+                    "matches first-entry-wins and cannot represent shared contacts"
+                )
+            seen[key] = ref
+        return self
 
 
 class BoundIdentity(BaseModel):
@@ -116,10 +154,6 @@ _DEFAULT_FIXTURE = CustomersFixture(
 )
 
 
-def _digits(value: str) -> str:
-    return "".join(ch for ch in value if ch.isdigit())
-
-
 class CustomerDirectory:
     """The stub identity SoR lookup: a spoken contact claim -> the customer it names.
 
@@ -147,19 +181,17 @@ class CustomerDirectory:
         email = spoken_email(cleaned)
         if email is not None:
             for ref, entry in self.fixture.customers.items():
-                if "@" in entry.contact and "".join(entry.contact.lower().split()) == email:
+                if "@" in entry.contact and _match_key(entry.contact) == email:
                     return BoundIdentity(customer_ref=ref, masked_contact=entry.masked_contact)
             return None
         claimed = spoken_digits(cleaned)
         if not claimed:
             return None
+        key = _match_key(claimed)
         for ref, entry in self.fixture.customers.items():
             if "@" in entry.contact:
                 continue  # never match a phone claim against an email contact
-            have = _digits(entry.contact)
-            if claimed == have or (
-                len(claimed) >= 10 and len(have) >= 10 and claimed[-10:] == have[-10:]
-            ):
+            if _match_key(entry.contact) == key:
                 return BoundIdentity(customer_ref=ref, masked_contact=entry.masked_contact)
         return None
 
@@ -212,3 +244,32 @@ def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIden
         owner = store.order_owner(order_id)
         return owner is not None and owner == bound.customer_ref
     return False
+
+
+def try_grant_by_contact(
+    order_id: str,
+    claim: str,
+    *,
+    store: OrderStore,
+    customers: CustomerDirectory,
+    identity: CallerIdentityStore,
+) -> Literal["granted", "mismatch"]:
+    """The ONE rung-1 grant decision: does this contact CLAIM own that ORDER? — shared by the
+    order_status tool and the support-selection gate (they previously each ran this same
+    match->owner->compare->grant sequence, a drift risk between two auth surfaces).
+
+    Grants THAT order for the session on a match (the code-matched guest-lookup pair — the
+    claim is never model-judged), and returns a CLOSED verdict; the caller owns its own
+    telemetry, response wording, and retry counters (they differ by surface). `mismatch`
+    covers wrong-pair, unknown claim, AND an unresolved `order_id` (owner is None) uniformly —
+    the existence-oracle discipline lives in the callers' single combined not-found line.
+
+    Callers MUST have already handled their own pre-checks (an existing authorization, an
+    empty claim): this function assumes a non-empty claim and performs no grant on mismatch.
+    """
+    matched = customers.match_contact(claim)
+    owner = store.order_owner(order_id)
+    if matched is None or owner is None or owner != matched.customer_ref:
+        return "mismatch"
+    identity.grant_order(order_id)
+    return "granted"

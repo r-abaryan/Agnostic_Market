@@ -6,12 +6,14 @@ from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from llm_fakes import FakeChatModel
+from policy_helpers import make_policy
 
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.verification import OtpProvider
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
 
@@ -21,6 +23,7 @@ from agnostic_market.voice.tools import build_voice_tools
 # mechanism test must use a destination that still ends at the spoken deferral.
 _HANDOVER_ARGS = {"request_handover": {"destination": "planner", "reason_code": "multi_step"}}
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
+_TEST_OTP = "482913"
 
 
 def _granted(*order_ids: str) -> CallerIdentityStore:
@@ -33,11 +36,14 @@ def _granted(*order_ids: str) -> CallerIdentityStore:
 
 
 def _tools(
-    store: OrderStore, cart: CartStore, identity: CallerIdentityStore
+    store: OrderStore,
+    cart: CartStore,
+    pointer: LastOrderPointer,
+    identity: CallerIdentityStore,
 ) -> list:
     return [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, LastOrderPointer(), identity, CustomerDirectory())
+        for t in build_voice_tools(store, cart, pointer, identity, CustomerDirectory())
     ]
 
 
@@ -47,26 +53,21 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     # different cart than the render node (split-brain, graph docstring). Same for the
     # identity store (P7): the tool grants into it, the render router reads it.
     cart = kwargs.pop("cart_store", None) or CartStore()
+    pointer = kwargs.pop("pointer", None) or LastOrderPointer()
     identity = kwargs.pop("identity", None) or CallerIdentityStore()
     return build_frontline_graph(
         fake,
-        _tools(store, cart, identity),
+        _tools(store, cart, pointer, identity),
         display_name="Acme Store",
         tenant_id="acme_store",
         cart_store=cart,
+        pointer=pointer,
+        otp=kwargs.pop("otp", None) or OtpProvider(valid_code=_TEST_OTP),
         identity_store=identity,
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
-        policy=PolicyContext(
-            max_order_value_usd=500.0,
-            allow_ai_merchant_handoff=True,
-            refund_auto_approve_under_usd=50.0,
-            refund_require_human_above_usd=200.0,
-            refund_returnless_under_usd=50.0,
-            return_window_days=30,
-            pending_ttl_seconds=120.0,
-        ),
+        policy=kwargs.pop("policy", None) or make_policy(refund_returnless_under_usd=50.0),
         **kwargs,
     )
 
@@ -108,8 +109,14 @@ async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
     # ENTERS the support flow (it no longer defers — that was the 3c-only behavior). The
     # support assemble model runs and proposes the cancel; the flow reaches its readback
     # interrupt. (Group C: address/contact change enter too; only payment_change defers.)
+    # The guest pair rides along: ORD-1002 is CUST-002's, unowned by this session, so it
+    # is NOT in the model-visible candidate list — the caller STATES the order number and
+    # the support-selection gate grants it via the guest-lookup pair (rung 1) pre-mint.
     reasoning = FakeChatModel(
-        force_tool="propose_cancel", canned_args={"propose_cancel": {"order_key": "2"}},
+        force_tool="propose_cancel",
+        canned_args={
+            "propose_cancel": {"order_key": "ORD-1002", "account_contact": "casey@example.com"}
+        },
         tool_call_limit=1,
     )
     graph = _graph(config_root, FakeChatModel(tool_call_limit=1), reasoning_model=reasoning)
@@ -247,18 +254,129 @@ async def test_plain_answer_ends_without_tools(config_root: Path) -> None:
 
 
 async def test_runaway_tool_loop_is_bounded(config_root: Path) -> None:
-    # A model that never stops calling read tools must not spin forever: the hop guard
-    # ends the turn after _MAX_TOOL_HOPS round-trips (no framework loop protection here).
+    # A model that never stops calling read tools must not spin forever: the hop guard ends
+    # the turn after policy.max_tool_hops round-trips (no framework loop protection here).
     # Forces catalog_search (NON-renderable — stays on the model->tools->model loop; a
     # single renderable read like order_status would divert to read_render and END after one
     # hop, which is a STRONGER bound, not the loop this guard protects).
-    from agnostic_market.agents.frontline import _MAX_TOOL_HOPS
-
+    default_hops = make_policy().max_tool_hops
     fake = FakeChatModel(force_tool="catalog_search", canned_args=_READ_ARGS)  # no limit set
     graph = _graph(config_root, fake)
     out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
     hops = sum(1 for m in out["messages"] if isinstance(m, AIMessage) and m.tool_calls)
-    assert hops == _MAX_TOOL_HOPS + 1  # the hop that crossed the bound ended the turn
+    assert hops == default_hops
+    assert isinstance(out["messages"][-1], AIMessage)
+    assert out["messages"][-1].content  # limit produces a final answer, not a dangling call
+    for index, message in enumerate(out["messages"]):
+        if isinstance(message, AIMessage) and message.tool_calls:
+            assert isinstance(out["messages"][index + 1], ToolMessage)
+
+
+async def test_tool_hop_bound_tracks_the_policy_knob(config_root: Path) -> None:
+    # The bound is config-driven (policies.security.max_tool_hops), not a hardcoded constant:
+    # a tightened knob ends the turn sooner. Pins that the value actually THREADS to the guard.
+    fake = FakeChatModel(force_tool="catalog_search", canned_args=_READ_ARGS)
+    graph = _graph(config_root, fake, policy=make_policy(max_tool_hops=2))
+    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
+    hops = sum(1 for m in out["messages"] if isinstance(m, AIMessage) and m.tool_calls)
+    assert hops == 2
+
+
+async def test_tool_hop_bound_strips_a_provider_tool_call_from_the_final_pass(
+    config_root: Path,
+) -> None:
+    class ToolCallingWithoutToolsFake(FakeChatModel):
+        def _respond(self, messages, **kwargs):  # type: ignore[override]
+            if not kwargs.get("tools"):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "catalog_search",
+                            "args": {"query": "shoes"},
+                            "id": "invalid_final_call",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            return super()._respond(messages, **kwargs)
+
+    fake = ToolCallingWithoutToolsFake(
+        force_tool="catalog_search", canned_args=_READ_ARGS, tool_call_limit=None
+    )
+    graph = _graph(config_root, fake, policy=make_policy(max_tool_hops=1))
+    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
+    tool_messages = [message for message in out["messages"] if isinstance(message, ToolMessage)]
+    assert len(tool_messages) == 1
+    final = out["messages"][-1]
+    assert isinstance(final, AIMessage) and not final.tool_calls and final.content
+
+
+async def test_state_followup_reads_the_pointer_without_calling_the_model(
+    config_root: Path,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store.cancel_order("cancel-1", order_id="ORD-1002")
+    pointer = LastOrderPointer()
+    pointer.set("ORD-1002")
+    identity = _granted("ORD-1002")
+    graph = _graph(
+        config_root,
+        FakeChatModel(raise_transport=True),
+        store=store,
+        pointer=pointer,
+        identity=identity,
+    )
+    out = await graph.ainvoke({"messages": [HumanMessage("is it cancelled?")]})
+    assert "ORD-1002" in out["messages"][-1].content
+    assert "cancelled" in out["messages"][-1].content
+
+
+async def test_plural_state_followup_corrects_a_memory_claim_from_live_store(
+    config_root: Path,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store.cancel_order("cancel-1", order_id="ORD-1002")
+    graph = _graph(
+        config_root,
+        FakeChatModel(raise_transport=True),
+        store=store,
+        identity=_granted("ORD-1001", "ORD-1002"),
+    )
+    out = await graph.ainvoke(
+        {
+            "messages": [
+                AIMessage("ORD-1001 and ORD-1002 are both cancelled."),
+                HumanMessage("so both are cancelled?"),
+            ]
+        }
+    )
+    line = out["messages"][-1].content
+    assert "ORD-1001" in line and "ORD-1002" in line
+    assert "ORD-1001" in line and "was expected" in line
+    assert "ORD-1002" in line and "cancelled" in line
+
+
+async def test_unverified_all_orders_state_check_enters_identity_flow(
+    config_root: Path,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(raise_transport=True),
+        reasoning_model=FakeChatModel(emit_tool_calls=False),
+    )
+    out = await graph.ainvoke({"messages": [HumanMessage("are all my orders cancelled?")]})
+    assert out.get("active_flow") == "identity"
+
+
+async def test_unverified_explicit_state_check_does_not_bypass_order_authorization(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel(emit_tool_calls=False))
+    out = await graph.ainvoke({"messages": [HumanMessage("is ORD-1002 cancelled?")]})
+    final = out["messages"][-1]
+    assert final.content == _TEXT_RESPONSE
+    assert "waterproof rain jacket" not in final.content
 
 
 async def test_answered_turn_writes_telemetry_negative(config_root: Path, tmp_path) -> None:
@@ -282,18 +400,16 @@ async def test_answered_turn_writes_telemetry_negative(config_root: Path, tmp_pa
 
 
 def _policy(**over) -> PolicyContext:
-    base = {
-        "max_order_value_usd": 500.0,
-        "allow_ai_merchant_handoff": True,
-        "refund_auto_approve_under_usd": 50.0,
-        "refund_require_human_above_usd": 200.0,
-        "refund_returnless_under_usd": 50.0,
-        "return_window_days": 30,
-        "pending_ttl_seconds": 120.0,
-        "spoken_policy_extra": "Refunds take 5 to 7 business days.",
-    }
-    base.update(over)
-    return PolicyContext(**base)
+    # The policy-grounding suite's default carries a spoken_policy_extra; everything else
+    # (incl. the security knobs) comes from the shared factory. Any field overridable —
+    # `over` wins over these defaults (a test may set spoken_policy_extra=None).
+    return make_policy(
+        **{
+            "refund_returnless_under_usd": 50.0,
+            "spoken_policy_extra": "Refunds take 5 to 7 business days.",
+            **over,
+        }
+    )
 
 
 def test_prompt_grounds_policy_from_enforced_values() -> None:
@@ -376,6 +492,21 @@ def test_shared_context_reaches_every_agent_prompt() -> None:
         assert "ONE continuous assistant" in prompt
         assert "Refunds take 5 to 7 business days." in prompt
         assert "$50" in prompt  # the derived enforced sentence reaches every tier
+
+
+def test_support_prompt_carries_the_multi_order_one_at_a_time_rule() -> None:
+    # D4 (F-16.2 prompt supplement): the support model is told multiple orders go one per
+    # turn, a follow-up is a NEW proposal, and never report an order done from memory. A
+    # content pin — the structural fix is code; this guards the wording against deletion.
+    from agnostic_market.agents.support.prompt import compose_support_prompt
+    from agnostic_market.commerce.orders import OrderCandidate
+
+    orders = [
+        OrderCandidate(key="1", order_id="ORD-1", summary="x", total_usd=1.0, status="processing")
+    ]
+    prompt = compose_support_prompt("Acme Store", orders, _policy())
+    assert "ONE order per" in prompt
+    assert "NEVER report an order as done from memory" in prompt
 
 
 # --- L3 deterministic read renderers: a single order_status/view_cart read is rendered in

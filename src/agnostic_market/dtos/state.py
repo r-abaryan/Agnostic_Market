@@ -64,6 +64,15 @@ class PolicyContext(BaseModel):
     # loudly at build, never run with a silent default.
     return_window_days: int = Field(ge=1)
     pending_ttl_seconds: float = Field(gt=0)
+    # Attempt-budget security knobs (config `policies.security.*`, resolver-clamped). REQUIRED,
+    # no default — the same lockstep discipline as return_window_days: a construction site that
+    # forgets one fails loudly. Consumed by the step-up collect loop (otp_max_attempts), the
+    # identity contact re-ask (contact_reask_max), the support gate corrective
+    # (auth_denials_before_human_offer), and the frontline tool-hop loop breaker (max_tool_hops).
+    otp_max_attempts: int = Field(ge=1)
+    contact_reask_max: int = Field(ge=0)
+    auth_denials_before_human_offer: int = Field(ge=1)
+    max_tool_hops: int = Field(ge=1)
     # Merchant free-text policy extras (config `policies.spoken_facts_extra`) — facts with
     # NO enforcing field (refund timeline, return conditions). The ENFORCED sentences are
     # DERIVED from the typed values above (agents/spoken_policy.py); this is only the

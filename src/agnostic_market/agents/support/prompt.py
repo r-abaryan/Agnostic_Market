@@ -3,9 +3,13 @@
 PROMPT ONLY — what the support (reasoning-tier) model reads while turning a post-purchase
 request into a `propose_refund(...)`, `propose_cancel(order_key)`, `propose_return(order_key)`
 or `propose_profile_change(field, new_value)`. The model picks a KEY into the code-narrowed
-order list; it never authors an order id, decides verification level, reads a card number,
-or authorizes the effect. Eligibility (cancellable? returnable? in window?), step-up
-(SIM-swap check, OTP), the readback, consent, and the guardrails are CODE in flow.py.
+order list — scoped to the caller's AUTHORIZED orders (live call #15: an unscoped list was
+recited to an unverified caller by a clarify question; the model can't speak what it never
+saw) — or, for an order NOT listed, relays the caller's STATED order number (the guest
+path; `order_status` precedent — the model still never AUTHORS an id, and code resolves the
+stated one fail-closed). It never decides verification level, reads a card number, or
+authorizes the effect. Eligibility (cancellable? returnable? in window?), step-up (SIM-swap
+check, OTP), the readback, consent, and the guardrails are CODE in flow.py.
 """
 
 from __future__ import annotations
@@ -16,9 +20,13 @@ from agnostic_market.dtos.state import PolicyContext
 
 _SUPPORT_INSTRUCTIONS = (
     "YOUR part: post-purchase requests - REFUNDS, RETURNS, order CANCELLATIONS, and the "
-    "account's delivery address or contact number. Work out which of the numbered orders "
-    "below the caller means (use only these). Each order shows its status - use it to pick "
-    "the RIGHT remedy:\n"
+    "account's delivery address or contact number. The numbered orders below are the ones "
+    "VERIFIED for this caller so far - work out which one they mean using only that list. "
+    "If the order they mean is NOT listed (or nothing is listed), do NOT guess and NEVER "
+    "say which orders exist, don't exist, or how many there are: ask ONE short question "
+    "for the ORDER NUMBER (like ORD-1234) and propose with that number as order_key - "
+    "verification is then handled for you; follow any tool result exactly. Each listed "
+    "order shows its status - use it to pick the RIGHT remedy:\n"
     "- 'processing' (not yet shipped): if the caller wants their money back, doesn't want "
     "the order, or wants to 'return' it, call propose_cancel with the order number - "
     "nothing has shipped, so cancelling returns the full charge to how they paid. A refund "
@@ -56,7 +64,16 @@ _SUPPORT_INSTRUCTIONS = (
     "confuses it. Once you know the order and the remedy, propose immediately. Every turn "
     "you do exactly ONE thing: a tool call WITH NO spoken text alongside it (the "
     "confirmation that follows is the voice - words like 'I'll set that up' collide with "
-    "it), OR one spoken fact-question - never narrate instead of acting. If the caller no "
+    "it), OR one spoken fact-question - never narrate instead of acting.\n"
+    "MULTIPLE orders in one request ('cancel both', 'return all three'): still ONE order per "
+    "turn - propose the first, let its readback and confirmation complete, and on the NEXT "
+    "turn propose the next one. A follow-up like 'and the other one' or 'the second one too' "
+    "is a NEW proposal for the next order (use the statuses in the list to see which are "
+    "already done - a 'cancelled' order needs nothing more). NEVER report an order as done "
+    "from memory: each 'Done' line is spoken by the system only after that order's own "
+    "confirmation, so do not say an order is cancelled/returned/refunded until you have "
+    "actually proposed it and it was confirmed this call.\n"
+    "If the caller no "
     "longer wants any of this, or asks about something unrelated, call leave_support - and "
     "when you leave, say NOTHING: emit only the tool call, no spoken text. Another part "
     "of the system answers the caller the instant you leave; any words from you would "
@@ -66,11 +83,16 @@ _SUPPORT_INSTRUCTIONS = (
 
 
 def render_orders(orders: list[OrderCandidate], last_order_id: str | None = None) -> str:
-    """The numbered order list the model chooses from (keyed 1..N; model-facing only —
-    the spoken readback is authored separately in flow.py). Status included: remedy
-    selection (cancel vs return vs refund vs nothing) is status-driven. The most recently
-    discussed order (the session pointer, Group C L4) is MARKED so a bare 'that order'
-    resolves to it instead of to conversational salience."""
+    """The numbered order list the model chooses from (model-facing only — the spoken
+    readback is authored separately in flow.py). The caller receives ONLY authorized
+    candidates (the assemble node scopes them; call #15), so an empty list means nothing
+    is verified yet — the placeholder keeps the model on the ask-for-the-order-number
+    path without implying any count. Status included: remedy selection (cancel vs return
+    vs refund vs nothing) is status-driven. The most recently discussed order (the session
+    pointer, Group C L4) is MARKED so a bare 'that order' resolves to it instead of to
+    conversational salience."""
+    if not orders:
+        return "(none verified for this caller yet - ask for the order number to act on one)"
     lines = []
     for o in orders:
         line = f"[{o.key}] {o.order_id} - {o.summary} (${o.total_usd:.2f}, {o.status})"

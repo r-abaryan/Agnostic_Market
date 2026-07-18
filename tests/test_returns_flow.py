@@ -9,22 +9,21 @@ from pathlib import Path
 
 import pytest
 from llm_fakes import FakeChatModel
-from support_helpers import SupportHarness, build_support_engine
+from policy_helpers import make_policy
+from support_helpers import (
+    TEST_OTP,
+    SupportHarness,
+    authorize_fixture_orders,
+    build_support_engine,
+)
 
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
 from agnostic_market.dtos.state import PolicyContext
 
-_POLICY = PolicyContext(
-    max_order_value_usd=500.0,
-    allow_ai_merchant_handoff=True,
-    refund_auto_approve_under_usd=50.0,
-    refund_require_human_above_usd=200.0,
-    refund_returnless_under_usd=500.0,  # high: return tests drive the RETURN door directly
-    return_window_days=30,
-    pending_ttl_seconds=120.0,
-)
+# returnless high (the default): the return tests drive the RETURN door directly.
+_POLICY = make_policy()
 _FACTS = TurnFacts()
 # ORD-1003 was delivered 2026-07-01T00:00:00Z (fixture) = this UTC epoch; window tests
 # freeze the flow clock relative to it (fixture dates age against wall clock).
@@ -39,15 +38,19 @@ def _return_harness(
     policy: PolicyContext = _POLICY,
     thread_id: str = "ret-1",
 ) -> SupportHarness:
-    return build_support_engine(
-        config_root,
-        policy=policy,
-        reasoning=FakeChatModel(
-            force_tool="propose_return",
-            canned_args={"propose_return": {"order_key": order_key}},
-            tool_call_limit=1,
-        ),
-        thread_id=thread_id,
+    # Fixture orders pre-authorized (rung-1): this suite pins the returns money logic;
+    # the selection gate has its own suite (test_support_scoping.py).
+    return authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=policy,
+            reasoning=FakeChatModel(
+                force_tool="propose_return",
+                canned_args={"propose_return": {"order_key": order_key}},
+                tool_call_limit=1,
+            ),
+            thread_id=thread_id,
+        )
     )
 
 
@@ -187,17 +190,21 @@ async def test_steered_refund_out_of_window_declines_before_promising(
     # when the return guardrail would decline — eligibility is checked BEFORE the promise.
     monkeypatch.setattr(support_flow.time, "time", lambda: _DELIVERED_EPOCH + 40 * _DAY)
     tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 10.0})
-    h = build_support_engine(
-        config_root,
-        policy=tight,
-        reasoning=FakeChatModel(
-            force_tool="propose_refund",
-            canned_args={
-                "propose_refund": {"order_key": "3", "amount_usd": 40.0, "destination": "original"}
-            },
-            tool_call_limit=1,
-        ),
-        thread_id="ret-steer-1",
+    h = authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=tight,
+            reasoning=FakeChatModel(
+                force_tool="propose_refund",
+                canned_args={
+                    "propose_refund": {
+                        "order_key": "3", "amount_usd": 40.0, "destination": "original"
+                    }
+                },
+                tool_call_limit=1,
+            ),
+            thread_id="ret-steer-1",
+        )
     )
     events = await _events(h.engine, "I want a refund for my socks order")
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
@@ -209,17 +216,21 @@ async def test_steered_refund_out_of_window_declines_before_promising(
 
 
 async def test_refund_with_open_return_points_at_it(config_root: Path) -> None:
-    h = build_support_engine(
-        config_root,
-        policy=_POLICY,
-        reasoning=FakeChatModel(
-            force_tool="propose_refund",
-            canned_args={
-                "propose_refund": {"order_key": "1", "amount_usd": 150.0, "destination": "original"}
-            },
-            tool_call_limit=1,
-        ),
-        thread_id="ret-open-1",
+    h = authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=_POLICY,
+            reasoning=FakeChatModel(
+                force_tool="propose_refund",
+                canned_args={
+                    "propose_refund": {
+                        "order_key": "1", "amount_usd": 150.0, "destination": "original"
+                    }
+                },
+                tool_call_limit=1,
+            ),
+            thread_id="ret-open-1",
+        )
     )
     existing = h.store.create_return(
         "rk-0", order_id="ORD-1001", refund_due_usd=179.98, destination="original"
@@ -283,22 +294,24 @@ async def test_human_at_readback_escapes_with_onramp_package(
 
 
 async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path: Path) -> None:
-    h = build_support_engine(
-        config_root,
-        policy=_POLICY,
-        reasoning=FakeChatModel(
-            force_tool="propose_refund",
-            canned_args={
-                "propose_refund": {
-                    "order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"
-                }
-            },
-            tool_call_limit=1,
-        ),
-        thread_id="ret-cross-1",
+    h = authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=_POLICY,
+            reasoning=FakeChatModel(
+                force_tool="propose_refund",
+                canned_args={
+                    "propose_refund": {
+                        "order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"
+                    }
+                },
+                tool_call_limit=1,
+            ),
+            thread_id="ret-cross-1",
+        )
     )
     await _events(h.engine, "I'd like a refund to a different card")  # pauses at OTP
-    await _events(h.engine, "482913")
+    await _events(h.engine, TEST_OTP)
     await _events(h.engine, "yes")
     assert h.store.refund_count == 1
     events = _telemetry_events(tmp_path)

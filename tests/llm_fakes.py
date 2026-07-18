@@ -73,8 +73,12 @@ class FakeChatModel(BaseChatModel):
     # mutation batching ("one from each" = N calls in one response). Exhausted → normal
     # behavior. Overrides force_tool/canned_args while entries remain.
     scripted_calls: list[list[tuple[str, dict[str, Any]]]] | None = None
+    # Capture every prompt this fake is invoked with — leak pins assert on what the model
+    # SAW (e.g. the support candidate list must contain no unauthorized order data).
+    record_prompts: bool = False
     _tool_calls_made: int = PrivateAttr(default=0)
     _script_index: int = PrivateAttr(default=0)
+    _seen_prompts: list[str] = PrivateAttr(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -94,6 +98,8 @@ class FakeChatModel(BaseChatModel):
         return correct
 
     def _respond(self, messages: list[BaseMessage], **kwargs: Any) -> AIMessage:
+        if self.record_prompts:
+            self._seen_prompts.append("\n".join(str(m.content) for m in messages))
         if self.raise_transport:
             raise ConnectionError("fake transport failure (simulated 429/timeout)")
         tools = kwargs.get("tools") or []

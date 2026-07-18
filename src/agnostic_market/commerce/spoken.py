@@ -62,3 +62,56 @@ def spoken_email(text: str) -> str | None:
     if "@" not in lowered:
         return None
     return "".join(lowered.split()).rstrip(".")
+
+
+# --- contact-span redaction for PERSISTED utterances (SECURITY §7d transcript-telemetry
+# --- gap): callers speak their email/phone to verify an order, and the answered-turn
+# --- classifier dataset records the raw utterance — these spans must not persist. ---------
+
+_TYPED_EMAIL = re.compile(r"\S+@\S+")
+# The spoken form: up to a few local-part tokens, " at ", a domain token, then one or more
+# " dot <label>" tails ("casey at example dot com", "k c at example dot com").
+_SPOKEN_EMAIL = re.compile(
+    r"(?:[\w.'-]+\s+){0,3}[\w.'-]+\s+at\s+[\w-]+(?:\s+dot\s+[\w-]+)+", re.IGNORECASE
+)
+# A contiguous digit-bearing token run this long is phone-shaped. Deliberately above an
+# order-id mention (ORD-1001 = 4 digits, and two ids read with a connector between them)
+# and below any dialable number (7 = the shortest local form).
+_MIN_PHONE_DIGITS = 7
+
+
+def redact_contact(text: str) -> str:
+    """`text` with contact-shaped spans replaced ([email]/[phone]) — for values being
+    PERSISTED (telemetry/logs), never for the listen path (the matcher needs the real one).
+
+    Best-effort and deliberately biased toward OVER-capture (a redacted-but-harmless span
+    costs one dataset utterance; an unredacted contact is PII at rest): typed emails, the
+    spoken " at ... dot ..." form, and any contiguous token run — digits or spoken digit
+    words — accumulating >= _MIN_PHONE_DIGITS digits. Rejoins tokens single-spaced (a log
+    value, not a transcript). Order-id mentions survive (4 digits, under the phone line).
+    """
+    redacted = _TYPED_EMAIL.sub("[email]", text)
+    redacted = _SPOKEN_EMAIL.sub("[email]", redacted)
+    out: list[str] = []
+    run: list[str] = []
+    run_digits = 0
+
+    def _flush() -> None:
+        nonlocal run, run_digits
+        if run_digits >= _MIN_PHONE_DIGITS:
+            out.append("[phone]")
+        else:
+            out.extend(run)
+        run, run_digits = [], 0
+
+    for token in redacted.split():
+        bare = re.sub(r"[^a-z0-9]", "", token.lower())
+        digits = 1 if bare in _DIGIT_WORDS else sum(ch.isdigit() for ch in bare)
+        if digits:
+            run.append(token)
+            run_digits += digits
+        else:
+            _flush()
+            out.append(token)
+    _flush()
+    return " ".join(out)

@@ -26,6 +26,7 @@ from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
     order_read_allowed,
+    try_grant_by_contact,
 )
 from agnostic_market.commerce.orders import (
     LastOrderPointer,
@@ -84,15 +85,23 @@ def build_voice_tools(
         if not claim:
             write_event({"event": "order_read_denied", "order_id_known": False})
             return _ASK_CONTACT
-        matched = customers.match_contact(claim)
-        owner = store.order_owner(order_id)
-        if matched is None or owner is None or owner != matched.customer_ref:
+        if (
+            try_grant_by_contact(
+                order_id, claim, store=store, customers=customers, identity=identity
+            )
+            == "mismatch"
+        ):
             # ONE combined response for wrong-pair AND unknown-order: which detail failed
             # is never revealed (existence-oracle discipline). `order_id_known` is
-            # telemetry-internal (abuse monitoring), never spoken.
-            write_event({"event": "order_read_denied", "order_id_known": owner is not None})
+            # telemetry-internal (abuse monitoring), never spoken — a separate owner read
+            # (not the grant decision) so the shared verdict stays wording-agnostic.
+            write_event(
+                {
+                    "event": "order_read_denied",
+                    "order_id_known": store.order_owner(order_id) is not None,
+                }
+            )
             return _COMBINED_NOT_FOUND
-        identity.grant_order(order_id)
         write_event(
             {
                 "event": "order_read_granted",

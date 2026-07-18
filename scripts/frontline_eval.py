@@ -34,6 +34,7 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.verification import OtpProvider, load_verification_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
@@ -114,6 +115,7 @@ async def _run() -> int:
         for t in build_voice_tools(store, cart_store, pointer, identity_store, customers)
     ]
     config = resolved.config
+    verification_fixture = load_verification_fixture(_CONFIG_ROOT, _MERCHANT_ID)
     graph = build_frontline_graph(
         chat_model,
         tools,
@@ -123,6 +125,7 @@ async def _run() -> int:
         # compiles as ONE shape — same construction path as production (F1 discipline).
         reasoning_model=LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
         store=store,
+        otp=OtpProvider(valid_code=verification_fixture.otp_code),
         cart_store=cart_store,  # SAME instance as view_cart (no split-brain)
         pointer=pointer,  # SAME instance as order_status (Group C L4)
         identity_store=identity_store,  # SAME instance as the tools' gate (P7, no split-brain)

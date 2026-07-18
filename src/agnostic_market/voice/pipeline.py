@@ -37,7 +37,12 @@ from agnostic_market.commerce.identity import (
 )
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import (
+    OtpProvider,
+    RiskProvider,
+    VerificationStore,
+    load_verification_fixture,
+)
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.llm.gateway import LLMGateway
@@ -128,7 +133,8 @@ def build_voice_loop(
     # Per-session step-up seams (AGENTS §A4a): built once here, like OrderStore, and torn
     # down with the session (no cross-session state — the durable/keyed form lands in Phase
     # 4). The store shares the SAME otp the dispatch node uses (verify + dispatch agree).
-    otp = OtpProvider()
+    verification_fixture = load_verification_fixture(config_root, config.merchant_id)
+    otp = OtpProvider(valid_code=verification_fixture.otp_code)
     verification_store = VerificationStore(otp)
     risk = RiskProvider()
     # Per-session profile SoR (Group C) — fixture-backed like OrderStore; the profile-change

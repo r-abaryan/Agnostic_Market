@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from llm_fakes import FakeChatModel
-from support_helpers import build_support_engine
+from policy_helpers import make_policy
+from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.support import flow as support_flow
@@ -28,18 +29,9 @@ from agnostic_market.dtos.events import (
 )
 from agnostic_market.dtos.state import PolicyContext
 
-_POLICY = PolicyContext(
-    max_order_value_usd=500.0,
-    allow_ai_merchant_handoff=True,
-    refund_auto_approve_under_usd=50.0,
-    refund_require_human_above_usd=200.0,
-    # High on purpose: the legacy amount-gate/step-up scenarios run refunds against the
-    # SHIPPED ORD-1001 and must exercise those gates in isolation; the return-first tests
-    # tighten this via model_copy.
-    refund_returnless_under_usd=500.0,
-    return_window_days=30,
-    pending_ttl_seconds=120.0,
-)
+# returnless high on purpose (the default): the legacy amount-gate/step-up scenarios run
+# refunds against the SHIPPED ORD-1001 in isolation; the return-first tests tighten via model_copy.
+_POLICY = make_policy()
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
 # The reasoning fake proposes a refund of $129.00 on order key "2" (ORD-1002) to a NEW card.
@@ -58,14 +50,18 @@ def _engine(
     thread_id: str = "support-1",
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
     """Thin wrapper over the shared harness (support_helpers) preserving this file's
-    4-tuple unpacking + its propose_refund default."""
-    harness = build_support_engine(
-        config_root,
-        policy=policy,
-        reasoning=reasoning
-        or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
-        risk_flagged=risk_flagged,
-        thread_id=thread_id,
+    4-tuple unpacking + its propose_refund default. Fixture orders are PRE-AUTHORIZED
+    (rung-1) — this suite pins the post-authorization money logic; the selection gate has
+    its own suite (test_support_scoping.py)."""
+    harness = authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=policy,
+            reasoning=reasoning
+            or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
+            risk_flagged=risk_flagged,
+            thread_id=thread_id,
+        )
     )
     return harness.engine, harness.store, harness.verification, harness.otp
 
@@ -149,6 +145,24 @@ async def test_wrong_otp_twice_stays_l1_and_never_refunds(config_root: Path) -> 
     assert verification.current_level() == 1
     assert store.refund_count == 0
     assert not engine.pending_interrupt()  # not trapped
+
+
+async def test_otp_attempt_budget_tracks_the_policy_knob(config_root: Path) -> None:
+    # otp_max_attempts is config-driven (policies.security): a merchant that raised it to 3
+    # gets a THIRD OTP ask where the default (2) would already have handed to a human. Pins
+    # that the value threads through build_stepup_nodes.
+    engine, store, verification, _ = _engine(
+        config_root, policy=_POLICY.model_copy(update={"otp_max_attempts": 3}), thread_id="otp3"
+    )
+    await _pause_at_otp(engine)
+    first = await _events(engine, "000000")  # wrong #1 -> re-collect
+    assert any(isinstance(e, InterruptEvent) for e in first)
+    second = await _events(engine, "111111")  # wrong #2 -> STILL re-collect (budget is 3)
+    assert any(isinstance(e, InterruptEvent) for e in second)
+    await _events(engine, "222222")  # wrong #3 -> exhausted
+    assert verification.current_level() == 1
+    assert store.refund_count == 0
+    assert not engine.pending_interrupt()
 
 
 async def test_live_read_blocks_a_lapsed_grant_at_place(config_root: Path) -> None:

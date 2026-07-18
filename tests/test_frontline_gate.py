@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from agnostic_market.agents.gate import gate_check
+from agnostic_market.agents.gate import gate_check, status_check
 
 # Irreversible-action REQUESTS the slim gate must catch.
 _IRREVERSIBLE = [
@@ -85,3 +85,34 @@ def test_trip_returns_reason_and_destination() -> None:
 def test_empty_transcript_does_not_trip() -> None:
     assert gate_check("") is None
     assert gate_check("   ") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "scope"),
+    [
+        ("is it cancelled?", "one"),
+        ("has my order shipped?", "one"),
+        ("did that get delivered?", "one"),
+        ("so both are cancelled?", "list"),
+        ("have they all shipped?", "list"),
+        ("can you double-check that order?", "one"),
+        ("please check both orders again", "list"),
+    ],
+)
+def test_state_verification_scope(text: str, scope: str) -> None:
+    assert status_check(text) == scope
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "why was my order cancelled?",
+        "did my refund go through?",
+        "what is the status of ORD-1001?",
+        "where is my order?",
+        "can you confirm my reservation?",
+        "double-check the delivery address",
+    ],
+)
+def test_non_order_state_questions_do_not_force_a_status_read(text: str) -> None:
+    assert status_check(text) is None

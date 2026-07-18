@@ -143,6 +143,24 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
             f"{window_max} - the return window may be widened only up to the platform bound"
         )
 
+    # Security attempt-budget ceilings: each is a value where LARGER weakens security, so the
+    # ceiling caps the weakening (same direction as the money ceilings above). One loop over
+    # (config key, ceiling key) pairs — four near-identical checks would be copy-paste.
+    security = policies.get("security", {})
+    for field, ceiling_key in (
+        ("otp_max_attempts", "otp_max_attempts_ceiling"),
+        ("contact_reask_max", "contact_reask_ceiling"),
+        ("auth_denials_before_human_offer", "auth_denials_ceiling"),
+        ("max_tool_hops", "tool_hops_ceiling"),
+    ):
+        value = security.get(field)
+        limit = limits.get(ceiling_key)
+        if value is not None and limit is not None and value > limit:
+            raise PolicyBoundsViolationError(
+                f"policies.security.{field}={value} exceeds the platform ceiling {limit} - "
+                "a merchant may tighten an attempt budget, never widen it past the platform bound"
+            )
+
 
 def resolve_merchant_config(
     base: dict[str, Any],

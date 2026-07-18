@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from agnostic_market.dtos.config import MerchantConfig, PolicyConfig
+from agnostic_market.dtos.config import MerchantConfig, PolicyConfig, SecurityPolicy
 
 
 def _valid_merchant_dict() -> dict:
@@ -70,6 +70,24 @@ def test_to_policy_context_carries_every_enforced_value() -> None:
     assert context.return_window_days == 30  # DTO default
     assert context.pending_ttl_seconds == 120.0  # platform default TTL
     assert context.spoken_policy_extra is None
+    # Security knobs carried through the same one mapping (D1).
+    assert context.otp_max_attempts == 2
+    assert context.contact_reask_max == 1
+    assert context.auth_denials_before_human_offer == 2
+    assert context.max_tool_hops == 5
+
+
+def test_security_policy_defaults() -> None:
+    sec = SecurityPolicy()
+    assert (sec.otp_max_attempts, sec.contact_reask_max) == (2, 1)
+    assert (sec.auth_denials_before_human_offer, sec.max_tool_hops) == (2, 5)
+
+
+def test_security_policy_rejects_unknown_key_and_bad_floor() -> None:
+    with pytest.raises(ValidationError):
+        SecurityPolicy(surprise=1)  # extra="forbid"
+    with pytest.raises(ValidationError):
+        SecurityPolicy(otp_max_attempts=0)  # ge=1 floor
 
 
 def test_negative_order_cap_rejected() -> None:

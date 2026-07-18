@@ -112,6 +112,35 @@ class ReturnsPolicy(BaseModel):
 _DEFAULT_PENDING_TTL_SECONDS = 120.0
 
 
+class SecurityPolicy(BaseModel):
+    """Attempt-BUDGET knobs — merchant-set within platform CEILINGS (_platform.limits, the
+    resolver clamps loudly). Every knob here is a budget where a LARGER value WEAKENS security
+    (more guesses / more probe room / a later human offer / a longer tool loop), so the
+    ceiling caps the weakening — the mirror of the money knobs, where the ceiling caps a
+    refund the merchant would auto-approve.
+
+    NOT here (deliberately): the verification-LEVEL floors (refund/profile/identity_required_
+    level, dtos/confirmation.py) are fraud/ATO floors that live in code with no merchant knob
+    — a YAML copy would be the drifting second source of truth the removed
+    `ToolConfirmationPolicy.min_verification_level` already was. Attempt budgets are tunable;
+    the level a factor must reach is not."""
+
+    model_config = _STRICT
+
+    # OTP re-collect budget (shared by refund / profile / identity step-up). More tries =
+    # more guessing room against a 6-digit code.
+    otp_max_attempts: int = Field(ge=1, default=2)
+    # Identity-flow contact re-asks before the silent human handover. More = more match
+    # probes at the contact directory.
+    contact_reask_max: int = Field(ge=0, default=1)
+    # Support-gate failed matches on an order before the corrective offers a person. Later =
+    # more order/contact-pair probe room in one session.
+    auth_denials_before_human_offer: int = Field(ge=1, default=2)
+    # Frontline read-only tool round-trips per turn before the loop is broken (runaway /
+    # cost bound, not an auth control — kept here so all conversation budgets live together).
+    max_tool_hops: int = Field(ge=1, default=5)
+
+
 class PolicyConfig(BaseModel):
     """Merchant policy values — set within platform-enforced bounds (never disable a cap)."""
 
@@ -127,6 +156,9 @@ class PolicyConfig(BaseModel):
     pending_confirmation_ttl_seconds: float = Field(
         default=_DEFAULT_PENDING_TTL_SECONDS, gt=0
     )
+    # Attempt-budget security knobs (default_factory so existing merchant YAMLs, which don't
+    # set it, keep the platform defaults; the resolver clamps each against its ceiling).
+    security: SecurityPolicy = Field(default_factory=SecurityPolicy)
     # Optional merchant free-text policy facts that have NO enforcing field — refund
     # TIMELINE ("5-7 business days"), condition clauses ("original condition"). The
     # ENFORCED policy sentences (returnless threshold, return window, human-review line)
@@ -153,6 +185,10 @@ class PolicyConfig(BaseModel):
             return_window_days=self.returns.window_days,
             pending_ttl_seconds=self.pending_confirmation_ttl_seconds,
             spoken_policy_extra=self.spoken_facts_extra,
+            otp_max_attempts=self.security.otp_max_attempts,
+            contact_reask_max=self.security.contact_reask_max,
+            auth_denials_before_human_offer=self.security.auth_denials_before_human_offer,
+            max_tool_hops=self.security.max_tool_hops,
         )
 
 

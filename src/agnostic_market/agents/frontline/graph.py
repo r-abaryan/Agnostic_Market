@@ -35,6 +35,7 @@ one prompt path). Node-authored caller copy (the deferral map) stays here — be
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Annotated
@@ -52,7 +53,7 @@ from agnostic_market.agents._consent import is_abort, is_support_abort, wants_hu
 from agnostic_market.agents._copy import warm_close
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
-from agnostic_market.agents.gate import gate_check
+from agnostic_market.agents.gate import gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
@@ -95,9 +96,14 @@ _GATE_OWNER: dict[HandoffDestination, ActiveFlow] = {
     "support": "support",
 }
 
-# Max read-only tool round-trips per turn before the graph ends (loop guard — the
-# hand-built graph has no framework loop protection like create_agent had).
-_MAX_TOOL_HOPS = 5
+_ORDER_ID = re.compile(r"\bORD-\d+\b", re.IGNORECASE)
+_TOOL_LIMIT_FALLBACK = (
+    "I've reached the lookup limit for this turn. Please ask again with the specific item "
+    "or order you want me to check."
+)
+
+# The read-only loop bound comes from `policy.max_tool_hops`. `model_node` switches to the
+# unbound model at the limit, producing a final answer without another dangling tool call.
 
 # Reads whose result a CODE renderer speaks directly, skipping the second model pass (L3
 # latency + grounding win). A SINGLE such call with nothing else pending is deterministic —
@@ -206,8 +212,8 @@ def build_frontline_graph(
     store: OrderStore,
     policy: PolicyContext,
     cart_store: CartStore | None = None,
+    otp: OtpProvider,
     verification_store: VerificationStore | None = None,
-    otp: OtpProvider | None = None,
     risk: RiskProvider | None = None,
     profile_store: ProfileStore | None = None,
     pointer: LastOrderPointer | None = None,
@@ -220,8 +226,8 @@ def build_frontline_graph(
     `read_only_tools` are already audit-wrapped (tooling.py). `checkpointer` is REQUIRED for
     the interrupt/resume paths (the engine passes one per session); None keeps the per-turn
     stateless mode the text eval uses. The support flow's step-up seams
-    (`verification_store`/`otp`/`risk`) default to fresh fakes when omitted (eval/tests that
-    never enter support).
+    (`verification_store`/`risk`) default to fresh fakes when omitted. `otp` is injected:
+    production loads the merchant verification fixture; tests declare their fake code.
 
     `cart_store` defaults to a fresh instance for frontline-only callers, BUT production and
     any cart+view_cart test MUST pass the SAME instance here that they passed to
@@ -229,9 +235,8 @@ def build_frontline_graph(
     the flow mutates (split-brain). The default exists only so eval/tests that never touch
     the cart don't have to build one.
     """
-    # Build otp first so a defaulted VerificationStore shares the SAME provider the dispatch
-    # node uses (else dispatch and verify would talk to different fakes).
-    otp = otp or OtpProvider()
+    # A defaulted VerificationStore shares the SAME provider the dispatch node uses (else
+    # dispatch and verify would talk to different fakes).
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
     cart_store = cart_store or CartStore()
@@ -282,7 +287,25 @@ def build_frontline_graph(
         }
 
     def route_after_gate(state: ReasoningState) -> str:
-        return "handover" if state.handover is not None else "model"
+        if state.handover is not None:
+            return "handover"
+        scope = status_check(_last_user_text(state))
+        if scope is None:
+            return "model"
+        if _status_order_ids(state, scope):
+            return "forced_status"
+        if scope == "list" and state.active_flow != "left_identity":
+            return "enumeration_gate"
+        return "model"
+
+    def _tool_hops_this_turn(state: ReasoningState) -> int:
+        hops = 0
+        for msg in reversed(state.messages):
+            if isinstance(msg, HumanMessage):
+                break
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                hops += 1
+        return hops
 
     def model_node(state: ReasoningState) -> dict[str, object]:
         # Prompt lives inside the graph (single source; eval == production).
@@ -291,29 +314,97 @@ def build_frontline_graph(
             # Per-turn suffix (the static prompt stays composed once): "that order"
             # resolves to the session pointer (Group C L4) — a reference, never state.
             prompt_text = f"{system_prompt}\n{resolved_order_line(last_order)}"
+        tool_hops = _tool_hops_this_turn(state)
+        force_final = tool_hops >= policy.max_tool_hops
+        if force_final:
+            logger.warning(
+                "frontline reached the %d-tool-hop turn limit; forcing a final answer",
+                policy.max_tool_hops,
+            )
+            prompt_text += (
+                "\nThe read-tool limit for this turn has been reached. Answer now from the "
+                "completed tool results already in the conversation. Do not request another "
+                "tool or promise a later check."
+            )
+            model = chat_model
+        else:
+            model = model_with_tools
         messages = [SystemMessage(prompt_text), *state.messages]
-        response = model_with_tools.invoke(messages)
+        response = model.invoke(messages)
+        if force_final and response.tool_calls:
+            logger.error("unbound frontline model returned a tool call at the turn limit")
+            content = response.content if isinstance(response.content, str) else ""
+            response = AIMessage(content=content.strip() or _TOOL_LIMIT_FALLBACK)
         return {"messages": [response]}
 
     def route_after_model(state: ReasoningState) -> str:
         last = state.messages[-1]
         if not (isinstance(last, AIMessage) and last.tool_calls):
             return "finalize"
-        # Bounded read-only tool loop: a model that never stops calling tools (or a
-        # provider quirk) must not spin. After _MAX_TOOL_HOPS read-only round-trips in
-        # THIS TURN (counted back to the last user message — state may carry prior turns
-        # once a checkpointer holds the thread), end rather than loop. (request_handover
-        # routes itself out via Command, so this only bounds legitimate read tools.)
-        tool_hops = 0
-        for msg in reversed(state.messages):
-            if isinstance(msg, HumanMessage):
-                break
-            if isinstance(msg, AIMessage) and msg.tool_calls:
-                tool_hops += 1
-        if tool_hops > _MAX_TOOL_HOPS:
-            logger.warning("frontline exceeded %d tool hops in a turn; ending", _MAX_TOOL_HOPS)
-            return "finalize"
         return "tools"
+
+    def _order_status_line(order_id: str) -> str:
+        """Render one live store status with the same per-turn date semantics as L3."""
+        return render_order_status_line(
+            order_id=order_id,
+            status=store.order_status(order_id) or "unknown",
+            items=store.order_item_summary(order_id),
+            eta=store.order_eta(order_id),
+            today=datetime.now().date(),
+        )
+
+    def _referenced_order_ids(state: ReasoningState) -> list[str]:
+        """Return recent authorized order ids explicitly present in session history."""
+        found: list[str] = []
+        for msg in reversed(state.messages):
+            content = msg.content if isinstance(msg.content, str) else ""
+            for match in reversed(list(_ORDER_ID.finditer(content))):
+                order_id = match.group(0).upper()
+                if order_id not in found and order_read_allowed(
+                    order_id, store=store, identity=identity_store
+                ):
+                    found.append(order_id)
+        return found
+
+    def _status_order_ids(state: ReasoningState, scope: str) -> list[str]:
+        referenced = _referenced_order_ids(state)
+        if scope == "one":
+            if referenced:
+                return referenced[:1]
+            pointed = pointer.get()
+            if pointed is not None and order_read_allowed(
+                pointed, store=store, identity=identity_store
+            ):
+                return [pointed]
+            return []
+
+        current = _last_user_text(state)
+        bound = identity_store.current()
+        if bound is not None and re.search(r"\b(?:all|orders|purchases)\b", current, re.I):
+            return [candidate.order_id for candidate in store.owned_orders(bound.customer_ref)]
+        if referenced:
+            return referenced[:2] if re.search(r"\bboth\b", current, re.I) else referenced
+        if bound is not None:
+            return [candidate.order_id for candidate in store.owned_orders(bound.customer_ref)]
+        return []
+
+    def forced_status_node(state: ReasoningState) -> dict[str, object]:
+        """Answer a state-verification follow-up from live authorized store reads."""
+        scope = status_check(_last_user_text(state))
+        assert scope is not None
+        order_ids = _status_order_ids(state, scope)
+        assert order_ids
+        line = " ".join(_order_status_line(order_id) for order_id in order_ids)
+        line += f" {warm_close()}"
+        write_event(
+            {
+                "utterance": _last_user_text(state),
+                "outcome": "answered",
+                "outcome_detail": "forced_status_read",
+                "order_count": len(order_ids),
+            }
+        )
+        return {"messages": [AIMessage(line)]}
 
     def finalize_node(state: ReasoningState) -> dict[str, object]:
         """Telemetry sink for ANSWERED turns — the classifier dataset needs negatives
@@ -413,13 +504,7 @@ def build_frontline_graph(
                     "the number?"
                 )
             else:
-                line = render_order_status_line(
-                    order_id=order_id,
-                    status=store.order_status(order_id) or "unknown",
-                    items=store.order_item_summary(order_id),
-                    eta=store.order_eta(order_id),
-                    today=datetime.now().date(),
-                ) + close
+                line = _order_status_line(order_id) + close
         # Same answered-turn telemetry as finalize_node (this path ENDs here, bypassing it),
         # tagged so the code-render count is measurable against the model-narration path.
         write_event(
@@ -638,6 +723,8 @@ def build_frontline_graph(
         policy,
         profile_store,
         pointer,
+        identity_store=identity_store,
+        customers=customers,
         display_name=display_name,
     )
     identity = build_identity_nodes(
@@ -821,6 +908,7 @@ def build_frontline_graph(
     graph.add_node("handover", handover_node)
     graph.add_node("finalize", finalize_node)
     graph.add_node("read_render", read_render_node)
+    graph.add_node("forced_status", forced_status_node)
     graph.add_node("enumeration_gate", enumeration_gate_node)
     graph.add_node("cart_assemble", cart.assemble)
     graph.add_node("cart_ack", cart.ack)
@@ -896,7 +984,14 @@ def build_frontline_graph(
     )
     graph.add_edge("cross_switch", "handover")
     graph.add_conditional_edges(
-        "gate", route_after_gate, {"handover": "handover", "model": "model"}
+        "gate",
+        route_after_gate,
+        {
+            "handover": "handover",
+            "model": "model",
+            "forced_status": "forced_status",
+            "enumeration_gate": "enumeration_gate",
+        },
     )
     graph.add_conditional_edges(
         "model", route_after_model, {"tools": "tools", "finalize": "finalize"}
@@ -1096,6 +1191,7 @@ def build_frontline_graph(
     graph.add_edge("identity_abort", END)
     graph.add_edge("identity_escape_human", "handover")
     graph.add_edge("finalize", END)
+    graph.add_edge("forced_status", END)
     graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
 
     compiled = graph.compile(checkpointer=checkpointer)
@@ -1103,7 +1199,7 @@ def build_frontline_graph(
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset({"handover", "read_render"})
+        frozenset({"handover", "read_render", "forced_status"})
         | cart.speakable_nodes
         | support.speakable_nodes
         | identity.speakable_nodes
