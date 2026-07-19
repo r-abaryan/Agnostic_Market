@@ -33,3 +33,13 @@ def warm_close() -> str:
 def all_closes() -> tuple[str, ...]:
     """The full close set (test surface: a rendered/ack line ends with ONE of these)."""
     return _CLOSES
+
+
+# The ONE closing line for a GUEST enumeration (session-scoped list): it both discloses that the
+# list is partial (this call only) and offers the path to more (verify -> account history). Used
+# INSTEAD OF warm_close() on that path so the caller hears exactly one closing invitation.
+GUEST_LIST_CLOSE = "To pull up any other orders on an account, I can verify you - just let me know."
+
+
+def guest_list_close() -> str:
+    return GUEST_LIST_CLOSE

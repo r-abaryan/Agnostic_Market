@@ -111,18 +111,26 @@ async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) 
 
 
 async def test_session_placed_order_appears_in_the_identified_list(config_root: Path) -> None:
+    # A caller who verifies AND has a session-placed order hears BOTH their account orders and the
+    # one they placed this call (the account list = fixture-owned + session-placed). We bind first,
+    # THEN place + list: an unbound "list my orders" with a session order now answers as a GUEST
+    # (Fix 3) and never reaches identity, so the bind must precede the placement to exercise the
+    # identified-list path this test protects.
+    from agnostic_market.commerce.identity import BoundIdentity
     from agnostic_market.dtos.state import CartLine
 
     h = _identity_harness(config_root, thread_id="ident-placed-1")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     h.store.place_cart(
         "k1",
         lines=[CartLine(sku="SKU-GRN-15", name="merino hiking socks", price_usd=14.5, quantity=2)],
         total_usd=29.0,
     )
-    await _events(h.engine, _REQUEST)
-    events = await _events(h.engine, _VALID_OTP)
-    line = next(e for e in _spoken(events) if e.node == "identity_apply")
-    assert "ORD-9001" in line.text  # placed THIS call = theirs by construction
+    # Bound -> the enumeration ask code-renders the account list directly (handover node), no OTP.
+    events = await _events(h.engine, _REQUEST)
+    line = next(e for e in _spoken(events) if e.node == "handover")
+    assert "ORD-9001" in line.text  # placed THIS call, listed alongside the account's own orders
+    assert "ORD-1001" in line.text  # CUST-001's fixture order too
 
 
 async def test_already_bound_reask_lists_without_a_second_otp(config_root: Path) -> None:

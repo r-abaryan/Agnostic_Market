@@ -443,6 +443,22 @@ def test_prompt_speaks_derived_policy_even_without_free_text() -> None:
     assert "NEVER invent" in prompt
 
 
+def test_prompt_forbids_order_status_from_confirming_account_ownership() -> None:
+    # Fix 4 (live 2026-07-18): a guest read ORD-1002 via order#+email, then asked "is it on
+    # this account, under that email?" and the model answered "Yes, it's on the account for
+    # casey@example.com" - an ownership ORACLE (anyone with an order number could learn whose
+    # account it is) + a PII echo. The frontline prompt must forbid confirming the account link
+    # and repeating the caller's contact; an order_status read speaks order STATE only.
+    from agnostic_market.agents.frontline.prompt import compose_system_prompt
+
+    prompt = compose_system_prompt("Acme Store", _policy())
+    assert "STATE ONLY" in prompt
+    assert "NEVER confirms, denies, or discusses WHOSE account" in prompt
+    assert "Never repeat the caller's email or phone number" in prompt
+    # the contrastive few-shot for the ownership probe is present
+    assert "that order is on this account" in prompt
+
+
 def test_shared_context_carries_todays_date_and_past_eta_rule() -> None:
     # Live call #9 P6: with no "today" in any prompt, a stored ETA of July 9 was spoken as
     # a FUTURE arrival on July 13. The date is read at compose time (per turn).
@@ -736,6 +752,96 @@ async def test_bound_enumeration_escapes_sticky_support_without_otp(config_root:
     assert "ORD-1002" in final.content and "ORD-1001" not in final.content
     assert out.get("active_flow") is None
     assert out.get("pending_identity") is None
+
+
+# --- Fix 3: a GUEST lists the orders they placed THIS session (no verification) ------------
+
+
+def _place_two_session_orders(store: OrderStore) -> tuple[str, str]:
+    from agnostic_market.dtos.state import CartLine
+
+    a = store.place_cart(
+        "s1", lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)],
+        total_usd=258.0,
+    )
+    b = store.place_cart(
+        "s2", lines=[CartLine(sku="SKU-RED-42", name="trail shoes", price_usd=89.99, quantity=1)],
+        total_usd=89.99,
+    )
+    return a.order_id, b.order_id
+
+
+async def test_guest_lists_session_placed_orders_without_verification(
+    config_root: Path, tmp_path: Path
+) -> None:
+    # THE Fix-3 pin (live trace 2026-07-18): an UNBOUND caller who placed orders this call asks
+    # to list them and hears them read back from CODE — no identity handover, no OTP. The spoken
+    # line DISCLOSES this-call scope (not "you've got N orders", which implies full history) and
+    # carries exactly ONE closing invitation (the verify-for-more line, NOT also warm_close).
+    import json
+
+    from agnostic_market.agents._copy import GUEST_LIST_CLOSE, all_closes
+
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    a, b = _place_two_session_orders(store)
+    graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)
+    out = await graph.ainvoke({"messages": [HumanMessage("tell me what orders are there")]})
+    final = out["messages"][-1]
+    assert a in final.content and b in final.content  # both session orders read back
+    assert out.get("active_flow") is None  # NO identity detour
+    assert out.get("pending_identity") is None
+    assert "on this call" in final.content  # scope disclosed (not full-history phrasing)
+    assert GUEST_LIST_CLOSE in final.content  # the verify-for-more invite
+    assert not any(c in final.content for c in all_closes())  # and NOT also a warm_close
+    scope = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+        if '"order_scope"' in line
+    ]
+    assert scope and scope[-1]["order_scope"] == "session"
+
+
+async def test_guest_enumeration_never_lists_fixture_orders(config_root: Path) -> None:
+    # SECURITY: a guest's session list is drawn ONLY from what they placed — never an account's
+    # fixture orders (a different code path). Place ONE order; the spoken list must not name any
+    # fixture order id.
+    from agnostic_market.dtos.state import CartLine
+
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    placed = store.place_cart(
+        "one", lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
+        total_usd=129.0,
+    )
+    graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)
+    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    final = out["messages"][-1]
+    assert placed.order_id in final.content
+    assert not any(x in final.content for x in ("ORD-1001", "ORD-1002", "ORD-1003"))
+
+
+async def test_guest_with_no_placed_orders_still_enters_identity(config_root: Path) -> None:
+    # An unbound caller who placed NOTHING has no session orders to read — so enumeration still
+    # enters the identity flow (today's behavior; nothing to list without an account).
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={"request_handover": {"destination": "support", "reason_code": "list_orders"}},
+        tool_call_limit=1,
+    )
+    graph = _graph(config_root, frontline, reasoning_model=FakeChatModel(emit_tool_calls=False))
+    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    assert out.get("active_flow") == "identity"
+
+
+async def test_guest_status_list_reads_session_placed(config_root: Path) -> None:
+    # Symmetry with the state-verification path: an unbound guest asking "are they both shipped?"
+    # reads the session-placed orders (forced-status), not nothing.
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    a, b = _place_two_session_orders(store)
+    graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)
+    out = await graph.ainvoke({"messages": [HumanMessage("are both of my orders shipped?")]})
+    final = out["messages"][-1]
+    assert a in final.content and b in final.content
+    assert out.get("active_flow") is None  # answered in code, no identity
 
 
 async def test_render_emits_exactly_one_answered_event(config_root: Path, tmp_path: Path) -> None:

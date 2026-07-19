@@ -531,6 +531,45 @@ def test_render_order_list_line_speaks_ids_items_status_only() -> None:
     assert "$" not in line  # no totals, no addresses, no contact — ids + items + status only
 
 
+def test_render_order_list_line_session_scope_discloses_this_call() -> None:
+    # Fix 3: the guest/session scope must NOT sound like a complete account history.
+    from agnostic_market.commerce.orders import OrderCandidate
+
+    one = [OrderCandidate(key="1", order_id="ORD-9001", summary="2 rain jackets",
+                          total_usd=258.0, status="processing")]
+    assert "on this call" in render_order_list_line(one, scope="session")
+    assert "You've got" not in render_order_list_line(one, scope="session")
+    assert "You've got 1 order" in render_order_list_line(one)  # account default unchanged
+
+
+def test_session_placed_orders_lists_only_placed_keyed_effective_status(config_root: Path) -> None:
+    # Fix 3: the GUEST enumeration view — placed records only (never a fixture/account order),
+    # keyed 1..N, effective (cancelled-overlay) status.
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-BLU-07", "jacket", 2, 129.0)  # ORD-9001
+    _place1(store, "k2", "SKU-RED-42", "shoes", 1, 89.99)  # ORD-9002
+    placed = store.session_placed_orders()
+    assert [c.order_id for c in placed] == ["ORD-9001", "ORD-9002"]
+    assert [c.key for c in placed] == ["1", "2"]
+    assert not any(c.order_id.startswith("ORD-100") for c in placed)  # NO fixture orders
+    store.cancel_order("c1", order_id="ORD-9001")
+    assert next(c for c in store.session_placed_orders() if c.order_id == "ORD-9001").status == (
+        "cancelled"
+    )
+
+
+def test_placed_candidate_mapper_keeps_listings_consistent(config_root: Path) -> None:
+    # The extracted _placed_candidate mapper is the ONE placed->OrderCandidate mapping: the placed
+    # tail of owned_orders, the placed rows of actionable_orders, and session_placed_orders must
+    # agree on the same (order_id, summary, status) for a given placed record (no drift).
+    store = _store(config_root)
+    _place1(store, "k1", "SKU-BLU-07", "jacket", 2, 129.0)  # ORD-9001
+    sess = {c.order_id: (c.summary, c.status) for c in store.session_placed_orders()}
+    owned = {c.order_id: (c.summary, c.status) for c in store.owned_orders("CUST-001")}
+    action = {c.order_id: (c.summary, c.status) for c in store.actionable_orders()}
+    assert sess["ORD-9001"] == owned["ORD-9001"] == action["ORD-9001"]
+
+
 def test_render_order_list_line_empty_and_unknown_status() -> None:
     from agnostic_market.commerce.orders import OrderCandidate
 

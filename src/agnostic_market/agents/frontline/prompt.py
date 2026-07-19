@@ -60,7 +60,14 @@ _INSTRUCTIONS = (
     "ONE order vs THEIR orders: a question about a SPECIFIC order is an order_status read. "
     "If its result asks for verification, ask the caller ONE short question - the email or "
     "phone number on the account - then call order_status again with the order id AND that "
-    "contact; never read out or confirm any order the tool didn't return. But any ask to "
+    "contact; never read out or confirm any order the tool didn't return. An order_status "
+    "read answers the order's STATE ONLY - items, status, ETA. It NEVER confirms, denies, or "
+    "discusses WHOSE account or WHICH email/phone an order belongs to. The contact the caller "
+    "gave is a lookup key, not something to read back: if they ask 'is it on this account?', "
+    "'is it under this email?', or 'does this order belong to me?', do NOT answer yes or no - "
+    "the order details you can state are the answer, and confirming the account link would "
+    "tell anyone holding an order number whose account it is. Never repeat the caller's email "
+    "or phone number back to them. But any ask to "
     "LIST or COUNT the caller's orders - 'what orders do I have', 'any other purchases', "
     "'what else is on my account' - goes through list_orders: call it FIRST, before "
     "answering anything, and follow what its result says. That includes REPEAT asks: even "
@@ -117,6 +124,12 @@ _FEW_SHOT: tuple[tuple[str, str], ...] = (
         "What's happening with order ORD-1002?",
         "ANSWER: order_status with that number; if it asks for verification, ask ONE "
         "short question for the email or phone on the account, then call it again with both",
+    ),
+    (
+        "Just to confirm, that order is on this account, under the email I gave you?",
+        "ANSWER (speak): state only the order's details from the order_status result - do "
+        "NOT confirm or deny whose account/email it's on (that would tell anyone with an "
+        "order number whose account it is), and never repeat the caller's email or phone",
     ),
 )
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from datetime import date, datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -153,22 +154,34 @@ def render_cart_line(lines: Sequence[CartLine], total_usd: float) -> str:
     return f"You've got {speak_lines(lines)} in your cart, ${total_usd:.2f} in total."
 
 
-def render_order_list_line(candidates: Sequence[OrderCandidate]) -> str:
+def render_order_list_line(
+    candidates: Sequence[OrderCandidate], *, scope: Literal["account", "session"] = "account"
+) -> str:
     """CODE-authored spoken order list (P7 enumeration — the identity flow's apply node and
     the verified `list_orders` tool both speak from THIS). Id + summary + humanized status
     ONLY — no addresses, no contact, no totals (not needed to answer "what orders do I
     have", and short lines TTS better). Statuses humanize via `_STATUS_PHRASE`, fail-closed
-    (an unknown status speaks the raw word, never an invented phrase)."""
+    (an unknown status speaks the raw word, never an invented phrase).
+
+    `scope="session"` DISCLOSES that the list is this-call-only (a guest listing the orders they
+    placed on this call, Fix 3) — "You've placed N …on this call" — so a partial list is never
+    voiced as if it were the complete account history."""
     if not candidates:
         return "I don't see any orders on your account."
     parts = [
         f"{c.order_id}, {c.summary}, {_STATUS_PHRASE.get(c.status, c.status)}"
         for c in candidates
     ]
+    if scope == "session":
+        lead_one = "You've placed 1 order on this call"
+        lead_many = f"You've placed {len(parts)} orders on this call"
+    else:
+        lead_one = "You've got 1 order"
+        lead_many = f"You've got {len(parts)} orders"
     if len(parts) == 1:
-        return f"You've got 1 order: {parts[0]}."
+        return f"{lead_one}: {parts[0]}."
     listed = "; ".join(parts[:-1]) + f"; and {parts[-1]}"
-    return f"You've got {len(parts)} orders: {listed}."
+    return f"{lead_many}: {listed}."
 
 
 def _cancel_outcome_clause(o: BatchCancelOutcome) -> str:
@@ -507,6 +520,18 @@ class OrderStore:
         normalized = order_id.strip().upper()
         return any(p.order_id == normalized for p in self._placed_by_key.values())
 
+    def _placed_candidate(self, record: PlacedOrder, key: str) -> OrderCandidate:
+        """The ONE placed-record -> OrderCandidate mapping (summary from `speak_lines`, effective
+        cancelled-overlay status). Shared by every listing so the placed view can't drift between
+        `_iter_owned_orders`, `actionable_orders`, and `session_placed_orders`."""
+        return OrderCandidate(
+            key=key,
+            order_id=record.order_id,
+            summary=speak_lines(record.lines),
+            total_usd=record.total_usd,
+            status=self.order_status(record.order_id) or "unknown",
+        )
+
     def _iter_owned_orders(self, customer_ref: str) -> Iterator[OrderCandidate]:
         """Yield the account/session order view without materializing full history."""
         index = 1
@@ -522,14 +547,27 @@ class OrderStore:
             )
             index += 1
         for record in self._placed_by_key.values():
-            yield OrderCandidate(
-                key=str(index),
-                order_id=record.order_id,
-                summary=speak_lines(record.lines),
-                total_usd=record.total_usd,
-                status=self.order_status(record.order_id) or "unknown",
-            )
+            yield self._placed_candidate(record, str(index))
             index += 1
+
+    def session_placed_orders(self) -> list[OrderCandidate]:
+        """The GUEST enumeration view: orders placed THIS session, keyed "1".."N". Readable with
+        NO verification — the caller placed them on this call, so reading them back is not a
+        privacy leak (the same session-placed rule `order_read_allowed` already honors for reads).
+        Structurally excludes fixture/account orders (it touches only `_placed_by_key`), so an
+        unbound listing can never surface another account's order.
+
+        PHASE-4 CAVEAT: "session" here means "this per-session OrderStore instance" — there is
+        no `session_id`; the isolation is the fixture store's per-call lifetime. When the store
+        becomes a durable SHARED SoR that boundary disappears: Phase 4 must stamp each guest-placed
+        order with an explicit GUEST SESSION ID (a temp-user handle minted per call) + tenant,
+        filter every query on it, and — for a guest who later signs up — migrate those session
+        orders onto the real account. This "session = the store" assumption must NOT be copied
+        into a shared store."""
+        return [
+            self._placed_candidate(record, str(i))
+            for i, record in enumerate(self._placed_by_key.values(), start=1)
+        ]
 
     def owned_orders(self, customer_ref: str) -> list[OrderCandidate]:
         """The bounded, keyed list of orders the IDENTIFIED caller may hear enumerated (P7
@@ -636,14 +674,10 @@ class OrderStore:
         listed (the caller may ask about them); the status lets the model — and the
         guardrails — answer honestly instead of proposing a dead action.
         """
-        candidates: list[tuple[str, str, float]] = [
+        fixture = [
             (oid, entry.summary, entry.total_usd) for oid, entry in self.fixture.orders.items()
         ]
-        candidates += [
-            (p.order_id, speak_lines(p.lines), p.total_usd)
-            for p in self._placed_by_key.values()
-        ]
-        return [
+        fixture_candidates = [
             OrderCandidate(
                 key=str(i),
                 order_id=oid,
@@ -651,8 +685,13 @@ class OrderStore:
                 total_usd=total,
                 status=self.order_status(oid) or "unknown",
             )
-            for i, (oid, summary, total) in enumerate(candidates, start=1)
+            for i, (oid, summary, total) in enumerate(fixture, start=1)
         ]
+        placed_candidates = [
+            self._placed_candidate(record, str(len(fixture) + i))
+            for i, record in enumerate(self._placed_by_key.values(), start=1)
+        ]
+        return fixture_candidates + placed_candidates
 
     def captured_total(self, order_id: str) -> float | None:
         """The captured amount for an order (fixture OR placed); None if unknown.

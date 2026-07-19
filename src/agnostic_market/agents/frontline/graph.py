@@ -50,7 +50,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
 from agnostic_market.agents._consent import is_abort, is_support_abort, wants_human
-from agnostic_market.agents._copy import warm_close
+from agnostic_market.agents._copy import guest_list_close, warm_close
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
@@ -388,7 +388,10 @@ def build_frontline_graph(
             return referenced[:2] if re.search(r"\bboth\b", current, re.I) else referenced
         if bound is not None:
             return [candidate.order_id for candidate in store.owned_orders(bound.customer_ref)]
-        return []
+        # Unbound GUEST (Fix 3): a "list" state-check ("are they shipped?") reads the orders they
+        # placed THIS session — the same no-verify session-placed read the enumeration path allows.
+        # Still [] for a guest who placed nothing (no account history without a bind).
+        return [candidate.order_id for candidate in store.session_placed_orders()]
 
     def forced_status_node(state: ReasoningState) -> dict[str, object]:
         """Answer a state-verification follow-up from live authorized store reads."""
@@ -523,31 +526,48 @@ def build_frontline_graph(
     def handover_node(state: ReasoningState) -> dict[str, object]:
         assert state.handover is not None  # only reached with a handover set
         handover = state.handover
-        # A clear enumeration ask is code-routed before the frontline model. If this
-        # session is already account-bound, answer from the same scoped store view as the
-        # list_orders tool instead of needlessly re-entering Identity (and asking for OTP
-        # again). Unbound callers continue into Identity below.
+        # A clear enumeration ask is code-routed before the frontline model. Two READ scopes
+        # answer here without re-entering Identity; a third case (unbound with nothing placed)
+        # falls through to Identity below:
+        #   account  — a BOUND session: the full scoped account view (list_orders-tool parity).
+        #   session  — an UNBOUND guest who placed orders THIS call (Fix 3): reading back what
+        #              they just placed needs no verification (the session-placed read rule), but
+        #              the spoken line DISCLOSES it is this-call-only and offers verify-for-more.
+        # The two share ONE render/telemetry/cleanup tail (no drift). `order_scope` is a closed
+        # slug so the two authorization paths are auditable without PII.
         bound = identity_store.current()
-        if (
-            handover.destination == "support"
-            and handover.reason_code == "list_orders"
-            and bound is not None
-        ):
-            write_event(
-                {
-                    "utterance": _last_user_text(state),
-                    "outcome": "answered",
-                    "outcome_detail": "code_render",
-                    "tool": "list_orders",
+        if handover.destination == "support" and handover.reason_code == "list_orders":
+            candidates = None
+            order_scope = ""
+            if bound is not None:
+                candidates = store.owned_orders(bound.customer_ref)
+                order_scope = "account"
+            elif store.session_placed_orders():
+                candidates = store.session_placed_orders()
+                order_scope = "session"
+            if candidates is not None:
+                write_event(
+                    {
+                        "utterance": _last_user_text(state),
+                        "outcome": "answered",
+                        "outcome_detail": "code_render",
+                        "tool": "list_orders",
+                        "order_scope": order_scope,
+                    }
+                )
+                if order_scope == "session":
+                    line = render_order_list_line(candidates, scope="session")
+                    close = guest_list_close()  # discloses partial scope + verify-for-more
+                else:
+                    line = render_order_list_line(candidates)
+                    close = warm_close()
+                return {
+                    "messages": [AIMessage(f"{line} {close}")],
+                    "active_flow": None,
+                    "handover": None,
+                    "identity_claim_misses": 0,
                 }
-            )
-            line = render_order_list_line(store.owned_orders(bound.customer_ref))
-            return {
-                "messages": [AIMessage(f"{line} {warm_close()}")],
-                "active_flow": None,
-                "handover": None,
-                "identity_claim_misses": 0,
-            }
+            # Unbound with nothing placed this call: nothing to read -> verify (fall through).
         write_event(
             {
                 "utterance": _last_user_text(state),
