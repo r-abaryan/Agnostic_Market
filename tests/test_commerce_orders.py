@@ -580,3 +580,48 @@ def test_render_order_list_line_empty_and_unknown_status() -> None:
     )
     assert "You've got 1 order" in line
     assert "returned" in line  # fail-closed: the raw status word, no invented phrase
+
+
+# --- Fix 5: session-placed teardown drops caller-ephemeral, keeps durable business state ----
+
+
+def test_clear_session_placed_drops_view_but_keeps_placement_ledger(config_root: Path) -> None:
+    store = _store(config_root)
+    placed = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)  # ORD-9001
+    assert store.is_session_placed("ORD-9001")
+    store.clear_session_placed()
+    assert not store.is_session_placed("ORD-9001")
+    assert store.session_placed_orders() == []
+    assert "ORD-9001" not in {candidate.order_id for candidate in store.actionable_orders()}
+    assert store.identical_cart_order(list(placed.lines)) is None
+    # The committed placement/idempotency ledger remains: a principal rotation must not erase
+    # the order or let a stale replay create it again, even though the new caller cannot see it.
+    assert store.placed_count == 1
+    assert store.order_status("ORD-9001") == "processing"
+    assert store.order_summary("ORD-9001") is not None
+    replay = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)
+    assert replay is placed
+    assert store.placed_count == 1
+    assert not store.is_session_placed("ORD-9001")  # replay never restores prior authority
+    # Fixture/account orders are durable-SoR state — untouched.
+    assert store.order_status("ORD-1001") == "shipped"
+    assert [c.order_id for c in store.owned_orders("CUST-001")] == ["ORD-1001", "ORD-1003"]
+
+
+def test_clear_session_placed_never_undoes_committed_effects(config_root: Path) -> None:
+    # A guest placed orders this call and had one cancelled + a (partial) refund on another. On a
+    # principal switch the guest VIEW drops, but the committed cancel/refund records + status
+    # overlay are durable business outcomes and must survive (never undo a completed action).
+    store = _store(config_root)
+    voided = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)  # ORD-9001 -> cancelled
+    refunded = _place1(store, "k2", "SKU-RED-42", "shoes", 1, 89.99)  # ORD-9002 -> refunded
+    store.cancel_order("c1", order_id=voided.order_id)
+    store.issue_refund("r1", order_id=refunded.order_id, amount_usd=20.0, destination="original")
+    before_cancels, before_refunds = store.cancel_count, store.refund_count
+    store.clear_session_placed()
+    assert store.cancel_count == before_cancels  # committed cancel record retained
+    assert store.refund_count == before_refunds  # committed refund record retained
+    assert store.placed_count == 2  # committed placement records retained
+    assert store.order_status(voided.order_id) == "cancelled"  # status overlay retained
+    assert store.order_status(refunded.order_id) == "processing"
+    assert store.refunded_so_far(refunded.order_id) == 20.0

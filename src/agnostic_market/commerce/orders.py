@@ -460,7 +460,11 @@ class OrderStore:
 
     def __init__(self, fixture: OrdersFixture) -> None:
         self.fixture = fixture
+        # `_placed_by_key` is the store's committed placement/idempotency ledger. Visibility
+        # is a separate caller-context concern: principal rotation clears the ids below without
+        # deleting the order record or making a replay create a second order.
         self._placed_by_key: dict[str, PlacedOrder] = {}
+        self._session_placed_ids: set[str] = set()
         self._next_seq = 9001  # placed-order ids ORD-9001.. (disjoint from fixture ids)
         self._refunds_by_key: dict[str, RefundRecord] = {}
         self._next_refund_seq = 7001  # refund references R-7001..
@@ -518,7 +522,23 @@ class OrderStore:
         """True when THIS session's store placed the order (the caller placed it on this
         call — readable by them without any further verification, P7 rung 1)."""
         normalized = order_id.strip().upper()
-        return any(p.order_id == normalized for p in self._placed_by_key.values())
+        return normalized in self._session_placed_ids
+
+    def clear_session_placed(self) -> None:
+        """Drop only the caller-scoped authorization/view of placed orders.
+
+        The committed placement records and idempotency keys remain in `_placed_by_key`, just
+        like cancellation/refund/return records and their overlays. A principal switch must
+        neither expose the prior caller's orders nor erase a completed business outcome."""
+        self._session_placed_ids.clear()
+
+    def _iter_session_placed(self) -> Iterator[PlacedOrder]:
+        """Yield committed placements visible to the current caller context."""
+        return (
+            record
+            for record in self._placed_by_key.values()
+            if record.order_id in self._session_placed_ids
+        )
 
     def _placed_candidate(self, record: PlacedOrder, key: str) -> OrderCandidate:
         """The ONE placed-record -> OrderCandidate mapping (summary from `speak_lines`, effective
@@ -546,7 +566,7 @@ class OrderStore:
                 status=self.order_status(order_id) or "unknown",
             )
             index += 1
-        for record in self._placed_by_key.values():
+        for record in self._iter_session_placed():
             yield self._placed_candidate(record, str(index))
             index += 1
 
@@ -554,8 +574,8 @@ class OrderStore:
         """The GUEST enumeration view: orders placed THIS session, keyed "1".."N". Readable with
         NO verification — the caller placed them on this call, so reading them back is not a
         privacy leak (the same session-placed rule `order_read_allowed` already honors for reads).
-        Structurally excludes fixture/account orders (it touches only `_placed_by_key`), so an
-        unbound listing can never surface another account's order.
+        Structurally excludes fixture/account orders and committed placements outside the current
+        caller view, so an unbound listing can never surface another principal's order.
 
         PHASE-4 CAVEAT: "session" here means "this per-session OrderStore instance" — there is
         no `session_id`; the isolation is the fixture store's per-call lifetime. When the store
@@ -566,7 +586,7 @@ class OrderStore:
         into a shared store."""
         return [
             self._placed_candidate(record, str(i))
-            for i, record in enumerate(self._placed_by_key.values(), start=1)
+            for i, record in enumerate(self._iter_session_placed(), start=1)
         ]
 
     def owned_orders(self, customer_ref: str) -> list[OrderCandidate]:
@@ -636,6 +656,7 @@ class OrderStore:
         )
         self._next_seq += 1
         self._placed_by_key[idempotency_key] = placed
+        self._session_placed_ids.add(placed.order_id)
         return placed
 
     @property
@@ -654,7 +675,7 @@ class OrderStore:
         re-ordering after a cancel is a normal intent.
         """
         want = {ln.sku: ln.quantity for ln in lines}
-        for placed in self._placed_by_key.values():
+        for placed in self._iter_session_placed():
             if placed.order_id in self._cancelled_ids:
                 continue
             have = {ln.sku: ln.quantity for ln in placed.lines}
@@ -689,7 +710,7 @@ class OrderStore:
         ]
         placed_candidates = [
             self._placed_candidate(record, str(len(fixture) + i))
-            for i, record in enumerate(self._placed_by_key.values(), start=1)
+            for i, record in enumerate(self._iter_session_placed(), start=1)
         ]
         return fixture_candidates + placed_candidates
 

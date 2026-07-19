@@ -22,13 +22,18 @@ from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    load_customers_fixture,
+)
 from agnostic_market.commerce.orders import (
     LastOrderPointer,
     OrderStore,
     load_orders_fixture,
     speak_quantity,
 )
+from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider
 from agnostic_market.dtos.events import InterruptEvent, TurnFacts
 from agnostic_market.voice.tools import build_voice_tools
@@ -63,7 +68,7 @@ def _build(
     cart = cart or CartStore()
     pointer = pointer or LastOrderPointer()
     identity = CallerIdentityStore()
-    customers = CustomerDirectory()  # default fake directory (same data as the fixture)
+    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
         wrap_readonly_tool(t, "acme_store")
         for t in build_voice_tools(store, cart, pointer, identity, customers)
@@ -80,6 +85,7 @@ def _build(
         pointer=pointer,  # the SAME pointer order_status sets (Group C L4)
         identity_store=identity,  # the SAME store the order_status gate grants into (P7)
         customers=customers,
+        profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=_POLICY,
         checkpointer=build_checkpointer(),
     )

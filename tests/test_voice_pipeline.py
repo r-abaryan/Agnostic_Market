@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from livekit.agents import Agent
 from livekit.plugins import cartesia, deepgram
 from livekit.plugins import langchain as lk_langchain
 from llm_fakes import RecordingResolver
 
 from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.commerce.profile import ProfileFixture, load_profile_fixture
+from agnostic_market.config.loader import ConfigError
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.llm.gateway import load_provider_credentials
 from agnostic_market.voice.graph import GraphVoiceAdapter
@@ -92,10 +95,104 @@ async def test_engine_seam_wiring(config_root: Path) -> None:
     assert not loop.engine.pending_interrupt()  # fresh thread
 
 
+async def test_session_build_rejects_profile_for_unknown_customer(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agnostic_market.voice import pipeline
+
+    loaded = load_profile_fixture(config_root, "acme_store")
+    profile = next(iter(loaded.profiles.values()))
+    monkeypatch.setattr(
+        pipeline,
+        "load_profile_fixture",
+        lambda _root, _merchant: ProfileFixture(profiles={"CUST-UNKNOWN": profile}),
+    )
+    resolved = ConfigRegistry(config_root).load().get("acme_store")
+    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
+    with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
+        build_voice_loop(
+            resolved, credentials, RecordingResolver(), config_root=config_root
+        )
+
+
+class _FakeEngine:
+    def __init__(self, *, pending: bool = True) -> None:
+        self.deletes = 0
+        self._pending = pending
+
+    def pending_interrupt(self) -> bool:
+        return self._pending
+
+    def delete_thread(self) -> None:
+        self.deletes += 1
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+
+    def on(self, event: str):
+        def _register(fn):
+            self.handlers[event] = fn
+            return fn
+
+        return _register
+
+
+class _FakeClearable:
+    def __init__(self) -> None:
+        self.clears = 0
+
+    def clear(self) -> None:
+        self.clears += 1
+
+
+class _FakeOrderStore:
+    def __init__(self) -> None:
+        self.session_placed_clears = 0
+
+    def clear_session_placed(self) -> None:
+        self.session_placed_clears += 1
+
+
+def _fake_caller_context(engine=None):
+    from agnostic_market.voice.context import CallerContext
+
+    return CallerContext(
+        engine=engine or _FakeEngine(),
+        verification_store=_FakeClearable(),  # type: ignore[arg-type]
+        cart_store=_FakeClearable(),  # type: ignore[arg-type]
+        pointer=_FakeClearable(),  # type: ignore[arg-type]
+        identity_store=_FakeClearable(),  # type: ignore[arg-type]
+        order_store=_FakeOrderStore(),  # type: ignore[arg-type]
+    )
+
+
+def test_close_session_clears_every_caller_store_and_thread() -> None:
+    # Milestone A postcondition: close_session tears down ALL caller-ephemeral state (cart,
+    # pointer, session-placed orders, verification, identity) AND deletes the reasoning thread.
+    ctx = _fake_caller_context()
+    ctx.close_session()
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.pointer.clears == 1  # type: ignore[attr-defined]
+    assert ctx.order_store.session_placed_clears == 1  # type: ignore[attr-defined]
+    assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 1  # type: ignore[attr-defined]
+
+
+def test_close_session_is_idempotent() -> None:
+    # A double close (a race, or a reaper firing after a future transition) is harmless.
+    ctx = _fake_caller_context()
+    ctx.close_session()
+    ctx.close_session()
+    assert ctx.engine.deletes == 2  # the op runs each call; delete_thread is itself idempotent
+    assert ctx.cart_store.clears == 2  # type: ignore[attr-defined]
+
+
 def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
-    # Clock B: a double-fired session close deletes the thread + emits the abandoned
-    # event AT MOST once (the checkpointer delete is idempotent; the guard is for OUR
-    # telemetry, and for savers whose repeat-call behavior is unverified).
+    # Clock B: a double-fired session close runs the teardown + emits the abandoned event AT
+    # MOST once (the reaper's own re-entrant guard; the teardown itself is idempotent too).
     import json
 
     from agnostic_market.agents import telemetry
@@ -103,48 +200,20 @@ def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(telemetry, "_TELEMETRY_PATH", tmp_path / "telemetry.jsonl")
 
-    class FakeEngine:
-        def __init__(self) -> None:
-            self.deletes = 0
-
-        def pending_interrupt(self) -> bool:
-            return True  # a live pending confirmation at teardown -> abandoned
-
-        def delete_thread(self) -> None:
-            self.deletes += 1
-
-    class FakeSession:
-        def __init__(self) -> None:
-            self.handlers: dict[str, object] = {}
-
-        def on(self, event: str):
-            def _register(fn):
-                self.handlers[event] = fn
-                return fn
-
-            return _register
-
-    class FakeClearable:
-        def __init__(self) -> None:
-            self.clears = 0
-
-        def clear(self) -> None:
-            self.clears += 1
-
-    session, engine = FakeSession(), FakeEngine()
-    verification, cart, pointer, identity = (
-        FakeClearable(), FakeClearable(), FakeClearable(), FakeClearable(),
-    )
-    _attach_thread_reaper(session, engine, verification, cart, pointer, identity)  # type: ignore[arg-type]
+    session = _FakeSession()
+    ctx = _fake_caller_context()
+    _attach_thread_reaper(session, ctx)  # type: ignore[arg-type]
     session.handlers["close"](object())
     session.handlers["close"](object())  # double fire
-    assert engine.deletes == 1  # reaped once despite the double fire
-    assert verification.clears == 1  # verification grant cleared once (re-entrant-safe)
-    assert cart.clears == 1  # cart cleared once too
-    assert pointer.clears == 1  # the "that order" pointer cleared once too (Group C L4)
-    assert identity.clears == 1  # the identity binding + order grants cleared once (P7)
+    assert ctx.engine.deletes == 1  # type: ignore[attr-defined]  # reaped once despite double fire
+    assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.pointer.clears == 1  # type: ignore[attr-defined]
+    assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.order_store.session_placed_clears == 1  # type: ignore[attr-defined]
     lines = [
         json.loads(line)
         for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert [rec["event"] for rec in lines] == ["flow_abandoned"]
+    # flow_abandoned (reaper, pending interrupt) then caller_context_closed (close_session), once.
+    assert [rec["event"] for rec in lines] == ["flow_abandoned", "caller_context_closed"]

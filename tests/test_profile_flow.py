@@ -13,7 +13,7 @@ from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 
 from agnostic_market.agents.support import flow as support_flow
-from agnostic_market.commerce.profile import ProfileError, ProfileStore
+from agnostic_market.commerce.profile import ProfileError, ProfileStore, load_profile_fixture
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
@@ -24,6 +24,9 @@ _NEW_ADDRESS = "7 Elm Street, Dover"
 _REQUEST = "I moved recently, please update my delivery details"
 
 
+_OWNER = "CUST-001"  # the customer with a fixture profile (Fix 5 Milestone B)
+
+
 def _profile_harness(
     config_root: Path,
     field: str = "address",
@@ -32,8 +35,9 @@ def _profile_harness(
     reason_code: str = "address_change",
     risk_flagged: bool = False,
     thread_id: str = "prof-1",
+    bound: bool = True,
 ) -> SupportHarness:
-    return build_support_engine(
+    h = build_support_engine(
         config_root,
         policy=_POLICY,
         frontline=FakeChatModel(
@@ -51,6 +55,14 @@ def _profile_harness(
         risk_flagged=risk_flagged,
         thread_id=thread_id,
     )
+    if bound:
+        # A profile change is account-scoped: it requires an OTP-bound identity (Fix 5 M-B). The
+        # happy-path suites verify the CHANGE mechanics, so they start already bound to CUST-001
+        # (the fixture-profile customer); the unbound-detour + wrong-customer cases bind their own.
+        from agnostic_market.commerce.identity import BoundIdentity
+
+        h.identity.bind(BoundIdentity(customer_ref=_OWNER, masked_contact="number ending 0119"))
+    return h
 
 
 async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
@@ -89,7 +101,7 @@ async def test_committed_otp_then_readback_then_one_change(config_root: Path) ->
     assert h.profile.change_count == 0
     done = await _events(h.engine, "yes")
     assert h.profile.change_count == 1
-    assert h.profile.address_on_file() == _NEW_ADDRESS
+    assert h.profile.address_on_file(_OWNER) == _NEW_ADDRESS
     spoken = [e for e in done if isinstance(e, SpokenMessageEvent)]
     assert any(
         e.node == "support_profile_place" and _NEW_ADDRESS in e.text for e in spoken
@@ -101,12 +113,12 @@ async def test_contact_change_updates_the_factor_reference(config_root: Path) ->
         config_root, field="contact", new_value="555-0187", reason_code="contact_change",
         thread_id="prof-contact-1",
     )
-    old_factor = h.profile.contact_on_file()
+    old_factor = h.profile.contact_on_file(_OWNER)
     await _events(h.engine, "I've got a new phone number, put it on my account")
     await _events(h.engine, _VALID_OTP)  # the OTP went to the OLD factor
     await _events(h.engine, "yes")
-    assert h.profile.contact_on_file() == "555-0187"
-    assert h.profile.contact_on_file() != old_factor
+    assert h.profile.contact_on_file(_OWNER) == "555-0187"
+    assert h.profile.contact_on_file(_OWNER) != old_factor
 
 
 # --- security branches ---------------------------------------------------------------------
@@ -216,9 +228,10 @@ async def test_new_value_never_reaches_telemetry(config_root: Path, tmp_path: Pa
     assert "new_value" not in confirmed[0]
 
 
-def test_profile_error_string_carries_no_value() -> None:
+def test_profile_error_string_carries_no_value(config_root: Path) -> None:
+    store = ProfileStore(load_profile_fixture(config_root, "acme_store"))
     with pytest.raises(ProfileError) as err:
-        ProfileStore().update_profile("k1", field="address", new_value="   ")
+        store.update_profile("k1", customer_ref="CUST-001", field="address", new_value="   ")
     assert "address" in str(err.value)  # the field slug, never a caller value
 
 

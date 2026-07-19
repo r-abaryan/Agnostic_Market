@@ -31,9 +31,15 @@ from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
+    assert_orders_have_customers,
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.profile import (
+    ProfileStore,
+    assert_profiles_have_customers,
+    load_profile_fixture,
+)
 from agnostic_market.commerce.verification import OtpProvider, load_verification_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
@@ -108,7 +114,12 @@ async def _run() -> int:
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
     cart_store = CartStore()
     pointer = LastOrderPointer()
-    customers = CustomerDirectory(load_customers_fixture(_CONFIG_ROOT, _MERCHANT_ID))
+    customers_fixture = load_customers_fixture(_CONFIG_ROOT, _MERCHANT_ID)
+    profile_fixture = load_profile_fixture(_CONFIG_ROOT, _MERCHANT_ID)
+    assert_orders_have_customers(store.fixture, customers_fixture)
+    assert_profiles_have_customers(profile_fixture, customers_fixture)
+    customers = CustomerDirectory(customers_fixture)
+    profile_store = ProfileStore(profile_fixture)
     identity_store = CallerIdentityStore()
     tools = [
         wrap_readonly_tool(t, _MERCHANT_ID)
@@ -130,6 +141,7 @@ async def _run() -> int:
         pointer=pointer,  # SAME instance as order_status (Group C L4)
         identity_store=identity_store,  # SAME instance as the tools' gate (P7, no split-brain)
         customers=customers,
+        profile_store=profile_store,
         # The ONE config->runtime policy mapping — identical to production (F1). The old
         # hand-built copy here had drifted (it silently omitted spoken_policy_extra).
         policy=config.policies.to_policy_context(),

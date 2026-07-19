@@ -22,21 +22,22 @@ from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
 
 
-def _directory() -> CustomerDirectory:
-    return CustomerDirectory()  # the default fake: CUST-001 phone, CUST-002 email
+def _directory(config_root: Path) -> CustomerDirectory:
+    # From the acme_store YAML fixture (CUST-001 phone, CUST-002 email) — no hardcoded data.
+    return CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
 
 
 # --- claim matching (stub semantics: routing convenience — the OTP proves identity) --------
 
 
-def test_email_match_normalizes_case_and_whitespace() -> None:
-    d = _directory()
+def test_email_match_normalizes_case_and_whitespace(config_root: Path) -> None:
+    d = _directory(config_root)
     assert d.match_contact(" Casey@Example.COM ").customer_ref == "CUST-002"
     assert d.match_contact("casey @ example.com").customer_ref == "CUST-002"
 
 
-def test_phone_match_tolerates_formats_and_country_code() -> None:
-    d = _directory()
+def test_phone_match_tolerates_formats_and_country_code(config_root: Path) -> None:
+    d = _directory(config_root)
     assert d.match_contact("+1 555 010 0119").customer_ref == "CUST-001"  # exact
     assert d.match_contact("555-010-0119").customer_ref == "CUST-001"  # last-10, punctuated
     assert d.match_contact("5550100119").customer_ref == "CUST-001"  # bare digits
@@ -45,7 +46,7 @@ def test_phone_match_tolerates_formats_and_country_code() -> None:
 def test_spoken_email_form_matches(config_root: Path) -> None:
     # Live call #12 F-12.1: STT delivers spoken emails WITHOUT an '@' character — the
     # matcher must normalize " at "/" dot " before deciding email-vs-phone.
-    d = _directory()
+    d = _directory(config_root)
     assert d.match_contact("casey at example dot com").customer_ref == "CUST-002"
     # A trailing sentence period from STT must not break a correct address. (A leading
     # phrase like "It's ..." never reaches here — the model extracts the contact; spaces
@@ -54,9 +55,9 @@ def test_spoken_email_form_matches(config_root: Path) -> None:
     assert d.match_contact("k c at example dot com") is None  # normalized but WRONG address
 
 
-def test_spoken_digit_phone_matches() -> None:
+def test_spoken_digit_phone_matches(config_root: Path) -> None:
     # A phone number spoken as words ("five five five ... oh one one nine") must match.
-    d = _directory()
+    d = _directory(config_root)
     assert (
         d.match_contact("five five five zero one zero zero one one nine").customer_ref
         == "CUST-001"
@@ -67,17 +68,17 @@ def test_spoken_digit_phone_matches() -> None:
     )
 
 
-def test_no_cross_type_and_no_short_match() -> None:
-    d = _directory()
+def test_no_cross_type_and_no_short_match(config_root: Path) -> None:
+    d = _directory(config_root)
     assert d.match_contact("nobody@nowhere.example") is None
     assert d.match_contact("0119") is None  # too short for last-10; no exact
     assert d.match_contact("casey") is None  # neither email nor digits
     assert d.match_contact("   ") is None
 
 
-def test_match_returns_the_masked_form_only() -> None:
+def test_match_returns_the_masked_form_only(config_root: Path) -> None:
     # The matched identity carries the SPEAKABLE masked contact — never the raw value.
-    matched = _directory().match_contact("casey@example.com")
+    matched = _directory(config_root).match_contact("casey@example.com")
     assert matched.masked_contact == "email ending example dot com"
     assert "@" not in matched.masked_contact or "casey" not in matched.masked_contact
 

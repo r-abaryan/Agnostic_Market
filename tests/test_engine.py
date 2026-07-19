@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Annotated, TypedDict
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langgraph.graph.message import add_messages
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
@@ -25,8 +27,13 @@ from agnostic_market.agents.engine import (
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    load_customers_fixture,
+)
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.voice.tools import build_voice_tools
@@ -49,7 +56,7 @@ def _engine(
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     pointer = LastOrderPointer()
     identity = identity or CallerIdentityStore()
-    customers = CustomerDirectory()  # default fake directory (same data as the fixture)
+    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
         wrap_readonly_tool(t, "acme_store")
         for t in build_voice_tools(store, CartStore(), pointer, identity, customers)
@@ -64,6 +71,8 @@ def _engine(
         store=store,
         otp=OtpProvider(valid_code=_TEST_OTP),
         pointer=pointer,
+        customers=customers,
+        profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=make_policy(refund_returnless_under_usd=50.0),
         checkpointer=build_checkpointer(),
     )
@@ -421,3 +430,101 @@ def test_engine_module_imports_no_livekit() -> None:
 
     source = Path(engine_module.__file__).read_text(encoding="utf-8")
     assert "livekit" not in source.lower()
+
+
+# --- Fix 5 Milestone 0: LangGraph thread-rotation CONTRACT (framework behavior gate) --------
+#
+# This is a self-contained FRAMEWORK contract test (a mini-graph below; NO production graph, NO
+# src/ dependency beyond build_checkpointer's production serde). It pins the LangGraph behaviors
+# Fix 5's principal-context rotation (Milestone D) will rely on, so a LangGraph upgrade that
+# changes any of them fails HERE instead of silently breaking rotation:
+#   1. a FRESH thread is seeded with ONLY a typed continuation via update_state(as_node=START);
+#   2. that seed routes DETERMINISTICALLY into the intended bootstrap node;
+#   3. a confirmation interrupt is created AND resumed IN THE NEW thread, its effect running once;
+#   4. a DELETED old thread cannot recover its messages/interrupt/continuation and does NOT run the
+#      old effect (it may restart from START — pinned precisely so a behavior change is caught).
+# The active-thread-id SWAP that makes "old cannot resume" a hard guarantee is PRODUCTION code
+# (Milestone D) with its own test; deletion alone is what this contract covers.
+
+
+def _rot_append(a: list | None, b: list | None) -> list:
+    return (a or []) + (b or [])
+
+
+class _RotState(TypedDict, total=False):
+    messages: Annotated[list, add_messages]
+    continuation: str | None  # the typed continuation SEED (a proposal, not authority)
+    resolved: str | None  # what the bootstrap froze from the continuation
+    effect_done: int  # idempotence witness
+    visited: Annotated[list[str], _rot_append]
+
+
+def _rotation_contract_graph():
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+
+    def resolver(state: _RotState) -> dict:  # the continuation bootstrap node
+        return {"resolved": f"target::{state.get('continuation')}", "visited": ["resolver"]}
+
+    def confirm(state: _RotState) -> dict:
+        decision = interrupt({"ask": f"confirm {state.get('resolved')}?"})
+        return {"visited": ["confirm"], "messages": [("human", str(decision))]}
+
+    def route_after_confirm(state: _RotState) -> str:
+        last = state["messages"][-1]
+        text = (last.content if hasattr(last, "content") else str(last)).lower()
+        return "effect" if "yes" in text else END
+
+    def effect(state: _RotState) -> dict:
+        return {"effect_done": state.get("effect_done", 0) + 1, "visited": ["effect"]}
+
+    g = StateGraph(_RotState)
+    g.add_node("resolver", resolver)
+    g.add_node("confirm", confirm)
+    g.add_node("effect", effect)
+    g.add_edge(START, "resolver")
+    g.add_edge("resolver", "confirm")
+    g.add_conditional_edges("confirm", route_after_confirm, {"effect": "effect", END: END})
+    g.add_edge("effect", END)
+    return g.compile(checkpointer=build_checkpointer())
+
+
+def test_langgraph_thread_rotation_contract() -> None:
+    from langgraph.types import Command
+
+    graph = _rotation_contract_graph()
+    old = {"configurable": {"thread_id": "OLD"}}
+    new = {"configurable": {"thread_id": "NEW"}}
+
+    # OLD thread accumulates prior-principal state and pauses at an interrupt.
+    graph.update_state(old, {"messages": [("human", "A-private")], "continuation": "A"})
+    graph.invoke(None, old)
+    assert graph.get_state(old).next == ("confirm",)
+    assert len(graph.get_state(old).interrupts) == 1
+
+    # ROTATE: delete OLD, seed a FRESH thread with ONLY the typed continuation.
+    graph.checkpointer.delete_thread("OLD")
+    graph.update_state(new, {"continuation": "B-cancel-all", "effect_done": 0}, as_node="__start__")
+    seeded = graph.get_state(new)
+    assert seeded.values.get("continuation") == "B-cancel-all"
+    assert seeded.values.get("messages") in (None, [])  # NO prior-principal message bleed
+    assert seeded.next == ("resolver",)  # (2) deterministic bootstrap into the intended node
+
+    # Drive NEW with no input: resolver -> confirm -> interrupt IN THE NEW THREAD.
+    graph.invoke(None, new)
+    st = graph.get_state(new)
+    assert [i.value["ask"] for i in st.interrupts] == ["confirm target::B-cancel-all?"]
+    assert st.next == ("confirm",)
+
+    # (4) DELETED OLD cannot recover: a stray resume restarts from START — old messages/interrupt/
+    # continuation gone, and the old effect is NOT executed.
+    old_after = graph.invoke(Command(resume="yes"), old)
+    assert old_after.get("effect_done") is None  # old effect never ran
+    assert old_after.get("visited") == ["resolver"]  # restarted from START, not resumed at confirm
+    assert old_after.get("messages", []) == []  # no "A-private" recovered
+
+    # (3) Resume the NEW thread's interrupt -> effect runs EXACTLY once.
+    final = graph.invoke(Command(resume="yes"), new)
+    assert final.get("effect_done") == 1
+    assert final.get("visited") == ["resolver", "confirm", "effect"]
+    assert graph.get_state(new).next == ()  # completed

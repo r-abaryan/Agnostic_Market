@@ -296,6 +296,10 @@ class PendingProfileChange(BaseModel):
 
     model_config = _FROZEN
 
+    # The OTP-BOUND customer this change belongs to (Fix 5 Milestone B) — captured from the live
+    # binding at proposal time, re-validated against the live binding at effect time (§A4c), and
+    # the scope key for the customer-owned profile read/update. Never a model argument.
+    customer_ref: str = Field(min_length=1)
     field: ProfileField
     new_value: str = Field(min_length=1)
     factor_ref: str = Field(min_length=1)

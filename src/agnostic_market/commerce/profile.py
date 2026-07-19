@@ -18,6 +18,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from agnostic_market.commerce.identity import CustomersFixture
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.confirmation import ProfileField
 
@@ -25,8 +26,8 @@ _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
 
-class ProfileFixture(BaseModel):
-    """Validated stub profile content for one merchant's demo caller."""
+class CustomerProfile(BaseModel):
+    """One customer's stub profile content."""
 
     model_config = _STRICT
 
@@ -36,12 +37,24 @@ class ProfileFixture(BaseModel):
     contact_on_file: str = Field(min_length=1)
 
 
+class ProfileFixture(BaseModel):
+    """Validated stub profiles for a merchant, keyed by `customer_ref` (Fix 5 Milestone B). The
+    KEY is the owning customer — absence is a FAILED LOOKUP, never a fallback to another customer;
+    the `customer_ref` is derived from the live session binding, never a model argument."""
+
+    model_config = _STRICT
+
+    profiles: dict[str, CustomerProfile] = Field(min_length=1)
+
+
 class ProfileChangeRecord(BaseModel):
     """A profile change this store performed (store-internal audit record). `new_value`
-    stays INSIDE the store — telemetry/audit log the field slug only, never the value."""
+    stays INSIDE the store — telemetry/audit log the field slug only, never the value.
+    `customer_ref` scopes the change to its owner (Fix 5 Milestone B)."""
 
     model_config = _FROZEN
 
+    customer_ref: str = Field(min_length=1)
     field: ProfileField
     new_value: str = Field(min_length=1)
 
@@ -59,57 +72,83 @@ def load_profile_fixture(config_root: Path, merchant_id: str) -> ProfileFixture:
         raise ConfigError(f"profile fixture {path} failed validation:\n{exc}") from exc
 
 
-# The injectable-fake seam for builders that never enter the profile flow (eval/tests) —
-# same fixture-backed test seam as OtpProvider. EXCEPTION: hardcoded fake on-file values,
-# because this IS the test seam; production loads a merchant fixture.
-_DEFAULT_FIXTURE = ProfileFixture(
-    address_on_file="12 Harbor Lane, Springfield",
-    contact_on_file="number ending 0119",
-)
+def assert_profiles_have_customers(
+    profiles: ProfileFixture, customers: CustomersFixture
+) -> None:
+    """Every profile owner must exist in the customer directory.
+
+    This is a build-time fixture integrity check, not a runtime authorization decision. Only
+    closed customer refs appear in the error; profile/contact/address values never do.
+    """
+    unknown = sorted(set(profiles.profiles) - set(customers.customers))
+    if unknown:
+        raise ConfigError(
+            "profiles fixture names customer_refs missing from the customers fixture: "
+            + ", ".join(unknown)
+        )
 
 
 class ProfileStore:
-    """The stub profile SoR: on-file reads (update overlay wins) + idempotent updates."""
+    """The stub profile SoR (Fix 5 Milestone B: customer-scoped): per-customer on-file reads
+    (update overlay wins) + idempotent updates. EVERY read/update requires a `customer_ref`,
+    which the flow derives from the LIVE session binding (never a model argument). A customer
+    with no fixture profile has none — reads/updates fail closed, never falling back to another
+    customer's data. Changes are keyed by `(customer_ref, intent_key)` so a replay is
+    per-customer scoped and one customer's change can never surface for another.
 
-    def __init__(self, fixture: ProfileFixture | None = None) -> None:
-        self.fixture = fixture or _DEFAULT_FIXTURE
-        self._changes_by_key: dict[str, ProfileChangeRecord] = {}
+    The `fixture` is REQUIRED — profile data lives in `config/fixtures/profiles/*.yaml`, never
+    hardcoded (load via `load_profile_fixture`); tests use the same loader, no baked-in default."""
 
-    def _current(self, field: ProfileField) -> str:
+    def __init__(self, fixture: ProfileFixture) -> None:
+        self.fixture = fixture
+        self._changes_by_key: dict[tuple[str, str], ProfileChangeRecord] = {}
+
+    def has_profile(self, customer_ref: str) -> bool:
+        """Whether THIS customer has a profile on file. The flow checks this BEFORE a mutation
+        and fails closed (neutral handover) when False — never revealing whether other profiles
+        exist."""
+        return customer_ref in self.fixture.profiles
+
+    def _current(self, customer_ref: str, field: ProfileField) -> str:
+        base = self.fixture.profiles.get(customer_ref)
+        if base is None:
+            raise ProfileError(f"no profile on file for {customer_ref}")
         latest = None
-        for record in self._changes_by_key.values():  # insertion-ordered: last write wins
-            if record.field == field:
-                latest = record.new_value
+        for (ref, _key), record in self._changes_by_key.items():  # insertion-ordered
+            if ref == customer_ref and record.field == field:
+                latest = record.new_value  # last write for THIS customer wins
         if latest is not None:
             return latest
-        return (
-            self.fixture.address_on_file if field == "address" else self.fixture.contact_on_file
-        )
+        return base.address_on_file if field == "address" else base.contact_on_file
 
-    def address_on_file(self) -> str:
-        """The effective delivery address (the latest applied change wins over the fixture)."""
-        return self._current("address")
+    def address_on_file(self, customer_ref: str) -> str:
+        """The bound customer's effective delivery address (latest change wins over fixture)."""
+        return self._current(customer_ref, "address")
 
-    def contact_on_file(self) -> str:
-        """The effective MASKED contact factor reference (latest change wins)."""
-        return self._current("contact")
+    def contact_on_file(self, customer_ref: str) -> str:
+        """The bound customer's effective MASKED contact factor reference (latest change wins).
+        This is the OTP factor for that customer — never another customer's."""
+        return self._current(customer_ref, "contact")
 
     def update_profile(
-        self, idempotency_key: str, *, field: ProfileField, new_value: str
+        self, idempotency_key: str, *, customer_ref: str, field: ProfileField, new_value: str
     ) -> ProfileChangeRecord:
-        """Apply a profile change, deduplicated by per-INTENT `idempotency_key` (SoR-arbiter
-        rule): a replayed effect returns the ORIGINAL record and never applies twice. The
-        caller must have already gated the L2 step-up (`profile_change_required_level`) —
-        the store re-validates shape, not identity (§A4c identity re-check is the flow's
-        live level read at place time)."""
-        existing = self._changes_by_key.get(idempotency_key)
+        """Apply a profile change for `customer_ref`, deduplicated by `(customer_ref, intent)`
+        (SoR-arbiter rule): a replayed effect returns the ORIGINAL record and never applies
+        twice. Fails closed for a customer with no profile on file. The caller must have already
+        gated the L2 step-up AND proven a binding to THIS customer (§A4c — the flow's live
+        re-read of both level and binding at place time)."""
+        if not self.has_profile(customer_ref):
+            raise ProfileError(f"no profile on file for {customer_ref}")
+        key = (customer_ref, idempotency_key)
+        existing = self._changes_by_key.get(key)
         if existing is not None:
             return existing
         cleaned = new_value.strip()
         if not cleaned:
             raise ProfileError(f"empty {field} value - nothing to update")
-        record = ProfileChangeRecord(field=field, new_value=cleaned)
-        self._changes_by_key[idempotency_key] = record
+        record = ProfileChangeRecord(customer_ref=customer_ref, field=field, new_value=cleaned)
+        self._changes_by_key[key] = record
         return record
 
     @property

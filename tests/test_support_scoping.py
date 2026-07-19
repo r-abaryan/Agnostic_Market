@@ -521,12 +521,8 @@ async def test_return_gated_at_assemble(config_root: Path, tmp_path: Path) -> No
 # --- scope boundaries + PII ----------------------------------------------------------------
 
 
-async def test_profile_change_not_gated_by_order_scope(
-    config_root: Path, tmp_path: Path
-) -> None:
-    # Profile changes target the ACCOUNT (L2 step-up on the old factor), not an order —
-    # the gate never runs; the OTP dispatch proves the flow proceeded.
-    h = build_support_engine(
+def _profile_harness(config_root: Path, thread_id: str) -> SupportHarness:
+    return build_support_engine(
         config_root,
         policy=_POLICY,
         frontline=FakeChatModel(
@@ -543,13 +539,63 @@ async def test_profile_change_not_gated_by_order_scope(
             },
             tool_call_limit=1,
         ),
-        thread_id="scope-15",
+        thread_id=thread_id,
     )
+
+
+async def test_profile_change_not_gated_by_order_scope(
+    config_root: Path, tmp_path: Path
+) -> None:
+    # Profile changes target the ACCOUNT (L2 step-up on the old factor), not an order — the
+    # ORDER gate never runs. A BOUND caller (Fix 5 M-B: profile requires a bound identity) whose
+    # customer has a profile proceeds; the OTP dispatch proves the flow was not order-gated.
+    h = _profile_harness(config_root, thread_id="scope-15")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     await _events(h.engine, "I have a new phone number for my account")
-    assert h.otp.dispatch_count == 1  # the step-up chain ran — the flow was not gated
+    assert h.otp.dispatch_count == 1  # the step-up chain ran — the flow was not order-gated
     tel = _telemetry(tmp_path)
     assert not any(e["event"].startswith("support_auth_") for e in tel)
     assert not any(e["event"] == "support_action_authorized" for e in tel)
+
+
+async def test_unbound_profile_change_detours_to_identity(
+    config_root: Path, tmp_path: Path
+) -> None:
+    # Fix 5 M-B: a profile change is account-scoped, so an UNBOUND caller cannot mutate — it
+    # detours into the identity OTP flow (no profile step-up dispatched, nothing changed).
+    h = _profile_harness(config_root, thread_id="scope-prof-unbound")
+    await _events(h.engine, "I have a new phone number for my account")
+    assert _active_flow(h, "scope-prof-unbound") == "identity"
+    assert h.otp.dispatch_count == 0  # no profile OTP — we're verifying identity first
+    assert h.profile.change_count == 0
+    assert any(
+        e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path)
+    )
+
+
+async def test_bound_customer_without_profile_fails_closed(
+    config_root: Path, tmp_path: Path
+) -> None:
+    # A caller bound to a customer with NO profile on file (CUST-002) is refused with the
+    # neutral not-available line — never a fallback to CUST-001's profile, never an oracle.
+    h = _profile_harness(config_root, thread_id="scope-prof-noprofile")
+    h.identity.bind(
+        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
+    )
+    events = await _events(h.engine, "I have a new phone number for my account")
+    assert h.otp.dispatch_count == 0
+    assert h.profile.change_count == 0
+    assert [e.text for e in events if isinstance(e, SpokenMessageEvent)] == [
+        "Let me get you to a person who can help with that."
+    ]
+    state = _state_values(h, "scope-prof-noprofile")
+    assert state.get("active_flow") is None
+    assert state.get("pending_profile_change") is None
+    assert state["handover"].destination == "human"
+    assert state["handover"].reason_code == "contact_change"
+    telemetry = _telemetry(tmp_path)
+    assert sum(e["event"] == "profile_change_denied" for e in telemetry) == 1
+    assert sum(e["event"] == "human_onramp" for e in telemetry) == 1
 
 
 async def test_needs_identity_detour_never_echoes_a_contact(
@@ -578,5 +624,3 @@ async def test_needs_identity_detour_never_echoes_a_contact(
         )
     tool_msgs = _tool_messages(h, "scope-16")
     assert not any(_CONTACT_1002 in str(m.content) for m in tool_msgs)
-
-

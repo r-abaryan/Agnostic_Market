@@ -216,10 +216,10 @@ def build_frontline_graph(
     otp: OtpProvider,
     verification_store: VerificationStore | None = None,
     risk: RiskProvider | None = None,
-    profile_store: ProfileStore | None = None,
+    profile_store: ProfileStore,
     pointer: LastOrderPointer | None = None,
     identity_store: CallerIdentityStore | None = None,
-    customers: CustomerDirectory | None = None,
+    customers: CustomerDirectory,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
@@ -241,7 +241,6 @@ def build_frontline_graph(
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
     cart_store = cart_store or CartStore()
-    profile_store = profile_store or ProfileStore()  # default fake fixture (test/eval seam)
     # Session "that order" pointer (Group C L4). Production + any pointer test MUST pass the
     # SAME instance given to build_voice_tools (the order_status set-site) — the default
     # exists only for callers that never resolve an order reference (split-brain otherwise).
@@ -250,7 +249,6 @@ def build_frontline_graph(
     # order_status tool GRANTS into `identity_store` and the render router READS it — pass
     # the ONE instance to both build_voice_tools and here.
     identity_store = identity_store or CallerIdentityStore()
-    customers = customers or CustomerDirectory()  # default fake fixture (test/eval seam)
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
@@ -853,7 +851,8 @@ def build_frontline_graph(
     # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
     #     the flow, closed over the store — support.route_after_* ) ---
     def route_after_support_assemble(state: ReasoningState) -> str:
-        # refund | cancel | return | profile | resolve | needs_identity | leave | clarify.
+        # refund | cancel | return | profile | resolve | needs_identity | handover | leave |
+        # clarify.
         decision = support.route_after_assemble(state)
         return {
             "refund": "support_guardrail",
@@ -862,6 +861,7 @@ def build_frontline_graph(
             "profile": "support_profile_guardrail",
             "resolve": "support_resolve",  # a bound caller's "cancel all" -> resolve now
             "needs_identity": "identity_assemble",  # unbound "cancel all" -> verify first
+            "handover": "handover",  # deterministic fail-closed path (for example no profile)
             "leave": "gate",  # model left; normal pipeline answers this same turn
             "clarify": END,  # a clarifying question was streamed already
         }[decision]
@@ -1136,6 +1136,7 @@ def build_frontline_graph(
             "support_profile_guardrail": "support_profile_guardrail",
             "support_resolve": "support_resolve",  # a bound caller's scope resolves now
             "identity_assemble": "identity_assemble",  # unbound scope -> verify first
+            "handover": "handover",
             END: END,
         },
     )

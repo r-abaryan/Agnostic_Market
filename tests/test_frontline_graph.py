@@ -11,8 +11,13 @@ from policy_helpers import make_policy
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
+from agnostic_market.commerce.identity import (
+    CallerIdentityStore,
+    CustomerDirectory,
+    load_customers_fixture,
+)
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.tools import build_voice_tools
@@ -36,14 +41,16 @@ def _granted(*order_ids: str) -> CallerIdentityStore:
 
 
 def _tools(
+    config_root: Path,
     store: OrderStore,
     cart: CartStore,
     pointer: LastOrderPointer,
     identity: CallerIdentityStore,
 ) -> list:
+    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     return [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, pointer, identity, CustomerDirectory())
+        for t in build_voice_tools(store, cart, pointer, identity, customers)
     ]
 
 
@@ -57,13 +64,15 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     identity = kwargs.pop("identity", None) or CallerIdentityStore()
     return build_frontline_graph(
         fake,
-        _tools(store, cart, pointer, identity),
+        _tools(config_root, store, cart, pointer, identity),
         display_name="Acme Store",
         tenant_id="acme_store",
         cart_store=cart,
         pointer=pointer,
         otp=kwargs.pop("otp", None) or OtpProvider(valid_code=_TEST_OTP),
         identity_store=identity,
+        customers=CustomerDirectory(load_customers_fixture(config_root, "acme_store")),
+        profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,

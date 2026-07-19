@@ -137,23 +137,6 @@ def assert_orders_have_customers(orders: OrdersFixture, customers: CustomersFixt
         )
 
 
-# The injectable-fake seam for builders that never exercise identity (same stance as
-# profile._DEFAULT_FIXTURE). EXCEPTION: hardcoded fake customer data, because this IS the
-# declared zero-config test seam; production loads a merchant fixture. CUST-001's phone
-# deliberately ends 0119 — the same masked factor the profile fixture carries, so the demo
-# caller's artifacts cohere.
-_DEFAULT_FIXTURE = CustomersFixture(
-    customers={
-        "CUST-001": CustomerEntry(
-            contact="+1 555 010 0119", masked_contact="number ending 0119"
-        ),
-        "CUST-002": CustomerEntry(
-            contact="casey@example.com", masked_contact="email ending example dot com"
-        ),
-    }
-)
-
-
 class CustomerDirectory:
     """The stub identity SoR lookup: a spoken contact claim -> the customer it names.
 
@@ -165,10 +148,13 @@ class CustomerDirectory:
     last-10-digits equality (country-code tolerance) — never across types. The leniency is
     a ROUTING convenience only: the OTP to the on-file factor is what proves identity, not
     this match. Never logs the claim.
+
+    The `fixture` is REQUIRED — customer data lives in `config/fixtures/customers/*.yaml`, never
+    hardcoded (load via `load_customers_fixture`); tests use the same loader, no baked-in default.
     """
 
-    def __init__(self, fixture: CustomersFixture | None = None) -> None:
-        self.fixture = fixture or _DEFAULT_FIXTURE
+    def __init__(self, fixture: CustomersFixture) -> None:
+        self.fixture = fixture
 
     def masked_contact(self, customer_ref: str) -> str | None:
         entry = self.fixture.customers.get(customer_ref)

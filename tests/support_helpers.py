@@ -18,7 +18,7 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
-from agnostic_market.commerce.profile import ProfileStore
+from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import PolicyContext
 
@@ -82,7 +82,7 @@ def build_support_engine(
     ]
     otp = OtpProvider(valid_code=TEST_OTP)
     verification = VerificationStore(otp)
-    profile = ProfileStore()
+    profile = ProfileStore(load_profile_fixture(config_root, "acme_store"))
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,

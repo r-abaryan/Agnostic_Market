@@ -713,6 +713,37 @@ def build_support_nodes(
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
+                # A profile change is ACCOUNT-scoped, so it requires a BOUND identity (Fix 5
+                # Milestone B): the customer whose profile is touched comes from the LIVE binding,
+                # never a model argument. An UNBOUND caller detours into the identity OTP flow to
+                # bind first, then re-proposes (reusing the mutation detour). A BOUND caller whose
+                # customer has no profile on file fails CLOSED — one neutral human-handover
+                # line, never falling back to (or revealing) another customer's profile.
+                bound = identity_store.current()
+                if bound is None:
+                    new_messages.append(
+                        ToolMessage("verification needed", tool_call_id=call["id"])
+                    )
+                    return _enter_identity_for_action(new_messages)
+                if not profile_store.has_profile(bound.customer_ref):
+                    write_event({"event": "profile_change_denied", "reason": "no_profile"})
+                    new_messages.append(
+                        ToolMessage("profile update unavailable", tool_call_id=call["id"])
+                    )
+                    return {
+                        "messages": new_messages,
+                        "pending_profile_change": None,
+                        "active_flow": None,
+                        "handover": HandoffRequest(
+                            destination="human",
+                            reason_code=(
+                                "address_change"
+                                if change.field == "address"
+                                else "contact_change"
+                            ),
+                            source="gate",
+                        ),
+                    }
                 # NO value echo in the tool result (PII: thread history is model-visible
                 # context, but the persisted line must not carry the raw value a second
                 # time beyond the pending itself).
@@ -722,11 +753,13 @@ def build_support_nodes(
                     )
                 )
                 pending_change = PendingProfileChange(
+                    customer_ref=bound.customer_ref,
                     field=change.field,
                     new_value=change.new_value.strip(),
                     # The MASKED on-file contact the OTP goes to — for a contact change
                     # this is the OLD factor (change-the-factor needs the factor, §A4a).
-                    factor_ref=profile_store.contact_on_file(),
+                    # Scoped to the bound customer (never a fallback's factor).
+                    factor_ref=profile_store.contact_on_file(bound.customer_ref),
                     idempotency_key=uuid.uuid4().hex,
                     attempt_key=uuid.uuid4().hex,
                     created_at=time.time(),
@@ -1666,8 +1699,15 @@ def build_support_nodes(
         pending = state.pending_profile_change
         assert pending is not None
         required = profile_change_required_level(pending.field)
-        if verification_store.current_level() < required:
-            write_event({"event": "profile_stepup_failed", "reason": "level_lapsed_at_place"})
+        # Re-validate BOTH legs live at effect time (§A4c): the level must still hold, AND the
+        # session must still be bound to the SAME customer the change was proposed for (Fix 5
+        # Milestone B — a binding that lapsed or switched between propose and here must not apply
+        # a change to the wrong / an unauthorized account).
+        bound = identity_store.current()
+        binding_holds = bound is not None and bound.customer_ref == pending.customer_ref
+        if verification_store.current_level() < required or not binding_holds:
+            reason = "level_lapsed_at_place" if binding_holds else "binding_lapsed_at_place"
+            write_event({"event": "profile_stepup_failed", "reason": reason})
             return {
                 "pending_profile_change": None,
                 "active_flow": None,
@@ -1677,7 +1717,10 @@ def build_support_nodes(
             }
         try:
             record = profile_store.update_profile(
-                pending.idempotency_key, field=pending.field, new_value=pending.new_value
+                pending.idempotency_key,
+                customer_ref=pending.customer_ref,
+                field=pending.field,
+                new_value=pending.new_value,
             )
         except ProfileError as exc:
             logger.warning("profile change refused by store: %s", type(exc).__name__)
@@ -1756,6 +1799,8 @@ def build_support_nodes(
 
     def route_after_assemble(state: ReasoningState) -> str:
         # Which effect did assemble mint? (a valid proposal sets exactly one pending.)
+        if state.handover is not None:
+            return "handover"
         if state.active_flow == "left_support":
             return "leave"  # model left / two invalid proposals -> normal pipeline answers
         if state.active_flow == "identity":

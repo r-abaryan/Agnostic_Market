@@ -36,7 +36,11 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
-from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
+from agnostic_market.commerce.profile import (
+    ProfileStore,
+    assert_profiles_have_customers,
+    load_profile_fixture,
+)
 from agnostic_market.commerce.verification import (
     OtpProvider,
     RiskProvider,
@@ -47,6 +51,7 @@ from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
+from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.stt_engine import build_stt
 from agnostic_market.voice.tools import build_voice_tools
@@ -137,9 +142,9 @@ def build_voice_loop(
     otp = OtpProvider(valid_code=verification_fixture.otp_code)
     verification_store = VerificationStore(otp)
     risk = RiskProvider()
-    # Per-session profile SoR (Group C) — fixture-backed like OrderStore; the profile-change
-    # flow's effect target. Dies with the session.
-    profile_store = ProfileStore(load_profile_fixture(config_root, config.merchant_id))
+    # Per-session profile SoR (Group C) — fixture-backed like OrderStore; validated against
+    # the customer directory below before its flow-facing store is constructed.
+    profile_fixture = load_profile_fixture(config_root, config.merchant_id)
     # Session "that order" pointer (Group C L4): the SAME instance feeds the order_status
     # tool (set on a found read) and the flows (set on place/cancel/return) — one instance
     # to both, or references resolve against different state (split-brain, like the cart).
@@ -147,9 +152,11 @@ def build_voice_loop(
     # Per-session authorization state + the customer directory (P7): the order_status tool
     # GRANTS into identity_store (rung 1) and the identity flow BINDS it (rung 2); the graph
     # reads the SAME instance (the render router's order-read gate) — split-brain otherwise.
-    # The build-time cross-check fails loudly on an order whose customer_ref names nobody.
+    # The build-time cross-checks fail loudly when an order or profile owner names nobody.
     customers_fixture = load_customers_fixture(config_root, config.merchant_id)
     assert_orders_have_customers(store.fixture, customers_fixture)
+    assert_profiles_have_customers(profile_fixture, customers_fixture)
+    profile_store = ProfileStore(profile_fixture)
     customers = CustomerDirectory(customers_fixture)
     identity_store = CallerIdentityStore()
     gateway = LLMGateway(credentials, secrets)
@@ -216,7 +223,15 @@ def build_voice_loop(
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    _attach_thread_reaper(session, engine, verification_store, cart_store, pointer, identity_store)
+    caller_context = CallerContext(
+        engine=engine,
+        verification_store=verification_store,
+        cart_store=cart_store,
+        pointer=pointer,
+        identity_store=identity_store,
+        order_store=store,
+    )
+    _attach_thread_reaper(session, caller_context)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -232,22 +247,15 @@ def build_voice_loop(
     )
 
 
-def _attach_thread_reaper(
-    session: AgentSession,
-    engine: ReasoningEngine,
-    verification_store: VerificationStore,
-    cart_store: CartStore,
-    pointer: LastOrderPointer,
-    identity_store: CallerIdentityStore,
-) -> None:
-    """Clock B (AGENTS §A10 rule 4): on session close, the thread is reaped UNCONDITIONALLY
-    — a dropped call must never leave a resumable placement/refund. Re-entrant-safe: a
-    double-fired close deletes once and emits the abandoned event at most once. Nothing is
-    spoken (the caller is gone); expiry of a still-connected caller's pending action is
-    Clock A, owned by the graph's confirm node. The verification grant, the cart, AND the
-    identity binding/order grants (P7) are cleared too, so a reattaching session can never
-    inherit a stale L2, a stale cart, or someone else's verified identity
-    (belt-and-suspenders — the per-session stores already die with the session)."""
+def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) -> None:
+    """Clock B (AGENTS §A10 rule 4): on session close, the caller context is torn down
+    UNCONDITIONALLY — a dropped call must never leave a resumable placement/refund, a stale
+    level, cart, pointer, verified identity, or guest order for a reattaching session (the
+    per-session stores already die with the session; this is belt-and-suspenders). The whole
+    teardown lives in `CallerContext.close_session` (Fix 5), which is itself idempotent; the
+    reaper adds the session-close-specific `flow_abandoned` telemetry (pending interrupt) and a
+    re-entrant guard so a double-fired close acts at most once. Nothing is spoken (the caller is
+    gone); expiry of a still-connected caller's pending action is Clock A (the confirm node)."""
     reaped = False
 
     @session.on("close")
@@ -256,13 +264,9 @@ def _attach_thread_reaper(
         if reaped:
             return
         reaped = True
-        if engine.pending_interrupt():
+        if caller_context.engine.pending_interrupt():
             write_event({"event": "flow_abandoned", "reason": "session_closed"})
-        engine.delete_thread()
-        verification_store.clear()
-        cart_store.clear()
-        pointer.clear()
-        identity_store.clear()
+        caller_context.close_session()
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:
