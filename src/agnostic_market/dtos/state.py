@@ -16,6 +16,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
+from agnostic_market.dtos.orchestration import CancelScope
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
@@ -174,9 +175,6 @@ CancelOutcomeCode = Literal[
     "store_refused",  # effect-time refusal (stale since preflight); CancelError carries no
     # typed reason, so a rare effect-time refusal collapses to this generic honest code
 ]
-
-CancelScope = Literal["all_cancellable", "both_cancellable"]
-
 
 class BatchCancelOutcome(BaseModel):
     """One target's cancel result — the STRUCTURED per-order fact the final line is rendered

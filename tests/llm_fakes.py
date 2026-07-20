@@ -35,17 +35,19 @@ class RecordingResolver:
 CONFORMANT_ARGS: dict[str, dict[str, Any]] = {
     "get_order_status": {"order_id": "ORD-1001"},
     "search_catalog": {"query": "running shoes"},
-    "CheckoutQuote": {
-        "items": [{"sku": "SKU-RED-42", "quantity": 2}],
-        "currency": "USD",
-        "total": 19.99,
+    "RouteDecision": {
+        "decision": "direct",
+        "request": {
+            "kind": "cancel_orders",
+            "target": {"selector": "cancellable_scope", "scope": "all_cancellable"},
+        },
     },
 }
 
-# Fails CheckoutQuote validation (bad types + missing required field).
-BROKEN_QUOTE_ARGS: dict[str, dict[str, Any]] = {
+# Fails RouteDecision validation (direct decisions require exactly one valid request).
+BROKEN_ROUTE_ARGS: dict[str, dict[str, Any]] = {
     **CONFORMANT_ARGS,
-    "CheckoutQuote": {"items": "not-a-list", "currency": "GBP"},
+    "RouteDecision": {"decision": "direct", "request": None},
 }
 
 _TEXT_RESPONSE = "A light, cushioned running shoe. It grips well on wet roads."

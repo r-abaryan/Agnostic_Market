@@ -12,8 +12,8 @@ check (-> chat-only); a transport/auth error raises `ConformanceRunError` and NO
 recorded — infrastructure failure is never converted into a capability verdict.
 
 Checks run async (`ainvoke`/`astream`) because that is the production voice-loop path.
-The structured-output schema is order-line-LIKE on purpose, NOT a commerce DTO — those land
-in Phase 3, and pre-inventing them here would create a second source of truth.
+The structured-output check uses the real routing contract now that it exists. This pins the
+configured commerce model to the nested/discriminated shape production routing will consume.
 """
 
 from __future__ import annotations
@@ -21,13 +21,12 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessageChunk
 from langchain_core.tools import tool
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.config import LLMConfig, MerchantConfig, ProviderModel
@@ -37,9 +36,15 @@ from agnostic_market.dtos.llm import (
     ConformanceReport,
     ConformanceTargetsConfig,
 )
+from agnostic_market.dtos.orchestration import (
+    CancellableOrderScope,
+    CancelOrders,
+    CapabilityId,
+    RouteDecision,
+)
 
 # Bump when checks are added/changed — outstanding reports then fail closed (re-certify).
-SUITE_VERSION = "1"
+SUITE_VERSION = "2"
 
 # Prompts name the required tool explicitly: the check verifies protocol conformance
 # (parse/emit/select), not semantic routing quality (that is Phase 6's behavioral eval).
@@ -47,7 +52,10 @@ _TOOL_CALL_PROMPT = (
     "Use the get_order_status tool to look up order 'ORD-1001'. Do not answer directly."
 )
 _EXPECTED_TOOL = "get_order_status"
-_STRUCTURED_PROMPT = "Produce a checkout quote for 2 units of sku 'SKU-RED-42', 19.99 USD total."
+_STRUCTURED_PROMPT = (
+    "Return a direct route for this caller request: 'cancel all my orders'. Use one "
+    "cancel_orders request with the all_cancellable scope."
+)
 _STREAMING_PROMPT = "In two short sentences, describe a running shoe."
 
 
@@ -69,23 +77,6 @@ def get_order_status(order_id: str) -> str:
 def search_catalog(query: str) -> str:
     """Search the product catalog for items matching a text query."""
     raise NotImplementedError("conformance probe - never executed")
-
-
-class QuoteLine(BaseModel):
-    sku: str
-    quantity: int
-
-
-class CheckoutQuote(BaseModel):
-    """Nested order-line-LIKE shape (list + enum) for the structured-output check.
-
-    No numeric-constraint keywords: provider strict-schema subsets vary, and a schema the
-    provider rejects would be a harness failure misread as a model failure.
-    """
-
-    items: list[QuoteLine]
-    currency: Literal["USD", "EUR"]
-    total: float
 
 
 def _clip(text: str) -> str:
@@ -114,9 +105,9 @@ async def _check_tool_call(chat_model: BaseChatModel) -> ConformanceCheck:
 
 
 async def _check_structured_output(chat_model: BaseChatModel) -> ConformanceCheck:
-    """`with_structured_output` must return a validated CheckoutQuote instance."""
+    """`with_structured_output` must return the real validated route contract."""
     name = "structured_output"
-    structured = chat_model.with_structured_output(CheckoutQuote)
+    structured = chat_model.with_structured_output(RouteDecision)
     try:
         result = await structured.ainvoke(_STRUCTURED_PROMPT)
     except (OutputParserException, ValidationError) as exc:
@@ -124,12 +115,19 @@ async def _check_structured_output(chat_model: BaseChatModel) -> ConformanceChec
         return ConformanceCheck(
             name=name, passed=False, detail=f"output failed schema ({type(exc).__name__})"
         )
-    if not isinstance(result, CheckoutQuote):
+    if not isinstance(result, RouteDecision):
         return ConformanceCheck(
-            name=name, passed=False, detail=f"no CheckoutQuote (got {type(result).__name__})"
+            name=name, passed=False, detail=f"no RouteDecision (got {type(result).__name__})"
         )
-    if not result.items:
-        return ConformanceCheck(name=name, passed=False, detail="quote has an empty items list")
+    request = result.request
+    if (
+        result.decision != "direct"
+        or not isinstance(request, CancelOrders)
+        or request.kind != CapabilityId.CANCEL_ORDERS
+        or not isinstance(request.target, CancellableOrderScope)
+        or request.target.scope != "all_cancellable"
+    ):
+        return ConformanceCheck(name=name, passed=False, detail="route has the wrong typed request")
     return ConformanceCheck(name=name, passed=True, detail="")
 
 

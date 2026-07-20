@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from llm_fakes import BROKEN_QUOTE_ARGS, FakeChatModel
+from llm_fakes import BROKEN_ROUTE_ARGS, FakeChatModel
 from pydantic import ValidationError
 
 from agnostic_market.config.loader import ConfigError
@@ -58,7 +58,7 @@ async def test_wrong_tool_selection_flagged_chat_only() -> None:
 
 async def test_invalid_structured_output_flagged_chat_only() -> None:
     report = await run_conformance(
-        FakeChatModel(canned_args=BROKEN_QUOTE_ARGS), provider="fake", model="bad-schema"
+        FakeChatModel(canned_args=BROKEN_ROUTE_ARGS), provider="fake", model="bad-schema"
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
