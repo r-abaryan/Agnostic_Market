@@ -1,10 +1,15 @@
-# Platform-owned provider credential REFS - resolved via the SecretResolver seam at use
-# time (SECURITY 5). NEVER a secret value; only refs. NOT part of the merchant 3-layer
-# resolution - merchants never touch this file. This is also the provider whitelist:
+# Platform-owned provider integration config. Credential REFS resolve through the
+# SecretResolver seam at use time (SECURITY 5): NEVER secret values. LLM entries also
+# declare their provider-native structured-output transport. NOT part of the merchant
+# 3-layer resolution - merchants never touch this file. This is also the provider whitelist:
 # the LLM gateway (llm/gateway.py) and the voice engine factories (voice/) serve only
 # providers listed here.
 providers:
-  anthropic: { api_key_ref: "env://ANTHROPIC_API_KEY" }
-  openai: { api_key_ref: "env://OPENAI_API_KEY" }
+  anthropic:
+    api_key_ref: "env://ANTHROPIC_API_KEY"
+    structured_output_method: "json_schema"
+  openai:
+    api_key_ref: "env://OPENAI_API_KEY"
+    structured_output_method: "function_calling"
   deepgram: { api_key_ref: "env://DEEPGRAM_API_KEY" }
   cartesia: { api_key_ref: "env://CARTESIA_API_KEY" }

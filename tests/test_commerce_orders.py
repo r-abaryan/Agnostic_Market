@@ -9,6 +9,7 @@ import pytest
 from agnostic_market.commerce.orders import (
     CancelError,
     OrderStore,
+    RecentOrderContext,
     RefundError,
     ReturnError,
     load_orders_fixture,
@@ -30,6 +31,15 @@ def _place1(store: OrderStore, key: str, sku: str, name: str, qty: int, total: f
     need 'an order exists' express it as one line."""
     return store.place_cart(key, lines=[_line(sku, name, round(total / qty, 2), qty)],
                             total_usd=total)
+
+
+def test_recent_order_context_marks_a_bounded_set_incomplete() -> None:
+    context = RecentOrderContext(max_refs=2)
+    context.record(["ORD-1001", "ORD-1002", "ORD-1003"], operation="list")
+    snapshot = context.snapshot()
+    assert snapshot.order_refs == ("ORD-1002", "ORD-1003")
+    assert snapshot.focused_order_ref == "ORD-1003"
+    assert snapshot.complete is False
 
 
 # --- the idempotency arbiter (A10 rule 5: replay/retry can never double-order) ---------

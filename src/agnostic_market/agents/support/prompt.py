@@ -93,8 +93,8 @@ def render_orders(orders: list[OrderCandidate], last_order_id: str | None = None
     candidates (the assemble node scopes them; call #15), so an empty list means nothing
     is verified yet — the placeholder keeps the model on the ask-for-the-order-number
     path without implying any count. Status included: remedy selection (cancel vs return
-    vs refund vs nothing) is status-driven. The most recently discussed order (the session
-    pointer, Group C L4) is MARKED so a bare 'that order' resolves to it instead of to
+    vs refund vs nothing) is status-driven. The most recently discussed order (from bounded
+    recent-order context, Group C L4) is MARKED so a bare 'that order' resolves to it instead of to
     conversational salience."""
     if not orders:
         return "(none verified for this caller yet - ask for the order number to act on one)"
@@ -114,6 +114,6 @@ def compose_support_prompt(
     last_order_id: str | None = None,
 ) -> str:
     """The assemble node's SystemMessage body: shared context (persona + derived policy) +
-    support role + the current order list (pointer-marked, Group C L4)."""
+    support role + the current order list (recent-order-context marked, Group C L4)."""
     shared = compose_shared_context(display_name, policy)
     return f"{shared}\n{_SUPPORT_INSTRUCTIONS.format(orders=render_orders(orders, last_order_id))}"

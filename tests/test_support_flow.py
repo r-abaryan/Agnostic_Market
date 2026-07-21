@@ -676,12 +676,45 @@ def _pending_cancel(harness, thread_id):
     return snap.values.get("pending_cancel")
 
 
+def _pending_request(harness, thread_id):
+    snap = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
+    return snap.values.get("pending_request")
+
+
+async def _enter_unbound_cancel_scope(harness) -> None:
+    events = await _events(harness.engine, "cancel all my orders")
+    warnings = [event for event in events if isinstance(event, InterruptEvent)]
+    assert len(warnings) == 1 and "clear this call's" in warnings[0].prompt
+    await _events(harness.engine, "yes")
+
+
+async def test_guest_context_warning_decline_preserves_guest_state(config_root: Path) -> None:
+    h = _scope_engine(config_root, thread_id="mb-warning-decline")
+    old_thread_id = h.engine.thread_id
+    events = await _events(h.engine, "cancel all my orders")
+    assert any(isinstance(event, InterruptEvent) for event in events)
+
+    declined = await _events(h.engine, "no")
+
+    assert any(
+        "won't start" in event.text
+        for event in declined
+        if isinstance(event, SpokenMessageEvent)
+    )
+    assert h.engine.thread_id == old_thread_id
+    assert h.identity.current() is None
+    assert h.store.session_placed_orders()
+    assert _pending_request(h, old_thread_id) is None
+    assert h.store.cancel_count == 0
+
+
 async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root: Path) -> None:
     # THE Milestone B pin: unverified "cancel all my orders" -> OTP -> NO order-list speech ->
     # the resolver freezes a batch over the caller's cancellable orders -> one confirmation ->
     # both voided. Identity establishes the binding; support re-resolves + authorizes live.
     h = _scope_engine(config_root, thread_id="mb-1")
-    await _events(h.engine, "cancel all my orders")  # -> identity (asks for contact)
+    old_thread_id = h.engine.thread_id
+    await _enter_unbound_cancel_scope(h)
     e1 = await _events(h.engine, "casey@example.com")  # -> OTP dispatched
     assert any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in e1)
     e2 = await _events(h.engine, "482913")  # OTP -> bind -> resolve -> readback
@@ -690,12 +723,19 @@ async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root:
     assert not any("you've got" in e.text.lower() for e in spoken2)
     interrupts = [e for e in e2 if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1
-    assert "ORD-1002" in interrupts[0].prompt and "ORD-9001" in interrupts[0].prompt
+    assert "ORD-1002" in interrupts[0].prompt
+    assert "ORD-9001" not in interrupts[0].prompt
+    assert h.engine.thread_id != old_thread_id
+    assert h.engine.pending_interrupt()
+    assert h.engine._graph.get_state(
+        {"configurable": {"thread_id": old_thread_id}}
+    ).values == {}
     assert h.store.cancel_count == 0  # nothing voided before consent
     await _events(h.engine, "yes")
-    assert h.store.cancel_count == 2
+    assert h.store.cancel_count == 1
     assert h.store.order_status("ORD-1002") == "cancelled"
-    assert h.store.order_status("ORD-9001") == "cancelled"
+    assert h.store.order_status("ORD-9001") == "processing"
+    assert h.store.session_placed_orders() == []
 
 
 async def test_bound_cancel_all_skips_identity(config_root: Path) -> None:
@@ -712,9 +752,9 @@ async def test_bound_cancel_all_skips_identity(config_root: Path) -> None:
 
 async def test_failed_otp_clears_the_retained_cancel_selection(config_root: Path) -> None:
     # SECURITY: a FAILED verification during a "cancel all" detour must leave ZERO cancel
-    # intent — the retained CancelSelection is cleared on OTP exhaustion, nothing voided.
+    # intent — the retained typed request is cleared on OTP exhaustion, nothing voided.
     h = _scope_engine(config_root, thread_id="mb-3", otp_max=2)
-    await _events(h.engine, "cancel all my orders")
+    await _enter_unbound_cancel_scope(h)
     await _events(h.engine, "casey@example.com")
     await _events(h.engine, "000000")  # wrong OTP 1 -> re-collect
     await _events(h.engine, "111111")  # wrong OTP 2 -> exhausted -> human
@@ -792,7 +832,7 @@ async def test_scope_resolver_reauthorizes_every_query_result(
 
 async def test_risk_after_identity_clears_scope_without_voiding(config_root: Path) -> None:
     h = _scope_engine(config_root, thread_id="mb-risk", risk_flagged=True)
-    await _events(h.engine, "cancel all my orders")
+    await _enter_unbound_cancel_scope(h)
     await _events(h.engine, "casey@example.com")
     events = await _events(h.engine, "482913")
     assert not any(isinstance(event, InterruptEvent) for event in events)
@@ -812,10 +852,11 @@ async def test_identity_exit_paths_clear_retained_cancel_scope(
     config_root: Path, utterance: str, thread_id: str
 ) -> None:
     h = _scope_engine(config_root, thread_id=thread_id)
-    await _events(h.engine, "cancel all my orders")
-    assert _pending_cancel(h, thread_id) is not None
+    await _enter_unbound_cancel_scope(h)
+    assert _pending_request(h, thread_id) is not None
 
     await _events(h.engine, utterance)
+    assert _pending_request(h, thread_id) is None
     assert _pending_cancel(h, thread_id) is None
     assert h.store.cancel_count == 0
 

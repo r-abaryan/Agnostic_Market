@@ -8,7 +8,29 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from agnostic_market.commerce.spoken import redact_contact
+from agnostic_market.commerce.spoken import (
+    caller_stated_order_id,
+    caller_stated_phone,
+    redact_contact,
+)
+
+
+def test_caller_stated_order_id_accepts_typed_and_spoken_ids() -> None:
+    assert caller_stated_order_id("cancel order ORD-1002", "ord-1002") == "ORD-1002"
+    assert caller_stated_order_id("cancel order one zero zero two", "ORD-1002") == "ORD-1002"
+
+
+def test_caller_stated_order_id_rejects_model_only_refs_and_option_keys() -> None:
+    assert caller_stated_order_id("cancel my rain jacket order", "ORD-1002") is None
+    assert caller_stated_order_id("cancel order ORD-1002", "2") is None
+    assert caller_stated_order_id("refund $1002", "ORD-1002") is None
+    assert caller_stated_order_id("refund my order for $1001", "ORD-1001") is None
+
+
+def test_caller_stated_phone_requires_one_complete_phone_shaped_run() -> None:
+    assert caller_stated_phone("Use five five five one one one two two two two", "555 111 2222")
+    assert not caller_stated_phone("Change the contact for order 1002", "1002")
+    assert not caller_stated_phone("Order 1002, then use 555 111 2222", "10025551112222")
 
 
 def test_typed_email_span_is_redacted() -> None:
@@ -56,3 +78,17 @@ def test_write_event_redacts_the_utterance_field(tmp_path: Path) -> None:
     ]
     assert lines[0]["utterance"] == "sure, [email]"
     assert lines[1] == {"event": "support_left", "reason": "left_flow"}
+
+
+def test_write_event_suppresses_profile_change_utterances(tmp_path: Path) -> None:
+    from agnostic_market.agents import telemetry
+
+    telemetry.write_event(
+        {
+            "utterance": "send future orders to 7 Elm Street, Dover",
+            "outcome": "handover",
+            "reason_code": "address_change",
+        }
+    )
+    record = json.loads((tmp_path / "telemetry.jsonl").read_text(encoding="utf-8"))
+    assert record["utterance"] == "[redacted]"

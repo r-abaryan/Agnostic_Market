@@ -32,8 +32,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -49,9 +51,32 @@ from agnostic_market.dtos.events import (
     TurnEvent,
     TurnFacts,
 )
+from agnostic_market.dtos.orchestration import (
+    AnswerQuestion,
+    CancellableOrderScope,
+    CancelOrders,
+    CapabilityId,
+    ChangeProfile,
+    ExplicitOrderSet,
+    ExplicitOrderTarget,
+    FocusedOrderSet,
+    FocusedOrderTarget,
+    ListOrders,
+    ModifyCart,
+    PlaceOrder,
+    PrincipalTransition,
+    RecentOrderSet,
+    RefundOrder,
+    RequestPerson,
+    ReturnOrder,
+    SearchCatalog,
+    SwitchAccount,
+    VerifyIdentity,
+    VerifyOrderStatus,
+    ViewCart,
+)
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
-    CancelSelection,
     CancelTarget,
     CartLine,
     HandoffRequest,
@@ -65,6 +90,13 @@ from agnostic_market.dtos.state import (
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
+
+
+class PrincipalTransitionLifecycle(Protocol):
+    def pending_transition(self) -> PrincipalTransition | None: ...
+
+    def complete_transition(self, transition_id: str) -> None: ...
+
 
 # The custom (non-message) types we checkpoint into graph state. langgraph's default
 # msgpack serde is permissive (deserializes anything with a warning), but that path is
@@ -81,7 +113,8 @@ _CHECKPOINTED_DTOS = (
     # The cancel lifecycle (F-16.2): the batch + its nested targets/outcomes are each checked
     # independently by the serde allowlist (like CartLine inside PendingPlacement), and the
     # pre-auth selector is its own checkpointed type.
-    CancelSelection,
+    CancellableOrderScope,
+    CapabilityId,
     PendingCancelBatch,
     CancelTarget,
     BatchCancelOutcome,
@@ -90,6 +123,25 @@ _CHECKPOINTED_DTOS = (
     PendingIdentity,
     HandoffRequest,
     ReasoningState,
+    AnswerQuestion,
+    SearchCatalog,
+    VerifyOrderStatus,
+    ExplicitOrderSet,
+    FocusedOrderSet,
+    RecentOrderSet,
+    ListOrders,
+    ViewCart,
+    ModifyCart,
+    PlaceOrder,
+    CancelOrders,
+    ExplicitOrderTarget,
+    FocusedOrderTarget,
+    RefundOrder,
+    ReturnOrder,
+    ChangeProfile,
+    VerifyIdentity,
+    SwitchAccount,
+    RequestPerson,
 )
 
 
@@ -234,7 +286,13 @@ class _GraphSpans:
 class ReasoningEngine:
     """Per-session engine over a compiled, checkpointer-backed reasoning graph."""
 
-    def __init__(self, graph: CompiledStateGraph, *, thread_id: str) -> None:
+    def __init__(
+        self,
+        graph: CompiledStateGraph,
+        *,
+        thread_id: str,
+        lifecycle: PrincipalTransitionLifecycle | None = None,
+    ) -> None:
         if graph.checkpointer is None:
             raise ValueError(
                 "ReasoningEngine requires a checkpointer-backed graph "
@@ -247,6 +305,7 @@ class ReasoningEngine:
         # A session is a serial conversation. A waiter re-checks the checkpoint so two
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
+        self._lifecycle = lifecycle
 
     @property
     def thread_id(self) -> str:
@@ -255,6 +314,31 @@ class ReasoningEngine:
     def pending_interrupt(self) -> bool:
         """True if the thread is paused at a HITL interrupt (next turn must resume it)."""
         return bool(self._graph.get_state(self._config).interrupts)
+
+    def _rotate_pending_transition(self) -> PrincipalTransition | None:
+        if self._lifecycle is None:
+            return None
+        transition = self._lifecycle.pending_transition()
+        if transition is None:
+            return None
+        old_thread_id = self._thread_id
+        self._graph.checkpointer.delete_thread(old_thread_id)
+        self._thread_id = uuid.uuid4().hex
+        self._config = {"configurable": {"thread_id": self._thread_id}}
+        if transition.continuation is not None:
+            self._graph.update_state(
+                self._config,
+                {"pending_request": transition.continuation},
+                as_node="__start__",
+            )
+        self._lifecycle.complete_transition(transition.transition_id)
+        write_event(
+            {
+                "event": "reasoning_context_rotated",
+                "transition_id": transition.transition_id,
+            }
+        )
+        return transition
 
     async def stream_turn(self, user_text: str, facts: TurnFacts) -> AsyncIterator[TurnEvent]:
         """Run one committed user turn; yield the caller-audible events it produces.
@@ -266,11 +350,18 @@ class ReasoningEngine:
         and ends the turn cleanly — the thread stays usable (nothing mid-node was
         committed; a pending interrupt stays paused and the next turn resumes it).
         """
+        arrived_thread_id = self._thread_id
         arrived = self._graph.get_state(self._config)
         arrived_during_continuation = bool(arrived.interrupts or arrived.next)
         async with self._turn_lock:
+            transition = self._rotate_pending_transition()
             snapshot = self._graph.get_state(self._config)
-            if arrived_during_continuation and not (snapshot.interrupts or snapshot.next):
+            if (
+                transition is None
+                and arrived_thread_id == self._thread_id
+                and arrived_during_continuation
+                and not (snapshot.interrupts or snapshot.next)
+            ):
                 write_event({"event": "duplicate_turn_ignored", "reason": "continuation_done"})
                 return
             if snapshot.interrupts:
@@ -292,16 +383,21 @@ class ReasoningEngine:
             speech = _TurnSpeech(self._speakable)
             spans = _GraphSpans()
             try:
-                async for mode, item in self._graph.astream(
-                    payload, config=self._config, stream_mode=["messages", "updates"]
-                ):
-                    if mode == "messages":
-                        token, meta = item
-                        spans.observe(token, meta)
-                        if (event := speech.feed(token, meta)) is not None:
-                            yield event
-                    elif mode == "updates" and "__interrupt__" in item:
-                        yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+                while True:
+                    async for mode, item in self._graph.astream(
+                        payload, config=self._config, stream_mode=["messages", "updates"]
+                    ):
+                        if mode == "messages":
+                            token, meta = item
+                            spans.observe(token, meta)
+                            if (event := speech.feed(token, meta)) is not None:
+                                yield event
+                        elif mode == "updates" and "__interrupt__" in item:
+                            yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+                    transition = self._rotate_pending_transition()
+                    if transition is None or transition.continuation is None:
+                        break
+                    payload = None
             except Exception:
                 # The degradation boundary, not error-swallowing: the full traceback is logged
                 # and the event telemetered (exception CLASS only — provider error messages are
@@ -311,6 +407,8 @@ class ReasoningEngine:
                 write_event({"event": "turn_failed", "reason": "graph_exception"})
                 yield SpokenMessageEvent(text=_TURN_FALLBACK_LINE, node=_TURN_FALLBACK_NODE)
                 return
+            finally:
+                self._rotate_pending_transition()
             for flushed in speech.flush():
                 yield flushed
             spans.log()

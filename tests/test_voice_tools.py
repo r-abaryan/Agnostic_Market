@@ -20,7 +20,7 @@ from agnostic_market.commerce.identity import (
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
 from agnostic_market.voice.tools import build_voice_tools
@@ -34,13 +34,13 @@ _CUST2_EMAIL = "casey@example.com"
 class Harness:
     def __init__(self, config_root: Path, cart: CartStore | None = None) -> None:
         self.store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-        self.pointer = LastOrderPointer()
+        self.recent_orders = RecentOrderContext(max_refs=10)
         self.identity = CallerIdentityStore()
         customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
         self.tools: dict[str, BaseTool] = {
             t.name: t
             for t in build_voice_tools(
-                self.store, cart or CartStore(), self.pointer, self.identity, customers
+                self.store, cart or CartStore(), self.recent_orders, self.identity, customers
             )
         }
 
@@ -69,14 +69,14 @@ def test_order_status_fails_closed_without_a_verifier(config_root: Path) -> None
     result = h.status("ORD-1001")
     assert "shipped" not in result and "shoes" not in result
     assert "email or phone" in result
-    assert h.pointer.get() is None
+    assert h.recent_orders.snapshot().focused_order_ref is None
 
 
 def test_order_plus_matching_contact_answers_and_grants(config_root: Path) -> None:
     h = Harness(config_root)
     result = h.status(" ord-1001 ", _CUST1_PHONE)
     assert "shipped" in result  # answered (id normalized, case-insensitive)
-    assert h.pointer.get() == "ORD-1001"  # authorized read sets the pointer
+    assert h.recent_orders.snapshot().focused_order_ref == "ORD-1001"
     # The grant is remembered: a repeat ask needs NO contact.
     assert "shipped" in h.status("ORD-1001")
 
@@ -89,7 +89,7 @@ def test_wrong_pair_and_unknown_order_are_indistinguishable(config_root: Path) -
     unknown = h.status("ORD-9999", _CUST2_EMAIL)  # no such order
     assert wrong_pair == unknown
     assert "shipped" not in wrong_pair and "ORD-1001 -" not in wrong_pair
-    assert h.pointer.get() is None
+    assert h.recent_orders.snapshot().focused_order_ref is None
 
 
 def test_contact_match_grants_only_that_order(config_root: Path) -> None:

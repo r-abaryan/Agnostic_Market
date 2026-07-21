@@ -21,8 +21,14 @@ def _credentials() -> ProviderCredentialsConfig:
     return ProviderCredentialsConfig.model_validate(
         {
             "providers": {
-                "anthropic": {"api_key_ref": "env://ANTHROPIC_API_KEY"},
-                "openai": {"api_key_ref": "env://OPENAI_API_KEY"},
+                "anthropic": {
+                    "api_key_ref": "env://ANTHROPIC_API_KEY",
+                    "structured_output_method": "json_schema",
+                },
+                "openai": {
+                    "api_key_ref": "env://OPENAI_API_KEY",
+                    "structured_output_method": "function_calling",
+                },
             }
         }
     )
@@ -50,6 +56,31 @@ def test_model_kwargs_pass_through() -> None:
         ProviderModel(provider="anthropic", model="claude-haiku-4-5"), max_retries=5
     )
     assert model.max_retries == 5
+
+
+def test_structured_output_method_comes_from_provider_config() -> None:
+    gateway = LLMGateway(_credentials(), RecordingResolver())
+
+    assert (
+        gateway.structured_output_method(
+            ProviderModel(provider="anthropic", model="claude-haiku-4-5")
+        )
+        == "json_schema"
+    )
+    assert (
+        gateway.structured_output_method(ProviderModel(provider="openai", model="gpt-5.4-mini"))
+        == "function_calling"
+    )
+
+
+def test_missing_structured_output_method_rejected_loudly() -> None:
+    credentials = ProviderCredentialsConfig.model_validate(
+        {"providers": {"fake": {"api_key_ref": "env://FAKE_API_KEY"}}}
+    )
+    gateway = LLMGateway(credentials, RecordingResolver())
+
+    with pytest.raises(GatewayError, match="no structured_output_method configured"):
+        gateway.structured_output_method(ProviderModel(provider="fake", model="model"))
 
 
 def test_transient_retries_default_on(  # F-13.1: a live 529 died with no retry
@@ -80,6 +111,8 @@ def test_repo_credentials_file_loads_and_validates() -> None:
     assert set(credentials.providers) == {"anthropic", "openai", "deepgram", "cartesia"}
     for entry in credentials.providers.values():
         assert entry.api_key_ref.startswith("env://")  # refs only — never values
+    assert credentials.providers["anthropic"].structured_output_method == "json_schema"
+    assert credentials.providers["openai"].structured_output_method == "function_calling"
 
 
 def test_bad_credentials_shape_rejected(tmp_path: Path) -> None:

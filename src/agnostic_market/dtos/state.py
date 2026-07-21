@@ -16,7 +16,10 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
-from agnostic_market.dtos.orchestration import CancelScope
+from agnostic_market.dtos.orchestration import (
+    CancellableOrderScope,
+    IntentRequest,
+)
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
@@ -37,6 +40,7 @@ HandoffReasonCode = Literal[
     "list_orders",  # account-wide order enumeration — needs OTP-bound identity (P7)
     "multi_step",
     "verification_required",
+    "switch_account",
     "other",
 ]
 
@@ -159,7 +163,7 @@ class PendingRefund(BaseModel):
 # --- the cancel lifecycle (F-16.2 batch-aware cancel) --------------------------------------
 # ONE lifecycle for one-or-many order cancellations (a single cancel is a one-target batch —
 # no scalar/batch fork for a future planner to bridge). Two phases, a discriminated union:
-#   CancelSelection   — PRE-auth: a SEMANTIC scope ("all/both my cancellable orders") the
+#   CancellableOrderScope — PRE-auth: a SEMANTIC scope ("all/both my cancellable orders") the
 #                       caller stated with no ids, retained across an identity detour (the
 #                       unbound "cancel all" case, Milestone B). Carries NO ids/keys/contact.
 #   PendingCancelBatch — POST-resolve: the FROZEN, authorized, preflighted target set the
@@ -213,20 +217,6 @@ class CancelTarget(BaseModel):
     idempotency_key: str = Field(min_length=1)
 
 
-class CancelSelection(BaseModel):
-    """PRE-auth cancel selector (Milestone B): a SEMANTIC scope the caller stated without ids,
-    retained across the identity detour when an unbound caller says "cancel all/both my
-    orders". Deliberately carries NO order ids, NO numeric candidate keys (a pre-bind key is
-    meaningless — the visible candidate set changes after binding), NO contact/customer_ref.
-    No `created_at`/TTL: a selector is consumed immediately on the post-bind turn (the batch it
-    resolves into carries the Clock-A TTL); a timestamp here would be dead state."""
-
-    model_config = _FROZEN
-
-    kind: Literal["selection"] = "selection"
-    scope: CancelScope
-
-
 class PendingCancelBatch(BaseModel):
     """POST-resolve cancel batch awaiting HITL confirmation then serialized void (AGENTS
     §A10a). The FROZEN authorized+preflighted target set: `targets` is the ELIGIBLE subset the
@@ -238,7 +228,7 @@ class PendingCancelBatch(BaseModel):
 
     model_config = _FROZEN
 
-    kind: Literal["batch"] = "batch"
+    selector: Literal["resolved_batch"] = "resolved_batch"
     targets: tuple[CancelTarget, ...] = Field(min_length=1)
     ineligible: tuple[BatchCancelOutcome, ...] = ()
     outcomes: tuple[BatchCancelOutcome, ...] = ()
@@ -247,7 +237,7 @@ class PendingCancelBatch(BaseModel):
 
 # The pending_cancel channel is a discriminated union over the two phases (single = batch).
 PendingCancel = Annotated[
-    CancelSelection | PendingCancelBatch, Field(discriminator="kind")
+    CancellableOrderScope | PendingCancelBatch, Field(discriminator="selector")
 ]
 
 
@@ -377,19 +367,14 @@ class ReasoningState(BaseModel):
     pending_return: PendingReturn | None = None
     pending_profile_change: PendingProfileChange | None = None
     pending_identity: PendingIdentity | None = None
+    # Sole cross-identity continuation: caller-stated intent only, never resolved authority.
+    pending_request: IntentRequest | None = None
     # Bounded re-ask counter for the identity flow's contact claim (P7 decision 4: ONE
     # softened re-ask on a no-match — STT mishears emails constantly — then a silent human
     # handover). Spans turns WITHIN the sticky flow; cleared on every flow exit (apply,
     # abort, escape, leave, cross-switch, terminal handover).
     identity_claim_misses: int = 0
     active_flow: ActiveFlow | None = None
-    # Where to resume after an identity BIND that support triggered to authorize a mutation
-    # (Fix 2, rung-2): an UNBOUND caller's cancel/refund/return detours into the identity OTP
-    # flow, and on a successful bind `identity_apply` routes back to `support_assemble` (the
-    # model re-proposes from history, now authorized as the bound owner). Ids-free by design
-    # (like CancelSelection) — a pure resume pointer carrying NO order authority. Cleared on the
-    # bind-resume AND on every identity exit (a FAILED verification leaves ZERO resume intent).
-    identity_resume: Literal["support_assemble"] | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
     # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response). Kept
     # OFF the assemble node because a speakable assemble double-speaks its streamed clarifies

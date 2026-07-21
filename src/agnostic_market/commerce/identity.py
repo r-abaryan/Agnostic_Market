@@ -10,7 +10,7 @@ Two rungs, matching the guest-lookup / logged-in split (P7 decisions, 2026-07-16
   every owned order. Level alone is NOT identity — a profile-flow OTP earns L2 without
   binding anyone (see `PendingIdentity.grants_at_mint` for the binding invariant).
 
-`CallerIdentityStore` follows the CartStore/LastOrderPointer pattern: one mutable object
+`CallerIdentityStore` follows the CartStore/RecentOrderContext pattern: one mutable object
 per session, closed into tools/nodes at build, live-read, NEVER checkpointed (a replayed
 checkpoint cannot resurrect a grant), cleared by the thread reaper on session close.
 

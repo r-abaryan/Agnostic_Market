@@ -162,7 +162,7 @@ def _fake_caller_context(engine=None):
         engine=engine or _FakeEngine(),
         verification_store=_FakeClearable(),  # type: ignore[arg-type]
         cart_store=_FakeClearable(),  # type: ignore[arg-type]
-        pointer=_FakeClearable(),  # type: ignore[arg-type]
+        recent_orders=_FakeClearable(),  # type: ignore[arg-type]
         identity_store=_FakeClearable(),  # type: ignore[arg-type]
         order_store=_FakeOrderStore(),  # type: ignore[arg-type]
     )
@@ -170,11 +170,11 @@ def _fake_caller_context(engine=None):
 
 def test_close_session_clears_every_caller_store_and_thread() -> None:
     # Milestone A postcondition: close_session tears down ALL caller-ephemeral state (cart,
-    # pointer, session-placed orders, verification, identity) AND deletes the reasoning thread.
+    # recent context, session-placed orders, verification, identity, and reasoning thread.
     ctx = _fake_caller_context()
     ctx.close_session()
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
-    assert ctx.pointer.clears == 1  # type: ignore[attr-defined]
+    assert ctx.recent_orders.clears == 1  # type: ignore[attr-defined]
     assert ctx.order_store.session_placed_clears == 1  # type: ignore[attr-defined]
     assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
@@ -208,7 +208,7 @@ def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
     assert ctx.engine.deletes == 1  # type: ignore[attr-defined]  # reaped once despite double fire
     assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
-    assert ctx.pointer.clears == 1  # type: ignore[attr-defined]
+    assert ctx.recent_orders.clears == 1  # type: ignore[attr-defined]
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.order_store.session_placed_clears == 1  # type: ignore[attr-defined]
     lines = [

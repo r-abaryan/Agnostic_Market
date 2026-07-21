@@ -84,7 +84,7 @@ async def test_direct_return_creates_one_rma_after_readback(config_root: Path) -
     assert h.store.refund_count == 0  # the refund RELEASES at Phase 4, never here
     spoken = [e for e in done if isinstance(e, SpokenMessageEvent)]
     assert any("RMA-3001" in e.text and e.node == "support_return_place" for e in spoken)
-    assert h.pointer.get() == "ORD-1001"  # the order most recently discussed (L4)
+    assert h.recent_orders.snapshot().focused_order_ref == "ORD-1001"
 
 
 async def test_stray_turn_after_completion_never_double_creates(config_root: Path) -> None:
@@ -322,7 +322,7 @@ async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path
 
 
 def test_render_orders_marks_the_pointed_order() -> None:
-    # The support model's order list marks the pointer's order so a bare "that order"
+    # The support model's order list marks the recent focused order so a bare "that order"
     # resolves by REFERENCE, not by conversational salience (live call #10 L4).
     from agnostic_market.agents.support.prompt import render_orders
     from agnostic_market.commerce.orders import OrderCandidate
@@ -336,4 +336,4 @@ def test_render_orders_marks_the_pointed_order() -> None:
     marked = render_orders(orders, "ORD-1002")
     assert "ORD-1002 - jacket ($129.00, processing) - the order most recently discussed" in marked
     assert "ORD-1001 - shoes ($179.98, shipped)\n" in marked  # unmarked line untouched
-    assert "most recently discussed" not in render_orders(orders)  # no pointer -> no mark
+    assert "most recently discussed" not in render_orders(orders)  # no context -> no mark

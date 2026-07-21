@@ -30,6 +30,11 @@ _DIGIT_WORDS = {
     "eight": "8",
     "nine": "9",
 }
+_ORDER_ID = re.compile(r"^ORD-(\d+)$", re.IGNORECASE)
+_ORDER_VALUE_PREFIXES = frozenset({"ord", "order"})
+_ORDER_VALUE_FILLERS = frozenset({"ord", "number", "id", "is"})
+# Seven digits is the shortest dialable local number accepted by the voice boundary.
+_MIN_PHONE_DIGITS = 7
 
 
 def spoken_digits(text: str) -> str:
@@ -47,6 +52,58 @@ def spoken_digits(text: str) -> str:
         else:
             out.append("".join(ch for ch in token if ch.isdigit()))
     return "".join(out)
+
+
+def caller_stated_phone(utterance: str, proposed: str) -> bool:
+    """Whether `proposed` is one complete phone-shaped run in committed caller speech."""
+    proposed_digits = spoken_digits(proposed)
+    if len(proposed_digits) < _MIN_PHONE_DIGITS:
+        return False
+    runs: list[str] = []
+    current: list[str] = []
+    for token in utterance.split():
+        digits = spoken_digits(token)
+        if digits:
+            current.append(digits)
+        elif current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return proposed_digits in runs
+
+
+def caller_stated_order_id(utterance: str, proposed: str) -> str | None:
+    """Return a normalized explicit order id only when the caller stated that id.
+
+    This binds an unverified model proposal to committed caller input before it may cross an
+    identity transition. Numbered option keys are intentionally rejected: no authorized option
+    list exists for an unbound caller, and a key must never become meaningful only after login.
+    """
+    match = _ORDER_ID.fullmatch(proposed.strip())
+    if match is None:
+        return None
+    stated: set[str] = set()
+    tokens = re.findall(r"[a-z0-9]+", utterance.casefold())
+    for index, token in enumerate(tokens):
+        if token not in _ORDER_VALUE_PREFIXES:
+            continue
+        cursor = index + 1
+        while cursor < len(tokens) and tokens[cursor] in _ORDER_VALUE_FILLERS:
+            cursor += 1
+        digits: list[str] = []
+        while cursor < len(tokens):
+            value = spoken_digits(tokens[cursor])
+            if not value:
+                break
+            digits.append(value)
+            cursor += 1
+        if digits:
+            stated.add("".join(digits))
+    number = match.group(1)
+    if number not in stated:
+        return None
+    return f"ORD-{number}"
 
 
 def spoken_email(text: str) -> str | None:
@@ -74,10 +131,6 @@ _TYPED_EMAIL = re.compile(r"\S+@\S+")
 _SPOKEN_EMAIL = re.compile(
     r"(?:[\w.'-]+\s+){0,3}[\w.'-]+\s+at\s+[\w-]+(?:\s+dot\s+[\w-]+)+", re.IGNORECASE
 )
-# A contiguous digit-bearing token run this long is phone-shaped. Deliberately above an
-# order-id mention (ORD-1001 = 4 digits, and two ids read with a connector between them)
-# and below any dialable number (7 = the shortest local form).
-_MIN_PHONE_DIGITS = 7
 
 
 def redact_contact(text: str) -> str:

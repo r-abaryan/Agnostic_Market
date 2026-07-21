@@ -21,6 +21,8 @@ _INSTRUCTIONS = (
     "it. Note the cart split: VIEWING the cart is a read you answer (view_cart); CHANGING "
     "it (add/remove/set quantity) or checking out is a request you hand over "
     "(cart_write/checkout).\n"
+    "If the caller asks to use, verify, or switch to a different account, hand over with "
+    "destination support and reason_code switch_account.\n"
     "CRITICAL when you hand over: say NOTHING - emit the request_handover tool call with "
     "NO spoken text at all. Do not announce the handover, do not say you're connecting "
     "them, do not say you can't do it, do not describe what happens next. The next words "
@@ -135,8 +137,8 @@ _FEW_SHOT: tuple[tuple[str, str], ...] = (
 
 
 def resolved_order_line(order_id: str) -> str:
-    """Per-turn prompt suffix when the session pointer is set (Group C L4): resolves a bare
-    'that order' to the most recently discussed id. The pointer is a REFERENCE, never state
+    """Per-turn prompt suffix when recent-order context is set (Group C L4): resolves a bare
+    'that order' to the most recently discussed id. The id is a REFERENCE, never status
     — the existence-vs-state rule above still requires an order_status read for any claim."""
     return (
         f"The order most recently discussed on this call is {order_id}. If the caller says "

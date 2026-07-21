@@ -6,6 +6,7 @@ Milestone 6 adds the ``plan`` route arm, ``ExecutionPlan``, and ``PlanStep``.
 
 from __future__ import annotations
 
+import uuid
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -172,6 +173,7 @@ class RefundOrder(BaseModel):
 
     kind: Literal[CapabilityId.REFUND_ORDER] = CapabilityId.REFUND_ORDER
     target: OrderTarget
+    amount_usd: float | None = Field(default=None, gt=0)
     destination: RefundDestination | None = None
 
 
@@ -326,3 +328,25 @@ class CapabilityOutcome(BaseModel):
     model_config = _FROZEN
 
     status: Literal["completed", "needs_input", "declined", "failed", "human_required"]
+
+
+class VerificationProof(BaseModel):
+    """One committed proof that may initialize a freshly rotated principal context."""
+
+    model_config = _FROZEN
+
+    proof_id: NonEmptyText = Field(default_factory=lambda: uuid.uuid4().hex)
+    method: Literal["otp"] = "otp"
+    raised_to: Literal[2] = 2
+
+
+class PrincipalTransition(BaseModel):
+    """Allowlisted payload carried outside the retired reasoning checkpoint."""
+
+    model_config = _FROZEN
+
+    transition_id: NonEmptyText = Field(default_factory=lambda: uuid.uuid4().hex)
+    customer_ref: NonEmptyText
+    masked_contact: NonEmptyText
+    fresh_proof: VerificationProof
+    continuation: IntentRequest | None = None

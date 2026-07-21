@@ -54,8 +54,13 @@ from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore
 from agnostic_market.commerce.orders import OrderStore, render_order_list_line
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import identity_required_level
+from agnostic_market.dtos.orchestration import (
+    IntentRequest,
+    PrincipalTransition,
+    SwitchAccount,
+    VerificationProof,
+)
 from agnostic_market.dtos.state import (
-    CancelSelection,
     HandoffRequest,
     PendingIdentity,
     PolicyContext,
@@ -101,17 +106,12 @@ class IdentityNodes:
 
 
 def _flow_exit(update: dict[str, object]) -> dict[str, object]:
-    """Every identity-flow exit clears the pending + the re-ask counter — AND any retained
-    CancelSelection (Milestone B) or `identity_resume` marker (Fix 2): a "cancel all" scope OR
-    an explicit-order mutation that entered identity to verify must leave ZERO action intent
-    behind on ANY failure/leave/abort/human path (a live selector/marker surviving a FAILED
-    verification is the security hazard). The success paths that resume support (bind -> resolve,
-    bind -> support_assemble) return their own update and do NOT go through here."""
+    """Clear identity state and every typed action request on an unsuccessful flow exit."""
     return {
         "pending_identity": None,
         "identity_claim_misses": 0,
         "pending_cancel": None,
-        "identity_resume": None,
+        "pending_request": None,
         **update,
     }
 
@@ -125,6 +125,9 @@ def build_identity_nodes(
     customers: CustomerDirectory,
     identity_store: CallerIdentityStore,
     policy: PolicyContext,
+    transition_principal: Callable[
+        [BoundIdentity, VerificationProof, IntentRequest | None], PrincipalTransition
+    ],
     *,
     display_name: str,
 ) -> IdentityNodes:
@@ -165,7 +168,8 @@ def build_identity_nodes(
         The claim is code-matched HERE (never model-judged); a match mints PendingIdentity
         with the grants-at-mint snapshot (the binding invariant's baseline)."""
         bound = identity_store.current()
-        if bound is not None:
+        switching = isinstance(state.pending_request, SwitchAccount)
+        if bound is not None and not switching:
             # Already proven this session (a misrouted second enumeration handover): mint
             # from the binding directly — no model call, no re-claim; the guardrail's
             # bound-same-customer check routes straight to apply (no second OTP).
@@ -304,13 +308,9 @@ def build_identity_nodes(
         chain's OTP really succeeded). An already-bound same-customer pass (the misrouted-
         handover shortcut) proceeds without re-proving.
 
-        Two continuations (the Milestone B split):
-          - a RETAINED CancelSelection (a "cancel all my orders" that came here to verify):
-            hand back to the support RESOLVER — keep the selection, set active_flow="support",
-            speak NO order list (the resolver reads the live binding + current cancellable
-            orders and freezes the batch). Does NOT go through `_flow_exit` (which would clear
-            the selection); it clears `pending_identity`/misses itself.
-          - otherwise (plain list_orders): speak the order list + exit (the enumeration ask)."""
+        A typed request survives only as a proposal. A new-principal bind hands it to the
+        lifecycle owner for fresh-thread bootstrap; a same-principal shortcut routes it to the
+        deterministic support continuation in the current thread."""
         pending = state.pending_identity
         assert pending is not None
         bound = identity_store.current()
@@ -322,40 +322,60 @@ def build_identity_nodes(
             if len(verification_store.grants) <= pending.grants_at_mint:
                 write_event({"event": "identity_stepup_failed", "reason": "unproven_binding"})
                 return _human_handover({})
-            identity_store.bind(
-                BoundIdentity(
-                    customer_ref=pending.customer_ref, masked_contact=pending.masked_contact
-                )
+            fresh_proof = verification_store.fresh_proof_since(pending.grants_at_mint)
+            if fresh_proof is None:
+                write_event({"event": "identity_stepup_failed", "reason": "missing_fresh_proof"})
+                return _human_handover({})
+            new_identity = BoundIdentity(
+                customer_ref=pending.customer_ref, masked_contact=pending.masked_contact
             )
+            continuation = (
+                None if isinstance(state.pending_request, SwitchAccount) else state.pending_request
+            )
+            transition_principal(new_identity, fresh_proof, continuation)
             write_event(
                 {
                     "event": "identity_bound",
                     "customer_ref": pending.customer_ref,
-                    "verification": [g.get("method") for g in verification_store.grants],
+                    "verification": [grant.method for grant in verification_store.grants],
                 }
             )
-        if isinstance(state.pending_cancel, CancelSelection):
-            # Cancel-SCOPE continuation ("cancel all"): bound, hand to the resolver (NOT
-            # _flow_exit — keep the selection). Clear only identity's own turn-scoped state here.
-            write_event(
-                {"event": "identity_bound_for_cancel", "customer_ref": pending.customer_ref}
-            )
+            if continuation is not None:
+                write_event(
+                    {
+                        "event": "identity_bound_for_action",
+                        "customer_ref": pending.customer_ref,
+                        "capability": continuation.kind,
+                    }
+                )
             return {
                 "pending_identity": None,
                 "identity_claim_misses": 0,
-                "active_flow": "support",
+                "pending_request": None,
+                "active_flow": None,
+                "messages": (
+                    [AIMessage("You're now verified on the new account.")]
+                    if isinstance(state.pending_request, SwitchAccount)
+                    else []
+                ),
             }
-        if state.identity_resume == "support_assemble":
-            # Explicit-order mutation continuation (Fix 2): bound, hand back to support_assemble
-            # so the model re-proposes the cancel/refund/return from history — now authorized as
-            # the bound owner (`order_mutation_allowed`). Clears the marker; speaks NO list.
+        if isinstance(state.pending_request, SwitchAccount):
+            write_event(
+                {"event": "principal_transition_skipped", "reason": "same_customer"}
+            )
+            return _flow_exit(
+                {
+                    "active_flow": None,
+                    "messages": [AIMessage("You're already verified on that account.")],
+                }
+            )
+        if state.pending_request is not None:
             write_event(
                 {"event": "identity_bound_for_action", "customer_ref": pending.customer_ref}
             )
             return {
                 "pending_identity": None,
                 "identity_claim_misses": 0,
-                "identity_resume": None,
                 "active_flow": "support",
             }
         line = render_order_list_line(order_store.owned_orders(pending.customer_ref))
@@ -409,16 +429,15 @@ def build_identity_nodes(
         node: Callable[[ReasoningState], dict[str, object]],
     ) -> Callable[[ReasoningState], dict[str, object]]:
         """Wrap a factory step-up node (risk_check/collect) so ANY handover it emits (SIM-swap
-        risk, OTP exhaustion) also drops a retained CancelSelection (Milestone B) AND the
-        `identity_resume` marker (Fix 2) — a FAILED verification must leave ZERO action intent,
-        so neither the scope selector nor the explicit-order resume survives to a later turn.
+        risk, OTP exhaustion) also drops every typed action request — a FAILED verification
+        must leave ZERO action intent for a later turn.
         The factory clears only `pending_identity`; both live in channels the shared factory
         must not know about — so the clear is HERE, not in _stepup.py."""
 
         def wrapped(state: ReasoningState) -> dict[str, object]:
             update = node(state)
             if update.get("handover") is not None:
-                update = {**update, "pending_cancel": None, "identity_resume": None}
+                update = {**update, "pending_cancel": None, "pending_request": None}
             return update
 
         return wrapped

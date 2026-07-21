@@ -28,14 +28,15 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
-    LastOrderPointer,
     OrderStore,
+    RecentOrderContext,
     load_orders_fixture,
     speak_quantity,
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider
+from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, TurnFacts
+from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
@@ -62,17 +63,26 @@ def _build(
     frontline: FakeChatModel | None = None,
     reasoning: FakeChatModel | None = None,
     cart: CartStore | None = None,
-    pointer: LastOrderPointer | None = None,
+    recent_orders: RecentOrderContext | None = None,
 ):
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     cart = cart or CartStore()
-    pointer = pointer or LastOrderPointer()
+    recent_orders = recent_orders or RecentOrderContext(max_refs=_POLICY.cancel_batch_max)
     identity = CallerIdentityStore()
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, pointer, identity, customers)
+        for t in build_voice_tools(store, cart, recent_orders, identity, customers)
     ]
+    otp = OtpProvider(valid_code=_TEST_OTP)
+    verification = VerificationStore(otp)
+    caller_context = CallerContext(
+        verification_store=verification,
+        cart_store=cart,
+        recent_orders=recent_orders,
+        identity_store=identity,
+        order_store=store,
+    )
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
@@ -81,12 +91,15 @@ def _build(
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
         store=store,
         cart_store=cart,  # the SAME cart the view_cart tool reads (no split-brain)
-        otp=OtpProvider(valid_code=_TEST_OTP),
-        pointer=pointer,  # the SAME pointer order_status sets (Group C L4)
+        otp=otp,
+        verification_store=verification,
+        recent_orders=recent_orders,
         identity_store=identity,  # the SAME store the order_status gate grants into (P7)
         customers=customers,
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=_POLICY,
+        transition_principal=caller_context.transition_principal,
+        principal_state_will_be_discarded=caller_context.has_discardable_state,
         checkpointer=build_checkpointer(),
     )
     return graph, store, cart
@@ -442,12 +455,14 @@ async def test_unhandled_tool_fails_loud_not_silent_misroute(config_root: Path) 
         await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
 
 
-async def test_place_sets_the_last_order_pointer(config_root: Path) -> None:
+async def test_place_records_recent_order_context(config_root: Path) -> None:
     # Group C L4: a just-placed order becomes "the order most recently discussed".
-    pointer = LastOrderPointer()
+    recent_orders = RecentOrderContext(max_refs=_POLICY.cancel_batch_max)
     reasoning = _tool_fake("buy_now", {"candidate_key": "2", "quantity": 1})
-    graph, _, _ = _build(config_root, reasoning=reasoning, pointer=pointer)
+    graph, _, _ = _build(
+        config_root, reasoning=reasoning, recent_orders=recent_orders
+    )
     await graph.ainvoke({"messages": [HumanMessage("buy it now")]}, _CFG)
-    assert pointer.get() is None  # nothing placed yet (paused at the readback)
+    assert recent_orders.snapshot().focused_order_ref is None
     await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
-    assert pointer.get() == "ORD-9001"
+    assert recent_orders.snapshot().focused_order_ref == "ORD-9001"

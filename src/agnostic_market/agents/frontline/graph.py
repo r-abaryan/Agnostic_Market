@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Annotated
 
@@ -47,9 +47,14 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
-from agnostic_market.agents._consent import is_abort, is_support_abort, wants_human
+from agnostic_market.agents._consent import (
+    classify_consent,
+    is_abort,
+    is_support_abort,
+    wants_human,
+)
 from agnostic_market.agents._copy import guest_list_close, warm_close
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
@@ -59,22 +64,29 @@ from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
+    BoundIdentity,
     CallerIdentityStore,
     CustomerDirectory,
     order_read_allowed,
 )
 from agnostic_market.commerce.orders import (
-    LastOrderPointer,
     OrderStore,
+    RecentOrderContext,
     render_cart_line,
     render_order_list_line,
     render_order_status_line,
 )
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.dtos.orchestration import (
+    IntentRequest,
+    ListOrders,
+    PrincipalTransition,
+    SwitchAccount,
+    VerificationProof,
+)
 from agnostic_market.dtos.state import (
     ActiveFlow,
-    CancelSelection,
     HandoffDestination,
     HandoffReasonCode,
     HandoffRequest,
@@ -97,7 +109,6 @@ _GATE_OWNER: dict[HandoffDestination, ActiveFlow] = {
     "support": "support",
 }
 
-_ORDER_ID = re.compile(r"\bORD-\d+\b", re.IGNORECASE)
 _TOOL_LIMIT_FALLBACK = (
     "I've reached the lookup limit for this turn. Please ask again with the specific item "
     "or order you want me to check."
@@ -217,9 +228,13 @@ def build_frontline_graph(
     verification_store: VerificationStore | None = None,
     risk: RiskProvider | None = None,
     profile_store: ProfileStore,
-    pointer: LastOrderPointer | None = None,
+    recent_orders: RecentOrderContext | None = None,
     identity_store: CallerIdentityStore | None = None,
     customers: CustomerDirectory,
+    transition_principal: Callable[
+        [BoundIdentity, VerificationProof, IntentRequest | None], PrincipalTransition
+    ],
+    principal_state_will_be_discarded: Callable[[], bool],
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
@@ -241,10 +256,10 @@ def build_frontline_graph(
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
     cart_store = cart_store or CartStore()
-    # Session "that order" pointer (Group C L4). Production + any pointer test MUST pass the
+    # Session recent-order context. Production + any context test MUST pass the
     # SAME instance given to build_voice_tools (the order_status set-site) — the default
     # exists only for callers that never resolve an order reference (split-brain otherwise).
-    pointer = pointer or LastOrderPointer()
+    recent_orders = recent_orders or RecentOrderContext(max_refs=policy.cancel_batch_max)
     # Session authorization store + customer directory (P7). Same split-brain rule: the
     # order_status tool GRANTS into `identity_store` and the render router READS it — pass
     # the ONE instance to both build_voice_tools and here.
@@ -310,9 +325,9 @@ def build_frontline_graph(
     def model_node(state: ReasoningState) -> dict[str, object]:
         # Prompt lives inside the graph (single source; eval == production).
         prompt_text = system_prompt
-        if (last_order := pointer.get()) is not None:
+        if (last_order := recent_orders.snapshot().focused_order_ref) is not None:
             # Per-turn suffix (the static prompt stays composed once): "that order"
-            # resolves to the session pointer (Group C L4) — a reference, never state.
+            # resolves to the focused order reference — never a cached state claim.
             prompt_text = f"{system_prompt}\n{resolved_order_line(last_order)}"
         tool_hops = _tool_hops_this_turn(state)
         force_final = tool_hops >= policy.max_tool_hops
@@ -353,36 +368,26 @@ def build_frontline_graph(
             today=datetime.now().date(),
         )
 
-    def _referenced_order_ids(state: ReasoningState) -> list[str]:
-        """Return recent authorized order ids explicitly present in session history."""
-        found: list[str] = []
-        for msg in reversed(state.messages):
-            content = msg.content if isinstance(msg.content, str) else ""
-            for match in reversed(list(_ORDER_ID.finditer(content))):
-                order_id = match.group(0).upper()
-                if order_id not in found and order_read_allowed(
-                    order_id, store=store, identity=identity_store
-                ):
-                    found.append(order_id)
-        return found
-
     def _status_order_ids(state: ReasoningState, scope: str) -> list[str]:
-        referenced = _referenced_order_ids(state)
+        recent = recent_orders.snapshot()
+        referenced = [
+            order_id
+            for order_id in reversed(recent.order_refs)
+            if order_read_allowed(order_id, store=store, identity=identity_store)
+        ]
         if scope == "one":
-            if referenced:
-                return referenced[:1]
-            pointed = pointer.get()
-            if pointed is not None and order_read_allowed(
-                pointed, store=store, identity=identity_store
+            focused = recent.focused_order_ref
+            if focused is not None and order_read_allowed(
+                focused, store=store, identity=identity_store
             ):
-                return [pointed]
+                return [focused]
             return []
 
         current = _last_user_text(state)
         bound = identity_store.current()
         if bound is not None and re.search(r"\b(?:all|orders|purchases)\b", current, re.I):
             return [candidate.order_id for candidate in store.owned_orders(bound.customer_ref)]
-        if referenced:
+        if referenced and recent.complete:
             return referenced[:2] if re.search(r"\bboth\b", current, re.I) else referenced
         if bound is not None:
             return [candidate.order_id for candidate in store.owned_orders(bound.customer_ref)]
@@ -602,6 +607,17 @@ def build_frontline_graph(
         # the CART flow — the single-line checkout flow it replaces is gone.
         if handover.destination == "checkout" and state.active_flow != "left_cart":
             return {"active_flow": "cart", "handover": None}
+        if (
+            handover.destination == "support"
+            and handover.reason_code == "switch_account"
+            and state.active_flow != "left_identity"
+        ):
+            return {
+                "active_flow": "identity",
+                "handover": None,
+                "identity_claim_misses": 0,
+                "pending_request": SwitchAccount(),
+            }
         # Unbound LIST_ORDERS enters the IDENTITY flow (P7 rung 2: enumeration needs an
         # OTP-bound identity) — checked ABOVE the generic support branch since it shares
         # the support destination. The re-ask counter resets on ENTRY: each fresh engagement
@@ -611,7 +627,12 @@ def build_frontline_graph(
             and handover.reason_code == "list_orders"
             and state.active_flow != "left_identity"
         ):
-            return {"active_flow": "identity", "handover": None, "identity_claim_misses": 0}
+            return {
+                "active_flow": "identity",
+                "handover": None,
+                "identity_claim_misses": 0,
+                "pending_request": ListOrders(scope="account"),
+            }
         # Support handles REFUND, CANCEL_ORDER (Group A), and profile changes — address +
         # contact (Group C; contact = the OTP factor itself, stepped-up on the OLD factor).
         # PAYMENT_CHANGE stays deferred (payments = Phase 5): entering would run the
@@ -674,6 +695,7 @@ def build_frontline_graph(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
+            "pending_request": None,
             "pending_identity": None,
             "identity_claim_misses": 0,
             "pending_ack": None,
@@ -691,6 +713,8 @@ def build_frontline_graph(
         # to support's cancel-order path. The cross-switch closes the sticky-flow trap:
         # without it, a gate-certain intent for ANOTHER flow (e.g. "refund me" while stuck
         # in checkout) reaches the checkout model, which cannot serve it.
+        if state.pending_request is not None and state.active_flow is None:
+            return "support_continuation"
         text = _last_user_text(state)
         if state.active_flow == "cart":
             if wants_human(text):
@@ -740,12 +764,67 @@ def build_frontline_graph(
         # A cart/support/identity destination entered the flow (handover cleared, flow
         # set); everything else spoke its deferral and ends.
         if state.handover is None:
+            if state.active_flow == "identity" and state.pending_request is not None:
+                return (
+                    "principal_warning"
+                    if principal_state_will_be_discarded()
+                    else "identity_assemble"
+                )
             if state.active_flow == "cart":
                 return "cart_assemble"
             if state.active_flow == "support":
                 return "support_assemble"
             if state.active_flow == "identity":
                 return "identity_assemble"
+        return END
+
+    def principal_warning_node(state: ReasoningState) -> dict[str, object]:
+        request = state.pending_request
+        assert request is not None
+        switching = isinstance(request, SwitchAccount)
+        prompt = (
+            "If the new details belong to a different account, switching will clear this "
+            "call's cart and recent order context. Orders already placed will remain placed, "
+            "but they won't stay available in this conversation. Would you like to continue?"
+            if switching
+            else "Verifying an account will clear this call's cart and recent order context. "
+            "Orders already placed will remain placed, but they won't stay available in this "
+            "conversation. Would you like to continue?"
+        )
+        answer = interrupt(prompt)
+        verdict = classify_consent(str(answer.get("text", "")))
+        if answer.get("readback_interrupted") or verdict == "unclear":
+            action = "switch accounts" if switching else "verify the account"
+            answer = interrupt(f"To {action} and clear this call's context, say yes or no.")
+            verdict = classify_consent(str(answer.get("text", "")))
+        if verdict == "yes":
+            return {"active_flow": "identity"}
+        if verdict == "human":
+            return {
+                "pending_request": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human",
+                    reason_code="switch_account" if switching else "verification_required",
+                    source="gate",
+                ),
+            }
+        declined = (
+            "Okay, I'll keep you on the current account."
+            if switching
+            else "Okay, I won't start account verification."
+        )
+        return {
+            "pending_request": None,
+            "active_flow": None,
+            "messages": [AIMessage(declined)],
+        }
+
+    def route_after_principal_warning(state: ReasoningState) -> str:
+        if state.handover is not None:
+            return "handover"
+        if state.pending_request is not None:
+            return "identity_assemble"
         return END
 
     def route_after_cart_assemble(state: ReasoningState) -> str:
@@ -770,7 +849,7 @@ def build_frontline_graph(
         return END  # declined / expired (node spoke its line, clear-before-speak)
 
     cart = build_cart_nodes(
-        reasoning_model, store, cart_store, policy, pointer, display_name=display_name
+        reasoning_model, store, cart_store, policy, recent_orders, display_name=display_name
     )
     support = build_support_nodes(
         reasoning_model,
@@ -780,7 +859,7 @@ def build_frontline_graph(
         risk,
         policy,
         profile_store,
-        pointer,
+        recent_orders,
         identity_store=identity_store,
         display_name=display_name,
     )
@@ -793,6 +872,7 @@ def build_frontline_graph(
         customers,
         identity_store,
         policy,
+        transition_principal,
         display_name=display_name,
     )
 
@@ -831,21 +911,11 @@ def build_frontline_graph(
         }[identity.route_after_collect(state)]
 
     def route_after_identity_apply(state: ReasoningState) -> str:
-        # apply may hand to a human on a lapsed level / unproven binding; a retained
-        # CancelSelection (cancel-all continuation) routes into the support RESOLVER; an
-        # `identity_resume` marker (Fix 2, an explicit-order mutation that detoured to verify)
-        # routes back to support_ASSEMBLE (the model re-proposes, now the bound owner); else it
-        # spoke the scoped list + ends.
+        # Typed continuation routes to deterministic resolution; no transcript replay.
         if state.handover is not None:
             return "handover"
-        if isinstance(state.pending_cancel, CancelSelection):
-            return "support_resolve"
-        # apply consumed an `identity_resume` marker by setting active_flow="support" (the
-        # explicit-order mutation resume). It routes on active_flow — NOT the marker, which apply
-        # already cleared: this router runs on the POST-apply state, so reading the cleared marker
-        # here would always miss (the scope path above reads pending_cancel, which apply keeps).
-        if state.active_flow == "support":
-            return "support_assemble"
+        if state.pending_request is not None:
+            return "support_continuation"
         return END
 
     # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
@@ -854,13 +924,16 @@ def build_frontline_graph(
         # refund | cancel | return | profile | resolve | needs_identity | handover | leave |
         # clarify.
         decision = support.route_after_assemble(state)
+        if decision == "needs_identity":
+            return (
+                "principal_warning" if principal_state_will_be_discarded() else "identity_assemble"
+            )
         return {
             "refund": "support_guardrail",
             "cancel": "support_cancel_guardrail",
             "return": "support_return_guardrail",
             "profile": "support_profile_guardrail",
             "resolve": "support_resolve",  # a bound caller's "cancel all" -> resolve now
-            "needs_identity": "identity_assemble",  # unbound "cancel all" -> verify first
             "handover": "handover",  # deterministic fail-closed path (for example no profile)
             "leave": "gate",  # model left; normal pipeline answers this same turn
             "clarify": END,  # a clarifying question was streamed already
@@ -994,6 +1067,7 @@ def build_frontline_graph(
     graph.add_node("model", model_node)
     graph.add_node("tools", tool_node)
     graph.add_node("handover", handover_node)
+    graph.add_node("principal_warning", principal_warning_node)
     graph.add_node("finalize", finalize_node)
     graph.add_node("read_render", read_render_node)
     graph.add_node("forced_status", forced_status_node)
@@ -1006,6 +1080,7 @@ def build_frontline_graph(
     graph.add_node("cart_abort", cart.abort)
     graph.add_node("cart_escape_human", cart.escape_human)
     graph.add_node("support_assemble", support.assemble)
+    graph.add_node("support_continuation", support.continuation)
     graph.add_node("support_guardrail", support.guardrail)
     graph.add_node("support_risk_check", support.risk_check)
     graph.add_node("support_dispatch", support.dispatch)
@@ -1064,6 +1139,7 @@ def build_frontline_graph(
             "cart_abort": "cart_abort",
             "cart_escape_human": "cart_escape_human",
             "support_assemble": "support_assemble",
+            "support_continuation": "support_continuation",
             "support_abort": "support_abort",
             "support_escape_human": "support_escape_human",
             "identity_assemble": "identity_assemble",
@@ -1103,8 +1179,14 @@ def build_frontline_graph(
             "cart_assemble": "cart_assemble",
             "support_assemble": "support_assemble",
             "identity_assemble": "identity_assemble",
+            "principal_warning": "principal_warning",
             END: END,
         },
+    )
+    graph.add_conditional_edges(
+        "principal_warning",
+        route_after_principal_warning,
+        {"identity_assemble": "identity_assemble", "handover": "handover", END: END},
     )
     graph.add_conditional_edges(
         "cart_assemble",
@@ -1135,7 +1217,21 @@ def build_frontline_graph(
             "support_return_guardrail": "support_return_guardrail",
             "support_profile_guardrail": "support_profile_guardrail",
             "support_resolve": "support_resolve",  # a bound caller's scope resolves now
-            "identity_assemble": "identity_assemble",  # unbound scope -> verify first
+            "identity_assemble": "identity_assemble",  # unbound scope, no state to discard
+            "principal_warning": "principal_warning",
+            "handover": "handover",
+            END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "support_continuation",
+        route_after_support_assemble,
+        {
+            "support_guardrail": "support_guardrail",
+            "support_cancel_guardrail": "support_cancel_guardrail",
+            "support_return_guardrail": "support_return_guardrail",
+            "support_profile_guardrail": "support_profile_guardrail",
+            "support_resolve": "support_resolve",
             "handover": "handover",
             END: END,
         },
@@ -1290,8 +1386,7 @@ def build_frontline_graph(
         route_after_identity_apply,
         {
             "handover": "handover",
-            "support_resolve": "support_resolve",
-            "support_assemble": "support_assemble",  # Fix 2: explicit-order mutation resume
+            "support_continuation": "support_continuation",
             END: END,
         },
     )
@@ -1306,7 +1401,7 @@ def build_frontline_graph(
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset({"handover", "read_render", "forced_status"})
+        frozenset({"handover", "principal_warning", "read_render", "forced_status"})
         | cart.speakable_nodes
         | support.speakable_nodes
         | identity.speakable_nodes

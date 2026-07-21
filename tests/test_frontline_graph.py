@@ -16,10 +16,12 @@ from agnostic_market.commerce.identity import (
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider
+from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.dtos.orchestration import CancelOrders
 from agnostic_market.dtos.state import PolicyContext
+from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
 # A DEFERRING destination (planner) — these tests exercise the destination-agnostic handover
@@ -44,13 +46,13 @@ def _tools(
     config_root: Path,
     store: OrderStore,
     cart: CartStore,
-    pointer: LastOrderPointer,
+    recent_orders: RecentOrderContext,
     identity: CallerIdentityStore,
 ) -> list:
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     return [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, pointer, identity, customers)
+        for t in build_voice_tools(store, cart, recent_orders, identity, customers)
     ]
 
 
@@ -60,23 +62,38 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     # different cart than the render node (split-brain, graph docstring). Same for the
     # identity store (P7): the tool grants into it, the render router reads it.
     cart = kwargs.pop("cart_store", None) or CartStore()
-    pointer = kwargs.pop("pointer", None) or LastOrderPointer()
+    policy = kwargs.pop("policy", None) or make_policy(refund_returnless_under_usd=50.0)
+    recent_orders = kwargs.pop("recent_orders", None) or RecentOrderContext(
+        max_refs=policy.cancel_batch_max
+    )
     identity = kwargs.pop("identity", None) or CallerIdentityStore()
+    otp = kwargs.pop("otp", None) or OtpProvider(valid_code=_TEST_OTP)
+    verification = kwargs.pop("verification_store", None) or VerificationStore(otp)
+    caller_context = CallerContext(
+        verification_store=verification,
+        cart_store=cart,
+        recent_orders=recent_orders,
+        identity_store=identity,
+        order_store=store,
+    )
     return build_frontline_graph(
         fake,
-        _tools(config_root, store, cart, pointer, identity),
+        _tools(config_root, store, cart, recent_orders, identity),
         display_name="Acme Store",
         tenant_id="acme_store",
         cart_store=cart,
-        pointer=pointer,
-        otp=kwargs.pop("otp", None) or OtpProvider(valid_code=_TEST_OTP),
+        recent_orders=recent_orders,
+        otp=otp,
+        verification_store=verification,
         identity_store=identity,
         customers=CustomerDirectory(load_customers_fixture(config_root, "acme_store")),
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
-        policy=kwargs.pop("policy", None) or make_policy(refund_returnless_under_usd=50.0),
+        policy=policy,
+        transition_principal=caller_context.transition_principal,
+        principal_state_will_be_discarded=caller_context.has_discardable_state,
         **kwargs,
     )
 
@@ -126,11 +143,13 @@ async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
         tool_call_limit=1,
     )
     graph = _graph(config_root, FakeChatModel(tool_call_limit=1), reasoning_model=reasoning)
-    out = await graph.ainvoke({"messages": [HumanMessage("actually cancel that order")]})
+    out = await graph.ainvoke({"messages": [HumanMessage("actually cancel order ORD-1002")]})
     assert reasoning._tool_calls_made == 1  # the support model ran and proposed a cancel
     assert out.get("active_flow") == "identity"  # detoured to verify (rung-2 required)
     assert out.get("pending_cancel") is None  # nothing staged before the caller is bound
-    assert out.get("identity_resume") == "support_assemble"  # will resume the cancel post-bind
+    request = out.get("pending_request")
+    assert isinstance(request, CancelOrders)
+    assert request.target.order_refs == ("ORD-1002",)
 
 
 async def test_address_change_enters_the_support_flow(config_root: Path) -> None:
@@ -319,19 +338,19 @@ async def test_tool_hop_bound_strips_a_provider_tool_call_from_the_final_pass(
     assert isinstance(final, AIMessage) and not final.tool_calls and final.content
 
 
-async def test_state_followup_reads_the_pointer_without_calling_the_model(
+async def test_state_followup_reads_recent_context_without_calling_the_model(
     config_root: Path,
 ) -> None:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     store.cancel_order("cancel-1", order_id="ORD-1002")
-    pointer = LastOrderPointer()
-    pointer.set("ORD-1002")
+    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
+    recent_orders.record(["ORD-1002"], operation="read")
     identity = _granted("ORD-1002")
     graph = _graph(
         config_root,
         FakeChatModel(raise_transport=True),
         store=store,
-        pointer=pointer,
+        recent_orders=recent_orders,
         identity=identity,
     )
     out = await graph.ainvoke({"messages": [HumanMessage("is it cancelled?")]})
@@ -344,10 +363,13 @@ async def test_plural_state_followup_corrects_a_memory_claim_from_live_store(
 ) -> None:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     store.cancel_order("cancel-1", order_id="ORD-1002")
+    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
+    recent_orders.record(["ORD-1001", "ORD-1002"], operation="list")
     graph = _graph(
         config_root,
         FakeChatModel(raise_transport=True),
         store=store,
+        recent_orders=recent_orders,
         identity=_granted("ORD-1001", "ORD-1002"),
     )
     out = await graph.ainvoke(

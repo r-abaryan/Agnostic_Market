@@ -35,7 +35,7 @@ from agnostic_market.commerce.identity import (
     assert_orders_have_customers,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
 from agnostic_market.commerce.profile import (
     ProfileStore,
     assert_profiles_have_customers,
@@ -142,13 +142,12 @@ def build_voice_loop(
     otp = OtpProvider(valid_code=verification_fixture.otp_code)
     verification_store = VerificationStore(otp)
     risk = RiskProvider()
+    policy = config.policies.to_policy_context()
     # Per-session profile SoR (Group C) — fixture-backed like OrderStore; validated against
     # the customer directory below before its flow-facing store is constructed.
     profile_fixture = load_profile_fixture(config_root, config.merchant_id)
-    # Session "that order" pointer (Group C L4): the SAME instance feeds the order_status
-    # tool (set on a found read) and the flows (set on place/cancel/return) — one instance
-    # to both, or references resolve against different state (split-brain, like the cart).
-    pointer = LastOrderPointer()
+    # Bounded per-principal order references shared by reads and guarded flows.
+    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
     # Per-session authorization state + the customer directory (P7): the order_status tool
     # GRANTS into identity_store (rung 1) and the identity flow BINDS it (rung 2); the graph
     # reads the SAME instance (the render router's order-read gate) — split-brain otherwise.
@@ -159,12 +158,19 @@ def build_voice_loop(
     profile_store = ProfileStore(profile_fixture)
     customers = CustomerDirectory(customers_fixture)
     identity_store = CallerIdentityStore()
+    caller_context = CallerContext(
+        verification_store=verification_store,
+        cart_store=cart_store,
+        recent_orders=recent_orders,
+        identity_store=identity_store,
+        order_store=store,
+    )
     gateway = LLMGateway(credentials, secrets)
     # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
     # system prompts + few-shot (F1), so the Agent below carries NO instructions.
     tools = [
         wrap_readonly_tool(t, config.merchant_id)
-        for t in build_voice_tools(store, cart_store, pointer, identity_store, customers)
+        for t in build_voice_tools(store, cart_store, recent_orders, identity_store, customers)
     ]
     graph = build_frontline_graph(
         chat_model=gateway.chat_model(config.llm.routing),
@@ -177,7 +183,7 @@ def build_voice_loop(
         cart_store=cart_store,
         # The ONE config->runtime policy mapping (dtos/config.py to_policy_context) — a new
         # policy field lands there once, never per-site.
-        policy=config.policies.to_policy_context(),
+        policy=policy,
         # Support step-up seams (3c): the verification level lives in verification_store and
         # is read LIVE inside the support guardrail — never a checkpointed channel, so a
         # replayed checkpoint can't re-grant a level (§A388).
@@ -185,15 +191,20 @@ def build_voice_loop(
         otp=otp,
         risk=risk,
         profile_store=profile_store,
-        pointer=pointer,
+        recent_orders=recent_orders,
         identity_store=identity_store,
         customers=customers,
+        transition_principal=caller_context.transition_principal,
+        principal_state_will_be_discarded=caller_context.has_discardable_state,
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
         checkpointer=build_checkpointer(),
     )
-    engine = ReasoningEngine(graph, thread_id=uuid.uuid4().hex)
+    engine = ReasoningEngine(
+        graph, thread_id=uuid.uuid4().hex, lifecycle=caller_context
+    )
+    caller_context.attach_engine(engine)
     adapter = GraphVoiceAdapter(engine)
 
     session = AgentSession(
@@ -223,14 +234,6 @@ def build_voice_loop(
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    caller_context = CallerContext(
-        engine=engine,
-        verification_store=verification_store,
-        cart_store=cart_store,
-        pointer=pointer,
-        identity_store=identity_store,
-        order_store=store,
-    )
     _attach_thread_reaper(session, caller_context)
 
     agent = DisclosureFirstAgent(
@@ -250,8 +253,8 @@ def build_voice_loop(
 def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) -> None:
     """Clock B (AGENTS §A10 rule 4): on session close, the caller context is torn down
     UNCONDITIONALLY — a dropped call must never leave a resumable placement/refund, a stale
-    level, cart, pointer, verified identity, or guest order for a reattaching session (the
-    per-session stores already die with the session; this is belt-and-suspenders). The whole
+    level, cart, recent-order context, verified identity, or guest order for a reattaching
+    session. The per-session stores already die with it; this is belt-and-suspenders. The whole
     teardown lives in `CallerContext.close_session` (Fix 5), which is itself idempotent; the
     reaper adds the session-close-specific `flow_abandoned` telemetry (pending interrupt) and a
     re-entrant guard so a double-fired close acts at most once. Nothing is spoken (the caller is

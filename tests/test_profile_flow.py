@@ -21,7 +21,7 @@ _FACTS = TurnFacts()
 _VALID_OTP = "482913"
 _NEW_ADDRESS = "7 Elm Street, Dover"
 # Profile changes have NO gate patterns by design — entry is the MODEL's request_handover.
-_REQUEST = "I moved recently, please update my delivery details"
+_REQUEST = f"Please update my delivery address to {_NEW_ADDRESS}"
 
 
 _OWNER = "CUST-001"  # the customer with a fixture profile (Fix 5 Milestone B)
@@ -114,7 +114,7 @@ async def test_contact_change_updates_the_factor_reference(config_root: Path) ->
         thread_id="prof-contact-1",
     )
     old_factor = h.profile.contact_on_file(_OWNER)
-    await _events(h.engine, "I've got a new phone number, put it on my account")
+    await _events(h.engine, "Put my new phone number 555-0187 on my account")
     await _events(h.engine, _VALID_OTP)  # the OTP went to the OLD factor
     await _events(h.engine, "yes")
     assert h.profile.contact_on_file(_OWNER) == "555-0187"

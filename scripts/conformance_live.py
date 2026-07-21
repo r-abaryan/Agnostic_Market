@@ -45,7 +45,12 @@ async def _run() -> int:
         print(f"-> {label}")
         chat_model = gateway.chat_model(target, max_retries=targets_config.max_retries)
         try:
-            report = await run_conformance(chat_model, provider=target.provider, model=target.model)
+            report = await run_conformance(
+                chat_model,
+                provider=target.provider,
+                model=target.model,
+                structured_output_method=gateway.structured_output_method(target),
+            )
         except ConformanceRunError as exc:
             run_errors.append(label)
             print(f"   RUN ERROR (no verdict): {exc}")

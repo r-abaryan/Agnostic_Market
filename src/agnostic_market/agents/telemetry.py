@@ -5,10 +5,10 @@ checkout lifecycle events (confirmed/cancelled/denied/expired/abandoned). PRODUC
 REQUIRES the COMPLIANCE consent/retention framework before storing real-caller
 transcripts — fixture-data-only until then. Reason codes only, never free model prose.
 
-The `utterance` field is contact-REDACTED at this chokepoint (SECURITY §7d): a caller
-verifying an order speaks their email/phone, and the raw utterance record would persist it
-— redacting here means no writer can forget. Everything else in a record is closed slugs
-by the callers' own discipline (never tool-arg values).
+The `utterance` field is redacted at this chokepoint (SECURITY §7d): contact-shaped spans are
+removed generally, and profile-change handovers suppress the whole utterance because an address
+has no reliable shape. Everything else in a record is closed slugs by the callers' own discipline
+(never tool-arg values).
 """
 
 from __future__ import annotations
@@ -22,12 +22,19 @@ from agnostic_market.commerce.spoken import redact_contact
 logger = logging.getLogger("agnostic_market.agents.telemetry")
 
 _TELEMETRY_PATH = Path(__file__).resolve().parents[3] / "config" / "telemetry" / "frontline.jsonl"
+_SENSITIVE_UTTERANCE_REASONS = frozenset({"address_change", "contact_change"})
+_REDACTED_UTTERANCE = "[redacted]"
 
 
 def write_event(record: dict[str, object]) -> None:
     utterance = record.get("utterance")
     if isinstance(utterance, str):
-        record = {**record, "utterance": redact_contact(utterance)}
+        redacted = (
+            _REDACTED_UTTERANCE
+            if record.get("reason_code") in _SENSITIVE_UTTERANCE_REASONS
+            else redact_contact(utterance)
+        )
+        record = {**record, "utterance": redacted}
     try:
         _TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
         with _TELEMETRY_PATH.open("a", encoding="utf-8") as fh:

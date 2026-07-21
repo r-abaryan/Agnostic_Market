@@ -34,17 +34,22 @@ from agnostic_market.commerce.identity import (
     assert_orders_have_customers,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
 from agnostic_market.commerce.profile import (
     ProfileStore,
     assert_profiles_have_customers,
     load_profile_fixture,
 )
-from agnostic_market.commerce.verification import OtpProvider, load_verification_fixture
+from agnostic_market.commerce.verification import (
+    OtpProvider,
+    VerificationStore,
+    load_verification_fixture,
+)
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
+from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
@@ -113,7 +118,6 @@ async def _run() -> int:
     chat_model = LLMGateway(credentials, secrets).chat_model(resolved.config.llm.routing)
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
     cart_store = CartStore()
-    pointer = LastOrderPointer()
     customers_fixture = load_customers_fixture(_CONFIG_ROOT, _MERCHANT_ID)
     profile_fixture = load_profile_fixture(_CONFIG_ROOT, _MERCHANT_ID)
     assert_orders_have_customers(store.fixture, customers_fixture)
@@ -121,12 +125,25 @@ async def _run() -> int:
     customers = CustomerDirectory(customers_fixture)
     profile_store = ProfileStore(profile_fixture)
     identity_store = CallerIdentityStore()
+    config = resolved.config
+    policy = config.policies.to_policy_context()
+    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
+    verification_fixture = load_verification_fixture(_CONFIG_ROOT, _MERCHANT_ID)
+    otp = OtpProvider(valid_code=verification_fixture.otp_code)
+    verification = VerificationStore(otp)
+    caller_context = CallerContext(
+        verification_store=verification,
+        cart_store=cart_store,
+        recent_orders=recent_orders,
+        identity_store=identity_store,
+        order_store=store,
+    )
     tools = [
         wrap_readonly_tool(t, _MERCHANT_ID)
-        for t in build_voice_tools(store, cart_store, pointer, identity_store, customers)
+        for t in build_voice_tools(
+            store, cart_store, recent_orders, identity_store, customers
+        )
     ]
-    config = resolved.config
-    verification_fixture = load_verification_fixture(_CONFIG_ROOT, _MERCHANT_ID)
     graph = build_frontline_graph(
         chat_model,
         tools,
@@ -136,15 +153,18 @@ async def _run() -> int:
         # compiles as ONE shape — same construction path as production (F1 discipline).
         reasoning_model=LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
         store=store,
-        otp=OtpProvider(valid_code=verification_fixture.otp_code),
+        otp=otp,
+        verification_store=verification,
         cart_store=cart_store,  # SAME instance as view_cart (no split-brain)
-        pointer=pointer,  # SAME instance as order_status (Group C L4)
+        recent_orders=recent_orders,
         identity_store=identity_store,  # SAME instance as the tools' gate (P7, no split-brain)
         customers=customers,
         profile_store=profile_store,
         # The ONE config->runtime policy mapping — identical to production (F1). The old
         # hand-built copy here had drifted (it silently omitted spoken_policy_extra).
-        policy=config.policies.to_policy_context(),
+        policy=policy,
+        transition_principal=caller_context.transition_principal,
+        principal_state_will_be_discarded=caller_context.has_discardable_state,
         # An utterance that reaches the confirm readback pauses at an interrupt, which
         # needs a checkpointer even in the text eval (fresh thread per utterance).
         checkpointer=InMemorySaver(),

@@ -1,7 +1,8 @@
-"""LLM-plane DTOs — provider credentials (refs only) + conformance verdicts (AGENTS §A11).
+"""LLM-plane DTOs — provider integration config + conformance verdicts (AGENTS §A11).
 
 Selections reuse `ProviderModel` from dtos/config.py — there is deliberately no second
-selection shape. Credentials hold SecretResolver REFS (e.g. `env://NAME`), never values.
+selection shape. Credentials hold SecretResolver REFS (e.g. `env://NAME`), never values;
+provider-native structured-output transport is explicit integration metadata.
 """
 
 from __future__ import annotations
@@ -18,14 +19,16 @@ _STRICT = ConfigDict(extra="forbid", validate_assignment=True)
 
 # Cap for ConformanceCheck.detail — the suite composes/clips against this same constant.
 DETAIL_MAX_LENGTH = 200
+StructuredOutputMethod = Literal["function_calling", "json_schema"]
 
 
 class ProviderEntry(BaseModel):
-    """One provider's credential reference — a resolver ref, never a secret value."""
+    """One provider's credential reference and optional LLM transport metadata."""
 
     model_config = _STRICT
 
     api_key_ref: str = Field(min_length=1)
+    structured_output_method: StructuredOutputMethod | None = None
 
 
 class ProviderCredentialsConfig(BaseModel):

@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agnostic_market.commerce.spoken import spoken_digits
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.dtos.orchestration import VerificationProof
 
 logger = logging.getLogger("agnostic_market.commerce.verification")
 
@@ -78,7 +79,7 @@ class VerificationStore:
         self._level = initial_level
         # Records the method + signals that granted each raise — dispute-defense audit
         # (§A4a "log the verification method + signals per action"). No PII, no code value.
-        self.grants: list[dict[str, object]] = []
+        self.grants: list[VerificationProof] = []
 
     def current_level(self) -> int:
         return self._level
@@ -99,9 +100,21 @@ class VerificationStore:
         spoken = spoken_digits(code)
         if self._otp.verify(spoken or code):
             self._level = 2
-            self.grants.append({"method": "otp", "raised_to": 2})
+            self.grants.append(VerificationProof())
             return True
         return False
+
+    def fresh_proof_since(self, grant_count: int) -> VerificationProof | None:
+        """Return this verification chain's newest proof, never an older session grant."""
+        fresh = self.grants[grant_count:]
+        return fresh[-1] if fresh else None
+
+    def retain_only(self, proof: VerificationProof) -> None:
+        """Replace prior verification history with one proof already earned this session."""
+        if proof not in self.grants:
+            raise ValueError("verification proof was not earned by this session")
+        self._level = proof.raised_to
+        self.grants[:] = [proof]
 
     def clear(self) -> None:
         """Reset the granted level (Clock-B teardown; also drops any recorded grants)."""

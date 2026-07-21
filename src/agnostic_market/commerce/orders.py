@@ -19,7 +19,8 @@ prose surface to speak from, one structured surface to select from.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -400,29 +401,73 @@ CANCELLED_STATUS = "cancelled"
 FULFILLED_STATUSES = frozenset({"shipped", "delivered"})
 
 
-class LastOrderPointer:
-    """The session's "that order" reference — a bounded conversational pointer (Group C, L4
-    from live call #10: "one thousand one" was mis-bound to the salient ORD-9001).
+OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
 
-    The CartStore pattern: one mutable per-session object, closed into tools + flows at
-    build, dies with the session (never a checkpointed state channel — nothing for a replay
-    to resurrect, and no Command/tool-injection machinery). Set ONLY on an explicit
-    order_status lookup or a successful order effect (place/cancel/return). It is a bare
-    ID for REFERENCE RESOLUTION — never a cache of order state: any status/delivery/refund
-    claim still requires an order_status read that turn (the frontline grounding rule).
+
+@dataclass(frozen=True)
+class RecentOrderSnapshot:
+    focused_order_ref: str | None
+    order_refs: tuple[str, ...]
+    operation: OrderContextOperation | None
+    outcomes: tuple[tuple[str, str], ...]
+    complete: bool
+
+
+class RecentOrderContext:
+    """Bounded per-principal references for deterministic order follow-ups.
+
+    References are never cached state claims: every status check re-reads `OrderStore`. The
+    latest operation replaces the prior set, so batch effects retain every target without
+    scanning model-visible transcript history. `max_refs` is injected from the platform's
+    graph-work bound; overflow is marked `complete=False` so consumers cannot mistake the
+    bounded reference set for a complete result.
     """
 
-    def __init__(self) -> None:
-        self._order_id: str | None = None
+    def __init__(self, *, max_refs: int) -> None:
+        if max_refs < 1:
+            raise ValueError("max_refs must be positive")
+        self._max_refs = max_refs
+        self.clear()
 
-    def set(self, order_id: str) -> None:
-        self._order_id = order_id.strip().upper()
+    def record(
+        self,
+        order_refs: Iterable[str],
+        *,
+        operation: OrderContextOperation,
+        focused_order_ref: str | None = None,
+        outcomes: Iterable[tuple[str, str]] = (),
+    ) -> None:
+        refs = tuple(dict.fromkeys(ref.strip().upper() for ref in order_refs if ref.strip()))
+        if not refs:
+            raise ValueError("recent order context requires at least one order reference")
+        complete = len(refs) <= self._max_refs
+        bounded_refs = refs[-self._max_refs :]
+        focused = focused_order_ref.strip().upper() if focused_order_ref else bounded_refs[-1]
+        if focused not in refs:
+            raise ValueError("focused order must be included in order_refs")
+        if focused not in bounded_refs:
+            bounded_refs = (*bounded_refs[1:], focused)
+        normalized_outcomes = tuple((ref.strip().upper(), code) for ref, code in outcomes)
+        if any(ref not in refs for ref, _code in normalized_outcomes):
+            raise ValueError("outcome order must be included in order_refs")
+        bounded_outcomes = tuple(
+            (ref, code) for ref, code in normalized_outcomes if ref in bounded_refs
+        )
+        self._snapshot = RecentOrderSnapshot(
+            focused_order_ref=focused,
+            order_refs=bounded_refs,
+            operation=operation,
+            outcomes=bounded_outcomes,
+            complete=complete,
+        )
 
-    def get(self) -> str | None:
-        return self._order_id
+    def snapshot(self) -> RecentOrderSnapshot:
+        return self._snapshot
 
     def clear(self) -> None:
-        self._order_id = None
+        self._snapshot = RecentOrderSnapshot(
+            focused_order_ref=None, order_refs=(), operation=None, outcomes=(), complete=True
+        )
 
 
 def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:

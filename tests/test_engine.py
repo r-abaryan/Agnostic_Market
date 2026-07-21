@@ -32,10 +32,11 @@ from agnostic_market.commerce.identity import (
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider
+from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
+from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
 # The reasoning fake buys option 2 (waterproof rain jacket, $129.00) x2 = $258.00 -> straight
@@ -54,13 +55,24 @@ def _engine(
     thread_id: str = "session-1",
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    pointer = LastOrderPointer()
+    policy = make_policy(refund_returnless_under_usd=50.0)
+    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
+    cart = CartStore()
     identity = identity or CallerIdentityStore()
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, CartStore(), pointer, identity, customers)
+        for t in build_voice_tools(store, cart, recent_orders, identity, customers)
     ]
+    otp = OtpProvider(valid_code=_TEST_OTP)
+    verification = VerificationStore(otp)
+    caller_context = CallerContext(
+        verification_store=verification,
+        cart_store=cart,
+        recent_orders=recent_orders,
+        identity_store=identity,
+        order_store=store,
+    )
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
@@ -69,14 +81,21 @@ def _engine(
         reasoning_model=reasoning
         or FakeChatModel(force_tool="buy_now", canned_args=_PROPOSE, tool_call_limit=1),
         store=store,
-        otp=OtpProvider(valid_code=_TEST_OTP),
-        pointer=pointer,
+        otp=otp,
+        verification_store=verification,
+        cart_store=cart,
+        recent_orders=recent_orders,
+        identity_store=identity,
         customers=customers,
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
-        policy=make_policy(refund_returnless_under_usd=50.0),
+        policy=policy,
+        transition_principal=caller_context.transition_principal,
+        principal_state_will_be_discarded=caller_context.has_discardable_state,
         checkpointer=build_checkpointer(),
     )
-    return ReasoningEngine(graph, thread_id=thread_id), store
+    engine = ReasoningEngine(graph, thread_id=thread_id, lifecycle=caller_context)
+    caller_context.attach_engine(engine)
+    return engine, store
 
 
 async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS) -> list:

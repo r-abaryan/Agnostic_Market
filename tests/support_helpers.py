@@ -17,10 +17,11 @@ from agnostic_market.commerce.identity import (
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import LastOrderPointer, OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import PolicyContext
+from agnostic_market.voice.context import CallerContext
 
 
 class SupportHarness(NamedTuple):
@@ -31,9 +32,10 @@ class SupportHarness(NamedTuple):
     verification: VerificationStore
     otp: OtpProvider
     profile: ProfileStore
-    pointer: LastOrderPointer
+    recent_orders: RecentOrderContext
     identity: CallerIdentityStore
     customers: CustomerDirectory
+    caller_context: CallerContext
 
 
 _FIXTURE_ORDERS = ("ORD-1001", "ORD-1002", "ORD-1003")
@@ -66,23 +68,31 @@ def build_support_engine(
 ) -> SupportHarness:
     """The production graph shape behind a ReasoningEngine, with fakes + per-test stores.
 
-    The pointer and identity-store instances are SHARED between the tools and the graph
+    The recent-order and identity-store instances are SHARED between the tools and the graph
     (the split-brain rule); the neutral reasoning default clarifies — suites pass their
     own force_tool/scripted fakes.
     """
     from agnostic_market.voice.tools import build_voice_tools
 
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    pointer = LastOrderPointer()
+    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
+    cart = CartStore()
     identity = CallerIdentityStore()
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
         wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, CartStore(), pointer, identity, customers)
+        for t in build_voice_tools(store, cart, recent_orders, identity, customers)
     ]
     otp = OtpProvider(valid_code=TEST_OTP)
     verification = VerificationStore(otp)
     profile = ProfileStore(load_profile_fixture(config_root, "acme_store"))
+    caller_context = CallerContext(
+        verification_store=verification,
+        cart_store=cart,
+        recent_orders=recent_orders,
+        identity_store=identity,
+        order_store=store,
+    )
     graph = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
@@ -95,18 +105,24 @@ def build_support_engine(
         otp=otp,
         risk=RiskProvider(flagged=risk_flagged),
         profile_store=profile,
-        pointer=pointer,
+        cart_store=cart,
+        recent_orders=recent_orders,
         identity_store=identity,
         customers=customers,
+        transition_principal=caller_context.transition_principal,
+        principal_state_will_be_discarded=caller_context.has_discardable_state,
         checkpointer=build_checkpointer(),
     )
+    engine = ReasoningEngine(graph, thread_id=thread_id, lifecycle=caller_context)
+    caller_context.attach_engine(engine)
     return SupportHarness(
-        ReasoningEngine(graph, thread_id=thread_id),
+        engine,
         store,
         verification,
         otp,
         profile,
-        pointer,
+        recent_orders,
         identity,
         customers,
+        caller_context,
     )

@@ -12,8 +12,9 @@ check (-> chat-only); a transport/auth error raises `ConformanceRunError` and NO
 recorded — infrastructure failure is never converted into a capability verdict.
 
 Checks run async (`ainvoke`/`astream`) because that is the production voice-loop path.
-The structured-output check uses the real routing contract now that it exists. This pins the
-configured commerce model to the nested/discriminated shape production routing will consume.
+The structured-output check uses the real routing contract and the gateway-selected native
+transport. This pins the configured commerce model to the nested/discriminated shape production
+routing will consume.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from agnostic_market.dtos.llm import (
     ConformanceCheck,
     ConformanceReport,
     ConformanceTargetsConfig,
+    StructuredOutputMethod,
 )
 from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
@@ -104,10 +106,12 @@ async def _check_tool_call(chat_model: BaseChatModel) -> ConformanceCheck:
     return ConformanceCheck(name=name, passed=True, detail="")
 
 
-async def _check_structured_output(chat_model: BaseChatModel) -> ConformanceCheck:
+async def _check_structured_output(
+    chat_model: BaseChatModel, *, method: StructuredOutputMethod
+) -> ConformanceCheck:
     """`with_structured_output` must return the real validated route contract."""
     name = "structured_output"
-    structured = chat_model.with_structured_output(RouteDecision)
+    structured = chat_model.with_structured_output(RouteDecision, method=method)
     try:
         result = await structured.ainvoke(_STRUCTURED_PROMPT)
     except (OutputParserException, ValidationError) as exc:
@@ -170,7 +174,11 @@ async def _check_streaming(chat_model: BaseChatModel) -> ConformanceCheck:
 
 
 async def run_conformance(
-    chat_model: BaseChatModel, *, provider: str, model: str
+    chat_model: BaseChatModel,
+    *,
+    provider: str,
+    model: str,
+    structured_output_method: StructuredOutputMethod,
 ) -> ConformanceReport:
     """Run all three checks; verdict is commerce-ready iff ALL pass.
 
@@ -181,7 +189,7 @@ async def run_conformance(
     checks: list[ConformanceCheck] = []
     try:
         checks.append(await _check_tool_call(chat_model))
-        checks.append(await _check_structured_output(chat_model))
+        checks.append(await _check_structured_output(chat_model, method=structured_output_method))
         checks.append(await _check_streaming(chat_model))
     except Exception as exc:
         # Deliberately broad: provider clients raise provider-specific transport/auth

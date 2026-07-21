@@ -23,6 +23,7 @@ from agnostic_market.llm.providers import (
 )
 
 _MAX_AGE_DAYS = 30
+_STRUCTURED_OUTPUT_METHOD = "function_calling"
 
 
 def _failed_checks(report: ConformanceReport) -> dict[str, str]:
@@ -33,7 +34,12 @@ def _failed_checks(report: ConformanceReport) -> dict[str, str]:
 
 
 async def test_conformant_model_is_commerce_ready() -> None:
-    report = await run_conformance(FakeChatModel(), provider="fake", model="good")
+    report = await run_conformance(
+        FakeChatModel(),
+        provider="fake",
+        model="good",
+        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+    )
     assert report.verdict == "commerce-ready", _failed_checks(report)
     assert report.suite_version == SUITE_VERSION
     assert [c.name for c in report.checks] == ["tool_call", "structured_output", "streaming"]
@@ -41,7 +47,10 @@ async def test_conformant_model_is_commerce_ready() -> None:
 
 async def test_no_tool_calls_flagged_chat_only() -> None:
     report = await run_conformance(
-        FakeChatModel(emit_tool_calls=False), provider="fake", model="no-tools"
+        FakeChatModel(emit_tool_calls=False),
+        provider="fake",
+        model="no-tools",
+        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
     )
     assert report.verdict == "chat-only"
     assert "no tool_calls" in _failed_checks(report)["tool_call"]
@@ -49,7 +58,10 @@ async def test_no_tool_calls_flagged_chat_only() -> None:
 
 async def test_wrong_tool_selection_flagged_chat_only() -> None:
     report = await run_conformance(
-        FakeChatModel(pick_wrong_tool=True), provider="fake", model="wrong-tool"
+        FakeChatModel(pick_wrong_tool=True),
+        provider="fake",
+        model="wrong-tool",
+        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
@@ -58,7 +70,10 @@ async def test_wrong_tool_selection_flagged_chat_only() -> None:
 
 async def test_invalid_structured_output_flagged_chat_only() -> None:
     report = await run_conformance(
-        FakeChatModel(canned_args=BROKEN_ROUTE_ARGS), provider="fake", model="bad-schema"
+        FakeChatModel(canned_args=BROKEN_ROUTE_ARGS),
+        provider="fake",
+        model="bad-schema",
+        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
@@ -68,7 +83,10 @@ async def test_invalid_structured_output_flagged_chat_only() -> None:
 
 async def test_non_streaming_flagged_chat_only() -> None:
     report = await run_conformance(
-        FakeChatModel(stream_chunks=1), provider="fake", model="no-stream"
+        FakeChatModel(stream_chunks=1),
+        provider="fake",
+        model="no-stream",
+        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
@@ -77,7 +95,12 @@ async def test_non_streaming_flagged_chat_only() -> None:
 
 async def test_transport_error_yields_no_verdict() -> None:
     with pytest.raises(ConformanceRunError, match="no verdict"):
-        await run_conformance(FakeChatModel(raise_transport=True), provider="fake", model="flaky")
+        await run_conformance(
+            FakeChatModel(raise_transport=True),
+            provider="fake",
+            model="flaky",
+            structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+        )
 
 
 # --- registry: persistence + three-way fail-closed gate --------------------------------
@@ -183,12 +206,12 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
             },
             "telephony": {"provider": "telnyx", "inbound_number": "+15550000000"},
             "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
-                "policies": {
-                    "max_order_value_usd": 1500,
-                    "refunds": {"auto_approve_under_usd": 50, "require_human_above_usd": 200},
-                    "allow_ai_merchant_handoff": True,
-                    "cancel_batch_max": 10,
-                },
+            "policies": {
+                "max_order_value_usd": 1500,
+                "refunds": {"auto_approve_under_usd": 50, "require_human_above_usd": 200},
+                "allow_ai_merchant_handoff": True,
+                "cancel_batch_max": 10,
+            },
             "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
             "integration": {
                 "order_sor": {"type": "api", "ref": "vault://m1/order", "idempotency": "supported"},

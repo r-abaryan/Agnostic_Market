@@ -69,7 +69,10 @@ def test_level_starts_at_l1_and_rises_only_on_correct_committed_otp() -> None:
     assert store.verify_otp(_TEST_OTP) is True
     assert store.current_level() == 2
     # the grant is recorded for dispute defense (§A4a) — method only, no PII/code value
-    assert store.grants == [{"method": "otp", "raised_to": 2}]
+    assert len(store.grants) == 1
+    assert store.grants[0].method == "otp"
+    assert store.grants[0].raised_to == 2
+    assert store.grants[0].proof_id
 
 
 def test_spoken_digit_code_verifies() -> None:

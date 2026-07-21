@@ -10,12 +10,17 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 
+from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
+_CUST1_REF = "CUST-001"
+_CUST2_REF = "CUST-002"
+_CUST1_MASK = "number ending 0119"
 _CUST1_PHONE = "+1 555 010 0119"  # CUST-001 on file: owns ORD-1001 + ORD-1003
+_CUST2_EMAIL = "casey@example.com"
 _UNKNOWN_CLAIM = "nobody@nowhere.example"
 # Enumeration has NO gate patterns by design — entry is the MODEL's request_handover.
 _REQUEST = "what orders do I have on my account?"
@@ -47,6 +52,51 @@ def _identity_harness(
         ),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
+    )
+
+
+def _switch_harness(
+    config_root: Path,
+    *,
+    claim: str,
+    thread_id: str,
+    otp_max_attempts: int = 3,
+) -> SupportHarness:
+    return build_support_engine(
+        config_root,
+        policy=_POLICY.model_copy(update={"otp_max_attempts": otp_max_attempts}),
+        frontline=FakeChatModel(
+            force_tool="request_handover",
+            canned_args={
+                "request_handover": {
+                    "destination": "support",
+                    "reason_code": "switch_account",
+                }
+            },
+            tool_call_limit=99,
+        ),
+        reasoning=FakeChatModel(
+            force_tool="propose_identity",
+            canned_args={"propose_identity": {"contact_claim": claim}},
+            tool_call_limit=99,
+        ),
+        thread_id=thread_id,
+    )
+
+
+def _establish_customer_one(harness: SupportHarness) -> str:
+    assert harness.verification.verify_otp(_VALID_OTP)
+    proof_id = harness.verification.grants[-1].proof_id
+    harness.identity.bind(BoundIdentity(customer_ref=_CUST1_REF, masked_contact=_CUST1_MASK))
+    return proof_id
+
+
+def _seed_cart(harness: SupportHarness) -> None:
+    harness.caller_context.cart_store.add_item(
+        sku="SKU-BLU-07",
+        name="blue wool hat",
+        price_usd=29.0,
+        quantity=1,
     )
 
 
@@ -84,12 +134,15 @@ async def test_enumeration_ask_dispatches_otp_before_naming_any_order(
 
 async def test_committed_otp_binds_and_speaks_only_their_orders(config_root: Path) -> None:
     h = _identity_harness(config_root)
+    old_thread_id = h.engine.thread_id
     await _events(h.engine, _REQUEST)
     events = await _events(h.engine, _VALID_OTP)
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-001"
     assert h.verification.current_level() == 2
-    lines = [e for e in _spoken(events) if e.node == "identity_apply"]
+    assert h.engine.thread_id != old_thread_id
+    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    lines = [e for e in _spoken(events) if e.node == "support_continuation"]
     assert len(lines) == 1
     # THE privacy property: CUST-001 hears 1001 + 1003 and NEVER CUST-002's 1002.
     assert "ORD-1001" in lines[0].text and "ORD-1003" in lines[0].text
@@ -106,8 +159,129 @@ async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) 
     events = await _events(h.engine, "It should be four eight two nine one three.")
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-002"
-    line = next(e for e in _spoken(events) if e.node == "identity_apply")
+    line = next(e for e in _spoken(events) if e.node == "support_continuation")
     assert "ORD-1002" in line.text and "ORD-1001" not in line.text
+
+
+async def test_verified_account_switch_rotates_all_principal_context(
+    config_root: Path,
+) -> None:
+    h = _switch_harness(
+        config_root,
+        claim=_CUST2_EMAIL,
+        thread_id="switch-success",
+    )
+    old_proof_id = _establish_customer_one(h)
+    h.identity.grant_order("ORD-1001")
+    h.identity.grant_mutation_for_test("ORD-1001")
+    _seed_cart(h)
+    h.recent_orders.record(["ORD-1001"], operation="read")
+    old_thread_id = h.engine.thread_id
+
+    warning = await _events(h.engine, "I want to use another account")
+    prompts = [event.prompt for event in warning if isinstance(event, InterruptEvent)]
+    assert len(prompts) == 1 and "different account" in prompts[0]
+    assert h.identity.current().customer_ref == _CUST1_REF
+
+    dispatched = await _events(h.engine, "yes")
+    assert any(
+        isinstance(event, InterruptEvent) and "6-digit code" in event.prompt for event in dispatched
+    )
+    assert h.identity.current().customer_ref == _CUST1_REF
+    assert not h.caller_context.cart_store.is_empty()
+
+    completed = await _events(h.engine, _VALID_OTP)
+    assert any(
+        event.node == "identity_apply" and "new account" in event.text
+        for event in _spoken(completed)
+    )
+    assert h.engine.thread_id != old_thread_id
+    assert h.identity.current().customer_ref == _CUST2_REF
+    assert h.caller_context.cart_store.is_empty()
+    assert h.recent_orders.snapshot().order_refs == ()
+    assert not h.identity.order_granted("ORD-1001")
+    assert not h.identity.mutation_granted_for_test("ORD-1001")
+    assert len(h.verification.grants) == 1
+    assert h.verification.grants[0].proof_id != old_proof_id
+    old_state = h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}})
+    assert old_state.values == {}
+    assert old_state.interrupts == ()
+
+
+async def test_failed_account_switch_preserves_original_principal(
+    config_root: Path,
+) -> None:
+    h = _switch_harness(
+        config_root,
+        claim=_CUST2_EMAIL,
+        thread_id="switch-failed",
+        otp_max_attempts=1,
+    )
+    old_proof_id = _establish_customer_one(h)
+    _seed_cart(h)
+    old_thread_id = h.engine.thread_id
+
+    await _events(h.engine, "switch my account")
+    await _events(h.engine, "yes")
+    await _events(h.engine, "000000")
+
+    assert h.engine.thread_id == old_thread_id
+    assert h.identity.current().customer_ref == _CUST1_REF
+    assert not h.caller_context.cart_store.is_empty()
+    assert [proof.proof_id for proof in h.verification.grants] == [old_proof_id]
+    state = h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}})
+    assert state.values.get("pending_request") is None
+
+
+async def test_same_account_switch_skips_rotation_and_preserves_context(
+    config_root: Path,
+) -> None:
+    h = _switch_harness(
+        config_root,
+        claim=_CUST1_PHONE,
+        thread_id="switch-same",
+    )
+    old_proof_id = _establish_customer_one(h)
+    _seed_cart(h)
+    old_thread_id = h.engine.thread_id
+
+    await _events(h.engine, "switch my account")
+    completed = await _events(h.engine, "yes")
+
+    assert any("already verified" in event.text for event in _spoken(completed))
+    assert h.engine.thread_id == old_thread_id
+    assert h.identity.current().customer_ref == _CUST1_REF
+    assert not h.caller_context.cart_store.is_empty()
+    assert [proof.proof_id for proof in h.verification.grants] == [old_proof_id]
+
+
+async def test_closing_turn_stream_completes_a_pending_context_rotation(
+    config_root: Path,
+) -> None:
+    h = _switch_harness(
+        config_root,
+        claim=_CUST2_EMAIL,
+        thread_id="switch-stream-close",
+    )
+    _establish_customer_one(h)
+    old_thread_id = h.engine.thread_id
+    dispatched = await _events(h.engine, "switch my account")
+    assert any(isinstance(event, InterruptEvent) for event in dispatched)
+
+    stream = h.engine.stream_turn(_VALID_OTP, _FACTS)
+    try:
+        while True:
+            event = await anext(stream)
+            if isinstance(event, SpokenMessageEvent) and event.node == "identity_apply":
+                break
+        assert h.caller_context.pending_transition() is not None
+    finally:
+        await stream.aclose()
+
+    assert h.caller_context.pending_transition() is None
+    assert h.engine.thread_id != old_thread_id
+    assert h.identity.current().customer_ref == _CUST2_REF
+    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
 
 
 async def test_session_placed_order_appears_in_the_identified_list(config_root: Path) -> None:
@@ -174,7 +348,7 @@ async def test_stale_l2_then_correct_otp_binds(config_root: Path) -> None:
     events = await _events(h.engine, _VALID_OTP)  # correct on the re-collect
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-001"
-    assert any(e.node == "identity_apply" for e in _spoken(events))
+    assert any(e.node == "support_continuation" for e in _spoken(events))
 
 
 async def test_stale_l2_wrong_otp_twice_exhausts_to_human(config_root: Path) -> None:

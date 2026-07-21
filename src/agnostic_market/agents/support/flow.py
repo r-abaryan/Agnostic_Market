@@ -37,6 +37,7 @@ readback is not consent (§4a) — the confirm node re-confirms once.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -62,14 +63,19 @@ from agnostic_market.commerce.orders import (
     CANCELLED_STATUS,
     FULFILLED_STATUSES,
     CancelError,
-    LastOrderPointer,
     OrderCandidate,
     OrderStore,
+    RecentOrderContext,
     RefundError,
     ReturnError,
     render_batch_cancel_outcome,
+    render_order_list_line,
 )
 from agnostic_market.commerce.profile import ProfileError, ProfileStore
+from agnostic_market.commerce.spoken import (
+    caller_stated_order_id,
+    caller_stated_phone,
+)
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import (
     CREATE_RETURN_POLICY,
@@ -81,10 +87,20 @@ from agnostic_market.dtos.confirmation import (
     profile_change_required_level,
     refund_required_level,
 )
+from agnostic_market.dtos.orchestration import (
+    CancellableOrderScope,
+    CancelOrders,
+    CancelScope,
+    ChangeProfile,
+    ExplicitOrderSet,
+    ExplicitOrderTarget,
+    IntentRequest,
+    ListOrders,
+    RefundOrder,
+    ReturnOrder,
+)
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
-    CancelScope,
-    CancelSelection,
     CancelTarget,
     HandoffRequest,
     PendingCancelBatch,
@@ -122,6 +138,9 @@ _SUPPORT_NOT_FOUND_OFFER_HUMAN = (
     "couldn't find an order matching those details, and OFFER to connect them with a "
     "person who can verify them another way."
 )
+_CONTINUATION_NOT_FOUND = (
+    "I couldn't find an order matching those details, so I haven't changed anything."
+)
 # The denial counter's bucket for references that never resolved to a store order — one
 # bounded key, never the caller's free text (an attacker probing random ids must not grow
 # an unbounded dict of their own strings).
@@ -133,6 +152,38 @@ def _last_user_text(state: ReasoningState) -> str:
         if isinstance(msg, HumanMessage):
             return str(msg.content)
     return ""
+
+
+def _caller_stated_profile_value(utterance: str, field: ProfileField, value: str) -> bool:
+    stated = " ".join(utterance.casefold().split())
+    proposed = " ".join(value.casefold().split())
+    if field != "contact":
+        return bool(proposed) and proposed in stated
+    return caller_stated_phone(utterance, value)
+
+
+def _caller_stated_refund_amount(utterance: str, amount_usd: float) -> float | None:
+    variants = {f"{amount_usd:g}", f"{amount_usd:.2f}"}
+    amount = "|".join(re.escape(value) for value in sorted(variants, key=len, reverse=True))
+    pattern = rf"(?:\$\s*(?:{amount})\b|\b(?:{amount})\s*(?:dollars?|usd)\b)"
+    return round(amount_usd, 2) if re.search(pattern, utterance, re.IGNORECASE) else None
+
+
+def _caller_stated_refund_destination(
+    utterance: str, destination: RefundDestination
+) -> RefundDestination | None:
+    if destination == "original":
+        return destination
+    lowered = utterance.casefold()
+    if destination == "new_instrument" and re.search(
+        r"\b(?:new|different|another)\b[^.?!]*\b(?:card|instrument)\b", lowered
+    ):
+        return destination
+    if destination == "new_address" and re.search(
+        r"\b(?:new|different|another)\b[^.?!]*\baddress\b", lowered
+    ):
+        return destination
+    return None
 
 
 def _readback_line(pending: PendingRefund, policy: ToolConfirmationPolicy) -> str:
@@ -298,6 +349,7 @@ class SupportNodes:
     """
 
     assemble: Callable[[ReasoningState], dict[str, object]]
+    continuation: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     risk_check: Callable[[ReasoningState], dict[str, object]]
     dispatch: Callable[[ReasoningState], dict[str, object]]
@@ -307,9 +359,8 @@ class SupportNodes:
     cancel_guardrail: Callable[[ReasoningState], dict[str, object]]
     cancel_confirm: Callable[[ReasoningState], dict[str, object]]
     cancel_void: Callable[[ReasoningState], dict[str, object]]
-    # Resolve a retained CancelSelection into a batch AFTER an identity bind (Milestone B): the
-    # account-wide "cancel all" continuation. Reached from identity_apply (selection retained)
-    # or directly from assemble (an ALREADY-bound caller's scope), never speaks a list.
+    # Resolve a CancellableOrderScope into a batch after authorization. Reached from the typed
+    # continuation or directly from an already-bound caller's assemble, and never speaks a list.
     resolve: Callable[[ReasoningState], dict[str, object]]
     abort: Callable[[ReasoningState], dict[str, object]]
     escape_human: Callable[[ReasoningState], dict[str, object]]
@@ -360,7 +411,7 @@ def build_support_nodes(
     risk: RiskProvider,
     policy: PolicyContext,
     profile_store: ProfileStore,
-    pointer: LastOrderPointer,
+    recent_orders: RecentOrderContext,
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
@@ -420,19 +471,163 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
+            "pending_request": None,
         }
 
-    def _enter_identity_for_action(new_messages: list) -> dict[str, object]:
-        """An UNBOUND caller proposed a mutation on an explicit order (Fix 2, rung-2): enter the
-        identity OTP flow to BIND, then resume at support_assemble (the model re-proposes from
-        history, now authorized as the bound owner). Mints NO pending — the "no pending before
-        auth" invariant holds; only the ids-free `identity_resume` marker rides across the detour.
-        Mirrors the scope-path detour (a `CancelSelection` resumes at the resolver instead)."""
+    def continuation_node(state: ReasoningState) -> dict[str, object]:
+        """Consume one typed post-identity request without replaying prior transcript.
+
+        Every order reference is resolved against the current principal's live candidate set
+        and authorized again. The request is cleared in the same checkpoint that mints any
+        action-specific pending state, so no continuation can execute twice.
+        """
+        request = state.pending_request
+        assert request is not None
+        base: dict[str, object] = {
+            "pending_request": None,
+            "active_flow": "support",
+        }
+        full = order_store.actionable_orders()
+        by_id = {order.order_id: order for order in full}
+        authorized = [
+            order
+            for order in full
+            if order_read_allowed(order.order_id, store=order_store, identity=identity_store)
+        ]
+        by_key = {order.key: order for order in authorized}
+
+        def resolve(ref: str) -> OrderCandidate | None:
+            return by_key.get(ref) or by_id.get(ref.strip().upper())
+
+        def resolve_and_authorize(ref: str) -> OrderCandidate | None:
+            chosen = resolve(ref)
+            verdict = _authorize_target(
+                chosen.order_id if chosen else ref,
+                order_known=chosen is not None,
+            )
+            return chosen if verdict is None else None
+
+        if isinstance(request, ListOrders) and request.scope == "account":
+            bound = identity_store.current()
+            if bound is None:
+                return {
+                    **base,
+                    "active_flow": None,
+                    "messages": [AIMessage("I couldn't confirm your account.")],
+                }
+            orders = order_store.owned_orders(bound.customer_ref)
+            if orders:
+                recent_orders.record([order.order_id for order in orders], operation="list")
+            else:
+                recent_orders.clear()
+            return {
+                **base,
+                "active_flow": None,
+                "messages": [AIMessage(render_order_list_line(orders))],
+            }
+
+        if isinstance(request, CancelOrders):
+            if isinstance(request.target, CancellableOrderScope):
+                return {**base, "pending_cancel": request.target}
+            if isinstance(request.target, ExplicitOrderSet):
+                resolved: list[OrderCandidate] = []
+                seen: set[str] = set()
+                for ref in request.target.order_refs:
+                    chosen = resolve_and_authorize(ref)
+                    if chosen is None:
+                        return {
+                            **base,
+                            "active_flow": None,
+                            "messages": [AIMessage(_CONTINUATION_NOT_FOUND)],
+                        }
+                    if chosen.order_id not in seen:
+                        seen.add(chosen.order_id)
+                        resolved.append(chosen)
+                return {
+                    **base,
+                    "pending_cancel": _mint_cancel_batch(
+                        [(order.order_id, order.summary) for order in resolved]
+                    ),
+                }
+
+        if isinstance(request, RefundOrder) and isinstance(
+            request.target, ExplicitOrderTarget
+        ):
+            chosen = resolve_and_authorize(request.target.order_ref)
+            if chosen is not None and request.amount_usd is None:
+                return {
+                    **base,
+                    "messages": [AIMessage("What amount would you like refunded?")],
+                }
+            if chosen is not None and request.destination is None:
+                return {
+                    **base,
+                    "messages": [
+                        AIMessage(
+                            "Should that refund go back to the original payment method?"
+                        )
+                    ],
+                }
+            if chosen is not None:
+                assert request.amount_usd is not None and request.destination is not None
+                return {
+                    **base,
+                    "pending_refund": _mint_refund(
+                        chosen,
+                        amount_usd=request.amount_usd,
+                        destination=request.destination,
+                    ),
+                }
+
+        if isinstance(request, ReturnOrder) and isinstance(
+            request.target, ExplicitOrderTarget
+        ):
+            chosen = resolve_and_authorize(request.target.order_ref)
+            if chosen is not None:
+                return {**base, "pending_return": _mint_return(chosen)}
+
+        if isinstance(request, ChangeProfile) and request.new_value is not None:
+            pending = _mint_profile_change(request)
+            if pending is not None:
+                return {**base, "pending_profile_change": pending}
+            return {
+                **base,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human",
+                    reason_code=(
+                        "address_change" if request.field == "address" else "contact_change"
+                    ),
+                    source="gate",
+                ),
+            }
+
+        write_event(
+            {
+                "event": "identity_continuation_declined",
+                "capability": request.kind,
+                "reason": "unsupported_or_unresolved",
+            }
+        )
+        return {
+            **base,
+            "active_flow": None,
+            "messages": [AIMessage(_CONTINUATION_NOT_FOUND)],
+        }
+
+    def _enter_identity_for_action(
+        new_messages: list, request: IntentRequest
+    ) -> dict[str, object]:
+        """Retain one caller-stated typed request across the identity detour.
+
+        The request contains no resolved target or authority. A fresh context resolves and
+        authorizes it again; transcript replay and graph-node resume pointers are forbidden.
+        """
         write_event({"event": "support_action_needs_identity"})
         return {
             "messages": new_messages,
             "active_flow": "identity",
-            "identity_resume": "support_assemble",
+            "pending_request": request,
             "identity_claim_misses": 0,
         }
 
@@ -523,6 +718,56 @@ def build_support_nodes(
         new_messages.append(ToolMessage(verdict, tool_call_id=call_id))
         return verdict
 
+    def _mint_refund(
+        chosen: OrderCandidate, *, amount_usd: float, destination: RefundDestination
+    ) -> PendingRefund:
+        return PendingRefund(
+            order_id=chosen.order_id,
+            amount_usd=round(amount_usd, 2),
+            destination=destination,
+            instrument_ref=(
+                _NEW_INSTRUMENT_REF
+                if destination != "original"
+                else "original payment method"
+            ),
+            idempotency_key=uuid.uuid4().hex,
+            attempt_key=uuid.uuid4().hex,
+            created_at=time.time(),
+        )
+
+    def _mint_return(chosen: OrderCandidate) -> PendingReturn:
+        refund_due = max(
+            0.0,
+            round(
+                chosen.total_usd
+                - order_store.refunded_so_far(chosen.order_id)
+                - order_store.return_refund_due(chosen.order_id),
+                2,
+            ),
+        )
+        return PendingReturn(
+            order_id=chosen.order_id,
+            summary=chosen.summary,
+            refund_due_usd=refund_due,
+            idempotency_key=uuid.uuid4().hex,
+            created_at=time.time(),
+        )
+
+    def _mint_profile_change(change: ChangeProfile) -> PendingProfileChange | None:
+        bound = identity_store.current()
+        if bound is None or not profile_store.has_profile(bound.customer_ref):
+            return None
+        assert change.new_value is not None
+        return PendingProfileChange(
+            customer_ref=bound.customer_ref,
+            field=change.field,
+            new_value=change.new_value,
+            factor_ref=profile_store.contact_on_file(bound.customer_ref),
+            idempotency_key=uuid.uuid4().hex,
+            attempt_key=uuid.uuid4().hex,
+            created_at=time.time(),
+        )
+
     def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE support: propose a REFUND (order+amount+destination) or a CANCEL
         (one/many explicit orders or a semantic account scope), or clarify, or leave. Mints
@@ -551,7 +796,9 @@ def build_support_nodes(
             return by_key.get(stated) or by_id.get(stated.strip().upper())
 
         prompt = SystemMessage(
-            compose_support_prompt(display_name, orders, policy, pointer.get())
+            compose_support_prompt(
+                display_name, orders, policy, recent_orders.snapshot().focused_order_ref
+            )
         )
         messages: list = [prompt, *state.messages]
         new_messages: list = []
@@ -581,8 +828,7 @@ def build_support_nodes(
                 # A bare account-wide `scope` (no keys): "cancel all/both my orders" with no
                 # option numbers (Milestone B). A BOUND caller resolves immediately (the
                 # resolve node reads their cancellable orders); an UNBOUND caller must verify
-                # first — mint a CancelSelection (semantic scope only, no ids) that rides
-                # pending_cancel across the identity detour, then re-enter the resolver.
+                # first — retain a typed semantic scope with no ids across the identity detour.
                 if not cancel.order_keys:
                     assert cancel.scope is not None  # enforced by _ProposeCancel
                     new_messages.append(
@@ -590,17 +836,14 @@ def build_support_nodes(
                             f"proposed cancel of {cancel.scope}", tool_call_id=call["id"]
                         )
                     )
-                    selection = CancelSelection(scope=cancel.scope)
+                    selection = CancellableOrderScope(scope=cancel.scope)
                     if identity_store.current() is not None:
                         # Already verified: resolve now (route_after_assemble -> resolve).
                         return {"messages": new_messages, "pending_cancel": selection}
-                    # Unverified: retain the selection + enter identity (verify, then resolve).
-                    return {
-                        "messages": new_messages,
-                        "pending_cancel": selection,
-                        "active_flow": "identity",
-                        "identity_claim_misses": 0,
-                    }
+                    # Unverified: the shared typed request is the sole continuation channel.
+                    return _enter_identity_for_action(
+                        new_messages, CancelOrders(target=selection)
+                    )
                 # Resolve + AUTHORIZE every stated key, aggregating the outcome into EXACTLY ONE
                 # ToolMessage for this single tool_call_id (never one per target — F-4). An
                 # unresolved key is NOT an "invalid proposal" (that would enumerate keys): it is
@@ -632,10 +875,29 @@ def build_support_nodes(
                     resolved.append(hit)
                 if verdict is _NEEDS_IDENTITY:
                     # Unbound caller: bind first, then resume this cancel (no pending minted).
+                    stated_refs = tuple(
+                        caller_stated_order_id(_last_user_text(state), ref)
+                        for ref, _hit in unique
+                    )
+                    if any(ref is None for ref in stated_refs):
+                        new_messages.append(
+                            ToolMessage(
+                                "Ask the caller for the order number before verification.",
+                                tool_call_id=call["id"],
+                            )
+                        )
+                        messages = [prompt, *state.messages, *new_messages]
+                        continue
+                    validated_refs = tuple(ref for ref in stated_refs if ref is not None)
                     new_messages.append(
                         ToolMessage("verification needed", tool_call_id=call["id"])
                     )
-                    return _enter_identity_for_action(new_messages)
+                    return _enter_identity_for_action(
+                        new_messages,
+                        CancelOrders(
+                            target=ExplicitOrderSet(order_refs=validated_refs)
+                        ),
+                    )
                 if verdict is not None:
                     # Bound-mismatch: fail closed with the combined not-found + re-prompt.
                     new_messages.append(ToolMessage(verdict, tool_call_id=call["id"]))
@@ -669,10 +931,26 @@ def build_support_nodes(
                     order_known=chosen is not None,
                 )
                 if verdict is _NEEDS_IDENTITY:
+                    stated_ref = caller_stated_order_id(
+                        _last_user_text(state),
+                        chosen.order_id if chosen is not None else proposed.order_key,
+                    )
+                    if stated_ref is None:
+                        new_messages.append(
+                            ToolMessage(
+                                "Ask the caller for the order number before verification.",
+                                tool_call_id=call["id"],
+                            )
+                        )
+                        messages = [prompt, *state.messages, *new_messages]
+                        continue
                     new_messages.append(
                         ToolMessage("verification needed", tool_call_id=call["id"])
                     )
-                    return _enter_identity_for_action(new_messages)
+                    return _enter_identity_for_action(
+                        new_messages,
+                        ReturnOrder(target=ExplicitOrderTarget(order_ref=stated_ref)),
+                    )
                 if verdict is not None:  # bound-mismatch: corrective already appended, re-prompt
                     messages = [prompt, *state.messages, *new_messages]
                     continue
@@ -680,24 +958,7 @@ def build_support_nodes(
                 new_messages.append(
                     ToolMessage(f"proposed return on order {chosen.key}", tool_call_id=call["id"])
                 )
-                # refund_due is CODE-computed: what's still refundable on the order (captured
-                # minus refunds paid minus prior return promises) — never model arithmetic.
-                refund_due = max(
-                    0.0,
-                    round(
-                        chosen.total_usd
-                        - order_store.refunded_so_far(chosen.order_id)
-                        - order_store.return_refund_due(chosen.order_id),
-                        2,
-                    ),
-                )
-                pending_return = PendingReturn(
-                    order_id=chosen.order_id,
-                    summary=chosen.summary,
-                    refund_due_usd=refund_due,
-                    idempotency_key=uuid.uuid4().hex,
-                    created_at=time.time(),
-                )
+                pending_return = _mint_return(chosen)
                 return {"messages": new_messages, "pending_return": pending_return}
 
             if call["name"] == "propose_profile_change":
@@ -713,6 +974,17 @@ def build_support_nodes(
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
+                if not _caller_stated_profile_value(
+                    _last_user_text(state), change.field, change.new_value
+                ):
+                    new_messages.append(
+                        ToolMessage(
+                            "Ask the caller for the new profile value before proposing it.",
+                            tool_call_id=call["id"],
+                        )
+                    )
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
                 # A profile change is ACCOUNT-scoped, so it requires a BOUND identity (Fix 5
                 # Milestone B): the customer whose profile is touched comes from the LIVE binding,
                 # never a model argument. An UNBOUND caller detours into the identity OTP flow to
@@ -724,7 +996,10 @@ def build_support_nodes(
                     new_messages.append(
                         ToolMessage("verification needed", tool_call_id=call["id"])
                     )
-                    return _enter_identity_for_action(new_messages)
+                    return _enter_identity_for_action(
+                        new_messages,
+                        ChangeProfile(field=change.field, new_value=change.new_value.strip()),
+                    )
                 if not profile_store.has_profile(bound.customer_ref):
                     write_event({"event": "profile_change_denied", "reason": "no_profile"})
                     new_messages.append(
@@ -752,18 +1027,10 @@ def build_support_nodes(
                         f"proposed profile change: {change.field}", tool_call_id=call["id"]
                     )
                 )
-                pending_change = PendingProfileChange(
-                    customer_ref=bound.customer_ref,
-                    field=change.field,
-                    new_value=change.new_value.strip(),
-                    # The MASKED on-file contact the OTP goes to — for a contact change
-                    # this is the OLD factor (change-the-factor needs the factor, §A4a).
-                    # Scoped to the bound customer (never a fallback's factor).
-                    factor_ref=profile_store.contact_on_file(bound.customer_ref),
-                    idempotency_key=uuid.uuid4().hex,
-                    attempt_key=uuid.uuid4().hex,
-                    created_at=time.time(),
+                pending_change = _mint_profile_change(
+                    ChangeProfile(field=change.field, new_value=change.new_value.strip())
                 )
+                assert pending_change is not None
                 return {"messages": new_messages, "pending_profile_change": pending_change}
 
             if call["name"] == "propose_refund":
@@ -787,10 +1054,34 @@ def build_support_nodes(
                     order_known=chosen is not None,
                 )
                 if verdict is _NEEDS_IDENTITY:
+                    stated_ref = caller_stated_order_id(
+                        _last_user_text(state),
+                        chosen.order_id if chosen is not None else proposal.order_key,
+                    )
+                    if stated_ref is None:
+                        new_messages.append(
+                            ToolMessage(
+                                "Ask the caller for the order number before verification.",
+                                tool_call_id=call["id"],
+                            )
+                        )
+                        messages = [prompt, *state.messages, *new_messages]
+                        continue
                     new_messages.append(
                         ToolMessage("verification needed", tool_call_id=call["id"])
                     )
-                    return _enter_identity_for_action(new_messages)
+                    return _enter_identity_for_action(
+                        new_messages,
+                        RefundOrder(
+                            target=ExplicitOrderTarget(order_ref=stated_ref),
+                            amount_usd=_caller_stated_refund_amount(
+                                _last_user_text(state), proposal.amount_usd
+                            ),
+                            destination=_caller_stated_refund_destination(
+                                _last_user_text(state), proposal.destination
+                            ),
+                        ),
+                    )
                 if verdict is not None:  # bound-mismatch: corrective already appended, re-prompt
                     messages = [prompt, *state.messages, *new_messages]
                     continue
@@ -802,18 +1093,10 @@ def build_support_nodes(
                         tool_call_id=call["id"],
                     )
                 )
-                pending = PendingRefund(
-                    order_id=chosen.order_id,
-                    amount_usd=round(proposal.amount_usd, 2),
+                pending = _mint_refund(
+                    chosen,
+                    amount_usd=proposal.amount_usd,
                     destination=proposal.destination,
-                    instrument_ref=(
-                        _NEW_INSTRUMENT_REF
-                        if proposal.destination != "original"
-                        else "original payment method"
-                    ),
-                    idempotency_key=uuid.uuid4().hex,
-                    attempt_key=uuid.uuid4().hex,
-                    created_at=time.time(),
                 )
                 return {"messages": new_messages, "pending_refund": pending}
 
@@ -830,6 +1113,7 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
+            "pending_request": None,
         }
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
@@ -1098,13 +1382,13 @@ def build_support_nodes(
                     destination="human", reason_code="refund", source="gate"
                 ),
             }
-        pointer.set(pending.order_id)  # the order most recently discussed (Group C L4)
+        recent_orders.record([pending.order_id], operation="refund")
         write_event(
             {
                 "event": "refund_confirmed",
                 "refund_id": record.refund_id,
                 "amount": record.amount_usd,
-                "verification": [g.get("method") for g in verification_store.grants],
+                "verification": [grant.method for grant in verification_store.grants],
             }
         )
         return {
@@ -1277,7 +1561,6 @@ def build_support_nodes(
                 outcome="cancelled",
                 amount_usd=record.total_usd,
             )
-            pointer.set(record.order_id)  # most recently discussed (Group C L4)
             write_event({"event": "cancel_confirmed", "order_id": record.order_id})
         except CancelError as exc:
             # No typed reason on CancelError, and parsing its text is forbidden — a rare
@@ -1295,6 +1578,12 @@ def build_support_nodes(
         # Last target done: speak the whole truth from the collected records (+ any ineligible
         # ones stated at the readback) and end.
         all_outcomes = [*pending.ineligible, *outcomes]
+        recent_orders.record(
+            [outcome.order_id for outcome in all_outcomes],
+            operation="cancel",
+            focused_order_ref=all_outcomes[-1].order_id,
+            outcomes=[(outcome.order_id, outcome.outcome) for outcome in all_outcomes],
+        )
         return {
             "pending_cancel": None,
             "active_flow": None,
@@ -1302,7 +1591,7 @@ def build_support_nodes(
         }
 
     def resolve_node(state: ReasoningState) -> dict[str, object]:
-        """Resolve a retained CancelSelection into a batch AFTER the account is bound (Milestone
+        """Resolve a retained CancellableOrderScope after the account is bound (Milestone
         B — the "cancel all my orders" continuation). This is TRANSACTION AUTHORIZATION, not
         authentication: it reads the LIVE binding and the caller's CURRENT cancellable orders
         (never a set computed before the OTP, which could have gone stale). No contact claim,
@@ -1314,7 +1603,7 @@ def build_support_nodes(
         reached unbound clears + defers), nothing cancellable, or a 'both' scope that resolves
         to more than two candidates (ambiguous — ask which)."""
         selection = state.pending_cancel
-        assert isinstance(selection, CancelSelection)
+        assert isinstance(selection, CancellableOrderScope)
         bound = identity_store.current()
         if bound is None:
             # Unreachable in the happy path (resolve is only routed to post-bind); fail closed.
@@ -1583,7 +1872,7 @@ def build_support_nodes(
                     destination="human", reason_code="refund", source="gate"
                 ),
             }
-        pointer.set(record.order_id)  # the order most recently discussed (Group C L4)
+        recent_orders.record([record.order_id], operation="return")
         write_event(
             {
                 "event": "return_confirmed",
@@ -1744,7 +2033,7 @@ def build_support_nodes(
             {
                 "event": "profile_change_confirmed",
                 "field": record.field,
-                "verification": [g.get("method") for g in verification_store.grants],
+                "verification": [grant.method for grant in verification_store.grants],
             }
         )
         noun = "delivery address" if record.field == "address" else "contact number"
@@ -1766,6 +2055,7 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
+            "pending_request": None,
             "active_flow": None,
             "messages": [
                 AIMessage(
@@ -1782,6 +2072,7 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
+            "pending_request": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
@@ -1805,7 +2096,7 @@ def build_support_nodes(
             return "leave"  # model left / two invalid proposals -> normal pipeline answers
         if state.active_flow == "identity":
             return "needs_identity"  # unbound "cancel all" — verify first, then resolve
-        if isinstance(state.pending_cancel, CancelSelection):
+        if isinstance(state.pending_cancel, CancellableOrderScope):
             return "resolve"  # a BOUND caller's scope resolves immediately
         if state.pending_cancel is not None:  # a PendingCancelBatch
             return "cancel"
@@ -1844,6 +2135,7 @@ def build_support_nodes(
 
     return SupportNodes(
         assemble=assemble_node,
+        continuation=continuation_node,
         guardrail=guardrail_node,
         risk_check=refund_stepup.risk_check,
         dispatch=refund_stepup.dispatch,
@@ -1875,6 +2167,7 @@ def build_support_nodes(
         route_after_profile_collect=profile_stepup.route_after_collect,
         speakable_nodes=frozenset(
             {
+                "support_continuation",
                 "support_guardrail",  # authors the over-amount-threshold decline line
                 "support_risk_check",
                 "support_collect",

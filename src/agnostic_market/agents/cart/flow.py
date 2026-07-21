@@ -46,8 +46,8 @@ from agnostic_market.agents.cart.prompt import compose_cart_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
-    LastOrderPointer,
     OrderStore,
+    RecentOrderContext,
     resolve_candidates,
     speak_lines,
 )
@@ -148,7 +148,7 @@ def build_cart_nodes(
     order_store: OrderStore,
     cart_store: CartStore,
     policy: PolicyContext,
-    pointer: LastOrderPointer,
+    recent_orders: RecentOrderContext,
     *,
     display_name: str,
 ) -> CartNodes:
@@ -490,7 +490,7 @@ def build_cart_nodes(
         placed = order_store.place_cart(
             pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd)
         cart_store.clear()
-        pointer.set(placed.order_id)  # the order most recently discussed (Group C L4)
+        recent_orders.record([placed.order_id], operation="place")
         write_event({"event": "checkout_confirmed", "order_id": placed.order_id,
                      "total": placed.total_usd})
         return {

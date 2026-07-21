@@ -29,8 +29,8 @@ from agnostic_market.commerce.identity import (
     try_grant_by_contact,
 )
 from agnostic_market.commerce.orders import (
-    LastOrderPointer,
     OrderStore,
+    RecentOrderContext,
     render_order_list_line,
     speak_lines,
 )
@@ -59,11 +59,11 @@ _UNVERIFIED_LIST = (
 def build_voice_tools(
     store: OrderStore,
     cart: CartStore,
-    pointer: LastOrderPointer,
+    recent_orders: RecentOrderContext,
     identity: CallerIdentityStore,
     customers: CustomerDirectory,
 ) -> list[BaseTool]:
-    """The read-only tool set, closing over the session's stores. `cart`, `pointer`, and
+    """The read-only tool set, closing over the session's stores. `cart`, `recent_orders`, and
     `identity` are the SAME instances the flows mutate (pass one instance to both this and
     the graph, or the frontline reads different session state than the flows write —
     split-brain). All params REQUIRED on purpose: a call site that silently built its own
@@ -79,7 +79,7 @@ def build_voice_tools(
             if summary is None:
                 # Unreachable for a granted/owned/placed id, but never leak on a logic gap.
                 return _COMBINED_NOT_FOUND
-            pointer.set(order_id)
+            recent_orders.record([order_id], operation="read")
             return summary
         claim = account_contact.strip()
         if not claim:
@@ -113,7 +113,7 @@ def build_voice_tools(
         assert summary is not None  # the owner lookup just found it
         # A FOUND, AUTHORIZED order becomes "the order most recently discussed" (Group C
         # L4) — never set on a declined read (a probe must not hijack "that order").
-        pointer.set(order_id)
+        recent_orders.record([order_id], operation="read")
         return summary
 
     @tool
@@ -123,7 +123,12 @@ def build_voice_tools(
         bound = identity.current()
         if bound is None:
             return _UNVERIFIED_LIST
-        return render_order_list_line(store.owned_orders(bound.customer_ref))
+        orders = store.owned_orders(bound.customer_ref)
+        if orders:
+            recent_orders.record([order.order_id for order in orders], operation="list")
+        else:
+            recent_orders.clear()
+        return render_order_list_line(orders)
 
     @tool
     def catalog_search(query: str) -> str:

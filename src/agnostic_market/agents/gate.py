@@ -181,8 +181,8 @@ _ORDER_REFERENCE = re.compile(
 def status_check(text: str) -> Literal["one", "list"] | None:
     """Detect a STATE-verification question and its scope, else None.
 
-    "one"  -> the caller asks whether ONE order is in a state (resolve via a stated id / the
-              session pointer).
+    "one"  -> the caller asks whether ONE order is in a state (resolve via a stated id or the
+              recent-order context).
     "list" -> the caller asks about several / "both" / "all" / "my orders".
     None   -> NOT a state-verification question; the normal pipeline handles it (gate/model).
               None is not "safe" — it means "no high-certainty read opinion here."
