@@ -390,6 +390,25 @@ def test_tool_messages_never_surface() -> None:
     assert list(speech.flush()) == []
 
 
+@pytest.mark.xfail(strict=True, reason="transactional completed messages lack a speech allowlist")
+def test_unapproved_transactional_plain_text_never_reaches_caller() -> None:
+    """Live-call #18: a model-only cancellation claim is not caller-authoritative speech."""
+    speech = _TurnSpeech(_SPEAKABLE)
+    speech.feed(_chunk("Your order is cancelled.", "m1"), _ASSEMBLE_META)
+    assert (
+        speech.feed(AIMessage(content="Your order is cancelled.", id="m1"), _ASSEMBLE_META) is None
+    )
+    assert list(speech.flush()) == []
+
+
+@pytest.mark.xfail(strict=True, reason="orphaned chunks lack fail-closed speech provenance")
+def test_unapproved_orphan_chunk_never_flushes_to_caller() -> None:
+    """The incomplete-message fallback must fail closed when no approved source completed."""
+    speech = _TurnSpeech(_SPEAKABLE)
+    speech.feed(_chunk("Your order is cancelled.", "m1"), _ASSEMBLE_META)
+    assert list(speech.flush()) == []
+
+
 # --- graph latency spans (_GraphSpans, live call #10) ------------------------------------
 
 

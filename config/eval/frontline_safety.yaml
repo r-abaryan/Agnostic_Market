@@ -1,0 +1,28 @@
+# Zero-network structural cases for scripts/frontline_eval.py.
+# These are sanitized phrases observed in live-call #18, not a claim of real-dataset coverage.
+
+order_reference:
+  expected_order_id: "ORD-1002"
+  accepted_labelled_stt:
+    - "cancel order ORD-1002"
+    - "cancel order one zero zero two"
+    - "Cancel order. O r d one zero zero two."
+    - "cancel ord1002"
+    - "cancel ORD 1002"
+  rejected_stt:
+    - utterance: "cancel my rain jacket order"
+      proposed_order_id: "ORD-1002"
+    - utterance: "cancel one zero zero two"
+      proposed_order_id: "ORD-1002"
+    - utterance: "cancel option two"
+      proposed_order_id: "ORD-1002"
+    - utterance: "cancel order ORD-100"
+      proposed_order_id: "ORD-1002"
+    - utterance: "cancel order ORD-1002 or ORD-1001"
+      proposed_order_id: "ORD-1002"
+    - utterance: "cancel order ORD-1002"
+      proposed_order_id: "2"
+    - utterance: "refund $1002"
+      proposed_order_id: "ORD-1002"
+    - utterance: "refund my order for $1001"
+      proposed_order_id: "ORD-1001"

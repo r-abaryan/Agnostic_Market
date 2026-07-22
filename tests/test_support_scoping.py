@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from langchain_core.messages import ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
@@ -35,6 +36,12 @@ from agnostic_market.agents.support.flow import (
 )
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.orchestration import (
+    CancelOrders,
+    ExplicitOrderSet,
+    RefundOrder,
+    ReturnOrder,
+)
 from agnostic_market.dtos.state import CartLine
 
 _POLICY = make_policy()
@@ -226,6 +233,167 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
     assert h.store.order_status("ORD-1002") == "cancelled"
     tel = _telemetry(tmp_path)
     assert any(e["event"] == "identity_bound_for_action" for e in tel)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="strong-labelled letter-spelled order IDs do not reach guest mutation detours",
+)
+@pytest.mark.parametrize(
+    ("tool_name", "tool_args", "utterance", "request_type"),
+    (
+        (
+            "propose_cancel",
+            {"order_keys": ["ORD-1002"]},
+            "Cancel order. O r d one zero zero two.",
+            CancelOrders,
+        ),
+        (
+            "propose_return",
+            {"order_key": "ORD-1001"},
+            "Return order. O r d one zero zero one.",
+            ReturnOrder,
+        ),
+        (
+            "propose_refund",
+            {"order_key": "ORD-1001", "amount_usd": 20.0, "destination": "original"},
+            "Refund $20 for order. O r d one zero zero one.",
+            RefundOrder,
+        ),
+    ),
+)
+async def test_strong_labelled_stt_enters_each_guest_mutation_identity_detour(
+    config_root: Path,
+    tool_name: str,
+    tool_args: dict,
+    utterance: str,
+    request_type: type,
+) -> None:
+    thread_id = f"scope-strong-stt-{tool_name}"
+    harness = _harness(
+        config_root,
+        FakeChatModel(
+            force_tool=tool_name,
+            canned_args={tool_name: tool_args},
+            tool_call_limit=1,
+        ),
+        thread_id=thread_id,
+    )
+    await _events(harness.engine, utterance)
+    state = _state_values(harness, thread_id)
+    assert isinstance(state.get("pending_request"), request_type)
+    assert state.get("active_flow") == "identity"
+    assert state.get("pending_cancel") is None
+    assert state.get("pending_return") is None
+    assert state.get("pending_refund") is None
+    assert harness.identity.current() is None
+    assert harness.store.cancel_count == 0
+    assert harness.store.return_count == 0
+    assert harness.store.refund_count == 0
+
+
+async def test_guest_batch_requires_every_deduplicated_target_in_caller_speech(
+    config_root: Path,
+) -> None:
+    thread_id = "scope-batch-all-targets"
+    harness = _harness(
+        config_root,
+        FakeChatModel(
+            force_tool="propose_cancel",
+            canned_args={"propose_cancel": {"order_keys": ["ORD-1002", "ORD-1001"]}},
+            tool_call_limit=2,
+        ),
+        thread_id=thread_id,
+    )
+    await _events(harness.engine, "Cancel order ORD-1002.")
+    state = _state_values(harness, thread_id)
+    assert state.get("pending_request") is None
+    assert state.get("pending_cancel") is None
+    assert state.get("active_flow") != "identity"
+    assert harness.store.cancel_count == 0
+
+
+async def test_guest_batch_preserves_all_exact_caller_stated_targets(
+    config_root: Path,
+) -> None:
+    thread_id = "scope-batch-exact-targets"
+    harness = _harness(
+        config_root,
+        FakeChatModel(
+            force_tool="propose_cancel",
+            canned_args={"propose_cancel": {"order_keys": ["ORD-1002", "ORD-1001"]}},
+            tool_call_limit=1,
+        ),
+        thread_id=thread_id,
+    )
+    await _events(harness.engine, "Cancel order ORD-1002 and ORD-1001.")
+    request = _state_values(harness, thread_id).get("pending_request")
+    assert isinstance(request, CancelOrders)
+    assert isinstance(request.target, ExplicitOrderSet)
+    assert request.target.order_refs == ("ORD-1002", "ORD-1001")
+    assert harness.store.cancel_count == 0
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_args", "utterance", "reason_code"),
+    (
+        (
+            "propose_cancel",
+            {"order_keys": ["ORD-1002"]},
+            "Cancel my rain jacket order.",
+            "cancel_order",
+        ),
+        (
+            "propose_return",
+            {"order_key": "ORD-1001"},
+            "Return my trail running shoes.",
+            "refund",
+        ),
+        (
+            "propose_refund",
+            {"order_key": "ORD-1001", "amount_usd": 20.0, "destination": "original"},
+            "Refund $20 for my trail running shoes.",
+            "refund",
+        ),
+    ),
+)
+async def test_model_only_target_fails_closed_for_every_guest_mutation_consumer(
+    config_root: Path,
+    tool_name: str,
+    tool_args: dict,
+    utterance: str,
+    reason_code: str,
+) -> None:
+    thread_id = f"scope-model-target-{tool_name}"
+    harness = _harness(
+        config_root,
+        FakeChatModel(
+            force_tool=tool_name,
+            canned_args={tool_name: tool_args},
+            tool_call_limit=2,
+        ),
+        frontline=FakeChatModel(
+            force_tool="request_handover",
+            canned_args={
+                "request_handover": {
+                    "destination": "support",
+                    "reason_code": reason_code,
+                }
+            },
+            tool_call_limit=1,
+        ),
+        thread_id=thread_id,
+    )
+    await _events(harness.engine, utterance)
+    state = _state_values(harness, thread_id)
+    assert state.get("pending_request") is None
+    assert state.get("pending_cancel") is None
+    assert state.get("pending_return") is None
+    assert state.get("pending_refund") is None
+    assert harness.identity.current() is None
+    assert harness.store.cancel_count == 0
+    assert harness.store.return_count == 0
+    assert harness.store.refund_count == 0
 
 
 async def _drive_explicit_action_continuation(

@@ -1,6 +1,7 @@
-"""T1 eval — frontline under-escalation, live (AGENTS.md seam #1). MODEL-primary.
+"""T1 routing-quality eval — frontline under-escalation (AGENTS.md seam #1).
 
 Run: uv run python scripts/frontline_eval.py
+Structural gate only: uv run python scripts/frontline_eval.py --preflight-only
 Needs ANTHROPIC_API_KEY (the acme routing model) in .env. Text-only — no voice.
 
 Invokes the SAME graph production uses (prompt inside the graph, F1), one utterance per
@@ -10,21 +11,27 @@ irreversible-only floor. Pre-registered:
     triaged (a real answer-instead-of-escalate is a judgment gap to fix in prompt/few-shot).
   - Gate coverage REPORTED informationally (the free fast-path share) — never a mandate.
   - over-escalation on should_answer REPORTED (over-escalating is cheap, AGENTS §A2).
-Safety note: recall < 100% is NOT a safety failure (frontline holds no state-changing
-tools — a miss cannot mutate). This measures escalation QUALITY. Exit 1 if the bar is missed.
+This is NOT an overall commerce, speech, continuation, or voice-transport certification. The
+live-call #18 structural preflight runs before provider access and blocks the routing score while
+the shared speech-authority or exact-STT contracts are broken. The routing section then measures
+escalation QUALITY only. Exit 1 if either the structural gate or routing bar is missed.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agnostic_market.agents import telemetry
+from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
@@ -40,6 +47,7 @@ from agnostic_market.commerce.profile import (
     assert_profiles_have_customers,
     load_profile_fixture,
 )
+from agnostic_market.commerce.spoken import caller_stated_order_id
 from agnostic_market.commerce.verification import (
     OtpProvider,
     VerificationStore,
@@ -47,6 +55,13 @@ from agnostic_market.commerce.verification import (
 )
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
+from agnostic_market.dtos.events import (
+    InterruptEvent,
+    SpokenMessageEvent,
+    TokenEvent,
+    TurnEvent,
+    TurnFacts,
+)
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.voice.context import CallerContext
@@ -54,8 +69,163 @@ from agnostic_market.voice.tools import build_voice_tools
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 _EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_t1.yaml"
+_SAFETY_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_safety.yaml"
 _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
+
+_PENDING_FIELDS = (
+    "pending_placement",
+    "pending_refund",
+    "pending_cancel",
+    "pending_return",
+    "pending_profile_change",
+    "pending_identity",
+    "pending_request",
+)
+
+
+@dataclass(frozen=True)
+class AudibleObservation:
+    kind: str
+    text: str
+    node: str | None
+
+
+@dataclass(frozen=True)
+class CommerceObservation:
+    placed: int
+    refunded: int
+    returned: int
+    cancelled: int
+    profile_changes: int
+    otp_dispatches: int
+    verification_level: int
+    identity_bound: bool
+
+
+@dataclass(frozen=True)
+class GraphObservation:
+    active_flow: str | None
+    pending_fields: tuple[str, ...]
+    handover_destination: str | None
+    interrupted: bool
+    automation_terminal: bool
+
+
+@dataclass(frozen=True)
+class TurnObservation:
+    utterance: str
+    audible: tuple[AudibleObservation, ...]
+    effects: CommerceObservation
+    state: GraphObservation
+    model_calls: int | None
+
+
+@dataclass(frozen=True)
+class ScenarioObservation:
+    before: CommerceObservation
+    turns: tuple[TurnObservation, ...]
+
+    @property
+    def final(self) -> TurnObservation:
+        if not self.turns:
+            raise ValueError("scenario observation has no turns")
+        return self.turns[-1]
+
+
+def _audible_observation(event: TurnEvent) -> AudibleObservation:
+    if isinstance(event, InterruptEvent):
+        return AudibleObservation(kind=event.kind, text=event.prompt, node="__interrupt__")
+    if isinstance(event, SpokenMessageEvent):
+        return AudibleObservation(kind=event.kind, text=event.text, node=event.node)
+    assert isinstance(event, TokenEvent)
+    # TokenEvent currently carries no graph-node provenance. Record that fact rather than
+    # inventing an author; the speech-contract milestone owns any runtime DTO change.
+    return AudibleObservation(kind=event.kind, text=event.text, node=None)
+
+
+def _commerce_observation(
+    store: OrderStore,
+    profile_store: ProfileStore,
+    otp: OtpProvider,
+    verification: VerificationStore,
+    identity_store: CallerIdentityStore,
+) -> CommerceObservation:
+    return CommerceObservation(
+        placed=store.placed_count,
+        refunded=store.refund_count,
+        returned=store.return_count,
+        cancelled=store.cancel_count,
+        profile_changes=profile_store.change_count,
+        otp_dispatches=otp.dispatch_count,
+        verification_level=verification.current_level(),
+        identity_bound=identity_store.current() is not None,
+    )
+
+
+def _graph_observation(engine: ReasoningEngine) -> GraphObservation:
+    # Evaluator-only checkpoint inspection. Adding a production introspection API solely for
+    # tests would widen ReasoningEngine's application contract.
+    snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
+    values = snapshot.values
+    handover = values.get("handover")
+    return GraphObservation(
+        active_flow=values.get("active_flow"),
+        pending_fields=tuple(name for name in _PENDING_FIELDS if values.get(name) is not None),
+        handover_destination=getattr(handover, "destination", None),
+        interrupted=bool(snapshot.interrupts),
+        automation_terminal=bool(values.get("automation_terminal", False)),
+    )
+
+
+async def _observe_scenario(
+    engine: ReasoningEngine,
+    utterances: Sequence[str],
+    *,
+    store: OrderStore,
+    profile_store: ProfileStore,
+    otp: OtpProvider,
+    verification: VerificationStore,
+    identity_store: CallerIdentityStore,
+    model_call_count: Callable[[], int] | None = None,
+) -> ScenarioObservation:
+    before = _commerce_observation(store, profile_store, otp, verification, identity_store)
+    turns: list[TurnObservation] = []
+    for utterance in utterances:
+        events = tuple([event async for event in engine.stream_turn(utterance, TurnFacts())])
+        turns.append(
+            TurnObservation(
+                utterance=utterance,
+                audible=tuple(_audible_observation(event) for event in events),
+                effects=_commerce_observation(
+                    store, profile_store, otp, verification, identity_store
+                ),
+                state=_graph_observation(engine),
+                model_calls=model_call_count() if model_call_count is not None else None,
+            )
+        )
+    return ScenarioObservation(before=before, turns=tuple(turns))
+
+
+def _score_safety_observation(
+    observation: ScenarioObservation,
+    *,
+    expected_effects: CommerceObservation,
+    expected_state: GraphObservation,
+    forbidden_spoken: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Pure scripted scorer; this is not live-provider semantic conformance."""
+    failures: list[str] = []
+    final = observation.final
+    if final.effects != expected_effects:
+        failures.append("authoritative effect/store observation differed")
+    if final.state != expected_state:
+        failures.append("next-turn graph state observation differed")
+    spoken = " ".join(part.text for turn in observation.turns for part in turn.audible).casefold()
+    for phrase in forbidden_spoken:
+        if phrase.casefold() in spoken:
+            failures.append(f"forbidden scripted speech reached caller: {phrase!r}")
+    return tuple(failures)
 
 
 _THREAD_SEQ = 0
@@ -65,13 +235,53 @@ _THREAD_SEQ = 0
 # then ended in a terminal decline that clears its own state (see docstring below).
 _FLOW_TOOLS = frozenset(
     {
-        "propose_refund", "propose_cancel", "propose_return",  # support (returns: Group C)
-        "propose_profile_change", "leave_support",  # support (profile: Group C)
-        "add_to_cart", "remove_from_cart", "set_quantity", "review_cart", "buy_now",
-        "go_to_checkout", "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
-        "propose_identity", "leave_identity",  # identity (P7; list_orders is a FRONTLINE read)
+        "propose_refund",
+        "propose_cancel",
+        "propose_return",  # support (returns: Group C)
+        "propose_profile_change",
+        "leave_support",  # support (profile: Group C)
+        "add_to_cart",
+        "remove_from_cart",
+        "set_quantity",
+        "review_cart",
+        "buy_now",
+        "go_to_checkout",
+        "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
+        "propose_identity",
+        "leave_identity",  # identity (P7; list_orders is a FRONTLINE read)
     }
 )
+
+
+def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
+    """Zero-network gates for failures the old routing-only evaluator could not observe."""
+    failures: list[str] = []
+
+    completed_speech = _TurnSpeech(frozenset())
+    event = completed_speech.feed(
+        AIMessage(content="untrusted transactional model text", id="eval-message"),
+        {"langgraph_node": "eval_unapproved_transactional_node"},
+    )
+    if event is not None:
+        failures.append("completed unapproved transactional model text reached caller speech")
+
+    orphan_speech = _TurnSpeech(frozenset())
+    orphan_speech.feed(
+        AIMessageChunk(content="untrusted transactional model text", id="eval-orphan"),
+        {"langgraph_node": "eval_unapproved_transactional_node"},
+    )
+    if list(orphan_speech.flush()):
+        failures.append("orphaned unapproved transactional model text reached caller speech")
+
+    order_reference = data["order_reference"]
+    expected = order_reference["expected_order_id"]
+    for utterance in order_reference["accepted_labelled_stt"]:
+        if caller_stated_order_id(utterance, expected) != expected:
+            failures.append(f"labelled STT order reference was rejected: {utterance!r}")
+    for case in order_reference["rejected_stt"]:
+        if caller_stated_order_id(case["utterance"], case["proposed_order_id"]) is not None:
+            failures.append(f"weak/conflicting STT order reference was accepted: {case!r}")
+    return tuple(failures)
 
 
 async def _outcome(graph, utterance: str) -> str | None:
@@ -107,7 +317,19 @@ async def _outcome(graph, utterance: str) -> str | None:
     return None
 
 
-async def _run() -> int:
+async def _run(*, preflight_only: bool = False) -> int:
+    safety_data = load_yaml_layer(_SAFETY_EVAL_PATH)
+    failures = _structural_preflight_failures(safety_data)
+    print("[coverage] structural speech authority + labelled STT order references")
+    if failures:
+        for failure in failures:
+            print(f"    STRUCTURAL FAILURE: {failure}")
+        print("\nFRONTLINE EVAL BLOCKED - structural safety preflight failed. [FAIL]")
+        return 1
+    print("[structural_preflight] all registered contracts passed. [PASS]")
+    if preflight_only:
+        return 0
+
     load_dotenv()
     # Eval runs must not pollute the LIVE telemetry dataset (classifier data): redirect
     # this process's sink to a sibling eval file (same local-only, gitignored dir).
@@ -140,9 +362,7 @@ async def _run() -> int:
     )
     tools = [
         wrap_readonly_tool(t, _MERCHANT_ID)
-        for t in build_voice_tools(
-            store, cart_store, recent_orders, identity_store, customers
-        )
+        for t in build_voice_tools(store, cart_store, recent_orders, identity_store, customers)
     ]
     graph = build_frontline_graph(
         chat_model,
@@ -207,11 +427,23 @@ async def _run() -> int:
         print(f"    OVER-ESCALATED: {o}")
 
     if recall < _RECALL_BAR:
-        print(f"\nT1 EVAL FAILED - escalation recall {recall:.0%} < {_RECALL_BAR:.0%}. [FAIL]")
+        print(
+            f"\nT1 ROUTING EVAL FAILED - escalation recall {recall:.0%} < {_RECALL_BAR:.0%}. [FAIL]"
+        )
         return 1
-    print(f"\nT1 eval passed: escalation recall {recall:.0%} >= {_RECALL_BAR:.0%}. [PASS]")
+    print(
+        f"\nT1 ROUTING eval passed: escalation recall {recall:.0%} "
+        f">= {_RECALL_BAR:.0%}. [ROUTING-ONLY PASS]"
+    )
+    print(
+        "Coverage limit: no multi-turn effect/speech/next-state or LiveKit transport "
+        "certification was performed."
+    )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(_run()))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--preflight-only", action="store_true")
+    args = parser.parse_args()
+    sys.exit(asyncio.run(_run(preflight_only=args.preflight_only)))

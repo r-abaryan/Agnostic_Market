@@ -8,23 +8,59 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agnostic_market.commerce.spoken import (
     caller_stated_order_id,
     caller_stated_phone,
     redact_contact,
 )
 
-
-def test_caller_stated_order_id_accepts_typed_and_spoken_ids() -> None:
-    assert caller_stated_order_id("cancel order ORD-1002", "ord-1002") == "ORD-1002"
-    assert caller_stated_order_id("cancel order one zero zero two", "ORD-1002") == "ORD-1002"
+_XFAIL_STRONG_STT = "strong-labelled fused or letter-spelled order IDs are not normalized"
+_XFAIL_CONFLICTING_STT = "conflicting labelled order IDs are not rejected as a set"
 
 
-def test_caller_stated_order_id_rejects_model_only_refs_and_option_keys() -> None:
-    assert caller_stated_order_id("cancel my rain jacket order", "ORD-1002") is None
-    assert caller_stated_order_id("cancel order ORD-1002", "2") is None
-    assert caller_stated_order_id("refund $1002", "ORD-1002") is None
-    assert caller_stated_order_id("refund my order for $1001", "ORD-1001") is None
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "cancel order ORD-1002",
+        "cancel order one zero zero two",
+        pytest.param(
+            "Cancel order. O r d one zero zero two.",
+            marks=pytest.mark.xfail(strict=True, reason=_XFAIL_STRONG_STT),
+        ),
+        pytest.param(
+            "cancel ord1002",
+            marks=pytest.mark.xfail(strict=True, reason=_XFAIL_STRONG_STT),
+        ),
+        "cancel ORD 1002",
+    ),
+)
+def test_caller_stated_order_id_accepts_labelled_live_stt_forms(utterance: str) -> None:
+    assert caller_stated_order_id(utterance, "ord-1002") == "ORD-1002"
+
+
+@pytest.mark.parametrize(
+    ("utterance", "proposed"),
+    (
+        ("cancel my rain jacket order", "ORD-1002"),
+        ("cancel one zero zero two", "ORD-1002"),
+        ("cancel option two", "ORD-1002"),
+        ("cancel order ORD-100", "ORD-1002"),
+        pytest.param(
+            "cancel order ORD-1002 or ORD-1001",
+            "ORD-1002",
+            marks=pytest.mark.xfail(strict=True, reason=_XFAIL_CONFLICTING_STT),
+        ),
+        ("cancel order ORD-1002", "2"),
+        ("refund $1002", "ORD-1002"),
+        ("refund my order for $1001", "ORD-1001"),
+    ),
+)
+def test_caller_stated_order_id_rejects_weak_or_conflicting_forms(
+    utterance: str, proposed: str
+) -> None:
+    assert caller_stated_order_id(utterance, proposed) is None
 
 
 def test_caller_stated_phone_requires_one_complete_phone_shaped_run() -> None:
