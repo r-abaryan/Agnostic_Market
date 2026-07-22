@@ -98,12 +98,11 @@ logger = logging.getLogger("agnostic_market.agents.frontline")
 
 _HANDOVER_TOOL_NAME = "request_handover"
 
-# Graph topology is the source of truth for model-authored speech provenance. Milestone 3a
-# is deliberately compatibility-first: all four verified LLM invocation nodes retain their
-# current prose permission while unknown/missing/conflicting sources fail closed. Each
-# transactional source is removed atomically when its code-authored clarification node lands.
+# Graph topology is the source of truth for model-authored speech provenance. Identity has
+# completed its 3b code-authored clarification migration; Support and Cart retain compatibility
+# speech permission until their own atomic migrations.
 TRANSACTIONAL_MODEL_NODES = frozenset({"cart_assemble", "support_assemble", "identity_assemble"})
-MODEL_SPEECH_NODES = frozenset({"model"}) | TRANSACTIONAL_MODEL_NODES
+MODEL_SPEECH_NODES = frozenset({"model"}) | (TRANSACTIONAL_MODEL_NODES - {"identity_assemble"})
 FRONTLINE_SPEAKABLE_NODES = frozenset(
     {
         "handover",
@@ -883,7 +882,7 @@ def build_frontline_graph(
             "place": "cart_guardrail",
             "ack": "cart_ack",
             "leave": "gate",  # model left; normal pipeline answers this same turn
-            "clarify": END,  # a clarifying question was streamed already
+            "clarify": END,  # Cart keeps model-authored clarification until Milestone 3d.
         }[decision]
 
     def route_after_cart_guardrail(state: ReasoningState) -> str:
@@ -934,7 +933,8 @@ def build_frontline_graph(
             "handover": "handover",  # terminal no-match -> the silent human path
             "guardrail": "identity_guardrail",
             "reask": "identity_reask",  # the ONE bounded re-ask (own speakable node)
-            "clarify": END,  # a clarifying question was streamed already
+
+            "clarify": "identity_ask_contact",
         }[decision]
 
     def route_after_identity_guardrail(state: ReasoningState) -> str:
@@ -1152,6 +1152,7 @@ def build_frontline_graph(
     graph.add_node("support_abort", support.abort)
     graph.add_node("support_escape_human", support.escape_human)
     graph.add_node("identity_assemble", identity.assemble)
+    graph.add_node("identity_ask_contact", identity.ask_contact)
     graph.add_node("identity_reask", identity.reask)
     graph.add_node("identity_guardrail", identity.guardrail)
     graph.add_node("identity_risk_check", identity.risk_check)
@@ -1404,10 +1405,12 @@ def build_frontline_graph(
             "gate": "gate",
             "handover": "handover",
             "identity_guardrail": "identity_guardrail",
+            "identity_ask_contact": "identity_ask_contact",
             "identity_reask": "identity_reask",
             END: END,
         },
     )
+    graph.add_edge("identity_ask_contact", END)
     graph.add_edge("identity_reask", END)
     graph.add_conditional_edges(
         "identity_guardrail",

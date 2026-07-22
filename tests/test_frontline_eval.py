@@ -62,10 +62,10 @@ def test_frontline_eval_order_reference_preflight_is_green(config_root: Path) ->
     assert _order_reference_failures(data) == ()
 
 
-def test_frontline_eval_reports_exact_3a_open_speech_sources() -> None:
+def test_frontline_eval_reports_exact_3b_open_speech_sources() -> None:
     assert _speech_authority_failures() == tuple(
         f"{delivery} transactional model text reached caller speech: {node!r}"
-        for node in ("cart_assemble", "identity_assemble", "support_assemble")
+        for node in ("cart_assemble", "support_assemble")
         for delivery in ("completed", "orphaned")
     )
 

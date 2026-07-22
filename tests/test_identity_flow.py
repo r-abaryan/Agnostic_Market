@@ -11,7 +11,8 @@ from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 
 from agnostic_market.commerce.identity import BoundIdentity
-from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
+from agnostic_market.dtos.orchestration import ListOrders
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
@@ -22,6 +23,7 @@ _CUST1_MASK = "number ending 0119"
 _CUST1_PHONE = "+1 555 010 0119"  # CUST-001 on file: owns ORD-1001 + ORD-1003
 _CUST2_EMAIL = "casey@example.com"
 _UNKNOWN_CLAIM = "nobody@nowhere.example"
+_ASK_CONTACT_LINE = "What email address or phone number is on the account?"
 # Enumeration has NO gate patterns by design — entry is the MODEL's request_handover.
 _REQUEST = "what orders do I have on my account?"
 
@@ -34,6 +36,7 @@ def _identity_harness(
     thread_id: str = "ident-1",
     propose_limit: int = 99,
     policy=_POLICY,
+    reasoning: FakeChatModel | None = None,
 ) -> SupportHarness:
     return build_support_engine(
         config_root,
@@ -45,10 +48,14 @@ def _identity_harness(
             },
             tool_call_limit=99,
         ),
-        reasoning=FakeChatModel(
-            force_tool="propose_identity",
-            canned_args={"propose_identity": {"contact_claim": claim}},
-            tool_call_limit=propose_limit,
+        reasoning=(
+            reasoning
+            if reasoning is not None
+            else FakeChatModel(
+                force_tool="propose_identity",
+                canned_args={"propose_identity": {"contact_claim": claim}},
+                tool_call_limit=propose_limit,
+            )
         ),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
@@ -111,6 +118,107 @@ def _telemetry(tmp_path: Path) -> str:
 
 def _spoken(events: list) -> list[SpokenMessageEvent]:
     return [e for e in events if isinstance(e, SpokenMessageEvent)]
+
+
+def _assert_identity_contact_ask(
+    harness: SupportHarness,
+    events: list,
+    *,
+    thread_id: str,
+    expected_misses: int,
+) -> None:
+    assert [(event.node, event.text) for event in _spoken(events)] == [
+        ("identity_ask_contact", _ASK_CONTACT_LINE)
+    ]
+    assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
+    snapshot = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
+    state = snapshot.values
+    assert snapshot.next == ()
+    assert state.get("active_flow") == "identity"
+    assert state.get("identity_claim_misses") == expected_misses
+    assert state.get("pending_request") == ListOrders(scope="account")
+    assert state.get("pending_clarification") is None
+    for field in (
+        "pending_placement",
+        "pending_refund",
+        "pending_cancel",
+        "pending_return",
+        "pending_profile_change",
+        "pending_identity",
+    ):
+        assert state.get(field) is None
+    assert harness.identity.current() is None
+    assert harness.verification.grants == []
+    assert harness.otp.dispatch_count == 0
+    assert harness.store.placed_count == 0
+    assert harness.store.refund_count == 0
+    assert harness.store.cancel_count == 0
+    assert harness.store.return_count == 0
+    assert harness.profile.change_count == 0
+    assert harness.caller_context.cart_store.view() == ()
+
+
+# --- code-authored missing-contact clarification (Milestone 3b) ---------------------------
+
+
+async def test_explicit_identity_contact_request_is_code_authored(config_root: Path) -> None:
+    thread_id = "ident-clarify-tool"
+    reasoning = FakeChatModel(
+        force_tool="request_identity_contact",
+        tool_call_limit=99,
+        record_prompts=True,
+    )
+    h = _identity_harness(
+        config_root,
+        thread_id=thread_id,
+        reasoning=reasoning,
+    )
+    events = await _events(h.engine, _REQUEST)
+    _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=0)
+    assert "call request_identity_contact" in reasoning._seen_prompts[-1]
+    assert "one tool call WITH NO spoken text" in reasoning._seen_prompts[-1]
+
+
+async def test_identity_no_tool_prose_falls_back_to_code_question(config_root: Path) -> None:
+    thread_id = "ident-clarify-no-tool"
+    raw_model_text = "The account is already identified on my end."
+    h = _identity_harness(
+        config_root,
+        thread_id=thread_id,
+        reasoning=FakeChatModel(emit_tool_calls=False, text_response=raw_model_text),
+    )
+    events = await _events(h.engine, _REQUEST)
+    _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=0)
+    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert not any(raw_model_text in str(message.content) for message in state["messages"])
+
+
+async def test_malformed_identity_tools_preserve_miss_budget_and_continuation(
+    config_root: Path,
+) -> None:
+    thread_id = "ident-clarify-malformed"
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("propose_identity", {"contact_claim": _UNKNOWN_CLAIM})],
+            [("request_identity_contact", {"unexpected": "value"})],
+            [
+                (
+                    "propose_identity",
+                    {"contact_claim": _CUST2_EMAIL, "unexpected": "value"},
+                )
+            ],
+        ]
+    )
+    h = _identity_harness(config_root, thread_id=thread_id, reasoning=reasoning)
+
+    await _events(h.engine, _REQUEST)
+    after_miss = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert after_miss.get("identity_claim_misses") == 1
+    assert after_miss.get("pending_request") == ListOrders(scope="account")
+
+    events = await _events(h.engine, "It is the same contact I gave you.")
+    _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=1)
+    assert reasoning.invoke_count == 3
 
 
 # --- the happy path: claim -> OTP -> bind -> the SCOPED list -------------------------------

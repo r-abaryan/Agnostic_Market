@@ -29,9 +29,10 @@ A neutral "dispatch anyway" flow is NOT an option in the build phase: the stub O
 is global, so a doomed collect for an unmatched claim would grant L2 to an unverified
 caller.
 
-PII discipline: the raw spoken claim reaches `match_contact` and is never persisted —
-the pending carries the MASKED contact only; ToolMessages are constant (no value echo);
-telemetry carries closed slugs + the customer_ref fixture slug only.
+PII discipline: the checkpointed caller transcript and the model's `propose_identity` tool
+arguments contain the raw spoken claim. The pending carries the MASKED contact only;
+ToolMessages are constant (no value echo); telemetry carries closed slugs + the customer_ref
+fixture slug only. Durable-checkpoint minimization/encryption remains a Phase-4 gate.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from dataclasses import dataclass
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls
 from agnostic_market.agents.identity.prompt import compose_identity_prompt
@@ -62,6 +63,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.state import (
     HandoffRequest,
+    IdentityClarification,
     PendingIdentity,
     PolicyContext,
     ReasoningState,
@@ -73,10 +75,17 @@ logger = logging.getLogger("agnostic_market.agents.identity")
 # asserting it is not on file — "I couldn't find that" confirms non-existence to a probing
 # caller, and an STT mishear (not absence) is the likely cause anyway.
 _REASK_LINE = "Could you double-check the email or phone number on the account for me?"
+_ASK_CONTACT_LINE = "What email address or phone number is on the account?"
 
 
 class _ProposeIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     contact_claim: str
+
+
+class _RequestIdentityContact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,7 @@ class IdentityNodes:
     """
 
     assemble: Callable[[ReasoningState], dict[str, object]]
+    ask_contact: Callable[[ReasoningState], dict[str, object]]
     reask: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     risk_check: Callable[[ReasoningState], dict[str, object]]
@@ -112,6 +122,7 @@ def _flow_exit(update: dict[str, object]) -> dict[str, object]:
         "identity_claim_misses": 0,
         "pending_cancel": None,
         "pending_request": None,
+        "pending_clarification": None,
         **update,
     }
 
@@ -145,7 +156,12 @@ def build_identity_nodes(
         """Leave identity verification (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
-    model = reasoning_model.bind_tools([propose_identity, leave_identity])
+    @tool
+    def request_identity_contact() -> str:
+        """Request the account email address or phone number from the caller."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    model = reasoning_model.bind_tools([propose_identity, leave_identity, request_identity_contact])
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left identity", tool_call_id=call_id))
@@ -185,13 +201,32 @@ def build_identity_nodes(
         new_messages: list = []
         for _attempt in range(2):  # one invalid proposal gets ONE corrective re-prompt
             response = model.invoke(messages)
-            new_messages.append(response)
             if not response.tool_calls:
-                return {"messages": new_messages}  # clarifying question (streamed) — stay
+                return {
+                    "messages": new_messages,
+                    "pending_clarification": IdentityClarification(),
+                }
+            new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
             if call["name"] == "leave_identity":
                 return _leave(new_messages, call["id"], "left_flow")
+
+            if call["name"] == "request_identity_contact":
+                try:
+                    _RequestIdentityContact.model_validate(call["args"])
+                except ValueError:
+                    feedback = "Invalid request. request_identity_contact takes no arguments."
+                    new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                new_messages.append(
+                    ToolMessage("contact clarification requested", tool_call_id=call["id"])
+                )
+                return {
+                    "messages": new_messages,
+                    "pending_clarification": IdentityClarification(),
+                }
 
             if call["name"] == "propose_identity":
                 try:
@@ -206,11 +241,9 @@ def build_identity_nodes(
                     new_messages.append(ToolMessage(feedback, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
-                # Constant tool result — the claim is never echoed into thread history
-                # (the raw value's only journey is this stack frame -> match_contact).
-                new_messages.append(
-                    ToolMessage("identity claim received", tool_call_id=call["id"])
-                )
+                # Constant result: do not add another raw-value echo beyond the caller
+                # transcript and model tool arguments already in checkpoint history.
+                new_messages.append(ToolMessage("identity claim received", tool_call_id=call["id"]))
                 matched = customers.match_contact(proposed.contact_claim)
                 if matched is not None:
                     pending = PendingIdentity(
@@ -239,9 +272,20 @@ def build_identity_nodes(
             # Explicit terminal guard (not fall-through): every bound tool has a branch
             # above, so an unhandled name means a NEW tool was bound without a handler.
             raise ValueError(f"identity assemble: unhandled tool {call['name']!r}")
-        logger.warning("identity assemble: two invalid proposals; leaving flow")
-        write_event({"event": "identity_left", "reason": "invalid_proposals"})
-        return _flow_exit({"messages": new_messages, "active_flow": "left_identity"})
+        logger.warning("identity assemble: two invalid tool calls; asking for contact in code")
+        return {
+            "messages": new_messages,
+            "pending_clarification": IdentityClarification(),
+        }
+
+    def ask_contact_node(state: ReasoningState) -> dict[str, object]:
+        clarification = state.pending_clarification
+        if not isinstance(clarification, IdentityClarification):
+            raise TypeError("identity ask-contact node requires IdentityClarification")
+        return {
+            "pending_clarification": None,
+            "messages": [AIMessage(_ASK_CONTACT_LINE)],
+        }
 
     def reask_node(state: ReasoningState) -> dict[str, object]:
         """OWN speakable node for the code-authored re-ask (the cart_ack lesson: assemble
@@ -360,9 +404,7 @@ def build_identity_nodes(
                 ),
             }
         if isinstance(state.pending_request, SwitchAccount):
-            write_event(
-                {"event": "principal_transition_skipped", "reason": "same_customer"}
-            )
+            write_event({"event": "principal_transition_skipped", "reason": "same_customer"})
             return _flow_exit(
                 {
                     "active_flow": None,
@@ -402,9 +444,7 @@ def build_identity_nodes(
         return _flow_exit(
             {
                 "active_flow": None,
-                "handover": HandoffRequest(
-                    destination="human", reason_code="other", source="gate"
-                ),
+                "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
             }
         )
 
@@ -416,6 +456,10 @@ def build_identity_nodes(
             return "handover"  # terminal second no-match -> the silent human path
         if state.pending_identity is not None:
             return "guardrail"
+        if state.pending_clarification is not None:
+            if not isinstance(state.pending_clarification, IdentityClarification):
+                raise TypeError("identity assemble produced a non-identity clarification")
+            return "clarify"
         for msg in reversed(state.messages):
             if isinstance(msg, AIMessage):
                 # A propose_identity call that minted nothing = the claim didn't match
@@ -437,13 +481,19 @@ def build_identity_nodes(
         def wrapped(state: ReasoningState) -> dict[str, object]:
             update = node(state)
             if update.get("handover") is not None:
-                update = {**update, "pending_cancel": None, "pending_request": None}
+                update = {
+                    **update,
+                    "pending_cancel": None,
+                    "pending_request": None,
+                    "pending_clarification": None,
+                }
             return update
 
         return wrapped
 
     return IdentityNodes(
         assemble=assemble_node,
+        ask_contact=ask_contact_node,
         reask=reask_node,
         guardrail=guardrail_node,
         risk_check=_clear_selection_on_handover(stepup.risk_check),
@@ -457,6 +507,7 @@ def build_identity_nodes(
         route_after_collect=route_after_collect,
         speakable_nodes=frozenset(
             {
+                "identity_ask_contact",
                 "identity_reask",  # authors the softened re-ask line
                 "identity_risk_check",
                 "identity_collect",

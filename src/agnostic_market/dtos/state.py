@@ -302,8 +302,9 @@ class PendingIdentity(BaseModel):
     """An identity verification awaiting step-up (P7 — the third `_stepup.py` family).
 
     Minted by the identity flow's assemble AFTER the caller's contact claim code-matched a
-    customer. Carries the MASKED contact only (the factor_ref analogue) — the raw spoken
-    claim never enters the checkpoint. `grants_at_mint` snapshots
+    customer. Carries the MASKED contact only (the factor_ref analogue). The raw claim is
+    still present in checkpointed caller/model message history; this DTO adds no second raw-value
+    field. `grants_at_mint` snapshots
     `len(verification_store.grants)` at mint: THE binding invariant. A stale cross-family L2
     (e.g. an earlier profile-flow OTP) satisfies the factory's level-only confirm check even
     when THIS chain's OTP failed — the flow's collect router and apply node require a NEW

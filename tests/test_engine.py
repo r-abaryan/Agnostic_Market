@@ -358,6 +358,7 @@ async def test_pending_clarification_roundtrips_and_clears_at_fresh_entry(
 
 _SPEAKABLE = frozenset({"support_guardrail"})
 _ASSEMBLE_META = {"langgraph_node": "support_assemble"}
+_IDENTITY_ASSEMBLE_META = {"langgraph_node": "identity_assemble"}
 _MODEL_META = {"langgraph_node": "model"}
 
 
@@ -371,7 +372,22 @@ def test_graph_declares_disjoint_code_and_model_speech_sources(config_root: Path
     graph = engine._graph
     assert graph.model_speech_nodes == MODEL_SPEECH_NODES
     assert frozenset(graph.nodes) >= MODEL_SPEECH_NODES
+    assert "identity_ask_contact" in graph.speakable_nodes
     assert graph.speakable_nodes.isdisjoint(graph.model_speech_nodes)
+
+
+async def test_cart_clarification_never_routes_to_identity_contact(config_root: Path) -> None:
+    engine, _ = _engine(config_root, thread_id="cart-identity-isolation")
+    events = [event async for event in engine.stream_turn("checkout now please", _FACTS)]
+    assert not any(
+        isinstance(event, SpokenMessageEvent) and event.node == "identity_ask_contact"
+        for event in events
+    )
+    state = engine._graph.get_state(
+        {"configurable": {"thread_id": "cart-identity-isolation"}}
+    ).values
+    assert state.get("active_flow") == "cart"
+    assert state.get("pending_clarification") is None
 
 
 def test_streamed_clarify_speaks_once_at_message_completion() -> None:
@@ -414,13 +430,30 @@ def test_unstreamed_answer_speaks_once() -> None:
     assert event.text == "Hello!"
 
 
-@pytest.mark.parametrize(
-    "node", ["model", "identity_assemble", "support_assemble", "cart_assemble"]
-)
-def test_3a_compatibility_sources_retain_plain_text(node: str) -> None:
+@pytest.mark.parametrize("node", ["model", "support_assemble", "cart_assemble"])
+def test_3b_compatibility_sources_retain_plain_text(node: str) -> None:
     speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     event = speech.feed(AIMessage(content="Current behavior.", id="m1"), {"langgraph_node": node})
     assert isinstance(event, TokenEvent)
+
+
+def test_identity_assemble_completed_plain_text_is_not_caller_authoritative() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("What is your contact?", "m1"), _IDENTITY_ASSEMBLE_META)
+    assert (
+        speech.feed(
+            AIMessage(content="What is your contact?", id="m1"),
+            _IDENTITY_ASSEMBLE_META,
+        )
+        is None
+    )
+    assert list(speech.flush()) == []
+
+
+def test_identity_assemble_orphan_plain_text_is_not_caller_authoritative() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("What is your contact?", "m1"), _IDENTITY_ASSEMBLE_META)
+    assert list(speech.flush()) == []
 
 
 def test_speakable_node_line_is_a_spoken_message() -> None:

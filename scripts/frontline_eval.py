@@ -263,6 +263,7 @@ _FLOW_TOOLS = frozenset(
         "go_to_checkout",
         "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
         "propose_identity",
+        "request_identity_contact",
         "leave_identity",  # identity (P7; list_orders is a FRONTLINE read)
     }
 )
