@@ -361,6 +361,9 @@ class ReasoningState(BaseModel):
 
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     handover: HandoffRequest | None = None
+    # Session-terminal automation state. Set only by the shared human handover and retained
+    # until the caller lifecycle deletes the checkpoint; it is never an identity/account block.
+    automation_terminal: bool = False
     pending_placement: PendingPlacement | None = None
     pending_refund: PendingRefund | None = None
     pending_cancel: PendingCancel | None = None

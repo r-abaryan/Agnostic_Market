@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agnostic_market.agents import telemetry
@@ -81,6 +81,7 @@ _PENDING_FIELDS = (
     "pending_profile_change",
     "pending_identity",
     "pending_request",
+    "pending_ack",
 )
 
 
@@ -109,6 +110,7 @@ class GraphObservation:
     pending_fields: tuple[str, ...]
     handover_destination: str | None
     interrupted: bool
+    unfinished: bool
     automation_terminal: bool
 
 
@@ -119,6 +121,7 @@ class TurnObservation:
     effects: CommerceObservation
     state: GraphObservation
     model_calls: int | None
+    completed_tool_calls: int
 
 
 @dataclass(frozen=True)
@@ -163,18 +166,22 @@ def _commerce_observation(
     )
 
 
-def _graph_observation(engine: ReasoningEngine) -> GraphObservation:
+def _checkpoint_observation(engine: ReasoningEngine) -> tuple[GraphObservation, int]:
     # Evaluator-only checkpoint inspection. Adding a production introspection API solely for
     # tests would widen ReasoningEngine's application contract.
     snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
     values = snapshot.values
     handover = values.get("handover")
-    return GraphObservation(
-        active_flow=values.get("active_flow"),
-        pending_fields=tuple(name for name in _PENDING_FIELDS if values.get(name) is not None),
-        handover_destination=getattr(handover, "destination", None),
-        interrupted=bool(snapshot.interrupts),
-        automation_terminal=bool(values.get("automation_terminal", False)),
+    return (
+        GraphObservation(
+            active_flow=values.get("active_flow"),
+            pending_fields=tuple(name for name in _PENDING_FIELDS if values.get(name) is not None),
+            handover_destination=getattr(handover, "destination", None),
+            interrupted=bool(snapshot.interrupts),
+            unfinished=bool(snapshot.next),
+            automation_terminal=bool(values.get("automation_terminal", False)),
+        ),
+        sum(isinstance(message, ToolMessage) for message in values.get("messages", ())),
     )
 
 
@@ -193,6 +200,7 @@ async def _observe_scenario(
     turns: list[TurnObservation] = []
     for utterance in utterances:
         events = tuple([event async for event in engine.stream_turn(utterance, TurnFacts())])
+        state, completed_tool_calls = _checkpoint_observation(engine)
         turns.append(
             TurnObservation(
                 utterance=utterance,
@@ -200,8 +208,9 @@ async def _observe_scenario(
                 effects=_commerce_observation(
                     store, profile_store, otp, verification, identity_store
                 ),
-                state=_graph_observation(engine),
+                state=state,
                 model_calls=model_call_count() if model_call_count is not None else None,
+                completed_tool_calls=completed_tool_calls,
             )
         )
     return ScenarioObservation(before=before, turns=tuple(turns))

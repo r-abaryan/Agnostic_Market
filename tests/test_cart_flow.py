@@ -376,7 +376,8 @@ async def test_human_escape_breaks_stickiness(config_root: Path) -> None:
     await _enter_cart(graph)
     out = await graph.ainvoke({"messages": [HumanMessage("get me a person please")]}, _CFG)
     assert _flow(graph) is None
-    assert out["handover"].destination == "human"
+    assert out.get("handover") is None
+    assert out.get("automation_terminal") is True
 
 
 # --- view_cart read answered, not escalated ----------------------------------------------

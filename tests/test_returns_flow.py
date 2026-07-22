@@ -278,7 +278,10 @@ async def test_human_at_readback_escapes_with_onramp_package(
     assert h.store.return_count == 0
     assert not h.engine.pending_interrupt()  # §A9: never trapped
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any(e.node == "handover" and "person" in e.text for e in spoken)
+    assert any(
+        e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
+        for e in spoken
+    )
     # The warm-transfer context package (Group C on-ramp): closed slugs, exact keys, no PII.
     onramps = [e for e in _telemetry_events(tmp_path) if e.get("event") == "human_onramp"]
     assert len(onramps) == 1
@@ -288,6 +291,12 @@ async def test_human_at_readback_escapes_with_onramp_package(
     }
     assert onramps[0]["schema_version"] == 1
     assert onramps[0]["tenant"] == "acme_store"
+    responses = [
+        e
+        for e in _telemetry_events(tmp_path)
+        if e.get("event") == "automation_terminal_response"
+    ]
+    assert responses == [{"event": "automation_terminal_response"}]
 
 
 # --- crossover isolation (the step-up factory shares bodies, never state) ------------------

@@ -898,13 +898,14 @@ async def test_bound_customer_without_profile_fails_closed(
     assert h.otp.dispatch_count == 0
     assert h.profile.change_count == 0
     assert [e.text for e in events if isinstance(e, SpokenMessageEvent)] == [
-        "Let me get you to a person who can help with that."
+        "I can't continue with automated assistance on this call. "
+        "Please contact the store directly for further help."
     ]
     state = _state_values(h, "scope-prof-noprofile")
     assert state.get("active_flow") is None
     assert state.get("pending_profile_change") is None
-    assert state["handover"].destination == "human"
-    assert state["handover"].reason_code == "contact_change"
+    assert state.get("handover") is None
+    assert state.get("automation_terminal") is True
     telemetry = _telemetry(tmp_path)
     assert sum(e["event"] == "profile_change_denied" for e in telemetry) == 1
     assert sum(e["event"] == "human_onramp" for e in telemetry) == 1

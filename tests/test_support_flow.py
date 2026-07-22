@@ -302,7 +302,10 @@ async def test_cancel_risk_flagged_hands_to_human_without_voiding(config_root: P
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert store.cancel_count == 0  # a risk-flagged session gets no silent void
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any(e.node == "handover" and "person" in e.text.lower() for e in spoken)
+    assert any(
+        e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
+        for e in spoken
+    )
 
 
 async def test_cancel_no_at_readback_leaves_order_untouched(config_root: Path) -> None:

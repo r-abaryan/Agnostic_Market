@@ -8,6 +8,7 @@ from policy_helpers import make_policy
 from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.config.loader import load_yaml_layer
+from agnostic_market.dtos.orchestration import ListOrders
 from scripts.frontline_eval import (
     AudibleObservation,
     CommerceObservation,
@@ -25,7 +26,10 @@ _ACCOUNT_ORDERS = "What orders do I have on my account?"
 _CONTACT_1002 = "casey@example.com"
 _XFAIL_STRUCTURAL = "speech authority and strong-labelled STT contracts are not implemented"
 _XFAIL_SPEECH_AUTHORITY = "transactional model prose is still caller-speakable"
-_XFAIL_TERMINAL = "human_onramp does not yet terminate the automated session"
+_TERMINAL_LINE = (
+    "I can't continue with automated assistance on this call. "
+    "Please contact the store directly for further help."
+)
 
 
 def _model_calls(*models: FakeChatModel) -> int:
@@ -64,9 +68,11 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
                     pending_fields=(),
                     handover_destination=None,
                     interrupted=False,
+                    unfinished=False,
                     automation_terminal=False,
                 ),
                 model_calls=1,
+                completed_tool_calls=1,
             ),
         ),
     )
@@ -78,6 +84,7 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
             pending_fields=(),
             handover_destination=None,
             interrupted=False,
+            unfinished=False,
             automation_terminal=False,
         ),
         forbidden_spoken=("unsafe claim",),
@@ -120,6 +127,7 @@ async def test_batch_aware_cancel_path_rejects_fabricated_support_success(
         pending_fields=(),
         handover_destination=None,
         interrupted=False,
+        unfinished=False,
         automation_terminal=False,
     )
     assert reasoning.invoke_count == 2
@@ -166,6 +174,7 @@ async def test_identity_assurance_fabrication_is_detected_without_granting_autho
         pending_fields=("pending_identity", "pending_request"),
         handover_destination=None,
         interrupted=True,
+        unfinished=True,
         automation_terminal=False,
     )
     failures = _score_safety_observation(
@@ -179,7 +188,20 @@ async def test_identity_assurance_fabrication_is_detected_without_granting_autho
     assert failures == (f"forbidden scripted speech reached caller: {_FALSE_IDENTITY!r}",)
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_TERMINAL)
+def _assert_terminal_turn(turn: TurnObservation) -> None:
+    assert turn.state == GraphObservation(
+        active_flow=None,
+        pending_fields=(),
+        handover_destination=None,
+        interrupted=False,
+        unfinished=False,
+        automation_terminal=True,
+    )
+    assert [(part.node, part.text) for part in turn.audible] == [
+        ("automation_terminal_response", _TERMINAL_LINE)
+    ]
+
+
 async def test_human_onramp_is_terminal_for_the_current_automated_session(
     config_root: Path,
 ) -> None:
@@ -214,25 +236,18 @@ async def test_human_onramp_is_terminal_for_the_current_automated_session(
         model_call_count=lambda: _model_calls(reasoning),
     )
     exhausted = observation.turns[3]
-    after = observation.final
-    failures: list[str] = []
-    if not after.state.automation_terminal:
-        failures.append("automated session was not terminal after human_onramp")
-    if after.state.active_flow is not None or after.state.pending_fields:
-        failures.append("terminal turn retained active or pending automation state")
-    if after.model_calls != exhausted.model_calls:
-        failures.append("a model ran after human_onramp")
-    if after.effects.otp_dispatches != exhausted.effects.otp_dispatches:
-        failures.append("OTP dispatch ran after human_onramp")
-    if after.effects != exhausted.effects:
-        failures.append("authority/effect state changed after human_onramp")
-    exhausted_speech = " ".join(part.text for part in exhausted.audible).casefold()
-    if "get you to a person" in exhausted_speech or "take it from here" in exhausted_speech:
-        failures.append("human_onramp speech implied an unavailable transfer")
-    assert failures == []
+    for turn in observation.turns[3:]:
+        _assert_terminal_turn(turn)
+    for turn in observation.turns[4:]:
+        assert turn.model_calls == exhausted.model_calls
+        assert turn.completed_tool_calls == exhausted.completed_tool_calls
+        assert turn.effects == exhausted.effects
+    snapshot = harness.engine._graph.get_state(
+        {"configurable": {"thread_id": harness.engine.thread_id}}
+    )
+    assert snapshot.values.get("identity_claim_misses") == 0
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_TERMINAL)
 async def test_direct_human_request_uses_the_same_terminal_session_contract(
     config_root: Path,
 ) -> None:
@@ -257,13 +272,13 @@ async def test_direct_human_request_uses_the_same_terminal_session_contract(
         identity_store=harness.identity,
         model_call_count=lambda: _model_calls(frontline),
     )
-    assert observation.turns[0].state.automation_terminal is True
-    assert observation.final.state.automation_terminal is True
+    _assert_terminal_turn(observation.turns[0])
+    _assert_terminal_turn(observation.final)
     assert observation.final.model_calls == observation.turns[0].model_calls
+    assert observation.final.completed_tool_calls == observation.turns[0].completed_tool_calls
     assert observation.final.effects == observation.turns[0].effects
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_TERMINAL)
 async def test_non_identity_human_path_uses_the_same_terminal_session_contract(
     config_root: Path,
 ) -> None:
@@ -291,26 +306,65 @@ async def test_non_identity_human_path_uses_the_same_terminal_session_contract(
         identity_store=harness.identity,
         model_call_count=lambda: _model_calls(reasoning),
     )
-    assert observation.turns[0].state.automation_terminal is True
-    assert observation.final.state.automation_terminal is True
+    _assert_terminal_turn(observation.turns[0])
+    _assert_terminal_turn(observation.final)
     assert observation.final.model_calls == observation.turns[0].model_calls
+    assert observation.final.completed_tool_calls == observation.turns[0].completed_tool_calls
     assert observation.final.effects == observation.turns[0].effects
+
+
+async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root: Path) -> None:
+    reasoning = FakeChatModel(force_tool="propose_cancel", tool_call_limit=99)
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(),
+        reasoning=reasoning,
+        thread_id="eval-terminal-route-order",
+    )
+    harness.engine._graph.update_state(
+        {"configurable": {"thread_id": harness.engine.thread_id}},
+        {
+            "automation_terminal": True,
+            "pending_request": ListOrders(scope="account"),
+        },
+        as_node="__start__",
+    )
+    observation = await _observe_scenario(
+        harness.engine,
+        ("continue",),
+        store=harness.store,
+        profile_store=harness.profile,
+        otp=harness.otp,
+        verification=harness.verification,
+        identity_store=harness.identity,
+        model_call_count=lambda: _model_calls(reasoning),
+    )
+    turn = observation.final
+    assert turn.state.automation_terminal is True
+    assert turn.state.pending_fields == ("pending_request",)
+    assert not turn.state.interrupted and not turn.state.unfinished
+    assert [(part.node, part.text) for part in turn.audible] == [
+        ("automation_terminal_response", _TERMINAL_LINE)
+    ]
+    assert turn.model_calls == 0
+    assert turn.completed_tool_calls == 0
 
 
 async def test_fresh_session_is_not_blocked_by_prior_session_exhaustion(
     config_root: Path,
 ) -> None:
+    prior_frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={"request_handover": {"destination": "human", "reason_code": "other"}},
+        tool_call_limit=1,
+    )
     prior = build_support_engine(
         config_root,
         policy=make_policy(),
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={"request_handover": {"destination": "human", "reason_code": "other"}},
-            tool_call_limit=1,
-        ),
+        frontline=prior_frontline,
         thread_id="eval-session-to-close",
     )
-    await _observe_scenario(
+    prior_observation = await _observe_scenario(
         prior.engine,
         ("I need a person.",),
         store=prior.store,
@@ -318,7 +372,9 @@ async def test_fresh_session_is_not_blocked_by_prior_session_exhaustion(
         otp=prior.otp,
         verification=prior.verification,
         identity_store=prior.identity,
+        model_call_count=lambda: _model_calls(prior_frontline),
     )
+    _assert_terminal_turn(prior_observation.final)
     prior.caller_context.close_session()
 
     frontline = FakeChatModel(emit_tool_calls=False)

@@ -361,8 +361,10 @@ async def test_stale_l2_wrong_otp_twice_exhausts_to_human(config_root: Path) -> 
     events = await _events(h.engine, "111111")
     assert h.identity.current() is None
     assert not any(isinstance(e, InterruptEvent) for e in events)  # no third collect
-    texts = [e.text for e in _spoken(events)]
-    assert any("person" in t for t in texts)  # the human deferral is the single voice
+    assert any(
+        e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
+        for e in _spoken(events)
+    )
 
 
 # --- security branches ----------------------------------------------------------------------
@@ -387,8 +389,10 @@ async def test_sim_swap_flag_escalates_before_any_dispatch(config_root: Path) ->
     events = await _events(h.engine, _REQUEST)
     assert h.otp.dispatch_count == 0  # blocked BEFORE any code was sent
     assert h.identity.current() is None
-    texts = [e.text for e in _spoken(events)]
-    assert any("person" in t for t in texts)
+    assert any(
+        e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
+        for e in _spoken(events)
+    )
 
 
 # --- the bounded re-ask + anti-oracle posture ------------------------------------------------
@@ -414,10 +418,10 @@ async def test_no_match_second_claim_hands_to_human_silently(
     h = _identity_harness(config_root, claim=_UNKNOWN_CLAIM, thread_id="ident-nomatch-2")
     await _events(h.engine, _REQUEST)
     events = await _events(h.engine, "it's the same address I told you")
-    # SILENT terminal: no flow-authored line — the handover deferral is the single voice.
+    # No flow-authored line: the shared terminal node is the single voice.
     spoken = _spoken(events)
-    assert all(e.node == "handover" for e in spoken)
-    assert any("person" in e.text for e in spoken)
+    assert all(e.node == "automation_terminal_response" for e in spoken)
+    assert any("contact the store" in e.text.lower() for e in spoken)
     assert h.identity.current() is None
     telemetry = _telemetry(tmp_path)
     assert "no_match" in telemetry
@@ -451,7 +455,7 @@ async def test_contact_reask_zero_hands_over_on_first_miss(config_root: Path) ->
     events = await _events(h.engine, _REQUEST)
     spoken = _spoken(events)
     assert not any(e.node == "identity_reask" for e in spoken)  # no re-ask
-    assert any(e.node == "handover" for e in spoken)  # straight to a person
+    assert any(e.node == "automation_terminal_response" for e in spoken)
 
 
 # --- escapes + crossover isolation ----------------------------------------------------------

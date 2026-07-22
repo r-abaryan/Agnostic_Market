@@ -138,8 +138,12 @@ _DEFERRAL: dict[HandoffDestination, str] = {
         "so it can be handled."
     ),
     "planner": "That's a bit more than I can handle here yet, but I'll make sure it's picked up.",
-    "human": "Let me get you to a person who can help with that.",
 }
+
+_AUTOMATION_TERMINAL_LINE = (
+    "I can't continue with automated assistance on this call. "
+    "Please contact the store directly for further help."
+)
 
 
 def _build_handover_tool() -> BaseTool:
@@ -599,6 +603,20 @@ def build_frontline_graph(
                     "source": handover.source,
                 }
             )
+            return {
+                "automation_terminal": True,
+                "active_flow": None,
+                "handover": None,
+                "pending_placement": None,
+                "pending_refund": None,
+                "pending_cancel": None,
+                "pending_return": None,
+                "pending_profile_change": None,
+                "pending_identity": None,
+                "pending_request": None,
+                "identity_claim_misses": 0,
+                "pending_ack": None,
+            }
         # A cart/support handover ENTERS the flow (3b/3c/Group B) instead of speaking a
         # deferral: set the sticky flow marker, clear the handover signal, and let routing
         # carry us into the flow's assemble in this same turn. EXCEPT when that flow was
@@ -665,6 +683,10 @@ def build_frontline_graph(
             update["active_flow"] = None
         return update
 
+    def automation_terminal_response_node(_state: ReasoningState) -> dict[str, object]:
+        write_event({"event": "automation_terminal_response"})
+        return {"messages": [AIMessage(_AUTOMATION_TERMINAL_LINE)]}
+
     def cross_switch_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: while sticky in one gated flow, the caller voiced a
         HIGH-CERTAINTY intent for a DIFFERENT one (the gate tripped cross-flow). The 3b
@@ -713,6 +735,8 @@ def build_frontline_graph(
         # to support's cancel-order path. The cross-switch closes the sticky-flow trap:
         # without it, a gate-certain intent for ANOTHER flow (e.g. "refund me" while stuck
         # in checkout) reaches the checkout model, which cannot serve it.
+        if state.automation_terminal:
+            return "automation_terminal_response"
         if state.pending_request is not None and state.active_flow is None:
             return "support_continuation"
         text = _last_user_text(state)
@@ -761,8 +785,10 @@ def build_frontline_graph(
         return "gate"
 
     def route_after_handover(state: ReasoningState) -> str:
-        # A cart/support/identity destination entered the flow (handover cleared, flow
-        # set); everything else spoke its deferral and ends.
+        # Human transitions speak through the one terminal node. A cart/support/identity
+        # destination entered its flow (handover cleared, flow set); other destinations end.
+        if state.automation_terminal:
+            return "automation_terminal_response"
         if state.handover is None:
             if state.active_flow == "identity" and state.pending_request is not None:
                 return (
@@ -1067,6 +1093,7 @@ def build_frontline_graph(
     graph.add_node("model", model_node)
     graph.add_node("tools", tool_node)
     graph.add_node("handover", handover_node)
+    graph.add_node("automation_terminal_response", automation_terminal_response_node)
     graph.add_node("principal_warning", principal_warning_node)
     graph.add_node("finalize", finalize_node)
     graph.add_node("read_render", read_render_node)
@@ -1133,6 +1160,7 @@ def build_frontline_graph(
         "entry",
         route_after_entry,
         {
+            "automation_terminal_response": "automation_terminal_response",
             "gate": "gate",
             "cross_switch": "cross_switch",
             "cart_assemble": "cart_assemble",
@@ -1176,6 +1204,7 @@ def build_frontline_graph(
         "handover",
         route_after_handover,
         {
+            "automation_terminal_response": "automation_terminal_response",
             "cart_assemble": "cart_assemble",
             "support_assemble": "support_assemble",
             "identity_assemble": "identity_assemble",
@@ -1392,6 +1421,7 @@ def build_frontline_graph(
     )
     graph.add_edge("identity_abort", END)
     graph.add_edge("identity_escape_human", "handover")
+    graph.add_edge("automation_terminal_response", END)
     graph.add_edge("finalize", END)
     graph.add_edge("forced_status", END)
     graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
@@ -1401,7 +1431,15 @@ def build_frontline_graph(
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset({"handover", "principal_warning", "read_render", "forced_status"})
+        frozenset(
+            {
+                "handover",
+                "automation_terminal_response",
+                "principal_warning",
+                "read_render",
+                "forced_status",
+            }
+        )
         | cart.speakable_nodes
         | support.speakable_nodes
         | identity.speakable_nodes

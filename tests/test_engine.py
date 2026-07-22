@@ -242,7 +242,10 @@ async def test_human_request_at_confirmation_escapes(config_root: Path) -> None:
     assert store.placed_count == 0
     assert not engine.pending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any(e.node == "handover" and "person" in e.text for e in spoken)
+    assert any(
+        e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
+        for e in spoken
+    )
 
 
 # --- Clock A: pending-confirmation TTL --------------------------------------------------
