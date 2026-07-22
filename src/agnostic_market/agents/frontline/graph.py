@@ -98,6 +98,22 @@ logger = logging.getLogger("agnostic_market.agents.frontline")
 
 _HANDOVER_TOOL_NAME = "request_handover"
 
+# Graph topology is the source of truth for model-authored speech provenance. Milestone 3a
+# is deliberately compatibility-first: all four verified LLM invocation nodes retain their
+# current prose permission while unknown/missing/conflicting sources fail closed. Each
+# transactional source is removed atomically when its code-authored clarification node lands.
+TRANSACTIONAL_MODEL_NODES = frozenset({"cart_assemble", "support_assemble", "identity_assemble"})
+MODEL_SPEECH_NODES = frozenset({"model"}) | TRANSACTIONAL_MODEL_NODES
+FRONTLINE_SPEAKABLE_NODES = frozenset(
+    {
+        "handover",
+        "automation_terminal_response",
+        "principal_warning",
+        "read_render",
+        "forced_status",
+    }
+)
+
 # The gate speaks in DESTINATION names (its enum is the handover destination); the entry
 # router reasons in FLOW names (active_flow). They differ for the cart flow: the gate's
 # place-order rule maps to the legacy "checkout" destination, but the flow that serves it is
@@ -616,6 +632,7 @@ def build_frontline_graph(
                 "pending_request": None,
                 "identity_claim_misses": 0,
                 "pending_ack": None,
+                "pending_clarification": None,
             }
         # A cart/support handover ENTERS the flow (3b/3c/Group B) instead of speaking a
         # deferral: set the sticky flow marker, clear the handover signal, and let routing
@@ -674,11 +691,15 @@ def build_frontline_graph(
 
     def entry_node(state: ReasoningState) -> dict[str, object]:
         # Fresh-turn hygiene: with a checkpointer, LAST turn's handover signal, the
-        # turn-scoped "left_*" marker, and any turn-scoped pending_ack persist in thread
-        # state and must not affect THIS turn. (pending_placement needs no such reset:
+        # turn-scoped "left_*" marker, pending_ack, and pending_clarification persist in
+        # thread state and must not affect THIS turn. (pending_placement needs no such reset:
         # while one exists the graph is paused at confirm and turns arrive as resumes,
         # never through here.)
-        update: dict[str, object] = {"handover": None, "pending_ack": None}
+        update: dict[str, object] = {
+            "handover": None,
+            "pending_ack": None,
+            "pending_clarification": None,
+        }
         if state.active_flow in ("left_cart", "left_support", "left_identity"):
             update["active_flow"] = None
         return update
@@ -721,6 +742,7 @@ def build_frontline_graph(
             "pending_identity": None,
             "identity_claim_misses": 0,
             "pending_ack": None,
+            "pending_clarification": None,
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
             ),
@@ -1431,17 +1453,13 @@ def build_frontline_graph(
     # node-authored messages are caller-facing — the voice side never hard-codes names).
     compiled.frontline_read_only_tools = read_only_names  # type: ignore[attr-defined]
     compiled.speakable_nodes = (  # type: ignore[attr-defined]
-        frozenset(
-            {
-                "handover",
-                "automation_terminal_response",
-                "principal_warning",
-                "read_render",
-                "forced_status",
-            }
-        )
+        FRONTLINE_SPEAKABLE_NODES
         | cart.speakable_nodes
         | support.speakable_nodes
         | identity.speakable_nodes
     )
+    compiled.model_speech_nodes = MODEL_SPEECH_NODES  # type: ignore[attr-defined]
+    overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
+    if overlap:
+        raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")
     return compiled

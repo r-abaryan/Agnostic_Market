@@ -32,7 +32,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
-from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.frontline import (
+    FRONTLINE_SPEAKABLE_NODES,
+    MODEL_SPEECH_NODES,
+    TRANSACTIONAL_MODEL_NODES,
+    build_frontline_graph,
+)
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -82,6 +87,7 @@ _PENDING_FIELDS = (
     "pending_identity",
     "pending_request",
     "pending_ack",
+    "pending_clarification",
 )
 
 
@@ -262,25 +268,64 @@ _FLOW_TOOLS = frozenset(
 )
 
 
-def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
-    """Zero-network gates for failures the old routing-only evaluator could not observe."""
+def _speech_authority_failures() -> tuple[str, ...]:
+    """Exercise production speech-source policy against every transactional model node."""
     failures: list[str] = []
 
-    completed_speech = _TurnSpeech(frozenset())
-    event = completed_speech.feed(
-        AIMessage(content="untrusted transactional model text", id="eval-message"),
-        {"langgraph_node": "eval_unapproved_transactional_node"},
-    )
-    if event is not None:
-        failures.append("completed unapproved transactional model text reached caller speech")
+    for node in sorted(TRANSACTIONAL_MODEL_NODES):
+        meta = {"langgraph_node": node}
+        completed_speech = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
+        event = completed_speech.feed(
+            AIMessage(content="untrusted transactional model text", id=f"eval-{node}"),
+            meta,
+        )
+        if event is not None:
+            failures.append(f"completed transactional model text reached caller speech: {node!r}")
 
-    orphan_speech = _TurnSpeech(frozenset())
-    orphan_speech.feed(
-        AIMessageChunk(content="untrusted transactional model text", id="eval-orphan"),
-        {"langgraph_node": "eval_unapproved_transactional_node"},
-    )
-    if list(orphan_speech.flush()):
-        failures.append("orphaned unapproved transactional model text reached caller speech")
+        orphan_speech = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
+        orphan_speech.feed(
+            AIMessageChunk(content="untrusted transactional model text", id=f"orphan-{node}"),
+            meta,
+        )
+        if list(orphan_speech.flush()):
+            failures.append(f"orphaned transactional model text reached caller speech: {node!r}")
+
+    # Positive controls keep the gate honest: an approved frontline model answer and a
+    # code-owned line must remain audible while unknown and missing provenance fail closed.
+    model_control = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
+    if not isinstance(
+        model_control.feed(
+            AIMessage(content="approved model control", id="eval-model"),
+            {"langgraph_node": "model"},
+        ),
+        TokenEvent,
+    ):
+        failures.append("approved frontline model text was not caller-speakable")
+
+    code_node = "read_render"
+    code_control = _TurnSpeech(FRONTLINE_SPEAKABLE_NODES, MODEL_SPEECH_NODES)
+    if not isinstance(
+        code_control.feed(
+            AIMessage(content="approved code control", id="eval-code"),
+            {"langgraph_node": code_node},
+        ),
+        SpokenMessageEvent,
+    ):
+        failures.append("approved code-authored text was not caller-speakable")
+
+    for label, meta in (
+        ("unknown", {"langgraph_node": "eval_unknown_node"}),
+        ("missing", {}),
+    ):
+        denied = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
+        if denied.feed(AIMessage(content="untrusted", id=f"eval-{label}"), meta) is not None:
+            failures.append(f"{label} model speech provenance did not fail closed")
+    return tuple(failures)
+
+
+def _order_reference_failures(data: dict) -> tuple[str, ...]:
+    """Exercise strong-labelled order references without treating bare digits as authority."""
+    failures: list[str] = []
 
     order_reference = data["order_reference"]
     expected = order_reference["expected_order_id"]
@@ -291,6 +336,11 @@ def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
         if caller_stated_order_id(case["utterance"], case["proposed_order_id"]) is not None:
             failures.append(f"weak/conflicting STT order reference was accepted: {case!r}")
     return tuple(failures)
+
+
+def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
+    """Aggregate the independently staged zero-network structural safety gates."""
+    return _speech_authority_failures() + _order_reference_failures(data)
 
 
 async def _outcome(graph, utterance: str) -> str | None:
@@ -328,11 +378,19 @@ async def _outcome(graph, utterance: str) -> str | None:
 
 async def _run(*, preflight_only: bool = False) -> int:
     safety_data = load_yaml_layer(_SAFETY_EVAL_PATH)
-    failures = _structural_preflight_failures(safety_data)
-    print("[coverage] structural speech authority + labelled STT order references")
-    if failures:
-        for failure in failures:
-            print(f"    STRUCTURAL FAILURE: {failure}")
+    speech_failures = _speech_authority_failures()
+    order_failures = _order_reference_failures(safety_data)
+    print("[coverage] structural speech authority")
+    for failure in speech_failures:
+        print(f"    STRUCTURAL FAILURE: {failure}")
+    if not speech_failures:
+        print("[speech_authority] all registered contracts passed. [PASS]")
+    print("[coverage] strong-labelled STT order references")
+    for failure in order_failures:
+        print(f"    STRUCTURAL FAILURE: {failure}")
+    if not order_failures:
+        print("[order_reference] all registered contracts passed. [PASS]")
+    if speech_failures or order_failures:
         print("\nFRONTLINE EVAL BLOCKED - structural safety preflight failed. [FAIL]")
         return 1
     print("[structural_preflight] all registered contracts passed. [PASS]")

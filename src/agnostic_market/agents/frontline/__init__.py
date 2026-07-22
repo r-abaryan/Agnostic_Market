@@ -5,6 +5,16 @@
 - prompt.py : the frontline model-facing instructions + contrastive few-shot. PROMPT.
 """
 
-from agnostic_market.agents.frontline.graph import build_frontline_graph
+from agnostic_market.agents.frontline.graph import (
+    FRONTLINE_SPEAKABLE_NODES,
+    MODEL_SPEECH_NODES,
+    TRANSACTIONAL_MODEL_NODES,
+    build_frontline_graph,
+)
 
-__all__ = ["build_frontline_graph"]
+__all__ = [
+    "FRONTLINE_SPEAKABLE_NODES",
+    "MODEL_SPEECH_NODES",
+    "TRANSACTIONAL_MODEL_NODES",
+    "build_frontline_graph",
+]

@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langgraph.graph.message import add_messages
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
+from pydantic import ValidationError
 
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
@@ -24,7 +25,7 @@ from agnostic_market.agents.engine import (
     _TurnSpeech,
     build_checkpointer,
 )
-from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.frontline import MODEL_SPEECH_NODES, build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -36,6 +37,12 @@ from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
+from agnostic_market.dtos.state import (
+    CartClarification,
+    IdentityClarification,
+    ReasoningState,
+    SupportClarification,
+)
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
@@ -306,6 +313,44 @@ async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
     assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    "clarification",
+    (
+        IdentityClarification(),
+        SupportClarification(detail="order"),
+        CartClarification(detail="quantity"),
+    ),
+)
+def test_pending_clarification_is_a_closed_discriminated_union(clarification: object) -> None:
+    state = ReasoningState(pending_clarification=clarification)
+    assert state.pending_clarification == clarification
+
+
+def test_pending_clarification_rejects_cross_flow_detail() -> None:
+    with pytest.raises(ValidationError):
+        ReasoningState.model_validate(
+            {"pending_clarification": {"flow": "identity", "detail": "order"}}
+        )
+
+
+async def test_pending_clarification_roundtrips_and_clears_at_fresh_entry(
+    config_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine, _ = _engine(config_root, thread_id="clarification-hygiene")
+    engine._graph.update_state(
+        engine._config,
+        {"pending_clarification": SupportClarification(detail="order")},
+        as_node="__start__",
+    )
+    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
+        seeded = engine._graph.get_state(engine._config)
+        assert seeded.values["pending_clarification"] == SupportClarification(detail="order")
+        await _events(engine, "hello")
+        finished = engine._graph.get_state(engine._config)
+    assert finished.values.get("pending_clarification") is None
+    assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
+
+
 # --- buffer-before-speak (_TurnSpeech, live call #9 P2) ----------------------------------
 # The chunk path can't be driven through the graph with non-streaming fakes, so the
 # buffering unit is tested directly with synthetic stream items.
@@ -313,20 +358,27 @@ async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
 
 _SPEAKABLE = frozenset({"support_guardrail"})
 _ASSEMBLE_META = {"langgraph_node": "support_assemble"}
+_MODEL_META = {"langgraph_node": "model"}
 
 
 def _chunk(text: str, msg_id: str, *, tool_call: bool = False) -> AIMessageChunk:
-    chunks = (
-        [{"name": "propose_refund", "args": "", "id": "tc1", "index": 0}] if tool_call else []
-    )
+    chunks = [{"name": "propose_refund", "args": "", "id": "tc1", "index": 0}] if tool_call else []
     return AIMessageChunk(content=text, id=msg_id, tool_call_chunks=chunks)
 
 
+def test_graph_declares_disjoint_code_and_model_speech_sources(config_root: Path) -> None:
+    engine, _ = _engine(config_root)
+    graph = engine._graph
+    assert graph.model_speech_nodes == MODEL_SPEECH_NODES
+    assert frozenset(graph.nodes) >= MODEL_SPEECH_NODES
+    assert graph.speakable_nodes.isdisjoint(graph.model_speech_nodes)
+
+
 def test_streamed_clarify_speaks_once_at_message_completion() -> None:
-    speech = _TurnSpeech(_SPEAKABLE)
-    assert speech.feed(_chunk("Which ", "m1"), _ASSEMBLE_META) is None
-    assert speech.feed(_chunk("order?", "m1"), _ASSEMBLE_META) is None
-    event = speech.feed(AIMessage(content="Which order?", id="m1"), _ASSEMBLE_META)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    assert speech.feed(_chunk("Which ", "m1"), _MODEL_META) is None
+    assert speech.feed(_chunk("order?", "m1"), _MODEL_META) is None
+    event = speech.feed(AIMessage(content="Which order?", id="m1"), _MODEL_META)
     assert isinstance(event, TokenEvent)
     assert event.text == "Which order?"
     assert list(speech.flush()) == []  # never re-spoken
@@ -335,7 +387,7 @@ def test_streamed_clarify_speaks_once_at_message_completion() -> None:
 def test_toolcall_narration_never_reaches_the_caller() -> None:
     # Live call #9 P2: "Shall I set the refund...?" streamed alongside propose_refund and
     # was heard OVER the guardrail's return-first decline. The narration must be dropped.
-    speech = _TurnSpeech(_SPEAKABLE)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     speech.feed(_chunk("Shall I refund?", "m1"), _ASSEMBLE_META)
     done = AIMessage(
         content="Shall I refund?",
@@ -349,21 +401,30 @@ def test_toolcall_narration_never_reaches_the_caller() -> None:
 def test_toolcall_detected_from_chunks_alone_stays_dropped() -> None:
     # The completed message never arrives (or arrives under another id): chunks that
     # carried tool_call_chunks must stay dropped at flush.
-    speech = _TurnSpeech(_SPEAKABLE)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     speech.feed(_chunk("Refunding now.", "m1", tool_call=True), _ASSEMBLE_META)
     assert list(speech.flush()) == []
 
 
 def test_unstreamed_answer_speaks_once() -> None:
     # Non-streaming provider / test fake: the answer arrives only as one full message.
-    speech = _TurnSpeech(_SPEAKABLE)
-    event = speech.feed(AIMessage(content="Hello!"), {"langgraph_node": "frontline"})
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    event = speech.feed(AIMessage(content="Hello!"), _MODEL_META)
     assert isinstance(event, TokenEvent)
     assert event.text == "Hello!"
 
 
+@pytest.mark.parametrize(
+    "node", ["model", "identity_assemble", "support_assemble", "cart_assemble"]
+)
+def test_3a_compatibility_sources_retain_plain_text(node: str) -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    event = speech.feed(AIMessage(content="Current behavior.", id="m1"), {"langgraph_node": node})
+    assert isinstance(event, TokenEvent)
+
+
 def test_speakable_node_line_is_a_spoken_message() -> None:
-    speech = _TurnSpeech(_SPEAKABLE)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     event = speech.feed(
         AIMessage(content="Refund declined.", id="g1"), {"langgraph_node": "support_guardrail"}
     )
@@ -371,32 +432,83 @@ def test_speakable_node_line_is_a_spoken_message() -> None:
     assert event.node == "support_guardrail"
 
 
+def test_tool_call_text_is_dropped_even_with_a_speakable_node_label() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    message = AIMessage(
+        content="I did it.",
+        id="m1",
+        tool_calls=[{"name": "effect", "args": {}, "id": "tc1", "type": "tool_call"}],
+    )
+    assert speech.feed(message, {"langgraph_node": "support_guardrail"}) is None
+
+
+def test_code_and_model_speech_sources_must_be_disjoint() -> None:
+    with pytest.raises(ValueError, match="speech source sets overlap"):
+        _TurnSpeech(frozenset({"model"}), MODEL_SPEECH_NODES)
+
+
+@pytest.mark.parametrize("meta", [{}, {"langgraph_node": "unknown"}])
+def test_missing_or_unknown_completed_source_is_dropped(meta: dict[str, str]) -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    assert speech.feed(AIMessage(content="Untrusted.", id="m1"), meta) is None
+
+
+def test_missing_chunk_source_can_be_resolved_by_approved_completed_message() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Approved answer.", "m1"), {})
+    event = speech.feed(AIMessage(content="Approved answer.", id="m1"), _MODEL_META)
+    assert isinstance(event, TokenEvent)
+
+
+def test_conflicting_chunk_and_completed_sources_fail_closed() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Conflicting.", "m1"), _MODEL_META)
+    assert speech.feed(AIMessage(content="Conflicting.", id="m1"), _ASSEMBLE_META) is None
+
+
+def test_conflicting_chunk_sources_fail_closed() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Con", "m1"), _MODEL_META)
+    speech.feed(_chunk("flict.", "m1"), _ASSEMBLE_META)
+    assert speech.feed(AIMessage(content="Conflict.", id="m1"), _MODEL_META) is None
+
+
+def test_missing_or_unknown_orphan_source_is_dropped() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Missing.", "m1"), {})
+    speech.feed(_chunk("Unknown.", "m2"), {"langgraph_node": "unknown"})
+    assert list(speech.flush()) == []
+
+
 def test_orphan_streamed_clarify_flushes_exactly_once() -> None:
     # Defensive: chunks streamed but no completed message echoed — the clarify must not be
     # swallowed silently.
-    speech = _TurnSpeech(_SPEAKABLE)
-    speech.feed(_chunk("Which order?", "m1"), _ASSEMBLE_META)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Which order?", "m1"), _MODEL_META)
     assert [e.text for e in speech.flush()] == ["Which order?"]
 
 
 def test_id_change_between_chunk_and_completion_does_not_double_speak() -> None:
-    speech = _TurnSpeech(_SPEAKABLE)
-    speech.feed(_chunk("Which order?", "m1"), _ASSEMBLE_META)
-    event = speech.feed(AIMessage(content="Which order?", id="m2"), _ASSEMBLE_META)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Which order?", "m1"), _MODEL_META)
+    event = speech.feed(AIMessage(content="Which order?", id="m2"), _MODEL_META)
     assert isinstance(event, TokenEvent)  # spoken at completion under the new id
     assert list(speech.flush()) == []  # the orphaned m1 buffer must not re-speak it
 
 
 def test_tool_messages_never_surface() -> None:
-    speech = _TurnSpeech(_SPEAKABLE)
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     assert speech.feed(ToolMessage("raw", tool_call_id="t1"), _ASSEMBLE_META) is None
     assert list(speech.flush()) == []
 
 
-@pytest.mark.xfail(strict=True, reason="transactional completed messages lack a speech allowlist")
-def test_unapproved_transactional_plain_text_never_reaches_caller() -> None:
-    """Live-call #18: a model-only cancellation claim is not caller-authoritative speech."""
-    speech = _TurnSpeech(_SPEAKABLE)
+@pytest.mark.xfail(
+    strict=True,
+    reason="support_assemble remains compatibility-approved until Milestone 3c",
+)
+def test_support_assemble_completed_plain_text_is_not_caller_authoritative() -> None:
+    """Live-call #18 target: Support completion claims require code-backed authority."""
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     speech.feed(_chunk("Your order is cancelled.", "m1"), _ASSEMBLE_META)
     assert (
         speech.feed(AIMessage(content="Your order is cancelled.", id="m1"), _ASSEMBLE_META) is None
@@ -404,10 +516,13 @@ def test_unapproved_transactional_plain_text_never_reaches_caller() -> None:
     assert list(speech.flush()) == []
 
 
-@pytest.mark.xfail(strict=True, reason="orphaned chunks lack fail-closed speech provenance")
-def test_unapproved_orphan_chunk_never_flushes_to_caller() -> None:
-    """The incomplete-message fallback must fail closed when no approved source completed."""
-    speech = _TurnSpeech(_SPEAKABLE)
+@pytest.mark.xfail(
+    strict=True,
+    reason="support_assemble remains compatibility-approved until Milestone 3c",
+)
+def test_support_assemble_orphan_plain_text_is_not_caller_authoritative() -> None:
+    """Live-call #18 target: orphaned Support prose loses authority in Milestone 3c."""
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     speech.feed(_chunk("Your order is cancelled.", "m1"), _ASSEMBLE_META)
     assert list(speech.flush()) == []
 
@@ -420,8 +535,13 @@ _MODEL = {"langgraph_node": "model"}  # the only node that runs the LLM
 
 def test_graph_spans_counts_tools_and_ttf_model() -> None:
     spans = _GraphSpans()
-    spans.observe(AIMessage(content="", tool_calls=[
-        {"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}]), _MODEL)
+    spans.observe(
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}],
+        ),
+        _MODEL,
+    )
     spans.observe(ToolMessage("processing", tool_call_id="t1"), {"langgraph_node": "tools"})
     spans.observe(AIMessage(content="It's processing."), _MODEL)  # a real second model pass
     # A tool ran, and the second model pass (rendering the result) is timed separately.
@@ -442,8 +562,12 @@ def test_graph_spans_ignores_empty_and_tool_only_for_ttf() -> None:
     spans = _GraphSpans()
     spans.observe(AIMessage(content=""), _MODEL)  # empty: not model output
     assert spans._ttf_model is None
-    spans.observe(AIMessage(content="", tool_calls=[
-        {"name": "x", "args": {}, "id": "t1", "type": "tool_call"}]), _MODEL)
+    spans.observe(
+        AIMessage(
+            content="", tool_calls=[{"name": "x", "args": {}, "id": "t1", "type": "tool_call"}]
+        ),
+        _MODEL,
+    )
     assert spans._ttf_model is not None  # a tool-call message IS model activity
 
 
@@ -452,11 +576,17 @@ def test_graph_spans_render_node_is_not_a_model_pass() -> None:
     # of a second model pass. That node-authored AIMessage must NOT be timed as model
     # activity, or every rendered turn shows a phantom tool_to_next_model cost.
     spans = _GraphSpans()
-    spans.observe(AIMessage(content="", tool_calls=[
-        {"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}]), _MODEL)
+    spans.observe(
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "order_status", "args": {}, "id": "t1", "type": "tool_call"}],
+        ),
+        _MODEL,
+    )
     spans.observe(ToolMessage("...", tool_call_id="t1"), {"langgraph_node": "tools"})
-    spans.observe(AIMessage(content="Your order ORD-1001 is on its way."),
-                  {"langgraph_node": "read_render"})
+    spans.observe(
+        AIMessage(content="Your order ORD-1001 is on its way."), {"langgraph_node": "read_render"}
+    )
     assert spans._tool_count == 1
     assert spans._tool_to_next_model is None  # rendered, NOT a second model pass
 

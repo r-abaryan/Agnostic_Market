@@ -16,14 +16,14 @@ plane — perception facts (§4a readback_interrupted) are passed IN via TurnFac
 caller. That one-way dependency (voice -> engine) is what makes the engine mockable, which
 is the seam's documented purpose.
 
-Speakable filtering + buffer-before-speak: the compiled graph carries `speakable_nodes`
-(single source of truth, stashed at build); node-authored AIMessages become
-SpokenMessageEvents only for those nodes. Model tokens are NEVER relayed as they stream —
-they buffer per message and speak only once the completed message is known to carry no
-tool calls (`_TurnSpeech`). A tool-call message's narration is dropped outright: the
-downstream node (guardrail decline, readback, outcome line) is the one author of what the
-caller hears, so streamed narration can never contradict the validation that runs after
-it (live call #9 P2: "shall I refund?" streamed over the guardrail's return-first
+Speakable filtering + buffer-before-speak: the compiled graph carries two disjoint source
+sets — `speakable_nodes` for code-authored lines and `model_speech_nodes` for approved
+model prose. Model tokens are NEVER relayed as they stream: they buffer per message and
+speak only once the completed message is known to carry no tool calls and an approved,
+unambiguous source (`_TurnSpeech`). A tool-call message's narration is dropped outright:
+the downstream node (guardrail decline, readback, outcome line) is the one author of what
+the caller hears, so streamed narration can never contradict the validation that runs
+after it (live call #9 P2: "shall I refund?" streamed over the guardrail's return-first
 decline). ToolMessages never surface.
 """
 
@@ -78,8 +78,10 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
     CancelTarget,
+    CartClarification,
     CartLine,
     HandoffRequest,
+    IdentityClarification,
     PendingCancelBatch,
     PendingIdentity,
     PendingPlacement,
@@ -87,6 +89,7 @@ from agnostic_market.dtos.state import (
     PendingRefund,
     PendingReturn,
     ReasoningState,
+    SupportClarification,
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
@@ -121,6 +124,9 @@ _CHECKPOINTED_DTOS = (
     PendingReturn,
     PendingProfileChange,
     PendingIdentity,
+    IdentityClarification,
+    SupportClarification,
+    CartClarification,
     HandoffRequest,
     ReasoningState,
     AnswerQuestion,
@@ -166,6 +172,8 @@ class _MsgBuffer:
 
     parts: list[str] = field(default_factory=list)
     has_tool_calls: bool = False
+    node: str | None = None
+    node_conflict: bool = False
 
     @property
     def text(self) -> str:
@@ -181,22 +189,44 @@ class _TurnSpeech:
     runs after it. Cost accepted by decision: clarify turns speak at message completion
     instead of first token.
 
-    Node-authored AIMessages (never streamed) speak only from speakable nodes, as before.
-    `flush()` covers the defensive case of a message that streamed but never arrived as a
-    completed AIMessage: text-only buffers speak (a clarify must not be swallowed),
-    tool-call buffers stay dropped; text-level dedup guards an id change between a chunk
-    and its completed message from double-speaking.
+    Code-authored AIMessages speak only from `speakable`; model prose speaks only from
+    `model_speech`. Unknown, missing, or conflicting provenance fails closed. `flush()`
+    covers a streamed message whose completed AIMessage never arrived, but only when its
+    buffered source is unambiguous and model-speakable. Text-level dedup guards an id
+    change between a chunk and its completed message from double-speaking.
     """
 
-    def __init__(self, speakable: frozenset[str]) -> None:
+    def __init__(self, speakable: frozenset[str], model_speech: frozenset[str]) -> None:
+        overlap = speakable & model_speech
+        if overlap:
+            raise ValueError(f"speech source sets overlap: {sorted(overlap)!r}")
         self._speakable = speakable
+        self._model_speech = model_speech
         self._buffers: dict[str | None, _MsgBuffer] = {}
         self._spoken_texts: set[str] = set()
+
+    @staticmethod
+    def _node(meta: object) -> str | None:
+        value = meta.get("langgraph_node") if isinstance(meta, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _source_matches(buf: _MsgBuffer | None, node: str | None) -> bool:
+        return bool(
+            node is not None
+            and (buf is None or (not buf.node_conflict and buf.node in (None, node)))
+        )
 
     def feed(self, token: object, meta: object) -> TurnEvent | None:
         """Consume one `messages`-mode stream item; return the event to speak, if any."""
         if isinstance(token, AIMessageChunk):
             buf = self._buffers.setdefault(token.id, _MsgBuffer())
+            node = self._node(meta)
+            if node is not None:
+                if buf.node is None:
+                    buf.node = node
+                elif buf.node != node:
+                    buf.node_conflict = True
             if token.tool_call_chunks:
                 buf.has_tool_calls = True
             if text := str(token.text):
@@ -206,22 +236,31 @@ class _TurnSpeech:
             return None  # ToolMessages and anything else never surface
         buf = self._buffers.pop(token.id, None)
         text = str(token.text)
-        node = meta.get("langgraph_node") if isinstance(meta, dict) else None
-        if node in self._speakable:
-            # Node-authored caller-facing line (deferral, readback outcome) — always spoken.
-            return SpokenMessageEvent(text=text, node=node) if text else None
+        node = self._node(meta)
+        # Tool narration is never authoritative, even if metadata accidentally labels the
+        # message as a code-speakable node. Suppression therefore precedes source checks.
         if token.tool_calls or (buf is not None and buf.has_tool_calls):
             return None  # tool-call message: narration dropped; the next node speaks
-        if text:
+        if not self._source_matches(buf, node):
+            return None
+        if node in self._speakable:
+            return SpokenMessageEvent(text=text, node=node) if text else None
+        if node in self._model_speech and text:
             self._spoken_texts.add(text)
             return TokenEvent(text=text)
         return None
 
     def flush(self) -> Iterator[TokenEvent]:
-        """End of turn: speak text-only buffers whose completed message never arrived."""
+        """Speak only unambiguous, approved model buffers lacking a completed message."""
         for buf in self._buffers.values():
             text = buf.text
-            if text and not buf.has_tool_calls and text not in self._spoken_texts:
+            if (
+                text
+                and not buf.has_tool_calls
+                and not buf.node_conflict
+                and buf.node in self._model_speech
+                and text not in self._spoken_texts
+            ):
                 yield TokenEvent(text=text)
         self._buffers.clear()
 
@@ -302,6 +341,7 @@ class ReasoningEngine:
         self._thread_id = thread_id
         self._config = {"configurable": {"thread_id": thread_id}}
         self._speakable: frozenset[str] = getattr(graph, "speakable_nodes", frozenset())
+        self._model_speech: frozenset[str] = getattr(graph, "model_speech_nodes", frozenset())
         # A session is a serial conversation. A waiter re-checks the checkpoint so two
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
@@ -380,7 +420,7 @@ class ReasoningEngine:
                 write_event({"event": "turn_recovering", "reason": "unfinished_checkpoint"})
             else:
                 payload = {"messages": [HumanMessage(user_text)]}
-            speech = _TurnSpeech(self._speakable)
+            speech = _TurnSpeech(self._speakable, self._model_speech)
             spans = _GraphSpans()
             try:
                 while True:

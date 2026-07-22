@@ -180,6 +180,7 @@ CancelOutcomeCode = Literal[
     # typed reason, so a rare effect-time refusal collapses to this generic honest code
 ]
 
+
 class BatchCancelOutcome(BaseModel):
     """One target's cancel result — the STRUCTURED per-order fact the final line is rendered
     from (INV-25: never inferred from pending intent). Lives here (not commerce) because it is
@@ -334,6 +335,48 @@ class PendingIdentity(BaseModel):
 ActiveFlow = Literal["cart", "left_cart", "support", "left_support", "identity", "left_identity"]
 
 
+class IdentityClarification(BaseModel):
+    """Turn-scoped instruction for Identity's code-authored clarification renderer."""
+
+    model_config = _FROZEN
+
+    flow: Literal["identity"] = "identity"
+    detail: Literal["contact"] = "contact"
+
+
+class SupportClarification(BaseModel):
+    """Turn-scoped instruction for Support's code-authored clarification renderer."""
+
+    model_config = _FROZEN
+
+    flow: Literal["support"] = "support"
+    detail: Literal[
+        "action",
+        "order",
+        "amount",
+        "refund_destination",
+        "profile_field",
+        "profile_value",
+    ]
+
+
+class CartClarification(BaseModel):
+    """Turn-scoped instruction for Cart's code-authored clarification renderer."""
+
+    model_config = _FROZEN
+
+    flow: Literal["cart"] = "cart"
+    detail: Literal["action", "item", "quantity"]
+
+
+# Selector only: no caller value, target, authority, or multi-turn progress belongs here.
+# Each owning flow will map its closed detail value to platform-authored copy before speech.
+PendingClarification = Annotated[
+    IdentityClarification | SupportClarification | CartClarification,
+    Field(discriminator="flow"),
+]
+
+
 class HandoffRequest(BaseModel):
     """A frontline decision to hand a turn to a higher tier (AGENTS.md handover boundary).
 
@@ -384,3 +427,7 @@ class ReasoningState(BaseModel):
     # (engine speaks any texty AIMessage from a speakable node). Reset at entry_node like the
     # left_* markers; cleared by cart_ack (clear-before-speak).
     pending_ack: str | None = None
+    # Turn-scoped instruction for a flow-owned, code-authored clarification line. Milestone
+    # 3a establishes the typed channel and hygiene only; flows begin writing it atomically
+    # as their raw model speech authority is removed in 3b-3d.
+    pending_clarification: PendingClarification | None = None
