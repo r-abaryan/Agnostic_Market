@@ -51,7 +51,11 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from agnostic_market.agents._consent import classify_cancel_consent, classify_consent
-from agnostic_market.agents._toolcalls import ack_extra_tool_calls
+from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
+from agnostic_market.agents.clarification import (
+    advance_clarification,
+    with_clarification_lifecycle,
+)
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
@@ -87,6 +91,7 @@ from agnostic_market.dtos.confirmation import (
     ToolConfirmationPolicy,
     profile_change_required_level,
     refund_required_level,
+    validate_confirmation_rendering,
 )
 from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
@@ -198,24 +203,17 @@ def _caller_stated_refund_destination(
     return None
 
 
-def _readback_line(pending: PendingRefund, policy: ToolConfirmationPolicy) -> str:
-    """The GRAPH-authored refund readback — the `interrupt()` payload.
-
-    Renders every field ISSUE_REFUND_POLICY declares; a declared field with no rendered
-    value fails loudly (readback can't be silently forgotten, §7a). Speech-native: no card
-    number is ever spoken beyond the masked tail.
-    """
+def _refund_confirmation_phrase(pending: PendingRefund, policy: ToolConfirmationPolicy) -> str:
     rendered: dict[str, str] = {
+        "order_id": pending.order_id,
         "total_amount": f"${pending.amount_usd:.2f}",
         "new_payment_instrument_ref": pending.instrument_ref,
     }
-    missing = policy.confirm_fields - rendered.keys()
-    if missing:
-        raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
-    return (
-        f"Just to confirm: a {rendered['total_amount']} refund to your "
-        f"{pending.instrument_ref}. Shall I go ahead?"
+    phrase = (
+        f"a {rendered['total_amount']} refund on your order for {pending.summary} "
+        f"({rendered['order_id']}) to your {rendered['new_payment_instrument_ref']}"
     )
+    return validate_confirmation_rendering(policy, rendered, phrase)
 
 
 def _mint_cancel_batch(targets: list[tuple[str, str]]) -> PendingCancelBatch:
@@ -273,31 +271,21 @@ def _cancel_readback_line(pending: PendingCancelBatch) -> str:
     return f"{prefix}Just to confirm - {eligible}? This can't be undone."
 
 
-def _return_readback_line(pending: PendingReturn, policy: ToolConfirmationPolicy) -> str:
-    """The GRAPH-authored return readback — the `interrupt()` payload (Group C).
-
-    Same loud-fail contract as `_readback_line`: the rendered dict MUST carry every field
-    CREATE_RETURN_POLICY declares, even though the sentence phrases them naturally. States
-    the honest money outcome — the refund follows the PROCESSED return, to the ORIGINAL
-    payment method (a v1 constant: a steered new-instrument refund must not carry an
-    unverified payout destination onto the return, dtos/state.py PendingReturn)."""
+def _return_confirmation_phrase(pending: PendingReturn, policy: ToolConfirmationPolicy) -> str:
     rendered: dict[str, str] = {
         "order_id": pending.order_id,
         "total_amount": f"${pending.refund_due_usd:.2f}",
     }
-    missing = policy.confirm_fields - rendered.keys()
-    if missing:
-        raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
-    return (
-        f"Just to confirm - set up a return for your {pending.summary} "
+    phrase = (
+        f"set up a return for your {pending.summary} "
         f"({rendered['order_id']})? You'll send the items back, and once we receive them the "
-        f"{rendered['total_amount']} refund goes to your original payment method. "
-        "Shall I go ahead?"
+        f"{rendered['total_amount']} refund goes to your original payment method"
     )
+    return validate_confirmation_rendering(policy, rendered, phrase)
 
 
-def _profile_readback_line(pending: PendingProfileChange) -> str:
-    """The GRAPH-authored profile-change readback — the `interrupt()` payload (Group C).
+def _profile_confirmation_phrase(pending: PendingProfileChange) -> str:
+    """The canonical, policy-validated description used by both profile-change prompts.
 
     The new VALUE is a declared critical field (one STT error = goods to the wrong street /
     an OTP factor the caller doesn't hold), so the loud-fail contract guarantees it is
@@ -305,13 +293,9 @@ def _profile_readback_line(pending: PendingProfileChange) -> str:
     policy = PROFILE_CHANGE_POLICIES[pending.field]
     key = "new_address" if pending.field == "address" else "new_contact"
     rendered: dict[str, str] = {key: pending.new_value}
-    missing = policy.confirm_fields - rendered.keys()
-    if missing:
-        raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
     noun = "delivery address" if pending.field == "address" else "contact number"
-    return (
-        f"Just to confirm - update the {noun} on your account to {rendered[key]}. Shall I go ahead?"
-    )
+    phrase = f"update the {noun} on your account to {rendered[key]}"
+    return validate_confirmation_rendering(policy, rendered, phrase)
 
 
 class _ProposeRefund(BaseModel):
@@ -486,16 +470,16 @@ def build_support_nodes(
         """Leave the support flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
-    model = reasoning_model.bind_tools(
-        [
-            propose_refund,
-            propose_cancel,
-            propose_return,
-            propose_profile_change,
-            request_support_clarification,
-            leave_support,
-        ]
+    support_tools = (
+        propose_refund,
+        propose_cancel,
+        propose_return,
+        propose_profile_change,
+        request_support_clarification,
+        leave_support,
     )
+    bound_tool_names = frozenset(tool.name for tool in support_tools)
+    model = reasoning_model.bind_tools(support_tools)
 
     def _leave(new_messages: list, call_id: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left support", tool_call_id=call_id))
@@ -754,6 +738,7 @@ def build_support_nodes(
     ) -> PendingRefund:
         return PendingRefund(
             order_id=chosen.order_id,
+            summary=chosen.summary,
             amount_usd=round(amount_usd, 2),
             destination=destination,
             instrument_ref=(
@@ -798,12 +783,36 @@ def build_support_nodes(
         )
 
     def _clarification_result(
-        new_messages: list, detail: SupportQuestionDetail | SupportAuthorizationDetail
+        state: ReasoningState,
+        new_messages: list,
+        detail: SupportQuestionDetail | SupportAuthorizationDetail,
     ) -> dict[str, object]:
+        step = advance_clarification(
+            state,
+            flow="support",
+            max_reasks=policy.support_clarification_reask_max,
+        )
+        if step.exhausted:
+            return {
+                "messages": new_messages,
+                "active_flow": None,
+                "pending_refund": None,
+                "pending_cancel": None,
+                "pending_return": None,
+                "pending_profile_change": None,
+                "pending_request": None,
+                "pending_clarification": None,
+                "handover": HandoffRequest(
+                    destination="human",
+                    reason_code="other",
+                    source="gate",
+                ),
+            }
         return {
             "messages": new_messages,
             "active_flow": "support",
             "pending_clarification": SupportClarification(detail=detail),
+            "clarification_progress": step.progress,
         }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
@@ -843,7 +852,7 @@ def build_support_nodes(
         for _attempt in range(2):  # one invalid proposal gets ONE corrective re-prompt
             response = model.invoke(messages)
             if not response.tool_calls:
-                return _clarification_result(new_messages, "action")
+                return _clarification_result(state, new_messages, "action")
             new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
@@ -864,7 +873,7 @@ def build_support_nodes(
                 new_messages.append(
                     ToolMessage("support clarification requested", tool_call_id=call["id"])
                 )
-                return _clarification_result(new_messages, clarification.detail)
+                return _clarification_result(state, new_messages, clarification.detail)
 
             if call["name"] == "propose_cancel":
                 try:
@@ -935,7 +944,7 @@ def build_support_nodes(
                                 tool_call_id=call["id"],
                             )
                         )
-                        return _clarification_result(new_messages, "order")
+                        return _clarification_result(state, new_messages, "order")
                     validated_refs = tuple(ref for ref in stated_refs if ref is not None)
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
@@ -944,7 +953,7 @@ def build_support_nodes(
                     )
                 if verdict is not None:
                     new_messages.append(ToolMessage(_ORDER_SELECTION_ACK, tool_call_id=call["id"]))
-                    return _clarification_result(new_messages, verdict)
+                    return _clarification_result(state, new_messages, verdict)
                 new_messages.append(
                     ToolMessage(
                         f"proposed cancel on {len(resolved)} order(s)", tool_call_id=call["id"]
@@ -982,14 +991,14 @@ def build_support_nodes(
                                 tool_call_id=call["id"],
                             )
                         )
-                        return _clarification_result(new_messages, "order")
+                        return _clarification_result(state, new_messages, "order")
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
                         new_messages,
                         ReturnOrder(target=ExplicitOrderTarget(order_ref=stated_ref)),
                     )
                 if verdict is not None:
-                    return _clarification_result(new_messages, verdict)
+                    return _clarification_result(state, new_messages, verdict)
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(f"proposed return on order {chosen.key}", tool_call_id=call["id"])
@@ -1019,7 +1028,7 @@ def build_support_nodes(
                             tool_call_id=call["id"],
                         )
                     )
-                    return _clarification_result(new_messages, "profile_value")
+                    return _clarification_result(state, new_messages, "profile_value")
                 # A profile change is ACCOUNT-scoped, so it requires a BOUND identity (Fix 5
                 # Milestone B): the customer whose profile is touched comes from the LIVE binding,
                 # never a model argument. An UNBOUND caller detours into the identity OTP flow to
@@ -1094,7 +1103,7 @@ def build_support_nodes(
                                 tool_call_id=call["id"],
                             )
                         )
-                        return _clarification_result(new_messages, "order")
+                        return _clarification_result(state, new_messages, "order")
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
                         new_messages,
@@ -1109,7 +1118,7 @@ def build_support_nodes(
                         ),
                     )
                 if verdict is not None:
-                    return _clarification_result(new_messages, verdict)
+                    return _clarification_result(state, new_messages, verdict)
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(
@@ -1125,12 +1134,14 @@ def build_support_nodes(
                 )
                 return {"messages": new_messages, "pending_refund": pending}
 
-            # Explicit terminal guard (not fall-through): every bound tool has a branch above,
-            # so an unhandled name means a NEW tool was bound without a handler — fail loud
-            # rather than silently misroute it into the last branch (a silent wrong-mutation).
-            raise ValueError(f"support assemble: unhandled tool {call['name']!r}")
+            if call["name"] not in bound_tool_names:
+                new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_support.name))
+                messages = [prompt, *state.messages, *new_messages]
+                continue
+            # A bound name reaching here is code drift: preserve the loud developer failure.
+            raise ValueError(f"support assemble: bound tool has no handler: {call['name']!r}")
         logger.warning("support assemble: two invalid tool calls; asking for action in code")
-        return _clarification_result(new_messages, "action")
+        return _clarification_result(state, new_messages, "action")
 
     def clarify_node(state: ReasoningState) -> dict[str, object]:
         clarification = state.pending_clarification
@@ -1336,13 +1347,11 @@ def build_support_nodes(
                     )
                 ],
             }
-        answer = interrupt(_readback_line(pending, ISSUE_REFUND_POLICY))
+        phrase = _refund_confirmation_phrase(pending, ISSUE_REFUND_POLICY)
+        answer = interrupt(f"Just to confirm: {phrase}. Shall I go ahead?")
         verdict = classify_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
-            retry = interrupt(
-                f"Sorry - just to be clear: a ${pending.amount_usd:.2f} refund to your "
-                f"{pending.instrument_ref}. Yes or no?"
-            )
+            retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
             verdict = classify_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
@@ -1844,13 +1853,11 @@ def build_support_nodes(
                     )
                 ],
             }
-        answer = interrupt(_return_readback_line(pending, CREATE_RETURN_POLICY))
+        phrase = _return_confirmation_phrase(pending, CREATE_RETURN_POLICY)
+        answer = interrupt(f"Just to confirm - {phrase}. Shall I go ahead?")
         verdict = classify_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
-            retry = interrupt(
-                f"Sorry - just to be clear: set up a return for {pending.summary} "
-                f"({pending.order_id})? Yes or no?"
-            )
+            retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
             verdict = classify_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
@@ -1973,14 +1980,11 @@ def build_support_nodes(
                     )
                 ],
             }
-        answer = interrupt(_profile_readback_line(pending))
+        phrase = _profile_confirmation_phrase(pending)
+        answer = interrupt(f"Just to confirm - {phrase}. Shall I go ahead?")
         verdict = classify_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
-            noun = "delivery address" if pending.field == "address" else "contact number"
-            retry = interrupt(
-                f"Sorry - just to be clear: update the {noun} on your account to "
-                f"{pending.new_value}? Yes or no?"
-            )
+            retry = interrupt(f"Sorry - just to be clear: {phrase}? Yes or no?")
             verdict = classify_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
@@ -2086,6 +2090,7 @@ def build_support_nodes(
             "pending_profile_change": None,
             "pending_request": None,
             "pending_clarification": None,
+            "clarification_progress": None,
             "active_flow": None,
             "messages": [
                 AIMessage("No problem - I've dropped that request. Your orders are unchanged.")
@@ -2102,6 +2107,7 @@ def build_support_nodes(
             "pending_profile_change": None,
             "pending_request": None,
             "pending_clarification": None,
+            "clarification_progress": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
@@ -2122,7 +2128,7 @@ def build_support_nodes(
         if state.handover is not None:
             return "handover"
         if state.active_flow == "left_support":
-            return "leave"  # model left / two invalid proposals -> normal pipeline answers
+            return "leave"  # model explicitly left; normal pipeline answers this turn
         if state.active_flow == "identity":
             return "needs_identity"  # unbound "cancel all" — verify first, then resolve
         if isinstance(state.pending_cancel, CancellableOrderScope):
@@ -2167,7 +2173,7 @@ def build_support_nodes(
         return "confirm"
 
     return SupportNodes(
-        assemble=assemble_node,
+        assemble=with_clarification_lifecycle(assemble_node),
         continuation=continuation_node,
         clarify=clarify_node,
         guardrail=guardrail_node,

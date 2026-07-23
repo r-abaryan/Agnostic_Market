@@ -103,14 +103,15 @@ async def test_committed_otp_then_readback_then_one_change(config_root: Path) ->
     assert h.profile.change_count == 1
     assert h.profile.address_on_file(_OWNER) == _NEW_ADDRESS
     spoken = [e for e in done if isinstance(e, SpokenMessageEvent)]
-    assert any(
-        e.node == "support_profile_place" and _NEW_ADDRESS in e.text for e in spoken
-    )
+    assert any(e.node == "support_profile_place" and _NEW_ADDRESS in e.text for e in spoken)
 
 
 async def test_contact_change_updates_the_factor_reference(config_root: Path) -> None:
     h = _profile_harness(
-        config_root, field="contact", new_value="555-0187", reason_code="contact_change",
+        config_root,
+        field="contact",
+        new_value="555-0187",
+        reason_code="contact_change",
         thread_id="prof-contact-1",
     )
     old_factor = h.profile.contact_on_file(_OWNER)
@@ -137,9 +138,7 @@ async def test_wrong_otp_twice_hands_to_human_without_changing(
     assert not h.engine.pending_interrupt()  # not trapped
     # The on-ramp package fired (2nd converging path besides the consent-"human" exit).
     onramps = [
-        json.loads(line)
-        for line in _telemetry(tmp_path).splitlines()
-        if '"human_onramp"' in line
+        json.loads(line) for line in _telemetry(tmp_path).splitlines() if '"human_onramp"' in line
     ]
     assert len(onramps) == 1
     assert onramps[0]["reason_code"] == "verification_required"
@@ -199,6 +198,23 @@ async def test_no_at_readback_changes_nothing(config_root: Path) -> None:
     assert h.profile.change_count == 0
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("leave your details as they are" in e.text for e in spoken)
+
+
+async def test_barged_profile_readback_repeats_the_new_value_before_changing(
+    config_root: Path,
+) -> None:
+    h = _profile_harness(config_root)
+    await _events(h.engine, _REQUEST)
+    await _events(h.engine, _VALID_OTP)
+    events = await _events(h.engine, "yes", TurnFacts(readback_interrupted=True))
+    assert h.profile.change_count == 0
+    reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(reconfirms) == 1
+    assert "yes or no" in reconfirms[0].prompt.lower()
+    assert "delivery address" in reconfirms[0].prompt
+    assert _NEW_ADDRESS in reconfirms[0].prompt
+    await _events(h.engine, "yes")
+    assert h.profile.change_count == 1
 
 
 async def test_payment_change_still_defers_honestly(config_root: Path) -> None:

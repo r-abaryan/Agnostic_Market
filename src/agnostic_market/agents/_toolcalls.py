@@ -1,4 +1,4 @@
-"""Assemble-node tool-call hygiene, shared by the gated flows (cart + support).
+"""Assemble-node tool-call hygiene shared by Cart, Identity, and Support.
 
 Control/terminal and money proposals act ONE per turn (`tool_calls[0]`); the cart flow's
 reversible mutations batch instead (its assemble answers each call itself). Either way a
@@ -11,6 +11,17 @@ session — one bad turn would poison the whole call.
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage, ToolMessage
+
+
+def unknown_tool_result(call_id: str, *, leave_tool: str) -> ToolMessage:
+    """Pair an out-of-contract model call with bounded corrective feedback."""
+    return ToolMessage(
+        (
+            f"Unavailable action. Use one of the provided tools, or call {leave_tool} "
+            "if the request belongs elsewhere."
+        ),
+        tool_call_id=call_id,
+    )
 
 
 def ack_extra_tool_calls(response: AIMessage, new_messages: list) -> None:

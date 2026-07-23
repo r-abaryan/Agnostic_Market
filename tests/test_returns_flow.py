@@ -95,14 +95,28 @@ async def test_stray_turn_after_completion_never_double_creates(config_root: Pat
     assert h.store.return_count == 1
 
 
-async def test_barged_readback_reconfirms_before_creating(config_root: Path) -> None:
-    h = _return_harness(config_root)
+@pytest.mark.parametrize(
+    ("response", "facts", "thread_id"),
+    [
+        ("yes", TurnFacts(readback_interrupted=True), "return-reconfirm-barged"),
+        ("I'm not sure", _FACTS, "return-reconfirm-unclear"),
+    ],
+)
+async def test_return_reconfirmation_repeats_policy_fields_before_creating(
+    config_root: Path,
+    response: str,
+    facts: TurnFacts,
+    thread_id: str,
+) -> None:
+    h = _return_harness(config_root, thread_id=thread_id)
     await _events(h.engine, "I need to return this order")
-    events = await _events(h.engine, "yes", TurnFacts(readback_interrupted=True))
+    events = await _events(h.engine, response, facts)
     assert h.store.return_count == 0  # §4a: consent over a barged readback is not consent
     reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(reconfirms) == 1
     assert "yes or no" in reconfirms[0].prompt.lower()
+    assert "ORD-1001" in reconfirms[0].prompt
+    assert "$179.98" in reconfirms[0].prompt
     await _events(h.engine, "yes")
     assert h.store.return_count == 1
 
@@ -198,7 +212,9 @@ async def test_steered_refund_out_of_window_declines_before_promising(
                 force_tool="propose_refund",
                 canned_args={
                     "propose_refund": {
-                        "order_key": "3", "amount_usd": 40.0, "destination": "original"
+                        "order_key": "3",
+                        "amount_usd": 40.0,
+                        "destination": "original",
                     }
                 },
                 tool_call_limit=1,
@@ -224,7 +240,9 @@ async def test_refund_with_open_return_points_at_it(config_root: Path) -> None:
                 force_tool="propose_refund",
                 canned_args={
                     "propose_refund": {
-                        "order_key": "1", "amount_usd": 150.0, "destination": "original"
+                        "order_key": "1",
+                        "amount_usd": 150.0,
+                        "destination": "original",
                     }
                 },
                 tool_call_limit=1,
@@ -286,15 +304,18 @@ async def test_human_at_readback_escapes_with_onramp_package(
     onramps = [e for e in _telemetry_events(tmp_path) if e.get("event") == "human_onramp"]
     assert len(onramps) == 1
     assert set(onramps[0]) == {
-        "event", "schema_version", "tenant", "verification_level",
-        "active_flow", "reason_code", "source",
+        "event",
+        "schema_version",
+        "tenant",
+        "verification_level",
+        "active_flow",
+        "reason_code",
+        "source",
     }
     assert onramps[0]["schema_version"] == 1
     assert onramps[0]["tenant"] == "acme_store"
     responses = [
-        e
-        for e in _telemetry_events(tmp_path)
-        if e.get("event") == "automation_terminal_response"
+        e for e in _telemetry_events(tmp_path) if e.get("event") == "automation_terminal_response"
     ]
     assert responses == [{"event": "automation_terminal_response"}]
 
@@ -311,7 +332,9 @@ async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path
                 force_tool="propose_refund",
                 canned_args={
                     "propose_refund": {
-                        "order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"
+                        "order_key": "2",
+                        "amount_usd": 129.0,
+                        "destination": "new_instrument",
                     }
                 },
                 tool_call_limit=1,
@@ -337,10 +360,12 @@ def test_render_orders_marks_the_pointed_order() -> None:
     from agnostic_market.commerce.orders import OrderCandidate
 
     orders = [
-        OrderCandidate(key="1", order_id="ORD-1001", summary="shoes", total_usd=179.98,
-                       status="shipped"),
-        OrderCandidate(key="2", order_id="ORD-1002", summary="jacket", total_usd=129.0,
-                       status="processing"),
+        OrderCandidate(
+            key="1", order_id="ORD-1001", summary="shoes", total_usd=179.98, status="shipped"
+        ),
+        OrderCandidate(
+            key="2", order_id="ORD-1002", summary="jacket", total_usd=129.0, status="processing"
+        ),
     ]
     marked = render_orders(orders, "ORD-1002")
     assert "ORD-1002 - jacket ($129.00, processing) - the order most recently discussed" in marked

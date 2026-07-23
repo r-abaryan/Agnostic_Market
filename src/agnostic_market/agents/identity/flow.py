@@ -47,7 +47,11 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, ConfigDict
 
-from agnostic_market.agents._toolcalls import ack_extra_tool_calls
+from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
+from agnostic_market.agents.clarification import (
+    advance_clarification,
+    with_clarification_lifecycle,
+)
 from agnostic_market.agents.identity.prompt import compose_identity_prompt
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.telemetry import write_event
@@ -123,6 +127,7 @@ def _flow_exit(update: dict[str, object]) -> dict[str, object]:
         "pending_cancel": None,
         "pending_request": None,
         "pending_clarification": None,
+        "clarification_progress": None,
         **update,
     }
 
@@ -161,7 +166,9 @@ def build_identity_nodes(
         """Request the account email address or phone number from the caller."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
-    model = reasoning_model.bind_tools([propose_identity, leave_identity, request_identity_contact])
+    identity_tools = (propose_identity, leave_identity, request_identity_contact)
+    bound_tool_names = frozenset(tool.name for tool in identity_tools)
+    model = reasoning_model.bind_tools(identity_tools)
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left identity", tool_call_id=call_id))
@@ -178,6 +185,20 @@ def build_identity_nodes(
                 **update,
             }
         )
+
+    def _clarification_result(state: ReasoningState, new_messages: list) -> dict[str, object]:
+        step = advance_clarification(
+            state,
+            flow="identity",
+            max_reasks=policy.identity_clarification_reask_max,
+        )
+        if step.exhausted:
+            return _human_handover({"messages": new_messages})
+        return {
+            "messages": new_messages,
+            "pending_clarification": IdentityClarification(),
+            "clarification_progress": step.progress,
+        }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE identity: collect the claimed contact, or clarify, or leave.
@@ -202,10 +223,7 @@ def build_identity_nodes(
         for _attempt in range(2):  # one invalid proposal gets ONE corrective re-prompt
             response = model.invoke(messages)
             if not response.tool_calls:
-                return {
-                    "messages": new_messages,
-                    "pending_clarification": IdentityClarification(),
-                }
+                return _clarification_result(state, new_messages)
             new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
@@ -223,10 +241,7 @@ def build_identity_nodes(
                 new_messages.append(
                     ToolMessage("contact clarification requested", tool_call_id=call["id"])
                 )
-                return {
-                    "messages": new_messages,
-                    "pending_clarification": IdentityClarification(),
-                }
+                return _clarification_result(state, new_messages)
 
             if call["name"] == "propose_identity":
                 try:
@@ -269,14 +284,14 @@ def build_identity_nodes(
                 write_event({"event": "identity_stepup_failed", "reason": "no_match"})
                 return _human_handover({"messages": new_messages})
 
-            # Explicit terminal guard (not fall-through): every bound tool has a branch
-            # above, so an unhandled name means a NEW tool was bound without a handler.
-            raise ValueError(f"identity assemble: unhandled tool {call['name']!r}")
+            if call["name"] not in bound_tool_names:
+                new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_identity.name))
+                messages = [prompt, *state.messages, *new_messages]
+                continue
+            # A bound name reaching here is code drift: preserve the loud developer failure.
+            raise ValueError(f"identity assemble: bound tool has no handler: {call['name']!r}")
         logger.warning("identity assemble: two invalid tool calls; asking for contact in code")
-        return {
-            "messages": new_messages,
-            "pending_clarification": IdentityClarification(),
-        }
+        return _clarification_result(state, new_messages)
 
     def ask_contact_node(state: ReasoningState) -> dict[str, object]:
         clarification = state.pending_clarification
@@ -451,7 +466,7 @@ def build_identity_nodes(
     def route_after_assemble(state: ReasoningState) -> str:
         # Which outcome did assemble reach? Order matters (terminal states first).
         if state.active_flow == "left_identity":
-            return "leave"  # model left / two invalid proposals -> normal pipeline answers
+            return "leave"  # model explicitly left; normal pipeline answers this turn
         if state.handover is not None:
             return "handover"  # terminal second no-match -> the silent human path
         if state.pending_identity is not None:
@@ -492,7 +507,7 @@ def build_identity_nodes(
         return wrapped
 
     return IdentityNodes(
-        assemble=assemble_node,
+        assemble=with_clarification_lifecycle(assemble_node),
         ask_contact=ask_contact_node,
         reask=reask_node,
         guardrail=guardrail_node,

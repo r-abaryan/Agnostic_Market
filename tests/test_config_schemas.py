@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from agnostic_market.dtos.config import MerchantConfig, PolicyConfig, SecurityPolicy
+from agnostic_market.dtos.config import MerchantConfig, PolicyConfig, SecurityPolicy, STTConfig
 
 
 def _valid_merchant_dict() -> dict:
@@ -30,6 +30,11 @@ def _valid_merchant_dict() -> dict:
             "refunds": {"auto_approve_under_usd": 10, "require_human_above_usd": 50},
             "allow_ai_merchant_handoff": True,
             "cancel_batch_max": 10,
+            "clarification_reask_max": {
+                "identity": 1,
+                "support": 2,
+                "cart": 2,
+            },
         },
         "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
         "integration": {
@@ -46,6 +51,24 @@ def test_valid_config_validates() -> None:
     config = MerchantConfig.model_validate(_valid_merchant_dict())
     assert config.merchant_id == "m1"
     assert config.isolation.tier == "shared"
+
+
+def test_stt_tuning_is_strict_and_rejects_bad_keyterms() -> None:
+    with pytest.raises(ValidationError):
+        STTConfig(provider="deepgram", model="nova-3", numerals="true")
+    with pytest.raises(ValidationError, match="blank"):
+        STTConfig(provider="deepgram", model="nova-3", keyterms=["ORD", " "])
+    with pytest.raises(ValidationError, match="unique"):
+        STTConfig(provider="deepgram", model="nova-3", keyterms=["ORD", "ord"])
+
+    config = STTConfig(
+        provider="deepgram",
+        model="nova-3",
+        numerals=True,
+        keyterms=[" ORD "],
+    )
+    assert config.numerals is True
+    assert config.keyterms == ("ORD",)
 
 
 def test_returns_policy_defaults_and_floor() -> None:
@@ -76,6 +99,9 @@ def test_to_policy_context_carries_every_enforced_value() -> None:
     assert context.contact_reask_max == 1
     assert context.auth_denials_before_human_offer == 2
     assert context.max_tool_hops == 5
+    assert context.identity_clarification_reask_max == 1
+    assert context.support_clarification_reask_max == 2
+    assert context.cart_clarification_reask_max == 2
     assert context.cancel_batch_max == 10
 
 
@@ -87,9 +113,26 @@ def test_security_policy_defaults() -> None:
 
 def test_security_policy_rejects_unknown_key_and_bad_floor() -> None:
     with pytest.raises(ValidationError):
-        SecurityPolicy(surprise=1)  # extra="forbid"
+        SecurityPolicy(surprise=1)
     with pytest.raises(ValidationError):
-        SecurityPolicy(otp_max_attempts=0)  # ge=1 floor
+        SecurityPolicy(otp_max_attempts=0)
+
+
+def test_clarification_reask_policy_is_required_closed_and_non_negative() -> None:
+    missing = _valid_merchant_dict()
+    del missing["policies"]["clarification_reask_max"]
+    with pytest.raises(ValidationError, match="clarification_reask_max"):
+        MerchantConfig.model_validate(missing)
+
+    extra = _valid_merchant_dict()
+    extra["policies"]["clarification_reask_max"]["surprise"] = 3
+    with pytest.raises(ValidationError):
+        MerchantConfig.model_validate(extra)
+
+    negative = _valid_merchant_dict()
+    negative["policies"]["clarification_reask_max"]["identity"] = -1
+    with pytest.raises(ValidationError):
+        MerchantConfig.model_validate(negative)
 
 
 def test_negative_order_cap_rejected() -> None:
@@ -100,6 +143,11 @@ def test_negative_order_cap_rejected() -> None:
                 "refunds": {"auto_approve_under_usd": 0, "require_human_above_usd": 0},
                 "allow_ai_merchant_handoff": True,
                 "cancel_batch_max": 10,
+                "clarification_reask_max": {
+                    "identity": 1,
+                    "support": 2,
+                    "cart": 2,
+                },
             }
         )
 

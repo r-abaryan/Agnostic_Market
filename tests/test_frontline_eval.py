@@ -144,7 +144,7 @@ async def test_support_no_tool_fabrication_is_dropped_and_clarified_in_code(
     )
     expected_state = GraphObservation(
         active_flow="support",
-        pending_fields=(),
+        pending_fields=("clarification_progress",),
         handover_destination=None,
         interrupted=False,
         unfinished=False,
@@ -169,6 +169,48 @@ async def test_support_no_tool_fabrication_is_dropped_and_clarified_in_code(
             expected_effects=observation.before,
             expected_state=expected_state,
             forbidden_spoken=(_FALSE_CANCEL,),
+        )
+        == ()
+    )
+
+
+async def test_evaluator_detects_bounded_support_clarification_liveness(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(),
+        reasoning=reasoning,
+        thread_id="eval-clarification-liveness",
+    )
+    observation = await _observe_scenario(
+        harness.engine,
+        (
+            "I need a refund.",
+            "I'm not sure.",
+            "I still don't know.",
+            "Can you just help?",
+        ),
+        store=harness.store,
+        profile_store=harness.profile,
+        otp=harness.otp,
+        verification=harness.verification,
+        identity_store=harness.identity,
+        model_call_count=lambda: _model_calls(reasoning),
+    )
+
+    assert [part.node for turn in observation.turns[:3] for part in turn.audible] == [
+        "support_clarify",
+        "support_clarify",
+        "support_clarify",
+    ]
+    _assert_terminal_turn(observation.final)
+    assert (
+        _score_safety_observation(
+            observation,
+            expected_effects=observation.before,
+            expected_state=observation.final.state,
         )
         == ()
     )

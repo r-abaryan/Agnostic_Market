@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from langchain_core.messages import ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
@@ -193,6 +195,100 @@ async def test_identity_no_tool_prose_falls_back_to_code_question(config_root: P
     assert not any(raw_model_text in str(message.content) for message in state["messages"])
 
 
+@pytest.mark.parametrize(
+    ("second_call", "unknown_results"),
+    [
+        ([("request_identity_contact", {})], 1),
+        ([("catalog_lookup", {"query": "orders"})], 2),
+    ],
+)
+async def test_unknown_identity_tool_uses_bounded_correction_without_authority(
+    config_root: Path,
+    second_call: list[tuple[str, dict]],
+    unknown_results: int,
+) -> None:
+    thread_id = f"ident-unknown-{unknown_results}"
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("catalog_lookup", {"query": "orders"})],
+            second_call,
+        ]
+    )
+    h = _identity_harness(config_root, thread_id=thread_id, reasoning=reasoning)
+
+    events = await _events(h.engine, _REQUEST)
+
+    _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=0)
+    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert reasoning.invoke_count == 2
+    assert (
+        sum(
+            isinstance(message, ToolMessage)
+            and str(message.content).startswith("Unavailable action.")
+            for message in state["messages"]
+        )
+        == unknown_results
+    )
+
+
+async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover(
+    config_root: Path, tmp_path: Path
+) -> None:
+    thread_id = "ident-clarify-exhausted"
+    h = _identity_harness(
+        config_root,
+        thread_id=thread_id,
+        reasoning=FakeChatModel(emit_tool_calls=False),
+    )
+
+    first = await _events(h.engine, _REQUEST)
+    second = await _events(h.engine, "I don't have an email address or phone number.")
+    exhausted = await _events(h.engine, "I still can't provide either one.")
+
+    assert [event.node for event in _spoken(first)] == ["identity_ask_contact"]
+    assert [event.node for event in _spoken(second)] == ["identity_ask_contact"]
+    assert [event.node for event in _spoken(exhausted)] == ["automation_terminal_response"]
+    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert state.get("automation_terminal") is True
+    assert state.get("active_flow") is None
+    assert state.get("pending_request") is None
+    assert state.get("clarification_progress") is None
+    assert h.identity.current() is None
+    assert h.otp.dispatch_count == 0
+    assert h.store.cancel_count == h.store.refund_count == h.store.return_count == 0
+    exhausted_events = [
+        line
+        for line in _telemetry(tmp_path).splitlines()
+        if '"event": "clarification_exhausted"' in line
+    ]
+    assert exhausted_events == [
+        '{"event": "clarification_exhausted", "flow": "identity", "consumed_reasks": 1, "limit": 1}'
+    ]
+
+
+async def test_valid_identity_claim_clears_prior_clarification_progress(
+    config_root: Path,
+) -> None:
+    thread_id = "ident-clarify-progress"
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("request_identity_contact", {})],
+            [("propose_identity", {"contact_claim": _CUST1_PHONE})],
+        ]
+    )
+    h = _identity_harness(config_root, thread_id=thread_id, reasoning=reasoning)
+
+    await _events(h.engine, _REQUEST)
+    before = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert before["clarification_progress"].flow == "identity"
+    events = await _events(h.engine, _CUST1_PHONE)
+
+    assert any(isinstance(event, InterruptEvent) for event in events)
+    after = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert after.get("clarification_progress") is None
+    assert h.otp.dispatch_count == 1
+
+
 async def test_malformed_identity_tools_preserve_miss_budget_and_continuation(
     config_root: Path,
 ) -> None:
@@ -219,6 +315,8 @@ async def test_malformed_identity_tools_preserve_miss_budget_and_continuation(
     events = await _events(h.engine, "It is the same contact I gave you.")
     _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=1)
     assert reasoning.invoke_count == 3
+    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert state["clarification_progress"].reasks == 0
 
 
 # --- the happy path: claim -> OTP -> bind -> the SCOPED list -------------------------------
@@ -611,10 +709,16 @@ async def test_cross_switch_out_of_identity_on_a_gate_certain_intent(
         thread_id="ident-cross-1",
     )
     await _events(h.engine, _REQUEST)
+    before_switch = h.engine._graph.get_state(
+        {"configurable": {"thread_id": "ident-cross-1"}}
+    ).values
+    assert before_switch["clarification_progress"].flow == "identity"
     await _events(h.engine, "cancel my order please")
     state = h.engine._graph.get_state({"configurable": {"thread_id": "ident-cross-1"}})
     assert state.values.get("active_flow") == "support"  # switched, not trapped
     assert state.values.get("pending_identity") is None
+    assert state.values["clarification_progress"].flow == "support"
+    assert state.values["clarification_progress"].reasks == 0
 
 
 async def test_identity_stepup_never_touches_refund_or_profile_state(

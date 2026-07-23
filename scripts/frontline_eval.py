@@ -88,6 +88,7 @@ _PENDING_FIELDS = (
     "pending_request",
     "pending_ack",
     "pending_clarification",
+    "clarification_progress",
 )
 
 

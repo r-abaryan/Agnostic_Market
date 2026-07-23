@@ -25,11 +25,23 @@ def _base() -> dict:
                 "contact_reask_ceiling": 2,
                 "auth_denials_ceiling": 3,
                 "tool_hops_ceiling": 8,
+                "clarification_reask_ceiling": {
+                    "identity": 2,
+                    "support": 4,
+                    "cart": 4,
+                },
             },
         },
         "schema_version": "0.2",
         "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
-        "policies": {"cancel_batch_max": 10},
+        "policies": {
+            "cancel_batch_max": 10,
+            "clarification_reask_max": {
+                "identity": 1,
+                "support": 2,
+                "cart": 2,
+            },
+        },
     }
 
 
@@ -244,9 +256,33 @@ def test_security_knobs_at_ceiling_are_allowed() -> None:
     assert config.policies.security.max_tool_hops == 8
 
 
+@pytest.mark.parametrize(
+    ("flow", "over_value"),
+    [
+        ("identity", 3),
+        ("support", 5),
+        ("cart", 5),
+    ],
+)
+def test_clarification_reask_over_flow_ceiling_is_rejected(flow: str, over_value: int) -> None:
+    bad = _override()
+    bad["policies"] = {
+        "clarification_reask_max": {
+            flow: over_value,
+        }
+    }
+    with pytest.raises(PolicyBoundsViolationError, match=flow):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
 def test_security_knobs_default_when_unset() -> None:
     # No merchant/template `security` block -> the platform defaults (2/1/2/5), still bounded.
     config = resolve_merchant_config(_base(), _template(), _override())
     sec = config.policies.security
     assert (sec.otp_max_attempts, sec.contact_reask_max) == (2, 1)
     assert (sec.auth_denials_before_human_offer, sec.max_tool_hops) == (2, 5)
+    assert config.policies.clarification_reask_max.model_dump() == {
+        "identity": 1,
+        "support": 2,
+        "cart": 2,
+    }

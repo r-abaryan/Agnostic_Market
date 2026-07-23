@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 if TYPE_CHECKING:
     from agnostic_market.dtos.state import PolicyContext
@@ -49,6 +49,22 @@ class STTConfig(BaseModel):
 
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    # STT recognition aids (Deepgram nova-3). `numerals` requests digit formatting and
+    # `keyterms` biases recognition toward merchant tokens such as an order-id label; neither
+    # guarantees a particular transcript. Defaults request the provider's pre-tuning behavior;
+    # these fields still enter the resolved config hash. Recognition quality is never authority.
+    numerals: StrictBool = False
+    keyterms: tuple[str, ...] = ()
+
+    @field_validator("keyterms")
+    @classmethod
+    def _keyterms_are_non_blank_and_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(term.strip() for term in value)
+        if any(not term for term in normalized):
+            raise ValueError("keyterms must not contain blank values")
+        if len({term.casefold() for term in normalized}) != len(normalized):
+            raise ValueError("keyterms must be unique")
+        return normalized
 
 
 class TTSConfig(BaseModel):
@@ -112,6 +128,20 @@ class ReturnsPolicy(BaseModel):
 _DEFAULT_PENDING_TTL_SECONDS = 120.0
 
 
+class ClarificationReaskPolicy(BaseModel):
+    """Per-flow conversational-liveness budgets.
+
+    Values count additional questions after the initial clarification. The fields are required:
+    effective values come from layered config, never a second set of source-code defaults.
+    """
+
+    model_config = _STRICT
+
+    identity: int = Field(ge=0)
+    support: int = Field(ge=0)
+    cart: int = Field(ge=0)
+
+
 class SecurityPolicy(BaseModel):
     """Attempt-BUDGET knobs — merchant-set within platform CEILINGS (_platform.limits, the
     resolver clamps loudly). Every knob here is a budget where a LARGER value WEAKENS security
@@ -153,12 +183,13 @@ class PolicyConfig(BaseModel):
     allow_ai_merchant_handoff: StrictBool
     # Optional: merchant-tunable within the platform max. Defaults so existing merchant YAMLs
     # (which don't set it) keep the platform default; the resolver clamps the ceiling.
-    pending_confirmation_ttl_seconds: float = Field(
-        default=_DEFAULT_PENDING_TTL_SECONDS, gt=0
-    )
+    pending_confirmation_ttl_seconds: float = Field(default=_DEFAULT_PENDING_TTL_SECONDS, gt=0)
     # Attempt-budget security knobs (default_factory so existing merchant YAMLs, which don't
     # set it, keep the platform defaults; the resolver clamps each against its ceiling).
     security: SecurityPolicy = Field(default_factory=SecurityPolicy)
+    # Conversational liveness is separate from SecurityPolicy: Cart questions are not auth
+    # evidence, even though all three flows share one tracker implementation.
+    clarification_reask_max: ClarificationReaskPolicy
     # Max orders in one cancel batch (F-16.2). The required value comes from base.yaml and its
     # path is safety-locked, so template/override layers cannot tune it. Keeping this REQUIRED
     # prevents a second, silent source-code default from drifting away from the base layer.
@@ -193,6 +224,9 @@ class PolicyConfig(BaseModel):
             contact_reask_max=self.security.contact_reask_max,
             auth_denials_before_human_offer=self.security.auth_denials_before_human_offer,
             max_tool_hops=self.security.max_tool_hops,
+            identity_clarification_reask_max=self.clarification_reask_max.identity,
+            support_clarification_reask_max=self.clarification_reask_max.support,
+            cart_clarification_reask_max=self.clarification_reask_max.cart,
             cancel_batch_max=self.cancel_batch_max,
         )
 

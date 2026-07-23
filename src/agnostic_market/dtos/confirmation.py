@@ -9,6 +9,7 @@ be silently forgotten when a new sensitive tool is added.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -62,6 +63,29 @@ class ToolConfirmationPolicy(BaseModel):
         return value
 
 
+def validate_confirmation_rendering(
+    policy: ToolConfirmationPolicy,
+    rendered: Mapping[str, str],
+    phrase: str,
+) -> str:
+    """Return a confirmation phrase only when it speaks every policy-declared value."""
+    missing = policy.confirm_fields - rendered.keys()
+    if missing:
+        raise ValueError(
+            f"{policy.tool} confirmation cannot render declared fields: {sorted(missing)}"
+        )
+    unspoken = {
+        field
+        for field in policy.confirm_fields
+        if not rendered[field] or rendered[field] not in phrase
+    }
+    if unspoken:
+        raise ValueError(
+            f"{policy.tool} confirmation does not speak declared fields: {sorted(unspoken)}"
+        )
+    return phrase
+
+
 # --- Refund destination as a first-class policy dimension (AGENTS §A4b, DESIGN_REVIEW C4) ---
 # The refund *destination* — not just the amount — decides the required verification level.
 # "original" = back to the instrument that paid; "new_instrument"/"new_address" = anywhere
@@ -91,7 +115,7 @@ def refund_required_level(amount_usd: float, destination: RefundDestination) -> 
 # The verification level is gated separately by `refund_required_level` (live, in-flow).
 ISSUE_REFUND_POLICY = ToolConfirmationPolicy(
     tool="issue_refund",
-    confirm_fields=frozenset({"total_amount", "new_payment_instrument_ref"}),
+    confirm_fields=frozenset({"order_id", "total_amount", "new_payment_instrument_ref"}),
     strength="explicit_yes",
 )
 

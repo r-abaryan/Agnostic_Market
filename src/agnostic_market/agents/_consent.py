@@ -22,7 +22,7 @@ _NO_RE = re.compile(
     r"\b(?:no|nope|nah|don'?t|do not|cancel|stop|never ?mind|forget it|wrong)\b", re.IGNORECASE
 )
 _YES_RE = re.compile(
-    r"\b(?:yes|yeah|yep|yup|sure|correct|right|confirm|confirmed|go ahead|place it|do it|"
+    r"\b(?:yes|yeah|yep|yup|correct|right|confirm|confirmed|go ahead|place it|do it|"
     r"sounds good|please do|ok(?:ay)?)\b",
     re.IGNORECASE,
 )

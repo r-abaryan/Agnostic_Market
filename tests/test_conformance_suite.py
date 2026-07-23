@@ -211,6 +211,11 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
                 "refunds": {"auto_approve_under_usd": 50, "require_human_above_usd": 200},
                 "allow_ai_merchant_handoff": True,
                 "cancel_batch_max": 10,
+                "clarification_reask_max": {
+                    "identity": 1,
+                    "support": 2,
+                    "cart": 2,
+                },
             },
             "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
             "integration": {

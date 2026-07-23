@@ -78,6 +78,10 @@ class PolicyContext(BaseModel):
     contact_reask_max: int = Field(ge=0)
     auth_denials_before_human_offer: int = Field(ge=1)
     max_tool_hops: int = Field(ge=1)
+    # Consecutive code-authored questions allowed after the initial clarification.
+    identity_clarification_reask_max: int = Field(ge=0)
+    support_clarification_reask_max: int = Field(ge=0)
+    cart_clarification_reask_max: int = Field(ge=0)
     # Max orders in one cancel batch — a SAFETY bound (a big batch must fit the LangGraph
     # recursion/step budget), NOT a merchant knob: it is `_safety_locked` in config, so no
     # tenant can touch it. Over-cap asks the caller to narrow, never silently takes the first
@@ -151,6 +155,8 @@ class PendingRefund(BaseModel):
     model_config = _FROZEN
 
     order_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1)  # the human order description, spoken in the readback so a
+    # wrong owned-order selection is caught (INV-32: ownership alone can't tell WHICH owned order).
     amount_usd: float = Field(ge=0)
     destination: RefundDestination
     instrument_ref: str = Field(min_length=1)
@@ -385,6 +391,18 @@ PendingClarification = Annotated[
 ]
 
 
+ClarificationOwner = Literal["identity", "support", "cart"]
+
+
+class ClarificationProgress(BaseModel):
+    """Consecutive clarification questions for one sticky flow engagement."""
+
+    model_config = _FROZEN
+
+    flow: ClarificationOwner
+    reasks: int = Field(ge=0)
+
+
 class HandoffRequest(BaseModel):
     """A frontline decision to hand a turn to a higher tier (AGENTS.md handover boundary).
 
@@ -437,3 +455,6 @@ class ReasoningState(BaseModel):
     # Turn-scoped instruction for a flow-owned, code-authored clarification line. Each
     # transactional flow writes its own selector atomically as it yields to its renderer.
     pending_clarification: PendingClarification | None = None
+    # Engagement-scoped liveness tracker. Entry preserves it while the same sticky flow
+    # continues; real progress and every lifecycle exit clear it.
+    clarification_progress: ClarificationProgress | None = None

@@ -39,8 +39,12 @@ from pydantic import BaseModel, ConfigDict
 
 from agnostic_market.agents._consent import classify_consent
 from agnostic_market.agents._copy import warm_close
-from agnostic_market.agents._toolcalls import ack_extra_tool_calls
+from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
 from agnostic_market.agents.cart.prompt import compose_cart_prompt
+from agnostic_market.agents.clarification import (
+    advance_clarification,
+    with_clarification_lifecycle,
+)
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
@@ -49,7 +53,10 @@ from agnostic_market.commerce.orders import (
     resolve_candidates,
     speak_lines,
 )
-from agnostic_market.dtos.confirmation import ToolConfirmationPolicy
+from agnostic_market.dtos.confirmation import (
+    ToolConfirmationPolicy,
+    validate_confirmation_rendering,
+)
 from agnostic_market.dtos.state import (
     CartClarification,
     CartClarificationDetail,
@@ -66,7 +73,8 @@ logger = logging.getLogger("agnostic_market.agents.cart")
 # these critical fields at explicit_yes strength. `line_items` (not `quantity`) — a single
 # scalar can't honestly describe N line quantities; the readback interpolates the rendered
 # `line_items` string VERBATIM, so the loud-fail check guarantees it is actually spoken (the
-# anti-theater lesson from the removed `return_id`). Enforced in `_readback_line`.
+# anti-theater lesson from the removed `return_id`). Enforced in
+# `_placement_confirmation_phrase`.
 PLACE_ORDER_POLICY = ToolConfirmationPolicy(
     tool="place_order",
     confirm_fields=frozenset({"line_items", "total_amount"}),
@@ -87,8 +95,10 @@ def _last_user_text(state: ReasoningState) -> str:
     return ""
 
 
-def _readback_line(pending: PendingPlacement, policy: ToolConfirmationPolicy) -> str:
-    """The GRAPH-authored whole-cart placement readback — the `interrupt()` payload.
+def _placement_confirmation_phrase(
+    pending: PendingPlacement, policy: ToolConfirmationPolicy
+) -> str:
+    """The canonical, policy-validated description used by both placement prompts.
 
     Renders every field the policy declares AND interpolates each rendered value verbatim,
     so the loud-fail check guarantees the spoken line literally contains them (no declared-
@@ -98,19 +108,15 @@ def _readback_line(pending: PendingPlacement, policy: ToolConfirmationPolicy) ->
         "line_items": speak_lines(pending.lines),
         "total_amount": f"${pending.total_usd:.2f}",
     }
-    missing = policy.confirm_fields - rendered.keys()
-    if missing:
-        raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
     if pending.duplicate_of is not None:
-        return (
-            f"Just to check - you already ordered {rendered['line_items']} on this call "
-            f"({pending.duplicate_of}), and that order is placed. Do you want a SECOND order "
-            f"of {rendered['line_items']} for another {rendered['total_amount']}?"
+        phrase = (
+            f"a SECOND order of {rendered['line_items']} for another "
+            f"{rendered['total_amount']}; your earlier order ({pending.duplicate_of}) "
+            "is already placed"
         )
-    return (
-        f"Just to confirm: {rendered['line_items']}, {rendered['total_amount']} total. "
-        "Shall I place the order?"
-    )
+    else:
+        phrase = f"an order for {rendered['line_items']}, {rendered['total_amount']} total"
+    return validate_confirmation_rendering(policy, rendered, phrase)
 
 
 class _ProposeItem(BaseModel):
@@ -212,18 +218,18 @@ def build_cart_nodes(
         """Leave the cart flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
-    model = reasoning_model.bind_tools(
-        [
-            add_to_cart,
-            remove_from_cart,
-            set_quantity,
-            review_cart,
-            buy_now,
-            go_to_checkout,
-            request_cart_clarification,
-            leave_cart,
-        ]
+    cart_tools = (
+        add_to_cart,
+        remove_from_cart,
+        set_quantity,
+        review_cart,
+        buy_now,
+        go_to_checkout,
+        request_cart_clarification,
+        leave_cart,
     )
+    bound_tool_names = frozenset(tool.name for tool in cart_tools)
+    model = reasoning_model.bind_tools(cart_tools)
 
     def _resolve(candidate_key: str, candidates: list) -> object | None:
         by_key = {c.key: c for c in candidates}
@@ -328,12 +334,26 @@ def build_cart_nodes(
         return True
 
     def _clarification_result(
-        new_messages: list, detail: CartClarificationDetail
+        state: ReasoningState,
+        new_messages: list,
+        detail: CartClarificationDetail,
     ) -> dict[str, object]:
+        step = advance_clarification(
+            state,
+            flow="cart",
+            max_reasks=policy.cart_clarification_reask_max,
+        )
+        if step.exhausted:
+            return {
+                "messages": new_messages,
+                "active_flow": "left_cart",
+                "pending_clarification": None,
+            }
         return {
             "messages": new_messages,
             "active_flow": "cart",
             "pending_clarification": CartClarification(detail=detail),
+            "clarification_progress": step.progress,
         }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
@@ -353,7 +373,7 @@ def build_cart_nodes(
         for _attempt in range(2):  # one invalid proposal/batch gets ONE corrective re-prompt
             response = model.invoke(messages)
             if not response.tool_calls:
-                return _clarification_result(new_messages, "action")
+                return _clarification_result(state, new_messages, "action")
             new_messages.append(response)
 
             if response.tool_calls[0]["name"] in _MUTATION_TOOLS:
@@ -403,7 +423,7 @@ def build_cart_nodes(
                 new_messages.append(
                     ToolMessage("cart clarification requested", tool_call_id=call["id"])
                 )
-                return _clarification_result(new_messages, clarification.detail)
+                return _clarification_result(state, new_messages, clarification.detail)
 
             if name == "leave_cart":
                 new_messages.append(ToolMessage("left cart", tool_call_id=call["id"]))
@@ -465,13 +485,15 @@ def build_cart_nodes(
                 write_event({"event": "cart_item_added", "sku": chosen.sku, "reason": "buy_now"})
                 return {"messages": new_messages, **_mint_placement()}
 
-            # Explicit terminal guard (not fall-through): every bound tool has a branch above,
-            # so an unhandled name means a NEW tool was bound without a handler — fail loud
-            # rather than silently misroute it into the last branch (a silent wrong-mutation).
-            raise ValueError(f"cart assemble: unhandled tool {name!r}")
+            if name not in bound_tool_names:
+                new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_cart.name))
+                messages = [prompt, *state.messages, *new_messages]
+                continue
+            # A bound name reaching here is code drift: preserve the loud developer failure.
+            raise ValueError(f"cart assemble: bound tool has no handler: {name!r}")
 
         logger.warning("cart assemble: two invalid tool calls; asking for action in code")
-        return _clarification_result(new_messages, "action")
+        return _clarification_result(state, new_messages, "action")
 
     def ack_node(state: ReasoningState) -> dict[str, object]:
         """Speak the code-authored in-flow line (mutation ack / review listing / empty-cart)
@@ -539,14 +561,11 @@ def build_cart_nodes(
                     )
                 ],
             }
-        answer = interrupt(_readback_line(pending, PLACE_ORDER_POLICY))
+        phrase = _placement_confirmation_phrase(pending, PLACE_ORDER_POLICY)
+        answer = interrupt(f"Just to confirm: shall I place {phrase}?")
         verdict = classify_consent(str(answer.get("text", "")))
         if answer.get("readback_interrupted") or verdict == "unclear":
-            second = "a SECOND order of " if pending.duplicate_of is not None else ""
-            retry = interrupt(
-                f"Sorry - just to be clear: {second}{speak_lines(pending.lines)}, "
-                f"${pending.total_usd:.2f} total. Yes or no?"
-            )
+            retry = interrupt(f"Sorry - just to be clear: shall I place {phrase}? Yes or no?")
             verdict = classify_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
@@ -605,6 +624,7 @@ def build_cart_nodes(
         return {
             "pending_placement": None,
             "pending_clarification": None,
+            "clarification_progress": None,
             "active_flow": None,
             "messages": [AIMessage(f"No problem - I've dropped that.{kept}")],
         }
@@ -615,6 +635,7 @@ def build_cart_nodes(
         return {
             "pending_placement": None,
             "pending_clarification": None,
+            "clarification_progress": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
@@ -633,7 +654,7 @@ def build_cart_nodes(
         raise RuntimeError("cart assemble produced no outcome")
 
     return CartNodes(
-        assemble=assemble_node,
+        assemble=with_clarification_lifecycle(assemble_node),
         ack=ack_node,
         clarify=clarify_node,
         guardrail=guardrail_node,

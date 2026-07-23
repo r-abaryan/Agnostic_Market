@@ -15,7 +15,11 @@ from agnostic_market.commerce.verification import (
     load_verification_fixture,
 )
 from agnostic_market.config.loader import ConfigError
-from agnostic_market.dtos.confirmation import refund_required_level
+from agnostic_market.dtos.confirmation import (
+    ISSUE_REFUND_POLICY,
+    refund_required_level,
+    validate_confirmation_rendering,
+)
 from agnostic_market.dtos.state import CartLine
 
 _TEST_OTP = "482913"
@@ -55,6 +59,33 @@ def test_refund_required_level_is_destination_first(
     amount: float, destination: str, expected: int
 ) -> None:
     assert refund_required_level(amount, destination) == expected  # type: ignore[arg-type]
+
+
+def test_confirmation_rendering_rejects_a_missing_declared_value() -> None:
+    rendered = {
+        "total_amount": "$129.00",
+        "new_payment_instrument_ref": "card ending 4471",
+    }
+    with pytest.raises(ValueError, match=r"cannot render declared fields: \['order_id'\]"):
+        validate_confirmation_rendering(
+            ISSUE_REFUND_POLICY,
+            rendered,
+            "a $129.00 refund to card ending 4471",
+        )
+
+
+def test_confirmation_rendering_rejects_a_declared_value_not_spoken() -> None:
+    rendered = {
+        "order_id": "ORD-1002",
+        "total_amount": "$129.00",
+        "new_payment_instrument_ref": "card ending 4471",
+    }
+    with pytest.raises(ValueError, match=r"does not speak declared fields: \['order_id'\]"):
+        validate_confirmation_rendering(
+            ISSUE_REFUND_POLICY,
+            rendered,
+            "a $129.00 refund to card ending 4471",
+        )
 
 
 # --- VerificationStore: level authority --------------------------------------------------
@@ -170,8 +201,10 @@ def test_refund_against_a_cancelled_order_is_refused(config_root: Path) -> None:
 def test_refund_can_target_a_just_placed_order(config_root: Path) -> None:
     store = _store(config_root)
     placed = store.place_cart(
-        "k1", lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
-        total_usd=129.0)
+        "k1",
+        lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
+        total_usd=129.0,
+    )
     rec = store.issue_refund(
         "i1", order_id=placed.order_id, amount_usd=129.0, destination="original"
     )

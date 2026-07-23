@@ -97,7 +97,10 @@ async def test_committed_otp_raises_level_then_reads_back_the_refund(config_root
     assert verification.current_level() == 2  # raised mid-flow
     interrupts = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1
-    # GRAPH-authored, speech-native readback (§7a): amount + masked instrument, no PAN.
+    # GRAPH-authored, speech-native readback (§7a): order + amount + masked instrument, no PAN.
+    # The order id/summary is named so a wrong owned-order refund is caught at consent (ownership
+    # alone can't tell WHICH owned order the caller meant — INV-32).
+    assert "ORD-1002" in interrupts[0].prompt
     assert "$129.00" in interrupts[0].prompt
     assert "card ending 4471" in interrupts[0].prompt
     assert store.refund_count == 0  # still nothing placed before the yes
@@ -182,16 +185,31 @@ async def test_live_read_blocks_a_lapsed_grant_at_place(config_root: Path) -> No
 # --- §4a committed-consent ---------------------------------------------------------------
 
 
-async def test_barged_readback_reconfirms_before_refunding(config_root: Path) -> None:
-    engine, store, _, _ = _engine(config_root)
+@pytest.mark.parametrize(
+    ("response", "facts", "thread_id"),
+    [
+        ("yes", TurnFacts(readback_interrupted=True), "refund-reconfirm-barged"),
+        ("I'm not sure", _FACTS, "refund-reconfirm-unclear"),
+        ("sure", _FACTS, "refund-reconfirm-ambiguous-sure"),
+    ],
+)
+async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
+    config_root: Path,
+    response: str,
+    facts: TurnFacts,
+    thread_id: str,
+) -> None:
+    engine, store, _, _ = _engine(config_root, thread_id=thread_id)
     await _pause_at_otp(engine)
     await _events(engine, _VALID_OTP)
-    # "yes" over a barged-over readback is not consent (§4a) -> re-confirm, not refund.
-    events = await _events(engine, "yes", TurnFacts(readback_interrupted=True))
+    events = await _events(engine, response, facts)
     assert store.refund_count == 0
     reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(reconfirms) == 1
     assert "yes or no" in reconfirms[0].prompt.lower()
+    assert "ORD-1002" in reconfirms[0].prompt
+    assert "$129.00" in reconfirms[0].prompt
+    assert "card ending 4471" in reconfirms[0].prompt
     await _events(engine, "yes")  # a clean committed yes places it
     assert store.refund_count == 1
 
@@ -1314,6 +1332,135 @@ async def test_support_no_tool_prose_falls_back_to_code_authored_action_question
     assert store.refund_count == store.return_count == store.cancel_count == 0
 
 
+@pytest.mark.parametrize(
+    ("second_call", "unknown_results"),
+    [
+        ([("request_support_clarification", {"detail": "action"})], 1),
+        ([("catalog_lookup", {"query": "shoes"})], 2),
+    ],
+)
+async def test_unknown_support_tool_uses_bounded_correction_without_an_effect(
+    config_root: Path,
+    second_call: list[tuple[str, dict]],
+    unknown_results: int,
+) -> None:
+    thread_id = f"support-unknown-{unknown_results}"
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("catalog_lookup", {"query": "shoes"})],
+            second_call,
+        ]
+    )
+    engine, store, verification, otp = _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id=thread_id,
+    )
+
+    events = await _events(engine, "I need a refund")
+
+    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert reasoning.invoke_count == 2
+    assert (
+        sum(
+            isinstance(message, ToolMessage)
+            and str(message.content).startswith("Unavailable action.")
+            for message in state["messages"]
+        )
+        == unknown_results
+    )
+    assert [
+        (event.node, event.text) for event in events if isinstance(event, SpokenMessageEvent)
+    ] == [
+        (
+            "support_clarify",
+            "What would you like help with: a cancellation, return, refund, or profile update?",
+        )
+    ]
+    assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
+    assert verification.current_level() == 1
+    assert otp.dispatch_count == 0
+    assert store.refund_count == store.return_count == store.cancel_count == 0
+
+
+async def test_repeated_support_clarification_exhausts_without_an_effect(
+    config_root: Path, tmp_path: Path
+) -> None:
+    thread_id = "support-clarify-exhausted"
+    engine, store, verification, otp = _engine(
+        config_root,
+        reasoning=FakeChatModel(emit_tool_calls=False),
+        thread_id=thread_id,
+    )
+
+    first = await _events(engine, "I need a refund")
+    second = await _events(engine, "I'm not sure.")
+    third = await _events(engine, "I still don't know.")
+    exhausted = await _events(engine, "Can you just help?")
+
+    assert [event.node for event in first if isinstance(event, SpokenMessageEvent)] == [
+        "support_clarify"
+    ]
+    assert [event.node for event in second if isinstance(event, SpokenMessageEvent)] == [
+        "support_clarify"
+    ]
+    assert [event.node for event in third if isinstance(event, SpokenMessageEvent)] == [
+        "support_clarify"
+    ]
+    assert [event.node for event in exhausted if isinstance(event, SpokenMessageEvent)] == [
+        "automation_terminal_response"
+    ]
+    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert state.get("automation_terminal") is True
+    assert state.get("active_flow") is None
+    assert state.get("pending_request") is None
+    assert state.get("clarification_progress") is None
+    assert verification.current_level() == 1
+    assert otp.dispatch_count == 0
+    assert store.refund_count == store.return_count == store.cancel_count == 0
+    exhausted_events = [
+        line
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+        if '"event": "clarification_exhausted"' in line
+    ]
+    assert exhausted_events == [
+        '{"event": "clarification_exhausted", "flow": "support", "consumed_reasks": 2, "limit": 2}'
+    ]
+
+
+async def test_changing_support_clarification_detail_does_not_reset_the_budget(
+    config_root: Path, tmp_path: Path
+) -> None:
+    thread_id = "support-clarify-changing-detail"
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("request_support_clarification", {"detail": "action"})],
+            [("request_support_clarification", {"detail": "order"})],
+            [("request_support_clarification", {"detail": "amount"})],
+            [("request_support_clarification", {"detail": "refund_destination"})],
+        ]
+    )
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id=thread_id,
+    )
+
+    await _events(engine, "I need a refund")
+    await _events(engine, "It is about an order.")
+    await _events(engine, "Maybe part of the amount.")
+    exhausted = await _events(engine, "I don't know where it should go.")
+
+    assert [event.node for event in exhausted if isinstance(event, SpokenMessageEvent)] == [
+        "automation_terminal_response"
+    ]
+    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert state.get("clarification_progress") is None
+    assert store.refund_count == store.return_count == store.cancel_count == 0
+    telemetry = (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8")
+    assert telemetry.count('"event": "clarification_exhausted"') == 1
+
+
 async def test_support_two_malformed_clarification_calls_are_paired_then_fall_back(
     config_root: Path,
 ) -> None:
@@ -1352,6 +1499,7 @@ async def test_support_two_malformed_clarification_calls_are_paired_then_fall_ba
     }
     assert tool_use_ids == tool_result_ids
     assert state["active_flow"] == "support"
+    assert state["clarification_progress"].reasks == 0
     assert store.refund_count == store.return_count == store.cancel_count == 0
 
 

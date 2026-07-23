@@ -632,6 +632,7 @@ def build_frontline_graph(
                 "identity_claim_misses": 0,
                 "pending_ack": None,
                 "pending_clarification": None,
+                "clarification_progress": None,
             }
         # A cart/support handover ENTERS the flow (3b/3c/Group B) instead of speaking a
         # deferral: set the sticky flow marker, clear the handover signal, and let routing
@@ -640,7 +641,11 @@ def build_frontline_graph(
         # deferral. The "checkout" DESTINATION (gate cart_write / model cart_write) enters
         # the CART flow — the single-line checkout flow it replaces is gone.
         if handover.destination == "checkout" and state.active_flow != "left_cart":
-            return {"active_flow": "cart", "handover": None}
+            return {
+                "active_flow": "cart",
+                "handover": None,
+                "clarification_progress": None,
+            }
         if (
             handover.destination == "support"
             and handover.reason_code == "switch_account"
@@ -650,6 +655,7 @@ def build_frontline_graph(
                 "active_flow": "identity",
                 "handover": None,
                 "identity_claim_misses": 0,
+                "clarification_progress": None,
                 "pending_request": SwitchAccount(),
             }
         # Unbound LIST_ORDERS enters the IDENTITY flow (P7 rung 2: enumeration needs an
@@ -665,6 +671,7 @@ def build_frontline_graph(
                 "active_flow": "identity",
                 "handover": None,
                 "identity_claim_misses": 0,
+                "clarification_progress": None,
                 "pending_request": ListOrders(scope="account"),
             }
         # Support handles REFUND, CANCEL_ORDER (Group A), and profile changes — address +
@@ -678,7 +685,11 @@ def build_frontline_graph(
             in ("refund", "cancel_order", "address_change", "contact_change")
             and state.active_flow != "left_support"
         ):
-            return {"active_flow": "support", "handover": None}
+            return {
+                "active_flow": "support",
+                "handover": None,
+                "clarification_progress": None,
+            }
         # The canned deferral is a FALLBACK, spoken only if nothing else will be. On the
         # gate path the model never ran → speak it. On the model path the model usually
         # narrates the handover in its own (streamed) tokens; appending the canned line
@@ -691,7 +702,9 @@ def build_frontline_graph(
     def entry_node(state: ReasoningState) -> dict[str, object]:
         # Fresh-turn hygiene: with a checkpointer, LAST turn's handover signal, the
         # turn-scoped "left_*" marker, pending_ack, and pending_clarification persist in
-        # thread state and must not affect THIS turn. (pending_placement needs no such reset:
+        # thread state and must not affect THIS turn. `clarification_progress` spans turns
+        # only while the matching sticky flow owns the engagement; an owner mismatch clears
+        # it below. (pending_placement needs no such reset:
         # while one exists the graph is paused at confirm and turns arrive as resumes,
         # never through here.)
         update: dict[str, object] = {
@@ -701,6 +714,11 @@ def build_frontline_graph(
         }
         if state.active_flow in ("left_cart", "left_support", "left_identity"):
             update["active_flow"] = None
+        if (
+            state.clarification_progress is not None
+            and state.active_flow != state.clarification_progress.flow
+        ):
+            update["clarification_progress"] = None
         return update
 
     def automation_terminal_response_node(_state: ReasoningState) -> dict[str, object]:
@@ -742,6 +760,7 @@ def build_frontline_graph(
             "identity_claim_misses": 0,
             "pending_ack": None,
             "pending_clarification": None,
+            "clarification_progress": None,
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
             ),

@@ -8,6 +8,7 @@ from llm_fakes import RecordingResolver
 
 from agnostic_market.dtos.config import STTConfig, TTSConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
+from agnostic_market.voice import stt_engine
 from agnostic_market.voice.credentials import VoiceEngineError
 from agnostic_market.voice.stt_engine import build_stt
 from agnostic_market.voice.tts_engine import build_tts
@@ -37,6 +38,49 @@ def test_stt_selection_is_config_driven_and_key_flows_through_seam() -> None:
     engine = build_stt(_stt_config(), _credentials(), resolver)
     assert isinstance(engine, deepgram.STT)
     assert resolver.resolved == ["env://DEEPGRAM_API_KEY"]
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            STTConfig(provider="deepgram", model="nova-3"),
+            {
+                "model": "nova-3",
+                "api_key": "sk-test-dummy",
+                "numerals": False,
+            },
+        ),
+        (
+            STTConfig(
+                provider="deepgram",
+                model="nova-3",
+                numerals=True,
+                keyterms=["ORD"],
+            ),
+            {
+                "model": "nova-3",
+                "api_key": "sk-test-dummy",
+                "numerals": True,
+                "keyterm": ["ORD"],
+            },
+        ),
+    ],
+)
+def test_deepgram_tuning_is_forwarded_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    config: STTConfig,
+    expected: dict[str, object],
+) -> None:
+    received: dict[str, object] = {}
+
+    def record_stt(**kwargs):
+        received.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(stt_engine.deepgram, "STT", record_stt)
+    build_stt(config, _credentials(), RecordingResolver())
+    assert received == expected
 
 
 def test_tts_selection_is_config_driven_and_key_flows_through_seam() -> None:

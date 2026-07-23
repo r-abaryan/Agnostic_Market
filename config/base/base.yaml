@@ -50,6 +50,10 @@ _platform:
     contact_reask_ceiling: 2                    # most identity contact re-asks before a human
     auth_denials_ceiling: 3                     # latest a support-gate human offer may come
     tool_hops_ceiling: 8                        # longest frontline read-tool loop per turn
+    clarification_reask_ceiling:
+      identity: 2                               # missing verification contact: exit sooner
+      support: 4                                # room for multi-slot support requests
+      cart: 4                                   # bounded shopping help, never placement
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"
@@ -58,6 +62,10 @@ schema_version: "0.2"
 # template and merchant override; the safety lock above prevents either later layer changing it.
 policies:
   cancel_batch_max: 10
+  clarification_reask_max:
+    identity: 1
+    support: 2
+    cart: 2
 
 # Call-start AI disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1), applies 2 Aug 2026).
 # WORDING is merchant-overridable (brand/voice/locale); WHETHER it plays is code

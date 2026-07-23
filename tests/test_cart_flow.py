@@ -216,6 +216,22 @@ def test_cart_clarification_tool_schema_is_closed(config_root: Path) -> None:
     assert set(detail_schema["enum"]) == set(_CART_CLARIFICATION_LINES)
 
 
+def test_cart_prompt_routes_explicit_browsing_through_the_existing_leave_seam() -> None:
+    from agnostic_market.agents.cart.prompt import compose_cart_prompt
+    from agnostic_market.commerce.orders import Candidate
+
+    prompt = compose_cart_prompt(
+        "Acme Store",
+        [Candidate(key="1", sku="SKU-1", name="trail running shoes", price_usd=89.99)],
+        CartStore(),
+        _POLICY,
+    )
+
+    assert "mentions a product but gives no clear cart action" in prompt
+    assert "only browsing, comparing products, or asking what is available" in prompt
+    assert "call leave_cart" in prompt
+
+
 def test_cart_router_rejects_a_cross_flow_clarification(config_root: Path) -> None:
     graph, _, _ = _build(config_root)
     with pytest.raises(TypeError, match="non-cart clarification"):
@@ -245,6 +261,76 @@ async def test_cart_no_tool_prose_falls_back_to_code_authored_action_question(
     )
 
 
+async def test_repeated_cart_clarification_returns_to_frontline_without_mutation(
+    config_root: Path, tmp_path: Path
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False, text_response="Frontline fallback.")
+    graph, store, cart = _build(
+        config_root,
+        frontline=frontline,
+        reasoning=FakeChatModel(emit_tool_calls=False),
+    )
+    engine = ReasoningEngine(graph, thread_id="t1")
+
+    first = await _events(engine, "checkout now please")
+    second = await _events(engine, "What do you have?")
+    third = await _events(engine, "What products are available?")
+    exhausted = await _events(engine, "Can you show me the catalog?")
+
+    assert [event.node for event in first if isinstance(event, SpokenMessageEvent)] == [
+        "cart_clarify"
+    ]
+    assert [event.node for event in second if isinstance(event, SpokenMessageEvent)] == [
+        "cart_clarify"
+    ]
+    assert [event.node for event in third if isinstance(event, SpokenMessageEvent)] == [
+        "cart_clarify"
+    ]
+    assert [event.text for event in exhausted if isinstance(event, TokenEvent)] == [
+        "Frontline fallback."
+    ]
+    state = graph.get_state(_CFG).values
+    assert state.get("active_flow") == "left_cart"
+    assert state.get("pending_clarification") is None
+    assert state.get("clarification_progress") is None
+    assert cart.is_empty()
+    assert store.placed_count == 0
+    assert store.cancel_count == store.refund_count == store.return_count == 0
+    exhausted_events = [
+        line
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+        if '"event": "clarification_exhausted"' in line
+    ]
+    assert exhausted_events == [
+        '{"event": "clarification_exhausted", "flow": "cart", "consumed_reasks": 2, "limit": 2}'
+    ]
+
+
+async def test_valid_cart_mutation_clears_prior_clarification_progress(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("request_cart_clarification", {"detail": "item"})],
+            [("add_to_cart", {"candidate_key": "1", "quantity": 1})],
+        ]
+    )
+    graph, _, cart = _build(config_root, reasoning=reasoning)
+    engine = ReasoningEngine(graph, thread_id="t1")
+
+    await _events(engine, "checkout now please")
+    before = graph.get_state(_CFG).values
+    assert before["clarification_progress"].flow == "cart"
+    events = await _events(engine, "Add the first item.")
+
+    assert any(
+        isinstance(event, SpokenMessageEvent) and event.node == "cart_ack" for event in events
+    )
+    after = graph.get_state(_CFG).values
+    assert after.get("clarification_progress") is None
+    assert cart.line_count == 1
+
+
 async def test_two_malformed_cart_clarifications_are_paired_and_stay_sticky(
     config_root: Path,
 ) -> None:
@@ -259,7 +345,9 @@ async def test_two_malformed_cart_clarifications_are_paired_and_stay_sticky(
     events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
     _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
     assert reasoning.invoke_count == 2
-    _assert_tool_calls_paired(graph.get_state(_CFG).values)
+    state = graph.get_state(_CFG).values
+    _assert_tool_calls_paired(state)
+    assert state["clarification_progress"].reasks == 0
 
 
 @pytest.mark.parametrize(
@@ -631,7 +719,11 @@ async def test_barged_readback_reconfirms_before_placing(config_root: Path) -> N
     [_ async for _ in engine.stream_turn("buy it now", TurnFacts())]
     events = [e async for e in engine.stream_turn("yes", TurnFacts(readback_interrupted=True))]
     assert store.placed_count == 0
-    assert any(isinstance(e, InterruptEvent) and "yes or no" in e.prompt.lower() for e in events)
+    reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(reconfirms) == 1
+    assert "yes or no" in reconfirms[0].prompt.lower()
+    assert "2 waterproof rain jackets" in reconfirms[0].prompt
+    assert "$258.00" in reconfirms[0].prompt
     [_ async for _ in engine.stream_turn("yes", TurnFacts())]
     assert store.placed_count == 1
 
@@ -669,15 +761,81 @@ async def test_speakable_nodes_and_read_only_tools(config_root: Path) -> None:
     }
 
 
-async def test_unhandled_tool_fails_loud_not_silent_misroute(config_root: Path) -> None:
-    # The terminal guard: a tool name with no branch (here: a future tool the fake forces)
-    # must RAISE, not silently fall into the last branch (remove_from_cart) — a silent
-    # wrong-mutation is the worst debug class. force_tool bypasses bind_tools, so this
-    # simulates an 8th tool bound without a handler.
-    reasoning = _tool_fake("some_new_unhandled_tool", {"candidate_key": "1"})
-    graph, _, _ = _build(config_root, reasoning=reasoning)
-    with pytest.raises(ValueError, match="unhandled tool"):
-        await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+@pytest.mark.parametrize(
+    ("second_call", "unknown_results"),
+    [
+        ([("request_cart_clarification", {"detail": "action"})], 1),
+        ([("catalog_lookup", {"query": "trail shoes"})], 2),
+    ],
+)
+async def test_unknown_cart_tool_uses_bounded_correction_without_an_effect(
+    config_root: Path,
+    second_call: list[tuple[str, dict]],
+    unknown_results: int,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("catalog_lookup", {"query": "trail shoes"})],
+            second_call,
+        ]
+    )
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    engine = ReasoningEngine(graph, thread_id="t1")
+
+    events = await _events(engine, "checkout now please")
+
+    state = graph.get_state(_CFG).values
+    _assert_tool_calls_paired(state)
+    assert reasoning.invoke_count == 2
+    assert (
+        sum(
+            isinstance(message, ToolMessage)
+            and str(message.content).startswith("Unavailable action.")
+            for message in state["messages"]
+        )
+        == unknown_results
+    )
+    assert [
+        (event.node, event.text) for event in events if isinstance(event, SpokenMessageEvent)
+    ] == [("cart_clarify", _CART_CLARIFICATION_LINES["action"])]
+    assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
+    assert cart.is_empty()
+    assert store.placed_count == 0
+    assert store.cancel_count == store.refund_count == store.return_count == 0
+
+
+async def test_unknown_cart_browse_tool_can_correct_to_leave_and_frontline_answer(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("request_cart_clarification", {"detail": "action"})],
+            [("catalog_lookup", {"query": "trail shoes"})],
+            [("leave_cart", {})],
+        ]
+    )
+    frontline = FakeChatModel(
+        emit_tool_calls=False,
+        text_response="We have trail running shoes available.",
+    )
+    graph, store, cart = _build(config_root, frontline=frontline, reasoning=reasoning)
+    engine = ReasoningEngine(graph, thread_id="t1")
+    await _events(engine, "checkout now please")
+
+    events = await _events(engine, "I'm only asking what shoes are available.")
+
+    state = graph.get_state(_CFG).values
+    _assert_tool_calls_paired(state)
+    assert [event.text for event in events if isinstance(event, TokenEvent)] == [
+        "We have trail running shoes available."
+    ]
+    assert state.get("active_flow") == "left_cart"
+    assert state.get("clarification_progress") is None
+    assert reasoning.invoke_count == 3
+    assert frontline.invoke_count == 1
+    assert cart.is_empty()
+    assert store.placed_count == 0
+    assert store.cancel_count == store.refund_count == store.return_count == 0
 
 
 async def test_place_records_recent_order_context(config_root: Path) -> None:

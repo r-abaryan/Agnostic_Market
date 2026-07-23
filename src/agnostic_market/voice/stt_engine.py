@@ -18,8 +18,16 @@ from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.voice.credentials import VoiceEngineError, provider_api_key
 
+
+def _build_deepgram(cfg: STTConfig, api_key: str) -> stt.STT:
+    # keyterm is nova-3's supported bias mechanism (keywords is rejected on nova-3); pass it only
+    # when configured so an untuned merchant keeps the provider's prior runtime behavior.
+    extra = {"keyterm": list(cfg.keyterms)} if cfg.keyterms else {}
+    return deepgram.STT(model=cfg.model, api_key=api_key, numerals=cfg.numerals, **extra)
+
+
 _BUILDERS: dict[str, Callable[[STTConfig, str], stt.STT]] = {
-    "deepgram": lambda cfg, api_key: deepgram.STT(model=cfg.model, api_key=api_key),
+    "deepgram": _build_deepgram,
 }
 
 

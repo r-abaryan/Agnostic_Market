@@ -39,6 +39,7 @@ from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.state import (
     CartClarification,
+    ClarificationProgress,
     IdentityClarification,
     ReasoningState,
     SupportClarification,
@@ -333,21 +334,28 @@ def test_pending_clarification_rejects_cross_flow_detail() -> None:
         )
 
 
-async def test_pending_clarification_roundtrips_and_clears_at_fresh_entry(
+async def test_clarification_state_roundtrips_and_clears_without_an_active_owner(
     config_root: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     engine, _ = _engine(config_root, thread_id="clarification-hygiene")
     engine._graph.update_state(
         engine._config,
-        {"pending_clarification": SupportClarification(detail="order")},
+        {
+            "pending_clarification": SupportClarification(detail="order"),
+            "clarification_progress": ClarificationProgress(flow="support", reasks=1),
+        },
         as_node="__start__",
     )
     with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
         seeded = engine._graph.get_state(engine._config)
         assert seeded.values["pending_clarification"] == SupportClarification(detail="order")
+        assert seeded.values["clarification_progress"] == ClarificationProgress(
+            flow="support", reasks=1
+        )
         await _events(engine, "hello")
         finished = engine._graph.get_state(engine._config)
     assert finished.values.get("pending_clarification") is None
+    assert finished.values.get("clarification_progress") is None
     assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
 
 
