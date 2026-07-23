@@ -99,12 +99,10 @@ logger = logging.getLogger("agnostic_market.agents.frontline")
 _HANDOVER_TOOL_NAME = "request_handover"
 
 # Graph topology is the source of truth for model-authored speech provenance. Identity has
-# completed its 3b code-authored clarification migration and Support has completed 3c; Cart
-# retains compatibility speech permission until its own atomic migration.
+# Identity, Support, and Cart retain transactional execution/audit identity after their
+# code-authored clarification migrations, but only the frontline model may author model prose.
 TRANSACTIONAL_MODEL_NODES = frozenset({"cart_assemble", "support_assemble", "identity_assemble"})
-MODEL_SPEECH_NODES = frozenset({"model"}) | (
-    TRANSACTIONAL_MODEL_NODES - {"identity_assemble", "support_assemble"}
-)
+MODEL_SPEECH_NODES = frozenset({"model"})
 FRONTLINE_SPEAKABLE_NODES = frozenset(
     {
         "handover",
@@ -884,7 +882,7 @@ def build_frontline_graph(
             "place": "cart_guardrail",
             "ack": "cart_ack",
             "leave": "gate",  # model left; normal pipeline answers this same turn
-            "clarify": END,  # Cart keeps model-authored clarification until Milestone 3d.
+            "clarify": "cart_clarify",
         }[decision]
 
     def route_after_cart_guardrail(state: ReasoningState) -> str:
@@ -1132,6 +1130,7 @@ def build_frontline_graph(
     graph.add_node("enumeration_gate", enumeration_gate_node)
     graph.add_node("cart_assemble", cart.assemble)
     graph.add_node("cart_ack", cart.ack)
+    graph.add_node("cart_clarify", cart.clarify)
     graph.add_node("cart_guardrail", cart.guardrail)
     graph.add_node("cart_confirm", cart.confirm)
     graph.add_node("cart_place", cart.place)
@@ -1253,9 +1252,15 @@ def build_frontline_graph(
     graph.add_conditional_edges(
         "cart_assemble",
         route_after_cart_assemble,
-        {"gate": "gate", "cart_ack": "cart_ack", "cart_guardrail": "cart_guardrail", END: END},
+        {
+            "gate": "gate",
+            "cart_ack": "cart_ack",
+            "cart_clarify": "cart_clarify",
+            "cart_guardrail": "cart_guardrail",
+        },
     )
     graph.add_edge("cart_ack", END)
+    graph.add_edge("cart_clarify", END)
     graph.add_conditional_edges(
         "cart_guardrail",
         route_after_cart_guardrail,

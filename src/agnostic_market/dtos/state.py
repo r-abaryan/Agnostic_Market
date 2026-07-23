@@ -365,13 +365,16 @@ class SupportClarification(BaseModel):
     detail: SupportQuestionDetail | SupportAuthorizationDetail
 
 
+CartClarificationDetail = Literal["action", "item", "quantity"]
+
+
 class CartClarification(BaseModel):
     """Turn-scoped instruction for Cart's code-authored clarification renderer."""
 
     model_config = _FROZEN
 
     flow: Literal["cart"] = "cart"
-    detail: Literal["action", "item", "quantity"]
+    detail: CartClarificationDetail
 
 
 # Selector only: no caller value, target, authority, or multi-turn progress belongs here.
@@ -427,12 +430,10 @@ class ReasoningState(BaseModel):
     identity_claim_misses: int = 0
     active_flow: ActiveFlow | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
-    # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response). Kept
-    # OFF the assemble node because a speakable assemble double-speaks its streamed clarifies
-    # (engine speaks any texty AIMessage from a speakable node). Reset at entry_node like the
-    # left_* markers; cleared by cart_ack (clear-before-speak).
+    # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response).
+    # Separate from the closed clarification selector below because these lines carry dynamic
+    # cart contents/totals. Reset at entry_node; cleared by cart_ack (clear-before-speak).
     pending_ack: str | None = None
-    # Turn-scoped instruction for a flow-owned, code-authored clarification line. Milestone
-    # 3a establishes the typed channel and hygiene only; flows begin writing it atomically
-    # as their raw model speech authority is removed in 3b-3d.
+    # Turn-scoped instruction for a flow-owned, code-authored clarification line. Each
+    # transactional flow writes its own selector atomically as it yields to its renderer.
     pending_clarification: PendingClarification | None = None

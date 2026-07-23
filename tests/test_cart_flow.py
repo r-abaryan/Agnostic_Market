@@ -9,6 +9,7 @@ needed; the flow's reasoning fake then decides what happens inside (mutate / pla
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -16,8 +17,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
+from pydantic import ValidationError
 
 from agnostic_market.agents._copy import all_closes
+from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
@@ -35,13 +38,19 @@ from agnostic_market.commerce.orders import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
-from agnostic_market.dtos.events import InterruptEvent, TurnFacts
+from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
+from agnostic_market.dtos.state import SupportClarification
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _CFG = {"configurable": {"thread_id": "t1"}}
 _TEST_OTP = "482913"
+_CART_CLARIFICATION_LINES = {
+    "action": "What would you like to do with your cart?",
+    "item": "Which item would you like?",
+    "quantity": "How many would you like?",
+}
 
 
 def _tool_fake(name: str, args: dict, *, limit: int = 1) -> FakeChatModel:
@@ -53,8 +62,10 @@ def _tool_fake(name: str, args: dict, *, limit: int = 1) -> FakeChatModel:
 # on the same thread can also hand over if the test drives multiple entries.
 def _handover_frontline() -> FakeChatModel:
     return FakeChatModel(
-        force_tool="request_handover", tool_call_limit=99,
-        canned_args={"request_handover": {"destination": "checkout", "reason_code": "cart_write"}})
+        force_tool="request_handover",
+        tool_call_limit=99,
+        canned_args={"request_handover": {"destination": "checkout", "reason_code": "cart_write"}},
+    )
 
 
 def _build(
@@ -113,6 +124,49 @@ def _ai_texts(out) -> list[str]:
     return [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
 
 
+async def _events(engine: ReasoningEngine, text: str) -> list:
+    return [event async for event in engine.stream_turn(text, TurnFacts())]
+
+
+def _assert_tool_calls_paired(state: dict) -> None:
+    tool_use_ids = Counter(
+        call["id"]
+        for message in state["messages"]
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    )
+    tool_result_ids = Counter(
+        message.tool_call_id for message in state["messages"] if isinstance(message, ToolMessage)
+    )
+    assert tool_use_ids == tool_result_ids
+
+
+def _assert_cart_clarification(
+    graph, store: OrderStore, cart: CartStore, events: list, line: str
+) -> None:
+    assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
+    assert [
+        (event.node, event.text) for event in events if isinstance(event, SpokenMessageEvent)
+    ] == [("cart_clarify", line)]
+    snapshot = graph.get_state(_CFG)
+    state = snapshot.values
+    assert snapshot.next == ()
+    assert state.get("active_flow") == "cart"
+    assert state.get("pending_clarification") is None
+    for field in (
+        "pending_placement",
+        "pending_refund",
+        "pending_cancel",
+        "pending_return",
+        "pending_profile_change",
+        "pending_identity",
+    ):
+        assert state.get(field) is None
+    assert not snapshot.interrupts
+    assert cart.is_empty()
+    assert store.placed_count == 0
+
+
 async def _enter_cart(graph) -> None:
     """Enter the cart flow via the gate ('checkout now' -> cart_write -> cart flow)."""
     await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
@@ -134,6 +188,155 @@ def test_speak_quantity_pluralizes_without_x_or_double_s(qty, name, expected) ->
     result = speak_quantity(qty, name)
     assert result == expected
     assert " x " not in result
+
+
+# --- code-authored Cart clarification ----------------------------------------------------
+
+
+@pytest.mark.parametrize("detail", ("action", "item", "quantity"))
+async def test_cart_clarification_tool_selects_one_code_authored_line(
+    config_root: Path, detail: str
+) -> None:
+    reasoning = FakeChatModel(
+        force_tool="request_cart_clarification",
+        canned_args={"request_cart_clarification": {"detail": detail}},
+        tool_call_limit=1,
+    )
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES[detail])
+
+
+def test_cart_clarification_tool_schema_is_closed(config_root: Path) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    _build(config_root, reasoning=reasoning)
+    detail_schema = reasoning.bound_tools["request_cart_clarification"]["function"]["parameters"][
+        "properties"
+    ]["detail"]
+    assert set(detail_schema["enum"]) == set(_CART_CLARIFICATION_LINES)
+
+
+def test_cart_router_rejects_a_cross_flow_clarification(config_root: Path) -> None:
+    graph, _, _ = _build(config_root)
+    with pytest.raises(TypeError, match="non-cart clarification"):
+        graph.update_state(
+            _CFG,
+            {
+                "active_flow": "cart",
+                "pending_clarification": SupportClarification(detail="order"),
+            },
+            as_node="cart_assemble",
+        )
+
+
+async def test_cart_no_tool_prose_falls_back_to_code_authored_action_question(
+    config_root: Path,
+) -> None:
+    raw_model_text = "I added the item and placed your order."
+    reasoning = FakeChatModel(emit_tool_calls=False, text_response=raw_model_text)
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
+    assert reasoning.emitted_messages[0].content == raw_model_text
+    state = graph.get_state(_CFG).values
+    assert not any(
+        isinstance(message, AIMessage) and message.content == raw_model_text
+        for message in state["messages"]
+    )
+
+
+async def test_two_malformed_cart_clarifications_are_paired_and_stay_sticky(
+    config_root: Path,
+) -> None:
+    malformed = [
+        (
+            "request_cart_clarification",
+            {"detail": "item", "unexpected": "not allowed"},
+        )
+    ]
+    reasoning = FakeChatModel(scripted_calls=[malformed, malformed])
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
+    assert reasoning.invoke_count == 2
+    _assert_tool_calls_paired(graph.get_state(_CFG).values)
+
+
+@pytest.mark.parametrize(
+    ("proposal_model", "arguments"),
+    (
+        (
+            cart_flow._ProposeItem,
+            {"candidate_key": "1", "quantity": 1, "unexpected": True},
+        ),
+        (cart_flow._ProposeKey, {"candidate_key": "1", "unexpected": True}),
+        (
+            cart_flow._RequestCartClarification,
+            {"detail": "item", "unexpected": True},
+        ),
+    ),
+)
+def test_cart_proposal_models_reject_undeclared_fields(
+    proposal_model: type, arguments: dict
+) -> None:
+    with pytest.raises(ValidationError):
+        proposal_model.model_validate(arguments)
+
+
+@pytest.mark.parametrize("tool_name", ("add_to_cart", "buy_now"))
+async def test_malformed_item_proposal_cannot_reach_cart_or_placement(
+    config_root: Path, tool_name: str
+) -> None:
+    malformed = [
+        (
+            tool_name,
+            {"candidate_key": "1", "quantity": 1, "unexpected": "not allowed"},
+        )
+    ]
+    reasoning = FakeChatModel(scripted_calls=[malformed, malformed])
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
+    _assert_tool_calls_paired(graph.get_state(_CFG).values)
+
+
+async def test_clarification_leading_a_mutation_response_does_not_mutate(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                ("request_cart_clarification", {"detail": "item"}),
+                ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
+            ]
+        ]
+    )
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["item"])
+    _assert_tool_calls_paired(graph.get_state(_CFG).values)
+
+
+async def test_mutation_leading_a_clarification_response_keeps_batch_contract(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
+                ("request_cart_clarification", {"detail": "quantity"}),
+            ]
+        ]
+    )
+    graph, store, cart = _build(config_root, reasoning=reasoning)
+    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    assert cart.line_count == 1
+    assert store.placed_count == 0
+    assert not any(
+        isinstance(event, SpokenMessageEvent) and event.node == "cart_clarify" for event in events
+    )
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    _assert_tool_calls_paired(graph.get_state(_CFG).values)
 
 
 # --- mutation ack ------------------------------------------------------------------------
@@ -164,11 +367,15 @@ async def test_repeat_add_increments(config_root: Path) -> None:
 async def test_batch_adds_apply_all_with_one_ack(config_root: Path) -> None:
     # Live call #9 P3: "one from each" — the model emitted N add_to_cart calls and N-1 were
     # silently dropped. A mutation-led response must apply EVERY mutation, one combined ack.
-    reasoning = FakeChatModel(scripted_calls=[[
-        ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
-        ("add_to_cart", {"candidate_key": "2", "quantity": 1}),
-        ("add_to_cart", {"candidate_key": "3", "quantity": 1}),
-    ]])
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
+                ("add_to_cart", {"candidate_key": "2", "quantity": 1}),
+                ("add_to_cart", {"candidate_key": "3", "quantity": 1}),
+            ]
+        ]
+    )
     graph, _, cart = _build(config_root, reasoning=reasoning)
     out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     assert cart.line_count == 3
@@ -183,10 +390,14 @@ async def test_batch_adds_apply_all_with_one_ack(config_root: Path) -> None:
 async def test_batch_add_and_remove_combined_ack(config_root: Path) -> None:
     cart = CartStore()
     cart.add_item(sku="SKU-GRN-15", name="merino hiking socks", price_usd=14.50, quantity=1)
-    reasoning = FakeChatModel(scripted_calls=[[
-        ("add_to_cart", {"candidate_key": "2", "quantity": 1}),
-        ("remove_from_cart", {"candidate_key": "3"}),
-    ]])
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                ("add_to_cart", {"candidate_key": "2", "quantity": 1}),
+                ("remove_from_cart", {"candidate_key": "3"}),
+            ]
+        ]
+    )
     graph, _, _ = _build(config_root, reasoning=reasoning, cart=cart)
     out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     assert cart.line_count == 1  # socks removed, jacket added
@@ -198,10 +409,14 @@ async def test_batch_add_and_remove_combined_ack(config_root: Path) -> None:
 async def test_control_call_behind_mutations_is_answered_not_acted(config_root: Path) -> None:
     # go_to_checkout riding BEHIND adds: the mutations apply; the control call gets a
     # tool_result (F-4) but does NOT act — control intent must lead its own turn.
-    reasoning = FakeChatModel(scripted_calls=[[
-        ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
-        ("go_to_checkout", {}),
-    ]])
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
+                ("go_to_checkout", {}),
+            ]
+        ]
+    )
     graph, store, cart = _build(config_root, reasoning=reasoning)
     await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     state = graph.get_state(_CFG)
@@ -209,20 +424,18 @@ async def test_control_call_behind_mutations_is_answered_not_acted(config_root: 
     assert store.placed_count == 0
     assert state.values.get("pending_placement") is None
     assert not state.interrupts
-    tool_use_ids = {
-        c["id"] for m in state.values["messages"] if isinstance(m, AIMessage) for c in m.tool_calls
-    }
-    tool_result_ids = {
-        m.tool_call_id for m in state.values["messages"] if isinstance(m, ToolMessage)
-    }
-    assert tool_use_ids <= tool_result_ids  # nothing dangling in the persisted thread
+    _assert_tool_calls_paired(state.values)
 
 
 async def test_batch_with_invalid_key_applies_valid_and_says_so(config_root: Path) -> None:
-    reasoning = FakeChatModel(scripted_calls=[[
-        ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
-        ("add_to_cart", {"candidate_key": "99", "quantity": 1}),  # no such option
-    ]])
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                ("add_to_cart", {"candidate_key": "1", "quantity": 1}),
+                ("add_to_cart", {"candidate_key": "99", "quantity": 1}),  # no such option
+            ]
+        ]
+    )
     graph, _, cart = _build(config_root, reasoning=reasoning)
     out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     assert cart.line_count == 1  # the valid add landed
@@ -231,10 +444,12 @@ async def test_batch_with_invalid_key_applies_valid_and_says_so(config_root: Pat
 
 
 async def test_all_invalid_batch_gets_one_corrective_retry(config_root: Path) -> None:
-    reasoning = FakeChatModel(scripted_calls=[
-        [("add_to_cart", {"candidate_key": "99", "quantity": 1})],  # all invalid -> re-prompt
-        [("add_to_cart", {"candidate_key": "1", "quantity": 1})],  # corrected on retry
-    ])
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("add_to_cart", {"candidate_key": "99", "quantity": 1})],  # all invalid -> re-prompt
+            [("add_to_cart", {"candidate_key": "1", "quantity": 1})],  # corrected on retry
+        ]
+    )
     graph, _, cart = _build(config_root, reasoning=reasoning)
     await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     assert cart.line_count == 1
@@ -391,8 +606,9 @@ async def test_view_cart_read_is_answered_not_escalated(config_root: Path) -> No
     out = await graph.ainvoke({"messages": [HumanMessage("what's in my cart")]}, _CFG)
     assert _flow(graph) is None  # never entered a flow
     assert out.get("handover") is None
-    assert any(isinstance(m, ToolMessage) and "rain jacket" in str(m.content)
-               for m in out["messages"])
+    assert any(
+        isinstance(m, ToolMessage) and "rain jacket" in str(m.content) for m in out["messages"]
+    )
 
 
 # --- A10a structure ----------------------------------------------------------------------
@@ -409,7 +625,8 @@ async def test_place_replay_yields_the_same_single_order(config_root: Path) -> N
 
 async def test_barged_readback_reconfirms_before_placing(config_root: Path) -> None:
     graph, store, _ = _build(
-        config_root, reasoning=_tool_fake("buy_now", {"candidate_key": "2", "quantity": 2}))
+        config_root, reasoning=_tool_fake("buy_now", {"candidate_key": "2", "quantity": 2})
+    )
     engine = ReasoningEngine(graph, thread_id="t1")
     [_ async for _ in engine.stream_turn("buy it now", TurnFacts())]
     events = [e async for e in engine.stream_turn("yes", TurnFacts(readback_interrupted=True))]
@@ -421,27 +638,34 @@ async def test_barged_readback_reconfirms_before_placing(config_root: Path) -> N
 
 async def test_double_tool_call_response_is_fully_acked(config_root: Path) -> None:
     reasoning = FakeChatModel(
-        force_tool="buy_now", tool_call_limit=1, double_tool_calls=True,
-        canned_args={"buy_now": {"candidate_key": "1", "quantity": 1}})
+        force_tool="buy_now",
+        tool_call_limit=1,
+        double_tool_calls=True,
+        canned_args={"buy_now": {"candidate_key": "1", "quantity": 1}},
+    )
     graph, _, _ = _build(config_root, reasoning=reasoning)
     await graph.ainvoke({"messages": [HumanMessage("buy it now")]}, _CFG)
     state = graph.get_state(_CFG)
     assert state.interrupts  # flow still proceeded to the readback
-    tool_use_ids = {
-        c["id"] for m in state.values["messages"] if isinstance(m, AIMessage) for c in m.tool_calls
-    }
-    tool_result_ids = {
-        m.tool_call_id for m in state.values["messages"] if isinstance(m, ToolMessage)
-    }
-    assert tool_use_ids <= tool_result_ids  # nothing dangling in the persisted thread
+    _assert_tool_calls_paired(state.values)
 
 
 async def test_speakable_nodes_and_read_only_tools(config_root: Path) -> None:
     graph, _, _ = _build(config_root)
-    assert {"handover", "cart_ack", "cart_guardrail", "cart_confirm", "cart_place",
-            "cart_abort"} <= graph.speakable_nodes
+    assert {
+        "handover",
+        "cart_ack",
+        "cart_clarify",
+        "cart_guardrail",
+        "cart_confirm",
+        "cart_place",
+        "cart_abort",
+    } <= graph.speakable_nodes
     assert graph.frontline_read_only_tools == {
-        "order_status", "list_orders", "catalog_search", "view_cart",
+        "order_status",
+        "list_orders",
+        "catalog_search",
+        "view_cart",
     }
 
 
@@ -460,9 +684,7 @@ async def test_place_records_recent_order_context(config_root: Path) -> None:
     # Group C L4: a just-placed order becomes "the order most recently discussed".
     recent_orders = RecentOrderContext(max_refs=_POLICY.cancel_batch_max)
     reasoning = _tool_fake("buy_now", {"candidate_key": "2", "quantity": 1})
-    graph, _, _ = _build(
-        config_root, reasoning=reasoning, recent_orders=recent_orders
-    )
+    graph, _, _ = _build(config_root, reasoning=reasoning, recent_orders=recent_orders)
     await graph.ainvoke({"messages": [HumanMessage("buy it now")]}, _CFG)
     assert recent_orders.snapshot().focused_order_ref is None
     await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)

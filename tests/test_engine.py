@@ -359,6 +359,7 @@ async def test_pending_clarification_roundtrips_and_clears_at_fresh_entry(
 _SPEAKABLE = frozenset({"support_guardrail"})
 _ASSEMBLE_META = {"langgraph_node": "support_assemble"}
 _IDENTITY_ASSEMBLE_META = {"langgraph_node": "identity_assemble"}
+_CART_ASSEMBLE_META = {"langgraph_node": "cart_assemble"}
 _MODEL_META = {"langgraph_node": "model"}
 
 
@@ -371,18 +372,28 @@ def test_graph_declares_disjoint_code_and_model_speech_sources(config_root: Path
     engine, _ = _engine(config_root)
     graph = engine._graph
     assert graph.model_speech_nodes == MODEL_SPEECH_NODES
+    assert graph.model_speech_nodes == frozenset({"model"})
     assert frozenset(graph.nodes) >= MODEL_SPEECH_NODES
+    assert "cart_clarify" in graph.speakable_nodes
     assert "identity_ask_contact" in graph.speakable_nodes
     assert graph.speakable_nodes.isdisjoint(graph.model_speech_nodes)
 
 
 async def test_cart_clarification_never_routes_to_identity_contact(config_root: Path) -> None:
-    engine, _ = _engine(config_root, thread_id="cart-identity-isolation")
+    engine, _ = _engine(
+        config_root,
+        reasoning=FakeChatModel(emit_tool_calls=False, text_response="Untrusted Cart prose."),
+        thread_id="cart-identity-isolation",
+    )
     events = [event async for event in engine.stream_turn("checkout now please", _FACTS)]
     assert not any(
         isinstance(event, SpokenMessageEvent) and event.node == "identity_ask_contact"
         for event in events
     )
+    assert [
+        (event.node, event.text) for event in events if isinstance(event, SpokenMessageEvent)
+    ] == [("cart_clarify", "What would you like to do with your cart?")]
+    assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
     state = engine._graph.get_state(
         {"configurable": {"thread_id": "cart-identity-isolation"}}
     ).values
@@ -430,10 +441,9 @@ def test_unstreamed_answer_speaks_once() -> None:
     assert event.text == "Hello!"
 
 
-@pytest.mark.parametrize("node", ["model", "cart_assemble"])
-def test_3c_compatibility_sources_retain_plain_text(node: str) -> None:
+def test_approved_frontline_model_retains_plain_text_authority() -> None:
     speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
-    event = speech.feed(AIMessage(content="Current behavior.", id="m1"), {"langgraph_node": node})
+    event = speech.feed(AIMessage(content="Current behavior.", id="m1"), _MODEL_META)
     assert isinstance(event, TokenEvent)
 
 
@@ -549,6 +559,25 @@ def test_support_assemble_orphan_plain_text_is_not_caller_authoritative() -> Non
     """Live-call #18 target: orphaned Support prose loses authority in Milestone 3c."""
     speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     speech.feed(_chunk("Your order is cancelled.", "m1"), _ASSEMBLE_META)
+    assert list(speech.flush()) == []
+
+
+def test_cart_assemble_completed_plain_text_is_not_caller_authoritative() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Your order is placed.", "m1"), _CART_ASSEMBLE_META)
+    assert (
+        speech.feed(
+            AIMessage(content="Your order is placed.", id="m1"),
+            _CART_ASSEMBLE_META,
+        )
+        is None
+    )
+    assert list(speech.flush()) == []
+
+
+def test_cart_assemble_orphan_plain_text_is_not_caller_authoritative() -> None:
+    speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
+    speech.feed(_chunk("Your order is placed.", "m1"), _CART_ASSEMBLE_META)
     assert list(speech.flush()) == []
 
 

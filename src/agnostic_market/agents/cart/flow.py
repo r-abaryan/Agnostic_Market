@@ -15,11 +15,9 @@ snapshot) BEFORE the interrupt (A10a rule 2); `confirm` holds the interrupt(s) a
 effects; the §4a barged-readback re-confirm; the Clock-A TTL checked first; `place` is the
 sole post-interrupt effect, idempotent by the OrderStore key dedup.
 
-Why `cart_ack` is its OWN node (not authored in assemble): the engine speaks ANY texty
-AIMessage from a speakable node, and assemble ALSO streams its clarify questions — so a
-speakable assemble double-speaks every clarify. The code-authored in-flow lines (mutation
-acks, the review listing, the empty-cart response) travel via the turn-scoped `pending_ack`
-state field to the speakable `cart_ack` node, which speaks + clears them.
+`cart_assemble` never speaks. Dynamic mutation/review/empty-cart results travel through the
+turn-scoped `pending_ack` channel to `cart_ack`; closed clarification selectors travel through
+`pending_clarification` to `cart_clarify`. Each code-owned node speaks and clears its own channel.
 
 SKU discipline (unchanged from checkout): the model NEVER emits a SKU — it picks a candidate
 KEY; code resolves key → sku → name → price and does all arithmetic.
@@ -37,7 +35,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from agnostic_market.agents._consent import classify_consent
 from agnostic_market.agents._copy import warm_close
@@ -53,6 +51,8 @@ from agnostic_market.commerce.orders import (
 )
 from agnostic_market.dtos.confirmation import ToolConfirmationPolicy
 from agnostic_market.dtos.state import (
+    CartClarification,
+    CartClarificationDetail,
     CartLine,
     HandoffRequest,
     PendingPlacement,
@@ -72,6 +72,12 @@ PLACE_ORDER_POLICY = ToolConfirmationPolicy(
     confirm_fields=frozenset({"line_items", "total_amount"}),
     strength="explicit_yes",
 )
+
+_CART_CLARIFICATION_LINES: dict[CartClarificationDetail, str] = {
+    "action": "What would you like to do with your cart?",
+    "item": "Which item would you like?",
+    "quantity": "How many would you like?",
+}
 
 
 def _last_user_text(state: ReasoningState) -> str:
@@ -108,12 +114,22 @@ def _readback_line(pending: PendingPlacement, policy: ToolConfirmationPolicy) ->
 
 
 class _ProposeItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     candidate_key: str
     quantity: int
 
 
 class _ProposeKey(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     candidate_key: str
+
+
+class _RequestCartClarification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detail: CartClarificationDetail
 
 
 # Reversible cart mutations BATCH within one model response (live call #9 P3: "one from
@@ -133,12 +149,13 @@ class CartNodes:
 
     assemble: Callable[[ReasoningState], dict[str, object]]
     ack: Callable[[ReasoningState], dict[str, object]]
+    clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
     abort: Callable[[ReasoningState], dict[str, object]]
     escape_human: Callable[[ReasoningState], dict[str, object]]
-    # After assemble: "place" (guardrail) | "ack" (spoken ack) | "leave" (gate) | "clarify" (END).
+    # After assemble: "place" (guardrail) | "ack" | "leave" (gate) | "clarify".
     route_after_assemble: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
@@ -186,13 +203,26 @@ def build_cart_nodes(
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
+    def request_cart_clarification(detail: CartClarificationDetail) -> str:
+        """Ask one platform-authored Cart question for the selected missing detail."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    @tool
     def leave_cart() -> str:
         """Leave the cart flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     model = reasoning_model.bind_tools(
-        [add_to_cart, remove_from_cart, set_quantity, review_cart, buy_now, go_to_checkout,
-         leave_cart]
+        [
+            add_to_cart,
+            remove_from_cart,
+            set_quantity,
+            review_cart,
+            buy_now,
+            go_to_checkout,
+            request_cart_clarification,
+            leave_cart,
+        ]
     )
 
     def _resolve(candidate_key: str, candidates: list) -> object | None:
@@ -260,8 +290,10 @@ def build_cart_nodes(
         except ValueError:
             proposal = None
         chosen = _resolve(proposal.candidate_key, candidates) if proposal else None
-        if chosen is None or proposal.quantity < 0 or (
-            name == "add_to_cart" and proposal.quantity < 1
+        if (
+            chosen is None
+            or proposal.quantity < 0
+            or (name == "add_to_cart" and proposal.quantity < 1)
         ):
             fb = (
                 f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}; "
@@ -295,10 +327,19 @@ def build_cart_nodes(
         )
         return True
 
+    def _clarification_result(
+        new_messages: list, detail: CartClarificationDetail
+    ) -> dict[str, object]:
+        return {
+            "messages": new_messages,
+            "active_flow": "cart",
+            "pending_clarification": CartClarification(detail=detail),
+        }
+
     def assemble_node(state: ReasoningState) -> dict[str, object]:
-        """Model turn INSIDE the cart flow: mutate the cart, review it, place it, or leave.
-        NOT speakable — its clarify questions stream; code-authored acks go via `pending_ack`
-        to the speakable `cart_ack` node (a speakable assemble would double-speak clarifies).
+        """Model turn INSIDE the cart flow: mutate, review, place, clarify, or leave.
+        It is not caller-speakable. Code-authored acks use `pending_ack`; clarification uses
+        the typed selector rendered by `cart_clarify`.
 
         Reversible mutations BATCH (live call #9 P3: "one from each" emitted N adds and
         N-1 were silently dropped): when the response LEADS with a mutation, every mutation
@@ -311,9 +352,9 @@ def build_cart_nodes(
         new_messages: list = []
         for _attempt in range(2):  # one invalid proposal/batch gets ONE corrective re-prompt
             response = model.invoke(messages)
-            new_messages.append(response)
             if not response.tool_calls:
-                return {"messages": new_messages}  # clarifying question (streamed) — stay
+                return _clarification_result(new_messages, "action")
+            new_messages.append(response)
 
             if response.tool_calls[0]["name"] in _MUTATION_TOOLS:
                 added: list[CartLine] = []
@@ -348,6 +389,22 @@ def build_cart_nodes(
             call = response.tool_calls[0]
             name = call["name"]
 
+            if name == "request_cart_clarification":
+                try:
+                    clarification = _RequestCartClarification.model_validate(call["args"])
+                except ValueError:
+                    clarification = None
+                if clarification is None:
+                    new_messages.append(
+                        ToolMessage("Invalid clarification request.", tool_call_id=call["id"])
+                    )
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                new_messages.append(
+                    ToolMessage("cart clarification requested", tool_call_id=call["id"])
+                )
+                return _clarification_result(new_messages, clarification.detail)
+
             if name == "leave_cart":
                 new_messages.append(ToolMessage("left cart", tool_call_id=call["id"]))
                 write_event({"event": "cart_left", "reason": "left_flow"})
@@ -355,6 +412,7 @@ def build_cart_nodes(
                     "messages": new_messages,
                     "active_flow": "left_cart",
                     "pending_placement": None,
+                    "pending_clarification": None,
                 }
 
             if name == "review_cart":
@@ -362,8 +420,10 @@ def build_cart_nodes(
                 if cart_store.is_empty():
                     ack = "Your cart's empty right now - what would you like to add?"
                 else:
-                    ack = f"You've got {speak_lines(cart_store.view())} - " \
-                          f"that's ${cart_store.cart_total():.2f}. {warm_close()}"
+                    ack = (
+                        f"You've got {speak_lines(cart_store.view())} - "
+                        f"that's ${cart_store.cart_total():.2f}. {warm_close()}"
+                    )
                 return {"messages": new_messages, "pending_ack": ack}
 
             if name == "go_to_checkout":
@@ -384,18 +444,24 @@ def build_cart_nodes(
                     proposal = None
                 chosen = _resolve(proposal.candidate_key, candidates) if proposal else None
                 if chosen is None or proposal.quantity < 1:
-                    fb = (f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}; "
-                          "quantity must be a whole number >= 1.")
+                    fb = (
+                        f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}; "
+                        "quantity must be a whole number >= 1."
+                    )
                     new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
                     messages = [prompt, *state.messages, *new_messages]
                     continue
                 cart_store.add_item(
-                    sku=chosen.sku, name=chosen.name,
-                    price_usd=chosen.price_usd, quantity=proposal.quantity,
+                    sku=chosen.sku,
+                    name=chosen.name,
+                    price_usd=chosen.price_usd,
+                    quantity=proposal.quantity,
                 )
                 new_messages.append(
-                    ToolMessage(f"buy now {proposal.quantity} of {chosen.key}",
-                                tool_call_id=call["id"]))
+                    ToolMessage(
+                        f"buy now {proposal.quantity} of {chosen.key}", tool_call_id=call["id"]
+                    )
+                )
                 write_event({"event": "cart_item_added", "sku": chosen.sku, "reason": "buy_now"})
                 return {"messages": new_messages, **_mint_placement()}
 
@@ -404,9 +470,8 @@ def build_cart_nodes(
             # rather than silently misroute it into the last branch (a silent wrong-mutation).
             raise ValueError(f"cart assemble: unhandled tool {name!r}")
 
-        logger.warning("cart assemble: two invalid proposals; leaving flow")
-        write_event({"event": "cart_left", "reason": "invalid_proposals"})
-        return {"messages": new_messages, "active_flow": "left_cart", "pending_placement": None}
+        logger.warning("cart assemble: two invalid tool calls; asking for action in code")
+        return _clarification_result(new_messages, "action")
 
     def ack_node(state: ReasoningState) -> dict[str, object]:
         """Speak the code-authored in-flow line (mutation ack / review listing / empty-cart)
@@ -415,6 +480,16 @@ def build_cart_nodes(
         ack = state.pending_ack or warm_close()
         return {"pending_ack": None, "messages": [AIMessage(ack)]}
 
+    def clarify_node(state: ReasoningState) -> dict[str, object]:
+        clarification = state.pending_clarification
+        if not isinstance(clarification, CartClarification):
+            raise TypeError("cart clarify node requires CartClarification")
+        return {
+            "pending_clarification": None,
+            "active_flow": "cart",
+            "messages": [AIMessage(_CART_CLARIFICATION_LINES[clarification.detail])],
+        }
+
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
         """CODE-enforced policy on the WHOLE cart: order-value cap on the cart total +
         duplicate-order disambiguation (an identical live order this session flips the
@@ -422,15 +497,23 @@ def build_cart_nodes(
         pending = state.pending_placement
         assert pending is not None
         if pending.total_usd > policy.max_order_value_usd:
-            write_event({"event": "checkout_denied", "reason": "order_value_cap",
-                         "total": pending.total_usd})
+            write_event(
+                {
+                    "event": "checkout_denied",
+                    "reason": "order_value_cap",
+                    "total": pending.total_usd,
+                }
+            )
             return {
                 "pending_placement": None,
                 "active_flow": None,
-                "messages": [AIMessage(
-                    f"I'm sorry - that order comes to ${pending.total_usd:.2f}, which is more "
-                    "than I'm able to place on this call. Your cart's still saved if you'd "
-                    "like to change it.")],
+                "messages": [
+                    AIMessage(
+                        f"I'm sorry - that order comes to ${pending.total_usd:.2f}, which is more "
+                        "than I'm able to place on this call. Your cart's still saved if you'd "
+                        "like to change it."
+                    )
+                ],
             }
         dup = order_store.identical_cart_order(pending.lines)
         if dup is not None:
@@ -449,9 +532,12 @@ def build_cart_nodes(
             return {
                 "pending_placement": None,
                 "active_flow": None,
-                "messages": [AIMessage(
-                    "That confirmation sat for a while, so I haven't placed anything. Your "
-                    "cart's still saved - just tell me when you're ready.")],
+                "messages": [
+                    AIMessage(
+                        "That confirmation sat for a while, so I haven't placed anything. Your "
+                        "cart's still saved - just tell me when you're ready."
+                    )
+                ],
             }
         answer = interrupt(_readback_line(pending, PLACE_ORDER_POLICY))
         verdict = classify_consent(str(answer.get("text", "")))
@@ -459,7 +545,8 @@ def build_cart_nodes(
             second = "a SECOND order of " if pending.duplicate_of is not None else ""
             retry = interrupt(
                 f"Sorry - just to be clear: {second}{speak_lines(pending.lines)}, "
-                f"${pending.total_usd:.2f} total. Yes or no?")
+                f"${pending.total_usd:.2f} total. Yes or no?"
+            )
             verdict = classify_consent(str(retry.get("text", "")))
             if verdict != "yes":
                 verdict = "human" if verdict == "human" else "no"
@@ -468,17 +555,21 @@ def build_cart_nodes(
             return {
                 "pending_placement": None,
                 "active_flow": None,
-                "handover": HandoffRequest(destination="human", reason_code="other",
-                                           source="model"),
+                "handover": HandoffRequest(
+                    destination="human", reason_code="other", source="model"
+                ),
             }
         if verdict == "no":
             write_event({"event": "checkout_cancelled", "reason": "declined"})
             return {
                 "pending_placement": None,
                 "active_flow": None,
-                "messages": [AIMessage(
-                    "Okay, I won't place it - your cart's still saved if you want to change "
-                    "anything.")],
+                "messages": [
+                    AIMessage(
+                        "Okay, I won't place it - your cart's still saved if you want to change "
+                        "anything."
+                    )
+                ],
             }
         return {}  # yes: pending survives; the router sends us to place
 
@@ -488,17 +579,22 @@ def build_cart_nodes(
         pending = state.pending_placement
         assert pending is not None
         placed = order_store.place_cart(
-            pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd)
+            pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd
+        )
         cart_store.clear()
         recent_orders.record([placed.order_id], operation="place")
-        write_event({"event": "checkout_confirmed", "order_id": placed.order_id,
-                     "total": placed.total_usd})
+        write_event(
+            {"event": "checkout_confirmed", "order_id": placed.order_id, "total": placed.total_usd}
+        )
         return {
             "pending_placement": None,
             "active_flow": None,
-            "messages": [AIMessage(
-                f"Done - your order for {speak_lines(placed.lines)} is placed. Your order "
-                f"number is {placed.order_id}.")],
+            "messages": [
+                AIMessage(
+                    f"Done - your order for {speak_lines(placed.lines)} is placed. Your order "
+                    f"number is {placed.order_id}."
+                )
+            ],
         }
 
     def abort_node(state: ReasoningState) -> dict[str, object]:
@@ -508,6 +604,7 @@ def build_cart_nodes(
         kept = "" if cart_store.is_empty() else " Your cart's still saved."
         return {
             "pending_placement": None,
+            "pending_clarification": None,
             "active_flow": None,
             "messages": [AIMessage(f"No problem - I've dropped that.{kept}")],
         }
@@ -517,22 +614,28 @@ def build_cart_nodes(
         write_event({"event": "checkout_cancelled", "reason": "human_requested"})
         return {
             "pending_placement": None,
+            "pending_clarification": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
 
     def route_after_assemble(state: ReasoningState) -> str:
         if state.active_flow == "left_cart":
-            return "leave"  # model left / two invalid proposals -> normal pipeline answers
+            return "leave"  # explicit leave -> normal pipeline answers
         if state.pending_placement is not None:
             return "place"  # buy_now / go_to_checkout minted a placement
         if state.pending_ack is not None:
             return "ack"  # a mutation / review / empty-cart line to speak
-        return "clarify"  # a clarifying question was streamed; end the turn in-flow
+        if state.pending_clarification is not None:
+            if not isinstance(state.pending_clarification, CartClarification):
+                raise TypeError("cart assemble produced a non-cart clarification")
+            return "clarify"
+        raise RuntimeError("cart assemble produced no outcome")
 
     return CartNodes(
         assemble=assemble_node,
         ack=ack_node,
+        clarify=clarify_node,
         guardrail=guardrail_node,
         confirm=confirm_node,
         place=place_node,
@@ -540,6 +643,13 @@ def build_cart_nodes(
         escape_human=escape_human_node,
         route_after_assemble=route_after_assemble,
         speakable_nodes=frozenset(
-            {"cart_ack", "cart_guardrail", "cart_confirm", "cart_place", "cart_abort"}
+            {
+                "cart_ack",
+                "cart_clarify",
+                "cart_guardrail",
+                "cart_confirm",
+                "cart_place",
+                "cart_abort",
+            }
         ),
     )

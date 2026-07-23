@@ -2,7 +2,8 @@
 
 PROMPT ONLY — what the cart (reasoning-tier) model reads while turning a request into a cart
 tool call (`add_to_cart`/`remove_from_cart`/`set_quantity`/`review_cart`/`buy_now`/
-`go_to_checkout`/`leave_cart`). The model picks a KEY into the code-narrowed candidate list;
+`go_to_checkout`/`request_cart_clarification`/`leave_cart`). The model picks a KEY into the
+code-narrowed candidate list;
 it never authors a SKU, a price, or a total (those are code). Consent classification, the
 readback, the guardrail, and the cart mutations are CODE in flow.py, not here.
 
@@ -35,12 +36,14 @@ _CART_INSTRUCTIONS = (
     "- caller wants to buy ONE item right now: buy_now with the option number and quantity.\n"
     "- caller is done shopping / says checkout / place the order: go_to_checkout (this places "
     "the WHOLE cart; the total is read back for confirmation - never announce it yourself).\n"
-    "Every turn you either ACT or ASK: tool calls carry NO spoken text alongside them (the "
-    "system speaks the result - words like 'I'll add that' collide with it), OR one short "
-    "clarifying question when something is genuinely unclear. Cart changes (add/remove/"
-    "set_quantity) may be several calls in one turn, one per item; review_cart, buy_now, "
-    "go_to_checkout, and leave_cart are always ONE call on its own. NEVER narrate instead "
-    "of acting: alone, narration sounds like something happened when nothing did.\n"
+    "Every response contains tool calls and NO spoken text. Cart changes (add/remove/"
+    "set_quantity) may be several calls in one response, one per item. Every other response "
+    "contains exactly ONE call. When a required detail is missing, call "
+    "request_cart_clarification: detail='action' when the requested cart operation is unclear, "
+    "detail='item' when the product is unclear, or detail='quantity' when the amount is unclear. "
+    "The system asks the question. review_cart, buy_now, go_to_checkout, "
+    "request_cart_clarification, and leave_cart are always ONE call on their own. NEVER narrate "
+    "instead of acting: narration can sound like something happened when nothing did.\n"
     "If the conversation already shows an order PLACED (an order number was announced) and "
     "the caller says 'complete'/'finish' the purchase, there is nothing to complete - they "
     "mean the order they already have: call leave_cart (do NOT re-add or re-place it). If "
