@@ -83,17 +83,29 @@ class FakeChatModel(BaseChatModel):
     _script_index: int = PrivateAttr(default=0)
     _invoke_count: int = PrivateAttr(default=0)
     _seen_prompts: list[str] = PrivateAttr(default_factory=list)
+    _emitted_messages: list[AIMessage] = PrivateAttr(default_factory=list)
+    _bound_tools: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
 
     @property
     def invoke_count(self) -> int:
         return self._invoke_count
 
     @property
+    def emitted_messages(self) -> tuple[AIMessage, ...]:
+        return tuple(self._emitted_messages)
+
+    @property
+    def bound_tools(self) -> dict[str, dict[str, Any]]:
+        return dict(self._bound_tools)
+
+    @property
     def _llm_type(self) -> str:
         return "fake-conformance"
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Runnable:
-        return self.bind(tools=[convert_to_openai_tool(t) for t in tools], **kwargs)
+        converted = [convert_to_openai_tool(tool) for tool in tools]
+        self._bound_tools.update({schema["function"]["name"]: schema for schema in converted})
+        return self.bind(tools=converted, **kwargs)
 
     def _pick_tool(self, tools: list[dict[str, Any]], messages: list[BaseMessage]) -> str:
         names = [t["function"]["name"] for t in tools]
@@ -116,13 +128,15 @@ class FakeChatModel(BaseChatModel):
             scripted = self.scripted_calls[self._script_index]
             self._script_index += 1
             self._tool_calls_made += 1
-            return AIMessage(
+            response = AIMessage(
                 content="",
                 tool_calls=[
                     {"name": n, "args": a, "id": f"call_{i + 1}", "type": "tool_call"}
                     for i, (n, a) in enumerate(scripted)
                 ],
             )
+            self._emitted_messages.append(response)
+            return response
         budget_left = self.tool_call_limit is None or self._tool_calls_made < self.tool_call_limit
         if tools and self.emit_tool_calls and budget_left:
             self._tool_calls_made += 1
@@ -137,8 +151,12 @@ class FakeChatModel(BaseChatModel):
             ]
             if self.double_tool_calls:
                 calls.append({**calls[0], "id": "call_2"})
-            return AIMessage(content="", tool_calls=calls)
-        return AIMessage(content=self.text_response)
+            response = AIMessage(content="", tool_calls=calls)
+            self._emitted_messages.append(response)
+            return response
+        response = AIMessage(content=self.text_response)
+        self._emitted_messages.append(response)
+        return response
 
     def _generate(
         self,

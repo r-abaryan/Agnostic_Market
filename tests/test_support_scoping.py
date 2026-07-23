@@ -35,7 +35,7 @@ from agnostic_market.agents.support.flow import (
     _SUPPORT_NOT_FOUND_OFFER_HUMAN,
 )
 from agnostic_market.commerce.identity import BoundIdentity
-from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.orchestration import (
     CancelOrders,
     ExplicitOrderSet,
@@ -84,9 +84,7 @@ def _telemetry(tmp_path: Path) -> list[dict]:
 
 
 def _state_values(harness: SupportHarness, thread_id: str) -> dict:
-    return harness.engine._graph.get_state(
-        {"configurable": {"thread_id": thread_id}}
-    ).values
+    return harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
 
 
 def _active_flow(harness: SupportHarness, thread_id: str) -> str | None:
@@ -108,8 +106,7 @@ def _tool_messages(harness: SupportHarness, thread_id: str) -> list[ToolMessage]
 def _no_pendings(harness: SupportHarness, thread_id: str) -> bool:
     values = _state_values(harness, thread_id)
     return all(
-        values.get(f) is None
-        for f in ("pending_cancel", "pending_refund", "pending_return")
+        values.get(f) is None for f in ("pending_cancel", "pending_refund", "pending_return")
     )
 
 
@@ -120,6 +117,10 @@ def _no_details_spoken(events: list) -> bool:
         return False
     spoken = [e.text for e in events if isinstance(e, SpokenMessageEvent)]
     return not any("$" in t or "rain jacket" in t for t in spoken)
+
+
+def _spoken(events: list) -> list[tuple[str, str]]:
+    return [(event.node, event.text) for event in events if isinstance(event, SpokenMessageEvent)]
 
 
 # --- THE call-#15 pins: the support model never SEES unauthorized order data --------------
@@ -417,9 +418,7 @@ async def _drive_explicit_action_continuation(
         thread_id=thread_id,
         frontline=FakeChatModel(
             force_tool="request_handover",
-            canned_args={
-                "request_handover": {"destination": "support", "reason_code": "refund"}
-            },
+            canned_args={"request_handover": {"destination": "support", "reason_code": "refund"}},
             tool_call_limit=1,
         ),
     )
@@ -427,8 +426,7 @@ async def _drive_explicit_action_continuation(
     assert _state_values(h, thread_id).get("pending_request") is not None
     dispatched = await _events(h.engine, _CONTACT_1001)
     assert any(
-        isinstance(event, InterruptEvent) and "6-digit code" in event.prompt
-        for event in dispatched
+        isinstance(event, InterruptEvent) and "6-digit code" in event.prompt for event in dispatched
     )
     model_calls_before_continuation = reasoning._tool_calls_made
     old_thread_id = h.engine.thread_id
@@ -539,9 +537,7 @@ async def test_guest_batch_detours_to_identity(config_root: Path, tmp_path: Path
     assert any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
     assert _active_flow(h, "scope-batch-guest") == "identity"
-    assert any(
-        e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path)
-    )
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
 
 # --- a BOUND caller targeting a non-owned / unknown order: fail closed (existence-oracle) ----
@@ -564,8 +560,8 @@ async def test_bound_cross_customer_target_is_combined_not_found(
     assert h.store.cancel_count == 0
     assert _no_pendings(h, "scope-xcust")
     denied = [e for e in _telemetry(tmp_path) if e["event"] == "support_auth_denied"]
-    assert denied and denied[0].get("order_id") == "ORD-1001" and denied[0]["attempt"] == 1
-    assert any(m.content == _SUPPORT_COMBINED_NOT_FOUND for m in _tool_messages(h, "scope-xcust"))
+    assert denied == [{"event": "support_auth_denied", "attempt": 1}]
+    assert _spoken(events) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
 
 
 async def test_bound_unknown_order_id_is_combined_not_found_and_never_logged(
@@ -586,10 +582,10 @@ async def test_bound_unknown_order_id_is_combined_not_found_and_never_logged(
     assert _no_pendings(h, "scope-4")
     tel = _telemetry(tmp_path)
     denied = [e for e in tel if e["event"] == "support_auth_denied"]
-    assert denied and denied[0]["order_id_known"] is False and "order_id" not in denied[0]
+    assert denied == [{"event": "support_auth_denied", "attempt": 1}]
     for event in tel:
         assert not any(isinstance(v, str) and "ORD-9999" in v for v in event.values())
-    assert any(m.content == _SUPPORT_COMBINED_NOT_FOUND for m in _tool_messages(h, "scope-4"))
+    assert _spoken(events) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
 
 
 async def test_bound_second_denial_offers_human(config_root: Path, tmp_path: Path) -> None:
@@ -599,21 +595,16 @@ async def test_bound_second_denial_offers_human(config_root: Path, tmp_path: Pat
     cross = {"order_keys": ["ORD-1001"]}  # CUST-001's, not this bound CUST-002 caller's
     scripted = [
         [("propose_cancel", dict(cross))],
-        [],
         [("propose_cancel", dict(cross))],
-        [],
     ]
     h = _harness(config_root, FakeChatModel(scripted_calls=scripted), thread_id="scope-7")
     _bind_cust2(h)
-    await _events(h.engine, "cancel order ORD-1001")
-    await _events(h.engine, "yes really cancel it")
-    attempts = [
-        e["attempt"] for e in _telemetry(tmp_path) if e["event"] == "support_auth_denied"
-    ]
+    first = await _events(h.engine, "cancel order ORD-1001")
+    second = await _events(h.engine, "yes really cancel it")
+    attempts = [e["attempt"] for e in _telemetry(tmp_path) if e["event"] == "support_auth_denied"]
     assert attempts == [1, 2]
-    assert any(
-        m.content == _SUPPORT_NOT_FOUND_OFFER_HUMAN for m in _tool_messages(h, "scope-7")
-    )
+    assert _spoken(first) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
+    assert _spoken(second) == [("support_clarify", _SUPPORT_NOT_FOUND_OFFER_HUMAN)]
     assert _no_pendings(h, "scope-7")
 
 
@@ -621,7 +612,7 @@ async def test_bound_denial_offer_threshold_tracks_the_policy_knob(config_root: 
     # auth_denials_before_human_offer is config-driven: raised to 3, the 2nd denial still
     # speaks the plain combined-not-found (the human offer waits for the 3rd).
     cross = {"order_keys": ["ORD-1001"]}
-    scripted = [[("propose_cancel", dict(cross))], [], [("propose_cancel", dict(cross))], []]
+    scripted = [[("propose_cancel", dict(cross))], [("propose_cancel", dict(cross))]]
     h = _harness(
         config_root,
         FakeChatModel(scripted_calls=scripted),
@@ -629,11 +620,186 @@ async def test_bound_denial_offer_threshold_tracks_the_policy_knob(config_root: 
         policy=_POLICY.model_copy(update={"auth_denials_before_human_offer": 3}),
     )
     _bind_cust2(h)
-    await _events(h.engine, "cancel order ORD-1001")
-    await _events(h.engine, "yes really cancel it")
-    msgs = [m.content for m in _tool_messages(h, "scope-denial3")]
-    assert msgs.count(_SUPPORT_COMBINED_NOT_FOUND) == 2  # both denials plain
-    assert _SUPPORT_NOT_FOUND_OFFER_HUMAN not in msgs  # the offer has NOT come yet
+    first = await _events(h.engine, "cancel order ORD-1001")
+    second = await _events(h.engine, "yes really cancel it")
+    assert _spoken(first) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
+    assert _spoken(second) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "utterance"),
+    [
+        (
+            "propose_cancel",
+            {"order_keys": ["ORD-1001"]},
+            "cancel order ORD-1001",
+        ),
+        (
+            "propose_return",
+            {"order_key": "ORD-1001"},
+            "return order ORD-1001",
+        ),
+        (
+            "propose_refund",
+            {
+                "order_key": "ORD-1001",
+                "amount_usd": 10.0,
+                "destination": "original",
+            },
+            "refund ten dollars on order ORD-1001 to my original payment method",
+        ),
+    ],
+)
+async def test_one_caller_turn_consumes_at_most_one_order_denial(
+    config_root: Path,
+    tmp_path: Path,
+    tool_name: str,
+    arguments: dict[str, object],
+    utterance: str,
+) -> None:
+    repeated = [(tool_name, dict(arguments))]
+    reasoning = FakeChatModel(scripted_calls=[repeated, repeated])
+    thread_id = f"one-denial-{tool_name}"
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {
+                "destination": "support",
+                "reason_code": "cancel_order" if tool_name == "propose_cancel" else "refund",
+            }
+        },
+        tool_call_limit=1,
+    )
+    harness = _harness(
+        config_root,
+        reasoning,
+        thread_id=thread_id,
+        frontline=frontline,
+    )
+    _bind_cust2(harness)
+
+    first = await _events(harness.engine, utterance)
+
+    assert reasoning.invoke_count == 1
+    assert [
+        event["attempt"]
+        for event in _telemetry(tmp_path)
+        if event["event"] == "support_auth_denied"
+    ] == [1]
+    assert _spoken(first) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
+    assert not any(isinstance(event, TokenEvent) for event in first)
+    assert _active_flow(harness, thread_id) == "support"
+    assert _no_pendings(harness, thread_id)
+    assert (
+        harness.store.cancel_count == harness.store.return_count == harness.store.refund_count == 0
+    )
+
+    second = await _events(harness.engine, "Please try that order again")
+
+    assert reasoning.invoke_count == 2
+    assert [
+        event["attempt"]
+        for event in _telemetry(tmp_path)
+        if event["event"] == "support_auth_denied"
+    ] == [1, 2]
+    assert _spoken(second) == [("support_clarify", _SUPPORT_NOT_FOUND_OFFER_HUMAN)]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "utterance"),
+    [
+        (
+            "propose_cancel",
+            {"order_keys": ["ORD-1002"]},
+            "cancel my order",
+        ),
+        (
+            "propose_return",
+            {"order_key": "ORD-1002"},
+            "return my order",
+        ),
+        (
+            "propose_refund",
+            {
+                "order_key": "ORD-1002",
+                "amount_usd": 10.0,
+                "destination": "original",
+            },
+            "refund ten dollars to my original payment method",
+        ),
+    ],
+)
+async def test_unbound_model_only_order_target_asks_for_caller_stated_number(
+    config_root: Path,
+    tool_name: str,
+    arguments: dict[str, object],
+    utterance: str,
+) -> None:
+    reasoning = FakeChatModel(
+        force_tool=tool_name,
+        canned_args={tool_name: arguments},
+        tool_call_limit=99,
+    )
+    thread_id = f"missing-stated-{tool_name}"
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {
+                "destination": "support",
+                "reason_code": "cancel_order" if tool_name == "propose_cancel" else "refund",
+            }
+        },
+        tool_call_limit=1,
+    )
+    harness = _harness(
+        config_root,
+        reasoning,
+        thread_id=thread_id,
+        frontline=frontline,
+    )
+
+    events = await _events(harness.engine, utterance)
+
+    assert reasoning.invoke_count == 1
+    assert _spoken(events) == [
+        ("support_clarify", "What is the order number, for example ORD-1234?")
+    ]
+    assert not any(isinstance(event, (TokenEvent, InterruptEvent)) for event in events)
+    state = _state_values(harness, thread_id)
+    assert state["active_flow"] == "support"
+    assert state.get("pending_request") is None
+    assert state.get("pending_clarification") is None
+    assert harness.identity.current() is None
+    assert harness.otp.dispatch_count == 0
+    assert _no_pendings(harness, thread_id)
+
+
+async def test_cancel_batch_authorizes_all_targets_before_minting_any_pending(
+    config_root: Path, tmp_path: Path
+) -> None:
+    reasoning = FakeChatModel(
+        force_tool="propose_cancel",
+        canned_args={"propose_cancel": {"order_keys": ["ORD-1002", "ORD-1001"]}},
+        tool_call_limit=99,
+    )
+    thread_id = "cancel-partial-denied"
+    harness = _harness(config_root, reasoning, thread_id=thread_id)
+    _bind_cust2(harness)
+
+    events = await _events(
+        harness.engine,
+        "cancel order ORD-1002 and order ORD-1001",
+    )
+
+    assert reasoning.invoke_count == 1
+    assert _spoken(events) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
+    assert [
+        event["attempt"]
+        for event in _telemetry(tmp_path)
+        if event["event"] == "support_auth_denied"
+    ] == [1]
+    assert _state_values(harness, thread_id).get("pending_cancel") is None
+    assert harness.store.cancel_count == 0
 
 
 # --- fast paths: session-placed / bound owner (rung-2 sails, no detour) --------------------
@@ -666,8 +832,7 @@ async def test_session_placed_order_needs_no_verification(
     assert not any(e["event"].startswith("support_auth_") for e in tel)
     assert not any(e["event"] == "support_action_needs_identity" for e in tel)
     assert any(
-        e["event"] == "support_action_authorized" and e["order_id"] == placed.order_id
-        for e in tel
+        e["event"] == "support_action_authorized" and e["order_id"] == placed.order_id for e in tel
     )
 
 
@@ -689,9 +854,7 @@ async def test_bound_identity_owned_sails_non_owned_detours_or_denies(
     h1.identity.bind(bound)
     e1 = await _events(h1.engine, "I need to return this order")
     assert any(isinstance(e, InterruptEvent) for e in e1)
-    assert not any(
-        e["event"].startswith("support_auth_") for e in _telemetry(tmp_path)
-    )
+    assert not any(e["event"].startswith("support_auth_") for e in _telemetry(tmp_path))
 
 
 async def test_rung1_read_grant_does_not_authorize_a_mutation(
@@ -714,9 +877,7 @@ async def test_rung1_read_grant_does_not_authorize_a_mutation(
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
     assert _active_flow(h, "scope-11") == "identity"
-    assert any(
-        e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path)
-    )
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
 
 # --- the KEY steer-leak pins (the reason the gate sits at assemble) -----------------------
@@ -760,7 +921,9 @@ async def test_shipped_refund_return_steer_does_not_leak_for_unauthorized_order(
             force_tool="propose_refund",
             canned_args={
                 "propose_refund": {
-                    "order_key": "ORD-1001", "amount_usd": 150.0, "destination": "original"
+                    "order_key": "ORD-1001",
+                    "amount_usd": 150.0,
+                    "destination": "original",
                 }
             },
             tool_call_limit=1,
@@ -769,9 +932,7 @@ async def test_shipped_refund_return_steer_does_not_leak_for_unauthorized_order(
     )
     events = await _events(h.engine, "Refund $150 for order ORD-1001 to my original card")
     assert not any(isinstance(e, InterruptEvent) for e in events)
-    assert not any(
-        "$" in e.text for e in events if isinstance(e, SpokenMessageEvent)
-    )
+    assert not any("$" in e.text for e in events if isinstance(e, SpokenMessageEvent))
     assert _no_pendings(h, "scope-13")
     tel = _telemetry(tmp_path)
     assert not any(e["event"] == "refund_steered_to_return" for e in tel)
@@ -793,10 +954,7 @@ async def test_return_gated_at_assemble(config_root: Path, tmp_path: Path) -> No
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert _no_pendings(h, "scope-14")
     assert h.store.return_count == 0
-    assert any(
-        e["event"] == "support_action_needs_identity"
-        for e in _telemetry(tmp_path)
-    )
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
 
 # --- scope boundaries + PII ----------------------------------------------------------------
@@ -827,9 +985,7 @@ def _profile_harness(
     )
 
 
-async def test_profile_change_not_gated_by_order_scope(
-    config_root: Path, tmp_path: Path
-) -> None:
+async def test_profile_change_not_gated_by_order_scope(config_root: Path, tmp_path: Path) -> None:
     # Profile changes target the ACCOUNT (L2 step-up on the old factor), not an order — the
     # ORDER gate never runs. A BOUND caller (Fix 5 M-B: profile requires a bound identity) whose
     # customer has a profile proceeds; the OTP dispatch proves the flow was not order-gated.
@@ -852,18 +1008,24 @@ async def test_unbound_profile_change_detours_to_identity(
     assert _active_flow(h, "scope-prof-unbound") == "identity"
     assert h.otp.dispatch_count == 0  # no profile OTP — we're verifying identity first
     assert h.profile.change_count == 0
-    assert any(
-        e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path)
-    )
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
 
 async def test_model_only_profile_value_cannot_cross_identity(config_root: Path) -> None:
     h = _profile_harness(config_root, thread_id="scope-prof-model-value")
-    await _events(h.engine, "I have a new phone number for my account")
+    events = await _events(h.engine, "I have a new phone number for my account")
     state = _state_values(h, "scope-prof-model-value")
+    assert _spoken(events) == [
+        (
+            "support_clarify",
+            "What new delivery address or contact number would you like to use?",
+        )
+    ]
+    assert not any(isinstance(event, TokenEvent) for event in events)
     assert state.get("pending_request") is None
     assert state.get("pending_profile_change") is None
-    assert state.get("active_flow") != "identity"
+    assert state.get("active_flow") == "support"
+    assert state.get("pending_clarification") is None
     assert h.otp.dispatch_count == 0
     assert h.profile.change_count == 0
 
@@ -932,8 +1094,6 @@ async def test_needs_identity_detour_never_echoes_a_contact(
     )
     await _events(h.engine, "cancel order ORD-1002")
     for event in _telemetry(tmp_path):
-        assert not any(
-            isinstance(v, str) and _CONTACT_1002 in v for v in event.values()
-        )
+        assert not any(isinstance(v, str) and _CONTACT_1002 in v for v in event.values())
     tool_msgs = _tool_messages(h, "scope-16")
     assert not any(_CONTACT_1002 in str(m.content) for m in tool_msgs)

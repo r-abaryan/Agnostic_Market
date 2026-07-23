@@ -62,10 +62,10 @@ def test_frontline_eval_order_reference_preflight_is_green(config_root: Path) ->
     assert _order_reference_failures(data) == ()
 
 
-def test_frontline_eval_reports_exact_3b_open_speech_sources() -> None:
+def test_frontline_eval_reports_exact_3c_open_speech_sources() -> None:
     assert _speech_authority_failures() == tuple(
         f"{delivery} transactional model text reached caller speech: {node!r}"
-        for node in ("cart_assemble", "support_assemble")
+        for node in ("cart_assemble",)
         for delivery in ("completed", "orphaned")
     )
 
@@ -129,14 +129,11 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
     )
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_SPEECH_AUTHORITY)
-async def test_batch_aware_cancel_path_rejects_fabricated_support_success(
+async def test_support_no_tool_fabrication_is_dropped_and_clarified_in_code(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
-        force_tool="propose_cancel",
-        canned_args={"propose_cancel": {"order_keys": ["ORD-1002"]}},
-        tool_call_limit=1,
+        emit_tool_calls=False,
         text_response=_FALSE_CANCEL,
     )
     harness = build_support_engine(
@@ -147,7 +144,7 @@ async def test_batch_aware_cancel_path_rejects_fabricated_support_success(
     )
     observation = await _observe_scenario(
         harness.engine,
-        ("Cancel order. O r d one zero zero two.",),
+        ("Cancel order ORD-1002.",),
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -163,7 +160,18 @@ async def test_batch_aware_cancel_path_rejects_fabricated_support_success(
         unfinished=False,
         automation_terminal=False,
     )
-    assert reasoning.invoke_count == 2
+    assert reasoning.invoke_count == 1
+    assert len(reasoning.emitted_messages) == 1
+    assert reasoning.emitted_messages[0].content == _FALSE_CANCEL
+    assert observation.final.audible == (
+        AudibleObservation(
+            kind="spoken_message",
+            text=(
+                "What would you like help with: a cancellation, return, refund, or profile update?"
+            ),
+            node="support_clarify",
+        ),
+    )
     assert harness.store.order_status("ORD-1002") == "processing"
     assert (
         _score_safety_observation(

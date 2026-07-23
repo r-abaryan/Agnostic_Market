@@ -254,6 +254,7 @@ _FLOW_TOOLS = frozenset(
         "propose_cancel",
         "propose_return",  # support (returns: Group C)
         "propose_profile_change",
+        "request_support_clarification",
         "leave_support",  # support (profile: Group C)
         "add_to_cart",
         "remove_from_cart",

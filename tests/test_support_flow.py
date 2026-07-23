@@ -16,6 +16,7 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
+from pydantic import ValidationError
 from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents.engine import ReasoningEngine
@@ -238,9 +239,7 @@ _CANCEL_SHIPPED = {"propose_cancel": {"order_keys": ["1"]}}  # ORD-1001, shipped
 def _cancel_engine(config_root, args, *, thread_id, risk_flagged=False):
     return _engine(
         config_root,
-        reasoning=FakeChatModel(
-            force_tool=next(iter(args)), canned_args=args, tool_call_limit=1
-        ),
+        reasoning=FakeChatModel(force_tool=next(iter(args)), canned_args=args, tool_call_limit=1),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
     )
@@ -521,8 +520,11 @@ async def test_batch_cancel_dedups_repeated_key(config_root: Path) -> None:
 async def test_batch_cancel_over_cap_asks_to_narrow(config_root: Path) -> None:
     # cancel_batch_max=1, a two-order batch: no void, ask the caller to narrow (never first-N).
     engine, store = _batch_engine(
-        config_root, ["2", "4"], thread_id="batch-5",
-        policy=make_policy(cancel_batch_max=1), place_second=True,
+        config_root,
+        ["2", "4"],
+        thread_id="batch-5",
+        policy=make_policy(cancel_batch_max=1),
+        place_second=True,
     )
     events = await _events(engine, "cancel both of my orders")
     assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback
@@ -590,8 +592,7 @@ async def test_engine_recovers_cancel_after_write_before_checkpoint(
     failed = await _events(engine, "yes")
     assert store.cancel_count == 1
     assert any(
-        isinstance(event, SpokenMessageEvent) and event.node == "turn_fallback"
-        for event in failed
+        isinstance(event, SpokenMessageEvent) and event.node == "turn_fallback" for event in failed
     )
 
     recovered = await _events(engine, "please try that again")
@@ -656,9 +657,7 @@ def _scope_engine(
     ]
     harness = build_support_engine(
         config_root,
-        policy=make_policy(
-            otp_max_attempts=otp_max, cancel_batch_max=cancel_batch_max
-        ),
+        policy=make_policy(otp_max_attempts=otp_max, cancel_batch_max=cancel_batch_max),
         frontline=frontline,
         reasoning=FakeChatModel(scripted_calls=scripted),
         risk_flagged=risk_flagged,
@@ -700,9 +699,7 @@ async def test_guest_context_warning_decline_preserves_guest_state(config_root: 
     declined = await _events(h.engine, "no")
 
     assert any(
-        "won't start" in event.text
-        for event in declined
-        if isinstance(event, SpokenMessageEvent)
+        "won't start" in event.text for event in declined if isinstance(event, SpokenMessageEvent)
     )
     assert h.engine.thread_id == old_thread_id
     assert h.identity.current() is None
@@ -730,9 +727,7 @@ async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root:
     assert "ORD-9001" not in interrupts[0].prompt
     assert h.engine.thread_id != old_thread_id
     assert h.engine.pending_interrupt()
-    assert h.engine._graph.get_state(
-        {"configurable": {"thread_id": old_thread_id}}
-    ).values == {}
+    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
     assert h.store.cancel_count == 0  # nothing voided before consent
     await _events(h.engine, "yes")
     assert h.store.cancel_count == 1
@@ -779,9 +774,7 @@ async def test_cancel_both_scope_with_more_than_two_asks_to_narrow(config_root: 
 
 
 async def test_cancel_both_scope_with_one_candidate_is_truthful(config_root: Path) -> None:
-    h = _scope_engine(
-        config_root, scope="both_cancellable", thread_id="mb-one", bound=True
-    )
+    h = _scope_engine(config_root, scope="both_cancellable", thread_id="mb-one", bound=True)
     h.store.cancel_order("already-done", order_id="ORD-1002")
     events = await _events(h.engine, "cancel both of my orders")
     assert not any(isinstance(event, InterruptEvent) for event in events)
@@ -794,14 +787,10 @@ async def test_cancel_both_scope_with_one_candidate_is_truthful(config_root: Pat
 
 
 async def test_cancel_all_exactly_cap_plus_one_never_truncates(config_root: Path) -> None:
-    h = _scope_engine(
-        config_root, thread_id="mb-cap-plus-one", bound=True, cancel_batch_max=1
-    )
+    h = _scope_engine(config_root, thread_id="mb-cap-plus-one", bound=True, cancel_batch_max=1)
     events = await _events(h.engine, "cancel all my orders")
     assert not any(isinstance(event, InterruptEvent) for event in events)
-    spoken = " ".join(
-        event.text for event in events if isinstance(event, SpokenMessageEvent)
-    )
+    spoken = " ".join(event.text for event in events if isinstance(event, SpokenMessageEvent))
     assert "up to 1" in spoken
     assert h.store.cancel_count == 0
     assert _pending_cancel(h, "mb-cap-plus-one") is None
@@ -1205,8 +1194,198 @@ async def test_cancel_phrase_while_sticky_in_support_reaches_the_model(
     events = await _events(engine, "yeah cancel it")
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert not any("dropped that" in e.text for e in spoken)  # abort did NOT fire
-    assert any(isinstance(e, TokenEvent) for e in events)  # the model answered instead
+    assert not any(isinstance(e, TokenEvent) for e in events)
+    assert [(e.node, e.text) for e in spoken] == [
+        (
+            "support_clarify",
+            "What would you like help with: a cancellation, return, refund, or profile update?",
+        )
+    ]
     assert store.cancel_count == 0  # and nothing was silently voided either
+
+
+@pytest.mark.parametrize(
+    ("detail", "line"),
+    [
+        (
+            "action",
+            "What would you like help with: a cancellation, return, refund, or profile update?",
+        ),
+        ("order", "What is the order number, for example ORD-1234?"),
+        ("amount", "What amount would you like refunded?"),
+        (
+            "refund_destination",
+            "Should the refund go back to the original payment method?",
+        ),
+        (
+            "profile_field",
+            "Would you like to update your delivery address or contact number?",
+        ),
+        (
+            "profile_value",
+            "What new delivery address or contact number would you like to use?",
+        ),
+    ],
+)
+async def test_support_clarification_tool_selects_one_code_authored_line(
+    config_root: Path, detail: str, line: str
+) -> None:
+    reasoning = FakeChatModel(
+        force_tool="request_support_clarification",
+        canned_args={"request_support_clarification": {"detail": detail}},
+        tool_call_limit=1,
+    )
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id=f"support-clarify-{detail}",
+    )
+
+    events = await _events(engine, "I need help with a refund")
+
+    assert reasoning.invoke_count == 1
+    assert not any(isinstance(e, TokenEvent) for e in events)
+    assert [(e.node, e.text) for e in events if isinstance(e, SpokenMessageEvent)] == [
+        ("support_clarify", line)
+    ]
+    state = engine._graph.get_state(
+        {"configurable": {"thread_id": f"support-clarify-{detail}"}}
+    ).values
+    assert state["active_flow"] == "support"
+    assert state.get("pending_clarification") is None
+    assert store.refund_count == store.return_count == store.cancel_count == 0
+
+
+def test_support_clarification_tool_schema_excludes_code_only_outcomes(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id="support-clarify-schema",
+    )
+
+    detail_schema = reasoning.bound_tools["request_support_clarification"]["function"][
+        "parameters"
+    ]["properties"]["detail"]
+    assert set(detail_schema["enum"]) == {
+        "action",
+        "order",
+        "amount",
+        "refund_destination",
+        "profile_field",
+        "profile_value",
+    }
+    assert "order_match" not in detail_schema["enum"]
+    assert "order_match_human_help" not in detail_schema["enum"]
+
+
+async def test_support_no_tool_prose_falls_back_to_code_authored_action_question(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        emit_tool_calls=False,
+        text_response="I already cancelled that order.",
+    )
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id="support-clarify-no-tool",
+    )
+
+    events = await _events(engine, "I need a refund")
+
+    assert reasoning.invoke_count == 1
+    assert not any(isinstance(e, TokenEvent) for e in events)
+    assert [(e.node, e.text) for e in events if isinstance(e, SpokenMessageEvent)] == [
+        (
+            "support_clarify",
+            "What would you like help with: a cancellation, return, refund, or profile update?",
+        )
+    ]
+    state = engine._graph.get_state(
+        {"configurable": {"thread_id": "support-clarify-no-tool"}}
+    ).values
+    assert not any(
+        isinstance(message, AIMessage) and message.content == reasoning.text_response
+        for message in state["messages"]
+    )
+    assert store.refund_count == store.return_count == store.cancel_count == 0
+
+
+async def test_support_two_malformed_clarification_calls_are_paired_then_fall_back(
+    config_root: Path,
+) -> None:
+    malformed = [
+        (
+            "request_support_clarification",
+            {"detail": "order", "unexpected": "not allowed"},
+        )
+    ]
+    reasoning = FakeChatModel(scripted_calls=[malformed, malformed])
+    thread_id = "support-clarify-malformed"
+    engine, store, _, _ = _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id=thread_id,
+    )
+
+    events = await _events(engine, "I need a refund")
+
+    assert reasoning.invoke_count == 2
+    assert [(e.node, e.text) for e in events if isinstance(e, SpokenMessageEvent)] == [
+        (
+            "support_clarify",
+            "What would you like help with: a cancellation, return, refund, or profile update?",
+        )
+    ]
+    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    tool_use_ids = {
+        call["id"]
+        for message in state["messages"]
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in state["messages"] if isinstance(message, ToolMessage)
+    }
+    assert tool_use_ids == tool_result_ids
+    assert state["active_flow"] == "support"
+    assert store.refund_count == store.return_count == store.cancel_count == 0
+
+
+@pytest.mark.parametrize(
+    ("proposal_model", "arguments"),
+    [
+        (
+            support_flow._ProposeRefund,
+            {
+                "order_key": "1",
+                "amount_usd": 10.0,
+                "destination": "original",
+                "unexpected": True,
+            },
+        ),
+        (
+            support_flow._ProposeCancel,
+            {"order_keys": ["1"], "unexpected": True},
+        ),
+        (
+            support_flow._ProposeReturn,
+            {"order_key": "1", "unexpected": True},
+        ),
+        (
+            support_flow._ProposeProfileChange,
+            {"field": "contact", "new_value": "+1 555 010 0000", "unexpected": True},
+        ),
+    ],
+)
+def test_support_proposal_models_reject_extra_fields(
+    proposal_model: type, arguments: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        proposal_model.model_validate(arguments)
 
 
 async def test_yeah_cancel_it_at_the_cancel_readback_is_consent(config_root: Path) -> None:

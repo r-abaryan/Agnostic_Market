@@ -430,8 +430,8 @@ def test_unstreamed_answer_speaks_once() -> None:
     assert event.text == "Hello!"
 
 
-@pytest.mark.parametrize("node", ["model", "support_assemble", "cart_assemble"])
-def test_3b_compatibility_sources_retain_plain_text(node: str) -> None:
+@pytest.mark.parametrize("node", ["model", "cart_assemble"])
+def test_3c_compatibility_sources_retain_plain_text(node: str) -> None:
     speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
     event = speech.feed(AIMessage(content="Current behavior.", id="m1"), {"langgraph_node": node})
     assert isinstance(event, TokenEvent)
@@ -535,10 +535,6 @@ def test_tool_messages_never_surface() -> None:
     assert list(speech.flush()) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="support_assemble remains compatibility-approved until Milestone 3c",
-)
 def test_support_assemble_completed_plain_text_is_not_caller_authoritative() -> None:
     """Live-call #18 target: Support completion claims require code-backed authority."""
     speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)
@@ -549,10 +545,6 @@ def test_support_assemble_completed_plain_text_is_not_caller_authoritative() -> 
     assert list(speech.flush()) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="support_assemble remains compatibility-approved until Milestone 3c",
-)
 def test_support_assemble_orphan_plain_text_is_not_caller_authoritative() -> None:
     """Live-call #18 target: orphaned Support prose loses authority in Milestone 3c."""
     speech = _TurnSpeech(_SPEAKABLE, MODEL_SPEECH_NODES)

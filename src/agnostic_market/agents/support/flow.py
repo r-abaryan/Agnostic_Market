@@ -42,6 +42,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -109,6 +110,9 @@ from agnostic_market.dtos.state import (
     PendingReturn,
     PolicyContext,
     ReasoningState,
+    SupportAuthorizationDetail,
+    SupportClarification,
+    SupportQuestionDetail,
 )
 
 logger = logging.getLogger("agnostic_market.agents.support")
@@ -121,23 +125,31 @@ _NEW_INSTRUMENT_REF = "card ending 4471"
 # An UNBOUND caller's mutation can never authorize this turn (a rung-1 contact grant is
 # READ-only, Fix 2) — the assemble branch routes into the identity flow instead of granting or
 # revealing anything. Distinct from a corrective LINE (which is spoken); this one is CONTROL flow.
-_NEEDS_IDENTITY = "<needs-identity>"
+_NEEDS_IDENTITY: Literal["<needs-identity>"] = "<needs-identity>"
 
-# Support-action not-found strings (SECURITY §7d) — the model-facing corrective ToolMessages
-# the assemble gate answers a propose call with when a BOUND caller targets an order that is not
-# theirs / doesn't resolve. Fail-closed wording adapted from the order_status tool: never confirm
-# an order exists, never say which detail failed, never read details. (The UNBOUND guest path no
-# longer asks for a contact — it detours to identity verification; see `_NEEDS_IDENTITY`.)
+# Platform-authored Support clarification copy. Authorization failures deliberately share one
+# existence-oracle-safe line; the threshold variant adds only truthful store-contact guidance.
 _SUPPORT_COMBINED_NOT_FOUND = (
-    "No order matches those details. Do not say which detail failed. Tell the caller: "
-    '"I couldn\'t find an order matching those details - could you double-check the order '
-    'number and the email or phone on the account?"'
+    "I couldn't find an order matching those details. Please double-check the order number "
+    "and the email or phone on the account. I haven't changed anything."
 )
 _SUPPORT_NOT_FOUND_OFFER_HUMAN = (
-    "No order matches those details. Do not say which detail failed. Tell the caller you "
-    "couldn't find an order matching those details, and OFFER to connect them with a "
-    "person who can verify them another way."
+    "I couldn't find an order matching those details. Please contact the store directly for "
+    "help verifying the order. I haven't changed anything."
 )
+_SUPPORT_CLARIFICATION_LINES: dict[SupportQuestionDetail | SupportAuthorizationDetail, str] = {
+    "action": "What would you like help with: a cancellation, return, refund, or profile update?",
+    "order": "What is the order number, for example ORD-1234?",
+    "amount": "What amount would you like refunded?",
+    "refund_destination": "Should the refund go back to the original payment method?",
+    "profile_field": "Would you like to update your delivery address or contact number?",
+    "profile_value": "What new delivery address or contact number would you like to use?",
+    "order_match": _SUPPORT_COMBINED_NOT_FOUND,
+    "order_match_human_help": _SUPPORT_NOT_FOUND_OFFER_HUMAN,
+}
+_ORDER_SELECTION_ACK = "order selection checked"
+_ORDER_REFERENCE_REQUIRED_ACK = "caller-stated order number required"
+_PROFILE_VALUE_REQUIRED_ACK = "caller-stated profile value required"
 _CONTINUATION_NOT_FOUND = (
     "I couldn't find an order matching those details, so I haven't changed anything."
 )
@@ -298,12 +310,13 @@ def _profile_readback_line(pending: PendingProfileChange) -> str:
         raise ValueError(f"readback cannot render declared confirm_fields: {sorted(missing)}")
     noun = "delivery address" if pending.field == "address" else "contact number"
     return (
-        f"Just to confirm - update the {noun} on your account to {rendered[key]}. "
-        "Shall I go ahead?"
+        f"Just to confirm - update the {noun} on your account to {rendered[key]}. Shall I go ahead?"
     )
 
 
 class _ProposeRefund(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     order_key: str
     amount_usd: float
     destination: RefundDestination
@@ -333,12 +346,22 @@ class _ProposeCancel(BaseModel):
 
 
 class _ProposeReturn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     order_key: str
 
 
 class _ProposeProfileChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     field: ProfileField
     new_value: str
+
+
+class _RequestSupportClarification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detail: SupportQuestionDetail
 
 
 @dataclass(frozen=True)
@@ -350,6 +373,7 @@ class SupportNodes:
 
     assemble: Callable[[ReasoningState], dict[str, object]]
     continuation: Callable[[ReasoningState], dict[str, object]]
+    clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     risk_check: Callable[[ReasoningState], dict[str, object]]
     dispatch: Callable[[ReasoningState], dict[str, object]]
@@ -453,12 +477,24 @@ def build_support_nodes(
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
+    def request_support_clarification(detail: SupportQuestionDetail) -> str:
+        """Ask one platform-authored Support question for the selected missing detail."""
+        raise NotImplementedError("intercepted by the assemble node; never executed")
+
+    @tool
     def leave_support() -> str:
         """Leave the support flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     model = reasoning_model.bind_tools(
-        [propose_refund, propose_cancel, propose_return, propose_profile_change, leave_support]
+        [
+            propose_refund,
+            propose_cancel,
+            propose_return,
+            propose_profile_change,
+            request_support_clarification,
+            leave_support,
+        ]
     )
 
     def _leave(new_messages: list, call_id: str) -> dict[str, object]:
@@ -472,6 +508,7 @@ def build_support_nodes(
             "pending_return": None,
             "pending_profile_change": None,
             "pending_request": None,
+            "pending_clarification": None,
         }
 
     def continuation_node(state: ReasoningState) -> dict[str, object]:
@@ -550,9 +587,7 @@ def build_support_nodes(
                     ),
                 }
 
-        if isinstance(request, RefundOrder) and isinstance(
-            request.target, ExplicitOrderTarget
-        ):
+        if isinstance(request, RefundOrder) and isinstance(request.target, ExplicitOrderTarget):
             chosen = resolve_and_authorize(request.target.order_ref)
             if chosen is not None and request.amount_usd is None:
                 return {
@@ -563,9 +598,7 @@ def build_support_nodes(
                 return {
                     **base,
                     "messages": [
-                        AIMessage(
-                            "Should that refund go back to the original payment method?"
-                        )
+                        AIMessage("Should that refund go back to the original payment method?")
                     ],
                 }
             if chosen is not None:
@@ -579,9 +612,7 @@ def build_support_nodes(
                     ),
                 }
 
-        if isinstance(request, ReturnOrder) and isinstance(
-            request.target, ExplicitOrderTarget
-        ):
+        if isinstance(request, ReturnOrder) and isinstance(request.target, ExplicitOrderTarget):
             chosen = resolve_and_authorize(request.target.order_ref)
             if chosen is not None:
                 return {**base, "pending_return": _mint_return(chosen)}
@@ -615,9 +646,7 @@ def build_support_nodes(
             "messages": [AIMessage(_CONTINUATION_NOT_FOUND)],
         }
 
-    def _enter_identity_for_action(
-        new_messages: list, request: IntentRequest
-    ) -> dict[str, object]:
+    def _enter_identity_for_action(new_messages: list, request: IntentRequest) -> dict[str, object]:
         """Retain one caller-stated typed request across the identity detour.
 
         The request contains no resolved target or authority. A fresh context resolves and
@@ -628,6 +657,7 @@ def build_support_nodes(
             "messages": new_messages,
             "active_flow": "identity",
             "pending_request": request,
+            "pending_clarification": None,
             "identity_claim_misses": 0,
         }
 
@@ -654,7 +684,9 @@ def build_support_nodes(
     # one that offers a person (the posture's "verification can't complete -> escalate").
     _auth_denials: dict[str, int] = {}
 
-    def _authorize_target(order_ref: str, *, order_known: bool) -> str | None:
+    def _authorize_target(
+        order_ref: str, *, order_known: bool
+    ) -> SupportAuthorizationDetail | Literal["<needs-identity>"] | None:
         """The support-selection AUTHORIZATION DECISION (SECURITY §7d): may THIS caller act on
         THAT order? A mutation (cancel/refund/return) requires RUNG-2 — the target is
         session-placed OR owned by the OTP-bound identity (`order_mutation_allowed`). A rung-1
@@ -668,14 +700,14 @@ def build_support_nodes(
                                    bind, then resume the action (support/flow.py detour). No
                                    order authority is spoken or granted; existence is never
                                    revealed (the caller simply verifies themselves).
-          - a corrective LINE    — the caller is BOUND but the order isn't theirs / doesn't
-                                   resolve: the ONE combined not-found (existence-oracle; never
-                                   which detail failed), escalating to a human offer after the
-                                   policy denial threshold.
+          - a clarification key — the caller is BOUND but the order isn't theirs / doesn't
+                                  resolve: the ONE combined not-found (existence-oracle; never
+                                  which detail failed), with store-contact guidance after the
+                                  policy denial threshold.
 
         `order_known` no longer drives a grant (the contact claim is not a mutation credential —
-        it is not even read here); `order_known=False` events carry only `order_id_known: False`,
-        never the raw text.
+        it is not even read here). Unbound needs-identity telemetry may record whether resolution
+        succeeded but never raw unresolved text; bound denials expose only the policy attempt.
         """
         if order_known and order_mutation_allowed(
             order_ref, store=order_store, identity=identity_store
@@ -697,25 +729,24 @@ def build_support_nodes(
         # combined not-found (existence-oracle) — never reveal that another account owns it.
         counter_key = order_ref.strip().upper() if order_known else _UNRESOLVED_ORDER
         attempt = _auth_denials[counter_key] = _auth_denials.get(counter_key, 0) + 1
-        write_event({"event": "support_auth_denied", **known_fields, "attempt": attempt})
+        write_event({"event": "support_auth_denied", "attempt": attempt})
         return (
-            _SUPPORT_NOT_FOUND_OFFER_HUMAN
+            "order_match_human_help"
             if attempt >= policy.auth_denials_before_human_offer
-            else _SUPPORT_COMBINED_NOT_FOUND
+            else "order_match"
         )
 
     def _authorize_action(
         order_ref: str, call_id: str, new_messages: list, *, order_known: bool
-    ) -> str | None:
+    ) -> SupportAuthorizationDetail | Literal["<needs-identity>"] | None:
         """The single-target authorization wrapper (refund/return paths): runs the decision and,
-        on a bound-mismatch, appends the corrective ToolMessage that answers the propose call
-        (no dangling tool_use). Returns None if authorized, `_NEEDS_IDENTITY` if the caller must
-        verify first (the branch enters the identity detour — no corrective appended), or the
-        (already-appended) LINE constant so the caller re-prompts."""
+        on a bound-mismatch, pairs the propose call with a constant acknowledgement. Returns
+        None if authorized, `_NEEDS_IDENTITY` if the caller must verify first, or the typed
+        platform-owned clarification outcome."""
         verdict = _authorize_target(order_ref, order_known=order_known)
-        if verdict is None or verdict is _NEEDS_IDENTITY:
+        if verdict is None or verdict == _NEEDS_IDENTITY:
             return verdict
-        new_messages.append(ToolMessage(verdict, tool_call_id=call_id))
+        new_messages.append(ToolMessage(_ORDER_SELECTION_ACK, tool_call_id=call_id))
         return verdict
 
     def _mint_refund(
@@ -726,9 +757,7 @@ def build_support_nodes(
             amount_usd=round(amount_usd, 2),
             destination=destination,
             instrument_ref=(
-                _NEW_INSTRUMENT_REF
-                if destination != "original"
-                else "original payment method"
+                _NEW_INSTRUMENT_REF if destination != "original" else "original payment method"
             ),
             idempotency_key=uuid.uuid4().hex,
             attempt_key=uuid.uuid4().hex,
@@ -768,6 +797,15 @@ def build_support_nodes(
             created_at=time.time(),
         )
 
+    def _clarification_result(
+        new_messages: list, detail: SupportQuestionDetail | SupportAuthorizationDetail
+    ) -> dict[str, object]:
+        return {
+            "messages": new_messages,
+            "active_flow": "support",
+            "pending_clarification": SupportClarification(detail=detail),
+        }
+
     def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE support: propose a REFUND (order+amount+destination) or a CANCEL
         (one/many explicit orders or a semantic account scope), or clarify, or leave. Mints
@@ -804,13 +842,29 @@ def build_support_nodes(
         new_messages: list = []
         for _attempt in range(2):  # one invalid proposal gets ONE corrective re-prompt
             response = model.invoke(messages)
-            new_messages.append(response)
             if not response.tool_calls:
-                return {"messages": new_messages}  # clarifying question (streamed) — stay
+                return _clarification_result(new_messages, "action")
+            new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
             if call["name"] == "leave_support":
                 return _leave(new_messages, call["id"])
+
+            if call["name"] == "request_support_clarification":
+                try:
+                    clarification = _RequestSupportClarification.model_validate(call["args"])
+                except ValueError:
+                    clarification = None
+                if clarification is None:
+                    new_messages.append(
+                        ToolMessage("Invalid clarification request.", tool_call_id=call["id"])
+                    )
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                new_messages.append(
+                    ToolMessage("support clarification requested", tool_call_id=call["id"])
+                )
+                return _clarification_result(new_messages, clarification.detail)
 
             if call["name"] == "propose_cancel":
                 try:
@@ -832,18 +886,14 @@ def build_support_nodes(
                 if not cancel.order_keys:
                     assert cancel.scope is not None  # enforced by _ProposeCancel
                     new_messages.append(
-                        ToolMessage(
-                            f"proposed cancel of {cancel.scope}", tool_call_id=call["id"]
-                        )
+                        ToolMessage(f"proposed cancel of {cancel.scope}", tool_call_id=call["id"])
                     )
                     selection = CancellableOrderScope(scope=cancel.scope)
                     if identity_store.current() is not None:
                         # Already verified: resolve now (route_after_assemble -> resolve).
                         return {"messages": new_messages, "pending_cancel": selection}
                     # Unverified: the shared typed request is the sole continuation channel.
-                    return _enter_identity_for_action(
-                        new_messages, CancelOrders(target=selection)
-                    )
+                    return _enter_identity_for_action(new_messages, CancelOrders(target=selection))
                 # Resolve + AUTHORIZE every stated key, aggregating the outcome into EXACTLY ONE
                 # ToolMessage for this single tool_call_id (never one per target — F-4). An
                 # unresolved key is NOT an "invalid proposal" (that would enumerate keys): it is
@@ -864,53 +914,43 @@ def build_support_nodes(
                         unique.append((ref, hit))
 
                 resolved: list[OrderCandidate] = []
-                verdict: str | None = None
+                verdict: SupportAuthorizationDetail | Literal["<needs-identity>"] | None = None
                 for ref, hit in unique:
                     verdict = _authorize_target(
                         hit.order_id if hit else ref, order_known=hit is not None
                     )
                     if verdict is not None:
-                        break  # _NEEDS_IDENTITY (detour) or a combined-not-found LINE
+                        break  # identity detour or a code-authored denial clarification
                     assert hit is not None  # unresolved never authorizes (no owner, no grant)
                     resolved.append(hit)
-                if verdict is _NEEDS_IDENTITY:
+                if verdict == _NEEDS_IDENTITY:
                     # Unbound caller: bind first, then resume this cancel (no pending minted).
                     stated_refs = tuple(
-                        caller_stated_order_id(_last_user_text(state), ref)
-                        for ref, _hit in unique
+                        caller_stated_order_id(_last_user_text(state), ref) for ref, _hit in unique
                     )
                     if any(ref is None for ref in stated_refs):
                         new_messages.append(
                             ToolMessage(
-                                "Ask the caller for the order number before verification.",
+                                _ORDER_REFERENCE_REQUIRED_ACK,
                                 tool_call_id=call["id"],
                             )
                         )
-                        messages = [prompt, *state.messages, *new_messages]
-                        continue
+                        return _clarification_result(new_messages, "order")
                     validated_refs = tuple(ref for ref in stated_refs if ref is not None)
-                    new_messages.append(
-                        ToolMessage("verification needed", tool_call_id=call["id"])
-                    )
+                    new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
                         new_messages,
-                        CancelOrders(
-                            target=ExplicitOrderSet(order_refs=validated_refs)
-                        ),
+                        CancelOrders(target=ExplicitOrderSet(order_refs=validated_refs)),
                     )
                 if verdict is not None:
-                    # Bound-mismatch: fail closed with the combined not-found + re-prompt.
-                    new_messages.append(ToolMessage(verdict, tool_call_id=call["id"]))
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
+                    new_messages.append(ToolMessage(_ORDER_SELECTION_ACK, tool_call_id=call["id"]))
+                    return _clarification_result(new_messages, verdict)
                 new_messages.append(
                     ToolMessage(
                         f"proposed cancel on {len(resolved)} order(s)", tool_call_id=call["id"]
                     )
                 )
-                pending_batch = _mint_cancel_batch(
-                    [(c.order_id, c.summary) for c in resolved]
-                )
+                pending_batch = _mint_cancel_batch([(c.order_id, c.summary) for c in resolved])
                 return {"messages": new_messages, "pending_cancel": pending_batch}
 
             if call["name"] == "propose_return":
@@ -930,7 +970,7 @@ def build_support_nodes(
                     new_messages,
                     order_known=chosen is not None,
                 )
-                if verdict is _NEEDS_IDENTITY:
+                if verdict == _NEEDS_IDENTITY:
                     stated_ref = caller_stated_order_id(
                         _last_user_text(state),
                         chosen.order_id if chosen is not None else proposed.order_key,
@@ -938,22 +978,18 @@ def build_support_nodes(
                     if stated_ref is None:
                         new_messages.append(
                             ToolMessage(
-                                "Ask the caller for the order number before verification.",
+                                _ORDER_REFERENCE_REQUIRED_ACK,
                                 tool_call_id=call["id"],
                             )
                         )
-                        messages = [prompt, *state.messages, *new_messages]
-                        continue
-                    new_messages.append(
-                        ToolMessage("verification needed", tool_call_id=call["id"])
-                    )
+                        return _clarification_result(new_messages, "order")
+                    new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
                         new_messages,
                         ReturnOrder(target=ExplicitOrderTarget(order_ref=stated_ref)),
                     )
-                if verdict is not None:  # bound-mismatch: corrective already appended, re-prompt
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
+                if verdict is not None:
+                    return _clarification_result(new_messages, verdict)
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(f"proposed return on order {chosen.key}", tool_call_id=call["id"])
@@ -979,12 +1015,11 @@ def build_support_nodes(
                 ):
                     new_messages.append(
                         ToolMessage(
-                            "Ask the caller for the new profile value before proposing it.",
+                            _PROFILE_VALUE_REQUIRED_ACK,
                             tool_call_id=call["id"],
                         )
                     )
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
+                    return _clarification_result(new_messages, "profile_value")
                 # A profile change is ACCOUNT-scoped, so it requires a BOUND identity (Fix 5
                 # Milestone B): the customer whose profile is touched comes from the LIVE binding,
                 # never a model argument. An UNBOUND caller detours into the identity OTP flow to
@@ -993,9 +1028,7 @@ def build_support_nodes(
                 # line, never falling back to (or revealing) another customer's profile.
                 bound = identity_store.current()
                 if bound is None:
-                    new_messages.append(
-                        ToolMessage("verification needed", tool_call_id=call["id"])
-                    )
+                    new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
                         new_messages,
                         ChangeProfile(field=change.field, new_value=change.new_value.strip()),
@@ -1012,9 +1045,7 @@ def build_support_nodes(
                         "handover": HandoffRequest(
                             destination="human",
                             reason_code=(
-                                "address_change"
-                                if change.field == "address"
-                                else "contact_change"
+                                "address_change" if change.field == "address" else "contact_change"
                             ),
                             source="gate",
                         ),
@@ -1023,9 +1054,7 @@ def build_support_nodes(
                 # context, but the persisted line must not carry the raw value a second
                 # time beyond the pending itself).
                 new_messages.append(
-                    ToolMessage(
-                        f"proposed profile change: {change.field}", tool_call_id=call["id"]
-                    )
+                    ToolMessage(f"proposed profile change: {change.field}", tool_call_id=call["id"])
                 )
                 pending_change = _mint_profile_change(
                     ChangeProfile(field=change.field, new_value=change.new_value.strip())
@@ -1053,7 +1082,7 @@ def build_support_nodes(
                     new_messages,
                     order_known=chosen is not None,
                 )
-                if verdict is _NEEDS_IDENTITY:
+                if verdict == _NEEDS_IDENTITY:
                     stated_ref = caller_stated_order_id(
                         _last_user_text(state),
                         chosen.order_id if chosen is not None else proposal.order_key,
@@ -1061,15 +1090,12 @@ def build_support_nodes(
                     if stated_ref is None:
                         new_messages.append(
                             ToolMessage(
-                                "Ask the caller for the order number before verification.",
+                                _ORDER_REFERENCE_REQUIRED_ACK,
                                 tool_call_id=call["id"],
                             )
                         )
-                        messages = [prompt, *state.messages, *new_messages]
-                        continue
-                    new_messages.append(
-                        ToolMessage("verification needed", tool_call_id=call["id"])
-                    )
+                        return _clarification_result(new_messages, "order")
+                    new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
                         new_messages,
                         RefundOrder(
@@ -1082,9 +1108,8 @@ def build_support_nodes(
                             ),
                         ),
                     )
-                if verdict is not None:  # bound-mismatch: corrective already appended, re-prompt
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
+                if verdict is not None:
+                    return _clarification_result(new_messages, verdict)
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
                 new_messages.append(
                     ToolMessage(
@@ -1104,16 +1129,17 @@ def build_support_nodes(
             # so an unhandled name means a NEW tool was bound without a handler — fail loud
             # rather than silently misroute it into the last branch (a silent wrong-mutation).
             raise ValueError(f"support assemble: unhandled tool {call['name']!r}")
-        logger.warning("support assemble: two invalid proposals; leaving flow")
-        write_event({"event": "support_left", "reason": "invalid_proposals"})
+        logger.warning("support assemble: two invalid tool calls; asking for action in code")
+        return _clarification_result(new_messages, "action")
+
+    def clarify_node(state: ReasoningState) -> dict[str, object]:
+        clarification = state.pending_clarification
+        if not isinstance(clarification, SupportClarification):
+            raise TypeError("support clarify node requires SupportClarification")
         return {
-            "messages": new_messages,
-            "active_flow": "left_support",
-            "pending_refund": None,
-            "pending_cancel": None,
-            "pending_return": None,
-            "pending_profile_change": None,
-            "pending_request": None,
+            "pending_clarification": None,
+            "active_flow": "support",
+            "messages": [AIMessage(_SUPPORT_CLARIFICATION_LINES[clarification.detail])],
         }
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
@@ -1259,8 +1285,7 @@ def build_support_nodes(
                 "pending_refund": None,
                 "pending_return": PendingReturn(
                     order_id=pending.order_id,
-                    summary=order_store.order_item_summary(pending.order_id)
-                    or pending.order_id,
+                    summary=order_store.order_item_summary(pending.order_id) or pending.order_id,
                     refund_due_usd=pending.amount_usd,
                     idempotency_key=uuid.uuid4().hex,
                     created_at=time.time(),
@@ -1448,9 +1473,7 @@ def build_support_nodes(
                 ),
             }
         if len(pending.targets) > policy.cancel_batch_max:
-            write_event(
-                {"event": "cancel_batch_over_cap", "count": len(pending.targets)}
-            )
+            write_event({"event": "cancel_batch_over_cap", "count": len(pending.targets)})
             return {
                 "pending_cancel": None,
                 "active_flow": None,
@@ -1472,8 +1495,11 @@ def build_support_nodes(
                 ineligible.append(verdict)
         if not eligible:
             write_event(
-                {"event": "cancel_declined", "reason": "batch_none_eligible",
-                 "count": len(ineligible)}
+                {
+                    "event": "cancel_declined",
+                    "reason": "batch_none_eligible",
+                    "count": len(ineligible),
+                }
             )
             return {
                 "pending_cancel": None,
@@ -1533,9 +1559,7 @@ def build_support_nodes(
             return {
                 "pending_cancel": None,
                 "active_flow": None,
-                "messages": [
-                    AIMessage(decline_line)
-                ],
+                "messages": [AIMessage(decline_line)],
             }
         return {}  # yes: pending survives; router -> void
 
@@ -1566,8 +1590,9 @@ def build_support_nodes(
             # No typed reason on CancelError, and parsing its text is forbidden — a rare
             # effect-time (stale-since-preflight) refusal is the honest generic store_refused.
             logger.warning("cancel refused by store: %s", exc)
-            write_event({"event": "cancel_denied", "reason": "store_refused",
-                         "order_id": target.order_id})
+            write_event(
+                {"event": "cancel_denied", "reason": "store_refused", "order_id": target.order_id}
+            )
             outcome = BatchCancelOutcome(
                 order_id=target.order_id, summary=target.summary, outcome="store_refused"
             )
@@ -1658,8 +1683,11 @@ def build_support_nodes(
             # "both" is only unambiguous with exactly two cancellable orders. Keep the
             # response truthful on either side of two.
             write_event(
-                {"event": "cancel_resolve_declined", "reason": "both_ambiguous",
-                 "count": len(candidates)}
+                {
+                    "event": "cancel_resolve_declined",
+                    "reason": "both_ambiguous",
+                    "count": len(candidates),
+                }
             )
             return {
                 "pending_cancel": None,
@@ -1690,8 +1718,11 @@ def build_support_nodes(
             }
         batch = _mint_cancel_batch([(c.order_id, c.summary) for c in candidates])
         write_event(
-            {"event": "cancel_resolved_from_scope", "scope": selection.scope,
-             "count": len(candidates)}
+            {
+                "event": "cancel_resolved_from_scope",
+                "scope": selection.scope,
+                "count": len(candidates),
+            }
         )
         return {"pending_cancel": batch, "active_flow": "support"}
 
@@ -1837,9 +1868,7 @@ def build_support_nodes(
             return {
                 "pending_return": None,
                 "active_flow": None,
-                "messages": [
-                    AIMessage("Okay, I won't set up a return - nothing has changed.")
-                ],
+                "messages": [AIMessage("Okay, I won't set up a return - nothing has changed.")],
             }
         return {}  # yes: pending survives; router -> place
 
@@ -2056,11 +2085,10 @@ def build_support_nodes(
             "pending_return": None,
             "pending_profile_change": None,
             "pending_request": None,
+            "pending_clarification": None,
             "active_flow": None,
             "messages": [
-                AIMessage(
-                    "No problem - I've dropped that request. Your orders are unchanged."
-                )
+                AIMessage("No problem - I've dropped that request. Your orders are unchanged.")
             ],
         }
 
@@ -2073,6 +2101,7 @@ def build_support_nodes(
             "pending_return": None,
             "pending_profile_change": None,
             "pending_request": None,
+            "pending_clarification": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
@@ -2106,7 +2135,11 @@ def build_support_nodes(
             return "profile"
         if state.pending_refund is not None:
             return "refund"
-        return "clarify"  # a clarifying question was streamed; end the turn in-flow
+        if state.pending_clarification is not None:
+            if not isinstance(state.pending_clarification, SupportClarification):
+                raise TypeError("support assemble produced a non-support clarification")
+            return "clarify"
+        return "clarify"  # support_continuation may have authored its own terminal line
 
     def route_after_resolve(state: ReasoningState) -> str:
         # "confirm" (a batch was frozen -> the cancel guardrail/readback/void) | "clarify"
@@ -2136,6 +2169,7 @@ def build_support_nodes(
     return SupportNodes(
         assemble=assemble_node,
         continuation=continuation_node,
+        clarify=clarify_node,
         guardrail=guardrail_node,
         risk_check=refund_stepup.risk_check,
         dispatch=refund_stepup.dispatch,
@@ -2168,6 +2202,7 @@ def build_support_nodes(
         speakable_nodes=frozenset(
             {
                 "support_continuation",
+                "support_clarify",
                 "support_guardrail",  # authors the over-amount-threshold decline line
                 "support_risk_check",
                 "support_collect",
@@ -2177,7 +2212,6 @@ def build_support_nodes(
                 "support_cancel_confirm",
                 "support_cancel_void",
                 "support_resolve",  # authors the none-cancellable / ambiguous-scope decline
-
                 "support_return_guardrail",  # authors the ineligible-return decline lines
                 "support_return_confirm",
                 "support_return_place",

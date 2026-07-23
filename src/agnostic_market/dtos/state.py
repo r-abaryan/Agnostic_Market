@@ -345,20 +345,24 @@ class IdentityClarification(BaseModel):
     detail: Literal["contact"] = "contact"
 
 
+SupportQuestionDetail = Literal[
+    "action",
+    "order",
+    "amount",
+    "refund_destination",
+    "profile_field",
+    "profile_value",
+]
+SupportAuthorizationDetail = Literal["order_match", "order_match_human_help"]
+
+
 class SupportClarification(BaseModel):
     """Turn-scoped instruction for Support's code-authored clarification renderer."""
 
     model_config = _FROZEN
 
     flow: Literal["support"] = "support"
-    detail: Literal[
-        "action",
-        "order",
-        "amount",
-        "refund_destination",
-        "profile_field",
-        "profile_value",
-    ]
+    detail: SupportQuestionDetail | SupportAuthorizationDetail
 
 
 class CartClarification(BaseModel):

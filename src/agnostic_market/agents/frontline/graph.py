@@ -99,10 +99,12 @@ logger = logging.getLogger("agnostic_market.agents.frontline")
 _HANDOVER_TOOL_NAME = "request_handover"
 
 # Graph topology is the source of truth for model-authored speech provenance. Identity has
-# completed its 3b code-authored clarification migration; Support and Cart retain compatibility
-# speech permission until their own atomic migrations.
+# completed its 3b code-authored clarification migration and Support has completed 3c; Cart
+# retains compatibility speech permission until its own atomic migration.
 TRANSACTIONAL_MODEL_NODES = frozenset({"cart_assemble", "support_assemble", "identity_assemble"})
-MODEL_SPEECH_NODES = frozenset({"model"}) | (TRANSACTIONAL_MODEL_NODES - {"identity_assemble"})
+MODEL_SPEECH_NODES = frozenset({"model"}) | (
+    TRANSACTIONAL_MODEL_NODES - {"identity_assemble", "support_assemble"}
+)
 FRONTLINE_SPEAKABLE_NODES = frozenset(
     {
         "handover",
@@ -933,7 +935,6 @@ def build_frontline_graph(
             "handover": "handover",  # terminal no-match -> the silent human path
             "guardrail": "identity_guardrail",
             "reask": "identity_reask",  # the ONE bounded re-ask (own speakable node)
-
             "clarify": "identity_ask_contact",
         }[decision]
 
@@ -968,7 +969,7 @@ def build_frontline_graph(
 
     # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
     #     the flow, closed over the store — support.route_after_* ) ---
-    def route_after_support_assemble(state: ReasoningState) -> str:
+    def _route_support_outcome(state: ReasoningState, *, clarify_target: str) -> str:
         # refund | cancel | return | profile | resolve | needs_identity | handover | leave |
         # clarify.
         decision = support.route_after_assemble(state)
@@ -984,8 +985,16 @@ def build_frontline_graph(
             "resolve": "support_resolve",  # a bound caller's "cancel all" -> resolve now
             "handover": "handover",  # deterministic fail-closed path (for example no profile)
             "leave": "gate",  # model left; normal pipeline answers this same turn
-            "clarify": END,  # a clarifying question was streamed already
+            "clarify": clarify_target,
         }[decision]
+
+    def route_after_support_assemble(state: ReasoningState) -> str:
+        return _route_support_outcome(state, clarify_target="support_clarify")
+
+    def route_after_support_continuation(state: ReasoningState) -> str:
+        # Continuation owns its existing code-authored missing-field/not-found lines and
+        # deliberately carries no SupportClarification selector.
+        return _route_support_outcome(state, clarify_target=END)
 
     def route_after_support_resolve(state: ReasoningState) -> str:
         # confirm (a batch was frozen -> the shared cancel guardrail) | clarify (none
@@ -1130,6 +1139,7 @@ def build_frontline_graph(
     graph.add_node("cart_escape_human", cart.escape_human)
     graph.add_node("support_assemble", support.assemble)
     graph.add_node("support_continuation", support.continuation)
+    graph.add_node("support_clarify", support.clarify)
     graph.add_node("support_guardrail", support.guardrail)
     graph.add_node("support_risk_check", support.risk_check)
     graph.add_node("support_dispatch", support.dispatch)
@@ -1271,13 +1281,14 @@ def build_frontline_graph(
             "support_resolve": "support_resolve",  # a bound caller's scope resolves now
             "identity_assemble": "identity_assemble",  # unbound scope, no state to discard
             "principal_warning": "principal_warning",
+            "support_clarify": "support_clarify",
             "handover": "handover",
             END: END,
         },
     )
     graph.add_conditional_edges(
         "support_continuation",
-        route_after_support_assemble,
+        route_after_support_continuation,
         {
             "support_guardrail": "support_guardrail",
             "support_cancel_guardrail": "support_cancel_guardrail",
@@ -1288,6 +1299,7 @@ def build_frontline_graph(
             END: END,
         },
     )
+    graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",
         route_support_guardrail,
