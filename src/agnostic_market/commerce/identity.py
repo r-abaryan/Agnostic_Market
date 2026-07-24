@@ -43,7 +43,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.commerce.orders import OrdersFixture, OrderStore
 from agnostic_market.commerce.spoken import spoken_digits, spoken_email
@@ -69,23 +69,12 @@ def _match_key(contact: str) -> str:
 
 class CustomerEntry(BaseModel):
     """One customer in the stub identity SoR. `contact` = the matching value (never spoken,
-    never logged); masked references are the only forms that may be spoken."""
+    never logged); `masked_contact` is the only speakable form."""
 
     model_config = _STRICT
 
     contact: str = Field(min_length=1)
     masked_contact: str = Field(min_length=1)
-    new_payment_instrument_ref: str | None = Field(default=None, min_length=1)
-
-    @field_validator("new_payment_instrument_ref")
-    @classmethod
-    def _instrument_ref_is_masked(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = value.strip()
-        if len(_digits(cleaned)) > 4:
-            raise ValueError("new payment instrument reference must be masked")
-        return cleaned
 
 
 class CustomersFixture(BaseModel):
@@ -170,11 +159,6 @@ class CustomerDirectory:
     def masked_contact(self, customer_ref: str) -> str | None:
         entry = self.fixture.customers.get(customer_ref)
         return entry.masked_contact if entry else None
-
-    def new_payment_instrument_ref(self, customer_ref: str) -> str | None:
-        """The customer's masked alternative refund instrument, when one is on file."""
-        entry = self.fixture.customers.get(customer_ref)
-        return entry.new_payment_instrument_ref if entry else None
 
     def match_contact(self, claim: str) -> BoundIdentity | None:
         cleaned = claim.strip()

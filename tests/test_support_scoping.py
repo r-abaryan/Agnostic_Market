@@ -453,6 +453,40 @@ async def test_explicit_refund_continuation_resolves_without_model_replay(
     assert h.store.refund_count == 1
 
 
+async def test_new_instrument_refund_continuation_uses_bound_customer_reference(
+    config_root: Path,
+) -> None:
+    h, _reasoning, events = await _drive_explicit_action_continuation(
+        config_root,
+        tool_name="propose_refund",
+        tool_args={
+            "order_key": "ORD-1001",
+            "amount_usd": 20.0,
+            "destination": "new_instrument",
+        },
+        utterance="refund $20 for order ORD-1001 to a different card",
+        thread_id="scope-new-instrument-continuation",
+    )
+    owner_ref = h.payment_instruments.new_instrument_ref("CUST-001")
+    other_ref = h.payment_instruments.new_instrument_ref("CUST-002")
+    assert owner_ref is not None and other_ref is not None
+    prompts = [event.prompt for event in events if isinstance(event, InterruptEvent)]
+    assert len(prompts) == 1
+    assert owner_ref in prompts[0]
+    assert other_ref not in prompts[0]
+
+    completed = await _events(h.engine, "yes")
+    assert h.store.refund_count == 1
+    spoken = [
+        event.text
+        for event in completed
+        if isinstance(event, SpokenMessageEvent) and event.node == "support_place"
+    ]
+    assert len(spoken) == 1
+    assert owner_ref in spoken[0]
+    assert other_ref not in spoken[0]
+
+
 async def test_model_only_refund_amount_cannot_reach_confirmation(
     config_root: Path,
 ) -> None:

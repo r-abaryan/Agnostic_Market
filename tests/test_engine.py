@@ -34,6 +34,10 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    load_payment_instruments_fixture,
+)
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
@@ -98,6 +102,9 @@ def _engine(
         recent_orders=recent_orders,
         identity_store=identity,
         customers=customers,
+        payment_instruments=PaymentInstrumentDirectory(
+            load_payment_instruments_fixture(config_root, "acme_store")
+        ),
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=policy,
         transition_principal=caller_context.transition_principal,

@@ -9,6 +9,7 @@ frontline gate trips on "refund ..." and enters the support flow.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -21,8 +22,11 @@ from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.support import flow as support_flow
-from agnostic_market.commerce.identity import load_customers_fixture
 from agnostic_market.commerce.orders import OrderStore
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentsFixture,
+    load_payment_instruments_fixture,
+)
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import (
     InterruptEvent,
@@ -30,7 +34,7 @@ from agnostic_market.dtos.events import (
     TokenEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.state import PolicyContext
+from agnostic_market.dtos.state import CartLine, PolicyContext
 
 # returnless high on purpose (the default): the legacy amount-gate/step-up scenarios run
 # refunds against the SHIPPED ORD-1001 in isolation; the return-first tests tighten via model_copy.
@@ -43,16 +47,15 @@ _PROPOSE = {
     "propose_refund": {"order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"}
 }
 _REFUND_REQUEST = "I'd like a refund to a different card"
+_REFUND_HANDOVER = {"request_handover": {"destination": "support", "reason_code": "refund"}}
 
 
 def _instrument_ref(config_root: Path, customer_ref: str) -> str:
-    value = (
-        load_customers_fixture(config_root, "acme_store")
-        .customers[customer_ref]
-        .new_payment_instrument_ref
+    return (
+        load_payment_instruments_fixture(config_root, "acme_store")
+        .payment_instruments[customer_ref]
+        .masked_ref
     )
-    assert value is not None
-    return value
 
 
 def _engine(
@@ -82,6 +85,54 @@ def _engine(
 
 async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS) -> list:
     return [event async for event in engine.stream_turn(text, facts)]
+
+
+def _telemetry_events(tmp_path: Path) -> list[dict]:
+    path = tmp_path / "telemetry.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if '"event"' in line
+    ]
+
+
+def _assert_refund_destination_failed_closed(
+    *,
+    engine: ReasoningEngine,
+    store: OrderStore,
+    events: list,
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    assert store.refund_count == 0
+    assert not any(isinstance(event, InterruptEvent | TokenEvent) for event in events)
+    spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
+    assert [event.node for event in spoken] == ["automation_terminal_response"]
+    assert "contact the store" in spoken[0].text.lower()
+    assert not engine.pending_interrupt()
+
+    snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
+    assert snapshot.next == ()
+    assert snapshot.values.get("automation_terminal") is True
+    assert snapshot.values.get("active_flow") is None
+    assert snapshot.values.get("handover") is None
+    assert snapshot.values.get("pending_refund") is None
+
+    telemetry = _telemetry_events(tmp_path)
+    unavailable = [
+        event for event in telemetry if event["event"] == "refund_destination_unavailable"
+    ]
+    assert unavailable == [{"event": "refund_destination_unavailable", "reason": reason}]
+    onramps = [event for event in telemetry if event["event"] == "human_onramp"]
+    assert len(onramps) == 1
+    assert onramps[0]["reason_code"] == "refund"
+    assert onramps[0]["source"] == "gate"
+    assert onramps[0]["active_flow"] is None
+    assert [event for event in telemetry if event["event"] == "automation_terminal_response"] == [
+        {"event": "automation_terminal_response"}
+    ]
 
 
 async def _pause_at_otp(engine: ReasoningEngine) -> list:
@@ -905,7 +956,7 @@ def _refund_engine(config_root, amount, dest, *, thread_id, policy=_POLICY):
 async def test_new_instrument_reference_follows_the_authorized_order_owner(
     config_root: Path,
 ) -> None:
-    engine, _, _, _ = _refund_engine(
+    engine, store, _, _ = _refund_engine(
         config_root,
         100.0,
         "new_instrument",
@@ -917,9 +968,17 @@ async def test_new_instrument_reference_follows_the_authorized_order_owner(
     assert len(interrupts) == 1
     assert _instrument_ref(config_root, "CUST-001") in interrupts[0].prompt
     assert _instrument_ref(config_root, "CUST-002") not in interrupts[0].prompt
+    completed = await _events(engine, "yes")
+    assert store.refund_count == 1
+    spoken = [event for event in completed if isinstance(event, SpokenMessageEvent)]
+    assert len(spoken) == 1 and spoken[0].node == "support_place"
+    assert _instrument_ref(config_root, "CUST-001") in spoken[0].text
+    assert _instrument_ref(config_root, "CUST-002") not in spoken[0].text
 
 
-async def test_unmodelled_refund_destination_fails_closed(config_root: Path) -> None:
+async def test_unmodelled_refund_destination_fails_closed(
+    config_root: Path, tmp_path: Path
+) -> None:
     engine, store, _, _ = _refund_engine(
         config_root,
         100.0,
@@ -927,9 +986,101 @@ async def test_unmodelled_refund_destination_fails_closed(config_root: Path) -> 
         thread_id="refund-new-address",
     )
     events = await _events(engine, "refund my order to a different address")
-    assert store.refund_count == 0
-    assert not any(isinstance(event, InterruptEvent) for event in events)
-    assert not engine.pending_interrupt()
+    _assert_refund_destination_failed_closed(
+        engine=engine,
+        store=store,
+        events=events,
+        tmp_path=tmp_path,
+        reason="new_address",
+    )
+
+
+async def test_missing_new_instrument_fails_closed(config_root: Path, tmp_path: Path) -> None:
+    harness = authorize_fixture_orders(
+        build_support_engine(
+            config_root,
+            policy=_POLICY,
+            reasoning=FakeChatModel(
+                force_tool="propose_refund",
+                canned_args={
+                    "propose_refund": {
+                        "order_key": "1",
+                        "amount_usd": 100.0,
+                        "destination": "new_instrument",
+                    }
+                },
+                tool_call_limit=1,
+            ),
+            frontline=FakeChatModel(
+                force_tool="request_handover",
+                canned_args=_REFUND_HANDOVER,
+                tool_call_limit=1,
+            ),
+            thread_id="refund-missing-instrument",
+            payment_instruments_fixture=PaymentInstrumentsFixture(payment_instruments={}),
+        )
+    )
+
+    events = await _events(harness.engine, "refund $100 for order ORD-1001 to a different card")
+    _assert_refund_destination_failed_closed(
+        engine=harness.engine,
+        store=harness.store,
+        events=events,
+        tmp_path=tmp_path,
+        reason="new_instrument",
+    )
+
+
+async def test_session_order_without_account_owner_cannot_select_new_instrument(
+    config_root: Path, tmp_path: Path
+) -> None:
+    reasoning = FakeChatModel(
+        force_tool="propose_refund",
+        canned_args={
+            "propose_refund": {
+                "order_key": "ORD-9001",
+                "amount_usd": 20.0,
+                "destination": "new_instrument",
+            }
+        },
+        tool_call_limit=1,
+    )
+    harness = build_support_engine(
+        config_root,
+        policy=_POLICY,
+        reasoning=reasoning,
+        frontline=FakeChatModel(
+            force_tool="request_handover",
+            canned_args=_REFUND_HANDOVER,
+            tool_call_limit=1,
+        ),
+        thread_id="refund-session-order-no-owner",
+    )
+    placed = harness.store.place_cart(
+        "session-order",
+        lines=[
+            CartLine(
+                sku="SKU-SESSION",
+                name="session item",
+                price_usd=20.0,
+                quantity=1,
+            )
+        ],
+        total_usd=20.0,
+    )
+    assert placed.order_id == "ORD-9001"
+
+    events = await _events(
+        harness.engine,
+        "refund $20 for order ORD-9001 to a different card",
+    )
+    _assert_refund_destination_failed_closed(
+        engine=harness.engine,
+        store=harness.store,
+        events=events,
+        tmp_path=tmp_path,
+        reason="new_instrument",
+    )
 
 
 async def test_refund_in_band_reaches_readback(config_root: Path) -> None:

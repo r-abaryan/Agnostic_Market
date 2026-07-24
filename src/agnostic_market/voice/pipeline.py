@@ -36,6 +36,11 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    assert_payment_instruments_have_customers,
+    load_payment_instruments_fixture,
+)
 from agnostic_market.commerce.profile import (
     ProfileStore,
     assert_profiles_have_customers,
@@ -153,10 +158,13 @@ def build_voice_loop(
     # reads the SAME instance (the render router's order-read gate) — split-brain otherwise.
     # The build-time cross-checks fail loudly when an order or profile owner names nobody.
     customers_fixture = load_customers_fixture(config_root, config.merchant_id)
+    payment_instruments_fixture = load_payment_instruments_fixture(config_root, config.merchant_id)
     assert_orders_have_customers(store.fixture, customers_fixture)
     assert_profiles_have_customers(profile_fixture, customers_fixture)
+    assert_payment_instruments_have_customers(payment_instruments_fixture, customers_fixture)
     profile_store = ProfileStore(profile_fixture)
     customers = CustomerDirectory(customers_fixture)
+    payment_instruments = PaymentInstrumentDirectory(payment_instruments_fixture)
     identity_store = CallerIdentityStore()
     caller_context = CallerContext(
         verification_store=verification_store,
@@ -194,6 +202,7 @@ def build_voice_loop(
         recent_orders=recent_orders,
         identity_store=identity_store,
         customers=customers,
+        payment_instruments=payment_instruments,
         transition_principal=caller_context.transition_principal,
         principal_state_will_be_discarded=caller_context.has_discardable_state,
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
@@ -201,9 +210,7 @@ def build_voice_loop(
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
         checkpointer=build_checkpointer(),
     )
-    engine = ReasoningEngine(
-        graph, thread_id=uuid.uuid4().hex, lifecycle=caller_context
-    )
+    engine = ReasoningEngine(graph, thread_id=uuid.uuid4().hex, lifecycle=caller_context)
     caller_context.attach_engine(engine)
     adapter = GraphVoiceAdapter(engine)
 
@@ -245,7 +252,9 @@ def build_voice_loop(
         ),
     )
     return VoiceLoop(
-        session=session, agent=agent, engine=engine,
+        session=session,
+        agent=agent,
+        engine=engine,
         background_audio=_build_background_audio(),
     )
 

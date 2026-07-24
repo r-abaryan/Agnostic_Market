@@ -16,6 +16,10 @@ from livekit.plugins import langchain as lk_langchain
 from llm_fakes import RecordingResolver
 
 from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentEntry,
+    PaymentInstrumentsFixture,
+)
 from agnostic_market.commerce.profile import ProfileFixture, load_profile_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.config.registry import ConfigRegistry
@@ -110,9 +114,27 @@ async def test_session_build_rejects_profile_for_unknown_customer(
     resolved = ConfigRegistry(config_root).load().get("acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_voice_loop(
-            resolved, credentials, RecordingResolver(), config_root=config_root
-        )
+        build_voice_loop(resolved, credentials, RecordingResolver(), config_root=config_root)
+
+
+async def test_session_build_rejects_payment_instrument_for_unknown_customer(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agnostic_market.voice import pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "load_payment_instruments_fixture",
+        lambda _root, _merchant: PaymentInstrumentsFixture(
+            payment_instruments={
+                "CUST-UNKNOWN": PaymentInstrumentEntry(masked_ref="card ending 1234")
+            }
+        ),
+    )
+    resolved = ConfigRegistry(config_root).load().get("acme_store")
+    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
+    with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
+        build_voice_loop(resolved, credentials, RecordingResolver(), config_root=config_root)
 
 
 class _FakeEngine:

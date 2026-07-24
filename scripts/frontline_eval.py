@@ -47,6 +47,11 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    assert_payment_instruments_have_customers,
+    load_payment_instruments_fixture,
+)
 from agnostic_market.commerce.profile import (
     ProfileStore,
     assert_profiles_have_customers,
@@ -426,10 +431,13 @@ async def _run(*, preflight_only: bool = False) -> int:
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
     cart_store = CartStore()
     customers_fixture = load_customers_fixture(_CONFIG_ROOT, _MERCHANT_ID)
+    payment_instruments_fixture = load_payment_instruments_fixture(_CONFIG_ROOT, _MERCHANT_ID)
     profile_fixture = load_profile_fixture(_CONFIG_ROOT, _MERCHANT_ID)
     assert_orders_have_customers(store.fixture, customers_fixture)
     assert_profiles_have_customers(profile_fixture, customers_fixture)
+    assert_payment_instruments_have_customers(payment_instruments_fixture, customers_fixture)
     customers = CustomerDirectory(customers_fixture)
+    payment_instruments = PaymentInstrumentDirectory(payment_instruments_fixture)
     profile_store = ProfileStore(profile_fixture)
     identity_store = CallerIdentityStore()
     config = resolved.config
@@ -464,6 +472,7 @@ async def _run(*, preflight_only: bool = False) -> int:
         recent_orders=recent_orders,
         identity_store=identity_store,  # SAME instance as the tools' gate (P7, no split-brain)
         customers=customers,
+        payment_instruments=payment_instruments,
         profile_store=profile_store,
         # The ONE config->runtime policy mapping — identical to production (F1). The old
         # hand-built copy here had drifted (it silently omitted spoken_policy_extra).

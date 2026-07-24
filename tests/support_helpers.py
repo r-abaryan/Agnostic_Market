@@ -18,6 +18,11 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    PaymentInstrumentsFixture,
+    load_payment_instruments_fixture,
+)
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import PolicyContext
@@ -35,6 +40,7 @@ class SupportHarness(NamedTuple):
     recent_orders: RecentOrderContext
     identity: CallerIdentityStore
     customers: CustomerDirectory
+    payment_instruments: PaymentInstrumentDirectory
     caller_context: CallerContext
 
 
@@ -65,6 +71,7 @@ def build_support_engine(
     frontline: FakeChatModel | None = None,
     risk_flagged: bool = False,
     thread_id: str = "support-1",
+    payment_instruments_fixture: PaymentInstrumentsFixture | None = None,
 ) -> SupportHarness:
     """The production graph shape behind a ReasoningEngine, with fakes + per-test stores.
 
@@ -79,6 +86,12 @@ def build_support_engine(
     cart = CartStore()
     identity = CallerIdentityStore()
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
+    instrument_fixture = (
+        payment_instruments_fixture
+        if payment_instruments_fixture is not None
+        else load_payment_instruments_fixture(config_root, "acme_store")
+    )
+    payment_instruments = PaymentInstrumentDirectory(instrument_fixture)
     tools = [
         wrap_readonly_tool(t, "acme_store")
         for t in build_voice_tools(store, cart, recent_orders, identity, customers)
@@ -109,6 +122,7 @@ def build_support_engine(
         recent_orders=recent_orders,
         identity_store=identity,
         customers=customers,
+        payment_instruments=payment_instruments,
         transition_principal=caller_context.transition_principal,
         principal_state_will_be_discarded=caller_context.has_discardable_state,
         checkpointer=build_checkpointer(),
@@ -124,5 +138,6 @@ def build_support_engine(
         recent_orders,
         identity,
         customers,
+        payment_instruments,
         caller_context,
     )

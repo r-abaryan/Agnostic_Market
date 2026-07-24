@@ -61,7 +61,6 @@ from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
-    CustomerDirectory,
     order_mutation_allowed,
     order_read_allowed,
 )
@@ -77,6 +76,7 @@ from agnostic_market.commerce.orders import (
     render_batch_cancel_outcome,
     render_order_list_line,
 )
+from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
 from agnostic_market.commerce.profile import ProfileError, ProfileStore
 from agnostic_market.commerce.spoken import (
     caller_stated_order_id,
@@ -417,16 +417,16 @@ def build_support_nodes(
     policy: PolicyContext,
     profile_store: ProfileStore,
     recent_orders: RecentOrderContext,
-    customers: CustomerDirectory,
+    payment_instruments: PaymentInstrumentDirectory,
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
 ) -> SupportNodes:
     """Build Support around session-bound stores, providers, and policy.
 
-    `identity_store` is the same instance used by tools and Identity. `customers` supplies only
-    the authorized account's masked payment-instrument reference; Support never contact-matches
-    or accepts a customer ref from the model.
+    `identity_store` is the same instance used by tools and Identity. `payment_instruments`
+    supplies only the authorized account's masked alternative refund destination; Support never
+    receives contact-matching data or accepts a customer ref from the model.
     """
 
     @tool
@@ -756,7 +756,7 @@ def build_support_nodes(
                 bound = identity_store.current()
                 customer_ref = bound.customer_ref if bound is not None else None
             instrument_ref = (
-                customers.new_payment_instrument_ref(customer_ref)
+                payment_instruments.new_instrument_ref(customer_ref)
                 if customer_ref is not None
                 else None
             )

@@ -21,6 +21,13 @@ from agnostic_market.commerce.orders import (
     speak_lines,
     speak_quantity,
 )
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    PaymentInstrumentEntry,
+    PaymentInstrumentsFixture,
+    assert_payment_instruments_have_customers,
+    load_payment_instruments_fixture,
+)
 
 __all__ = [
     "BoundIdentity",
@@ -31,10 +38,15 @@ __all__ = [
     "CustomersFixture",
     "OrderStore",
     "OrdersFixture",
+    "PaymentInstrumentDirectory",
+    "PaymentInstrumentEntry",
+    "PaymentInstrumentsFixture",
     "PlacedOrder",
     "assert_orders_have_customers",
+    "assert_payment_instruments_have_customers",
     "load_customers_fixture",
     "load_orders_fixture",
+    "load_payment_instruments_fixture",
     "order_mutation_allowed",
     "order_read_allowed",
     "resolve_candidates",

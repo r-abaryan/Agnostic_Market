@@ -17,6 +17,10 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    load_payment_instruments_fixture,
+)
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.orchestration import CancelOrders
@@ -87,6 +91,9 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         verification_store=verification,
         identity_store=identity,
         customers=CustomerDirectory(load_customers_fixture(config_root, "acme_store")),
+        payment_instruments=PaymentInstrumentDirectory(
+            load_payment_instruments_fixture(config_root, "acme_store")
+        ),
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
@@ -792,11 +799,13 @@ def _place_two_session_orders(store: OrderStore) -> tuple[str, str]:
     from agnostic_market.dtos.state import CartLine
 
     a = store.place_cart(
-        "s1", lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)],
+        "s1",
+        lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)],
         total_usd=258.0,
     )
     b = store.place_cart(
-        "s2", lines=[CartLine(sku="SKU-RED-42", name="trail shoes", price_usd=89.99, quantity=1)],
+        "s2",
+        lines=[CartLine(sku="SKU-RED-42", name="trail shoes", price_usd=89.99, quantity=1)],
         total_usd=89.99,
     )
     return a.order_id, b.order_id
@@ -840,7 +849,8 @@ async def test_guest_enumeration_never_lists_fixture_orders(config_root: Path) -
 
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     placed = store.place_cart(
-        "one", lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
+        "one",
+        lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
         total_usd=129.0,
     )
     graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)

@@ -76,6 +76,7 @@ from agnostic_market.commerce.orders import (
     render_order_list_line,
     render_order_status_line,
 )
+from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.orchestration import (
@@ -250,6 +251,7 @@ def build_frontline_graph(
     recent_orders: RecentOrderContext | None = None,
     identity_store: CallerIdentityStore | None = None,
     customers: CustomerDirectory,
+    payment_instruments: PaymentInstrumentDirectory,
     transition_principal: Callable[
         [BoundIdentity, VerificationProof, IntentRequest | None], PrincipalTransition
     ],
@@ -926,7 +928,7 @@ def build_frontline_graph(
         policy,
         profile_store,
         recent_orders,
-        customers,
+        payment_instruments,
         identity_store=identity_store,
         display_name=display_name,
     )

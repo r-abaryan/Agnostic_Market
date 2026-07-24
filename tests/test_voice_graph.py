@@ -139,4 +139,3 @@ async def test_unconsumed_turn_never_reaches_the_engine() -> None:
     spoken = await _spoken(adapter, {"messages": [HumanMessage("no, wait")]})
     assert engine.calls == [("no, wait", TurnFacts(readback_interrupted=False))]
     assert spoken == ["never spoken"]
-

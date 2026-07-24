@@ -26,8 +26,7 @@ def _returnless_sentence(policy: PolicyContext) -> str:
     if threshold <= 0:
         # Return-first for every shipped refund (the default).
         return (
-            "For an order that has already shipped, a refund is issued once the return "
-            "is arranged."
+            "For an order that has already shipped, a refund is issued once the return is arranged."
         )
     return (
         "For an order that has already shipped, refunds over "

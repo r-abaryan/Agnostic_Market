@@ -123,18 +123,6 @@ def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
 def test_customers_fixture_loads_from_config(config_root: Path) -> None:
     fixture = load_customers_fixture(config_root, "acme_store")
     assert set(fixture.customers) == {"CUST-001", "CUST-002"}
-    refs = [entry.new_payment_instrument_ref for entry in fixture.customers.values()]
-    assert all(refs)
-    assert len(set(refs)) == len(refs)
-
-
-def test_customer_fixture_rejects_an_unmasked_payment_instrument() -> None:
-    with pytest.raises(ValueError, match="must be masked"):
-        CustomerEntry(
-            contact="person@example.com",
-            masked_contact="email ending example dot com",
-            new_payment_instrument_ref="4111 1111 1111 1111",
-        )
 
 
 def test_missing_customers_fixture_fails_loudly(config_root: Path) -> None:

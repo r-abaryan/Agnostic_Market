@@ -44,7 +44,7 @@ _ASK_CONTACT = (
 _COMBINED_NOT_FOUND = (
     "No order matches those details. Do not say which detail failed. Tell the caller: "
     "\"I couldn't find an order matching those details - could you double-check the order "
-    "number and the email or phone on the account?\""
+    'number and the email or phone on the account?"'
 )
 # The "do not ask yourself" sentence is load-bearing (live call #12 F-12.3: the frontline
 # asked for the email itself, duplicating the identity flow's question and wasting a turn).
