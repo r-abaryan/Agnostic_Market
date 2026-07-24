@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Annotated, TypedDict
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
-from llm_fakes import FakeChatModel
+from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
 from policy_helpers import make_policy
 from pydantic import ValidationError
 
@@ -52,6 +52,9 @@ from agnostic_market.voice.tools import build_voice_tools
 _PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
 _TEST_OTP = "482913"
+_XFAIL_FAILURE_ADMISSION = (
+    "unfinished checkpoint recovery still discards the next committed caller utterance"
+)
 
 
 def _engine(
@@ -118,25 +121,18 @@ async def _pause_at_confirmation(engine: ReasoningEngine) -> list:
 # --- the turn-failure boundary (live call #13 F-13.1: a 529 died in SILENCE) -------------
 
 
-class _ExplodingFake(FakeChatModel):
-    """Raises once (a provider outage surviving SDK retries), then behaves normally."""
-
-    def _respond(self, messages, **kwargs):  # type: ignore[override]
-        if not getattr(self, "_exploded", False):
-            object.__setattr__(self, "_exploded", True)
-            raise RuntimeError("simulated provider 529 overloaded")
-        return super()._respond(messages, **kwargs)
-
-
 async def test_failed_turn_speaks_the_fallback_never_silence(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     import json
 
     from agnostic_market.agents import telemetry
     from agnostic_market.dtos.events import SpokenMessageEvent
 
-    engine, _ = _engine(config_root, frontline=_ExplodingFake(emit_tool_calls=False))
+    engine, _ = _engine(
+        config_root,
+        frontline=ExplodingOnceFakeChatModel(emit_tool_calls=False),
+    )
     events = await _events(engine, "hi there")  # the graph dies mid-turn...
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert len(spoken) == 1 and spoken[0].node == "turn_fallback"
@@ -149,6 +145,36 @@ async def test_failed_turn_speaks_the_fallback_never_silence(
     # The session SURVIVES: the next turn runs normally on the same thread.
     retry = await _events(engine, "hi again")
     assert any(isinstance(e, TokenEvent) and e.text for e in retry)
+
+
+@pytest.mark.xfail(strict=True, reason=_XFAIL_FAILURE_ADMISSION)
+async def test_failed_cart_turn_admits_changed_intent_instead_of_resuming_old_work(
+    config_root: Path,
+) -> None:
+    engine, store = _engine(
+        config_root,
+        reasoning=ExplodingOnceFakeChatModel(emit_tool_calls=False),
+        thread_id="failure-admission",
+    )
+
+    failed = await _events(engine, "checkout now please")
+    assert [event.node for event in failed if isinstance(event, SpokenMessageEvent)] == [
+        "turn_fallback"
+    ]
+    assert engine._graph.get_state(engine._config).next
+
+    await _events(engine, "never mind")
+    snapshot = engine._graph.get_state(engine._config)
+    admitted = tuple(
+        str(message.content)
+        for message in snapshot.values.get("messages", ())
+        if isinstance(message, HumanMessage)
+    )
+
+    assert admitted == ("checkout now please", "never mind")
+    assert store.placed_count == 0
+    assert snapshot.values.get("active_flow") is None
+    assert snapshot.next == ()
 
 
 # --- plain turns -----------------------------------------------------------------------

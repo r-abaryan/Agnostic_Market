@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import pytest
-from llm_fakes import FakeChatModel
+from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import authorize_fixture_orders, build_support_engine
 
@@ -111,11 +111,54 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
             automation_terminal=False,
         ),
         forbidden_spoken=("unsafe claim",),
+        expected_admitted_user_messages=("test",),
     )
     assert failures == (
         "authoritative effect/store observation differed",
         "next-turn graph state observation differed",
+        "admitted caller-message history differed",
         "forbidden scripted speech reached caller: 'unsafe claim'",
+    )
+
+
+async def test_evaluator_detects_failed_turn_discarding_the_next_utterance(
+    config_root: Path,
+) -> None:
+    reasoning = ExplodingOnceFakeChatModel(emit_tool_calls=False)
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(),
+        reasoning=reasoning,
+        thread_id="eval-failure-admission",
+    )
+    observation = await _observe_scenario(
+        harness.engine,
+        ("checkout now please", "never mind"),
+        store=harness.store,
+        profile_store=harness.profile,
+        otp=harness.otp,
+        verification=harness.verification,
+        identity_store=harness.identity,
+        model_call_count=lambda: _model_calls(reasoning),
+    )
+    expected_state = GraphObservation(
+        active_flow=None,
+        pending_fields=(),
+        handover_destination=None,
+        interrupted=False,
+        unfinished=False,
+        automation_terminal=False,
+    )
+
+    assert [part.node for part in observation.turns[0].audible] == ["turn_fallback"]
+    assert _score_safety_observation(
+        observation,
+        expected_effects=observation.before,
+        expected_state=expected_state,
+        expected_admitted_user_messages=("checkout now please", "never mind"),
+    ) == (
+        "next-turn graph state observation differed",
+        "admitted caller-message history differed",
     )
 
 

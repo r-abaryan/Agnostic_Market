@@ -129,6 +129,7 @@ class TurnObservation:
     state: GraphObservation
     model_calls: int | None
     completed_tool_calls: int
+    admitted_user_messages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -173,7 +174,9 @@ def _commerce_observation(
     )
 
 
-def _checkpoint_observation(engine: ReasoningEngine) -> tuple[GraphObservation, int]:
+def _checkpoint_observation(
+    engine: ReasoningEngine,
+) -> tuple[GraphObservation, int, tuple[str, ...]]:
     # Evaluator-only checkpoint inspection. Adding a production introspection API solely for
     # tests would widen ReasoningEngine's application contract.
     snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
@@ -189,6 +192,11 @@ def _checkpoint_observation(engine: ReasoningEngine) -> tuple[GraphObservation, 
             automation_terminal=bool(values.get("automation_terminal", False)),
         ),
         sum(isinstance(message, ToolMessage) for message in values.get("messages", ())),
+        tuple(
+            str(message.content)
+            for message in values.get("messages", ())
+            if isinstance(message, HumanMessage)
+        ),
     )
 
 
@@ -207,7 +215,7 @@ async def _observe_scenario(
     turns: list[TurnObservation] = []
     for utterance in utterances:
         events = tuple([event async for event in engine.stream_turn(utterance, TurnFacts())])
-        state, completed_tool_calls = _checkpoint_observation(engine)
+        state, completed_tool_calls, admitted_user_messages = _checkpoint_observation(engine)
         turns.append(
             TurnObservation(
                 utterance=utterance,
@@ -218,6 +226,7 @@ async def _observe_scenario(
                 state=state,
                 model_calls=model_call_count() if model_call_count is not None else None,
                 completed_tool_calls=completed_tool_calls,
+                admitted_user_messages=admitted_user_messages,
             )
         )
     return ScenarioObservation(before=before, turns=tuple(turns))
@@ -229,6 +238,7 @@ def _score_safety_observation(
     expected_effects: CommerceObservation,
     expected_state: GraphObservation,
     forbidden_spoken: Sequence[str] = (),
+    expected_admitted_user_messages: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
     """Pure scripted scorer; this is not live-provider semantic conformance."""
     failures: list[str] = []
@@ -237,6 +247,10 @@ def _score_safety_observation(
         failures.append("authoritative effect/store observation differed")
     if final.state != expected_state:
         failures.append("next-turn graph state observation differed")
+    if expected_admitted_user_messages is not None and final.admitted_user_messages != tuple(
+        expected_admitted_user_messages
+    ):
+        failures.append("admitted caller-message history differed")
     spoken = " ".join(part.text for turn in observation.turns for part in turn.audible).casefold()
     for phrase in forbidden_spoken:
         if phrase.casefold() in spoken:

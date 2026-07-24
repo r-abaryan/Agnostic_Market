@@ -182,3 +182,15 @@ class FakeChatModel(BaseChatModel):
         size = max(len(text) // self.stream_chunks, 1)
         for start in range(0, len(text), size):
             yield ChatGenerationChunk(message=AIMessageChunk(content=text[start : start + size]))
+
+
+class ExplodingOnceFakeChatModel(FakeChatModel):
+    """Raise once as a provider outage, then use the configured fake response."""
+
+    _exploded: bool = PrivateAttr(default=False)
+
+    def _respond(self, messages: list[BaseMessage], **kwargs: Any) -> AIMessage:
+        if not self._exploded:
+            self._exploded = True
+            raise RuntimeError("simulated provider 529 overloaded")
+        return super()._respond(messages, **kwargs)
