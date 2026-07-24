@@ -137,13 +137,13 @@ def test_idempotency_is_scoped_per_customer(config_root: Path) -> None:
     assert store.address_on_file(_STRANGER) == "9 Oak Ave"
     assert (
         store.update_profile(
-            "shared-key", customer_ref=_OWNER, field="address", new_value="ignored replay"
+            "shared-key", customer_ref=_OWNER, field="address", new_value="7 Elm St"
         )
         is first
     )
     assert (
         store.update_profile(
-            "shared-key", customer_ref=_STRANGER, field="address", new_value="ignored replay"
+            "shared-key", customer_ref=_STRANGER, field="address", new_value="9 Oak Ave"
         )
         is second
     )

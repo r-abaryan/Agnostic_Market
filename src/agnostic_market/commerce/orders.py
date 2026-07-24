@@ -27,6 +27,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.state import BatchCancelOutcome, CartLine
 
@@ -170,8 +171,7 @@ def render_order_list_line(
     if not candidates:
         return "I don't see any orders on your account."
     parts = [
-        f"{c.order_id}, {c.summary}, {_STATUS_PHRASE.get(c.status, c.status)}"
-        for c in candidates
+        f"{c.order_id}, {c.summary}, {_STATUS_PHRASE.get(c.status, c.status)}" for c in candidates
     ]
     if scope == "session":
         lead_one = "You've placed 1 order on this call"
@@ -338,9 +338,14 @@ class PlacedOrder(BaseModel):
     lines: tuple[PlacedLine, ...] = Field(min_length=1)
 
 
+class PlacementError(ValueError):
+    """A placement the store refused."""
+
+
 class RefundRecord(BaseModel):
     """A refund this store issued (the stub SoR's own record). `refund_id` is the refund
-    REFERENCE ("R-7001..") — distinct from a return/RMA id (Group C's `ReturnRecord`)."""
+    REFERENCE ("R-7001..") — distinct from a return/RMA id (Group C's `ReturnRecord`).
+    `instrument_ref` is masked display evidence, never raw payment data."""
 
     model_config = _FROZEN
 
@@ -348,6 +353,7 @@ class RefundRecord(BaseModel):
     order_id: str = Field(min_length=1)
     amount_usd: float = Field(ge=0)
     destination: str = Field(min_length=1)
+    instrument_ref: str = Field(min_length=1)
 
 
 class RefundError(ValueError):
@@ -388,6 +394,57 @@ class ReturnRecord(BaseModel):
 class ReturnError(ValueError):
     """A return the store refused: unknown/ineligible order, an open return already exists,
     or the recorded refund would exceed the order's refundable balance."""
+
+
+def _line_fingerprint(
+    lines: Iterable[CartLine | PlacedLine],
+) -> tuple[tuple[str, str, float, int], ...]:
+    return tuple((line.sku, line.name, line.price_usd, line.quantity) for line in lines)
+
+
+def _placement_matches(
+    record: PlacedOrder,
+    *,
+    lines: Sequence[CartLine],
+    total_usd: float,
+) -> bool:
+    return record.total_usd == total_usd and _line_fingerprint(record.lines) == _line_fingerprint(
+        lines
+    )
+
+
+def _refund_matches(
+    record: RefundRecord,
+    *,
+    order_id: str,
+    amount_usd: float,
+    destination: str,
+    instrument_ref: str,
+) -> bool:
+    return (
+        record.order_id == order_id.strip().upper()
+        and record.amount_usd == amount_usd
+        and record.destination == destination
+        and record.instrument_ref == instrument_ref.strip()
+    )
+
+
+def _cancel_matches(record: CancelRecord, *, order_id: str) -> bool:
+    return record.order_id == order_id.strip().upper()
+
+
+def _return_matches(
+    record: ReturnRecord,
+    *,
+    order_id: str,
+    refund_due_usd: float,
+    destination: str,
+) -> bool:
+    return (
+        record.order_id == order_id.strip().upper()
+        and record.refund_due_usd == refund_due_usd
+        and record.destination == destination
+    )
 
 
 # Fulfillment states an order can be cancelled from (§A4b / industry: only the pre-shipment
@@ -690,6 +747,10 @@ class OrderStore:
         """
         existing = self._placed_by_key.get(idempotency_key)
         if existing is not None:
+            if not _placement_matches(existing, lines=lines, total_usd=total_usd):
+                raise PlacementError(
+                    "placement idempotency key was reused with different parameters"
+                )
             return existing
         placed = PlacedOrder(
             order_id=f"ORD-{self._next_seq}",
@@ -703,6 +764,19 @@ class OrderStore:
         self._placed_by_key[idempotency_key] = placed
         self._session_placed_ids.add(placed.order_id)
         return placed
+
+    def placement_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        lines: Sequence[CartLine],
+        total_usd: float,
+    ) -> ReceiptLookup[PlacedOrder]:
+        """Read the placement ledger without placing or restoring session visibility."""
+        return classify_receipt(
+            self._placed_by_key.get(idempotency_key),
+            lambda record: _placement_matches(record, lines=lines, total_usd=total_usd),
+        )
 
     @property
     def placed_count(self) -> int:
@@ -810,9 +884,7 @@ class OrderStore:
         normalized = order_id.strip().upper()
         return round(
             sum(
-                r.refund_due_usd
-                for r in self._returns_by_key.values()
-                if r.order_id == normalized
+                r.refund_due_usd for r in self._returns_by_key.values() if r.order_id == normalized
             ),
             2,
         )
@@ -824,6 +896,7 @@ class OrderStore:
         order_id: str,
         amount_usd: float,
         destination: str,
+        instrument_ref: str,
     ) -> RefundRecord:
         """Issue a refund, deduplicated by per-INTENT `idempotency_key` (SoR-arbiter rule).
 
@@ -840,7 +913,18 @@ class OrderStore:
         """
         existing = self._refunds_by_key.get(idempotency_key)
         if existing is not None:
+            if not _refund_matches(
+                existing,
+                order_id=order_id,
+                amount_usd=amount_usd,
+                destination=destination,
+                instrument_ref=instrument_ref,
+            ):
+                raise RefundError("refund idempotency key was reused with different parameters")
             return existing
+        cleaned_instrument_ref = instrument_ref.strip()
+        if not cleaned_instrument_ref:
+            raise RefundError("empty refund instrument reference")
         captured = self.captured_total(order_id)
         if captured is None:
             raise RefundError(f"unknown order {order_id!r} - cannot refund")
@@ -862,10 +946,32 @@ class OrderStore:
             order_id=order_id.strip().upper(),
             amount_usd=amount_usd,
             destination=destination,
+            instrument_ref=cleaned_instrument_ref,
         )
         self._next_refund_seq += 1
         self._refunds_by_key[idempotency_key] = record
         return record
+
+    def refund_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        amount_usd: float,
+        destination: str,
+        instrument_ref: str,
+    ) -> ReceiptLookup[RefundRecord]:
+        """Read one exact refund-intent result from the authoritative ledger."""
+        return classify_receipt(
+            self._refunds_by_key.get(idempotency_key),
+            lambda record: _refund_matches(
+                record,
+                order_id=order_id,
+                amount_usd=amount_usd,
+                destination=destination,
+                instrument_ref=instrument_ref,
+            ),
+        )
 
     @property
     def refund_count(self) -> int:
@@ -895,6 +1001,13 @@ class OrderStore:
         """
         existing = self._returns_by_key.get(idempotency_key)
         if existing is not None:
+            if not _return_matches(
+                existing,
+                order_id=order_id,
+                refund_due_usd=refund_due_usd,
+                destination=destination,
+            ):
+                raise ReturnError("return idempotency key was reused with different parameters")
             return existing
         normalized = order_id.strip().upper()
         status = self.order_status(normalized)
@@ -907,9 +1020,7 @@ class OrderStore:
             )
         open_return = self.return_for_order(normalized)
         if open_return is not None:
-            raise ReturnError(
-                f"a return for {normalized} is already open ({open_return.rma_id})"
-            )
+            raise ReturnError(f"a return for {normalized} is already open ({open_return.rma_id})")
         captured = self.captured_total(normalized)
         assert captured is not None  # status resolved above, so the order is known
         already = self.refunded_so_far(normalized)
@@ -930,6 +1041,25 @@ class OrderStore:
         self._next_return_seq += 1
         self._returns_by_key[idempotency_key] = record
         return record
+
+    def return_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        refund_due_usd: float,
+        destination: str,
+    ) -> ReceiptLookup[ReturnRecord]:
+        """Read one exact return-intent result from the authoritative ledger."""
+        return classify_receipt(
+            self._returns_by_key.get(idempotency_key),
+            lambda record: _return_matches(
+                record,
+                order_id=order_id,
+                refund_due_usd=refund_due_usd,
+                destination=destination,
+            ),
+        )
 
     @property
     def return_count(self) -> int:
@@ -957,6 +1087,10 @@ class OrderStore:
         """
         existing = self._cancels_by_key.get(idempotency_key)
         if existing is not None:
+            if not _cancel_matches(existing, order_id=order_id):
+                raise CancelError(
+                    "cancellation idempotency key was reused with different parameters"
+                )
             return existing
         normalized = order_id.strip().upper()
         status = self.order_status(normalized)
@@ -979,6 +1113,18 @@ class OrderStore:
         record = CancelRecord(order_id=normalized, summary=summary, total_usd=captured)
         self._cancels_by_key[idempotency_key] = record
         return record
+
+    def cancel_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+    ) -> ReceiptLookup[CancelRecord]:
+        """Read one exact cancellation-intent result from the authoritative ledger."""
+        return classify_receipt(
+            self._cancels_by_key.get(idempotency_key),
+            lambda record: _cancel_matches(record, order_id=order_id),
+        )
 
     def order_item_summary(self, order_id: str) -> str:
         """The short item summary for an order (fixture or placed) — for spoken readbacks."""

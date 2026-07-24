@@ -21,6 +21,7 @@ from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.support import flow as support_flow
+from agnostic_market.commerce.identity import load_customers_fixture
 from agnostic_market.commerce.orders import OrderStore
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import (
@@ -36,11 +37,22 @@ from agnostic_market.dtos.state import PolicyContext
 _POLICY = make_policy()
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
+_ORIGINAL_INSTRUMENT = "original payment method"
 # The reasoning fake proposes a refund of $129.00 on order key "2" (ORD-1002) to a NEW card.
 _PROPOSE = {
     "propose_refund": {"order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"}
 }
 _REFUND_REQUEST = "I'd like a refund to a different card"
+
+
+def _instrument_ref(config_root: Path, customer_ref: str) -> str:
+    value = (
+        load_customers_fixture(config_root, "acme_store")
+        .customers[customer_ref]
+        .new_payment_instrument_ref
+    )
+    assert value is not None
+    return value
 
 
 def _engine(
@@ -102,7 +114,7 @@ async def test_committed_otp_raises_level_then_reads_back_the_refund(config_root
     # alone can't tell WHICH owned order the caller meant — INV-32).
     assert "ORD-1002" in interrupts[0].prompt
     assert "$129.00" in interrupts[0].prompt
-    assert "card ending 4471" in interrupts[0].prompt
+    assert _instrument_ref(config_root, "CUST-002") in interrupts[0].prompt
     assert store.refund_count == 0  # still nothing placed before the yes
 
 
@@ -209,7 +221,7 @@ async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
     assert "yes or no" in reconfirms[0].prompt.lower()
     assert "ORD-1002" in reconfirms[0].prompt
     assert "$129.00" in reconfirms[0].prompt
-    assert "card ending 4471" in reconfirms[0].prompt
+    assert _instrument_ref(config_root, "CUST-002") in reconfirms[0].prompt
     await _events(engine, "yes")  # a clean committed yes places it
     assert store.refund_count == 1
 
@@ -890,6 +902,36 @@ def _refund_engine(config_root, amount, dest, *, thread_id, policy=_POLICY):
     )
 
 
+async def test_new_instrument_reference_follows_the_authorized_order_owner(
+    config_root: Path,
+) -> None:
+    engine, _, _, _ = _refund_engine(
+        config_root,
+        100.0,
+        "new_instrument",
+        thread_id="instrument-owner",
+    )
+    await _events(engine, "refund my order to a different card")
+    events = await _events(engine, _VALID_OTP)
+    interrupts = [event for event in events if isinstance(event, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert _instrument_ref(config_root, "CUST-001") in interrupts[0].prompt
+    assert _instrument_ref(config_root, "CUST-002") not in interrupts[0].prompt
+
+
+async def test_unmodelled_refund_destination_fails_closed(config_root: Path) -> None:
+    engine, store, _, _ = _refund_engine(
+        config_root,
+        100.0,
+        "new_address",
+        thread_id="refund-new-address",
+    )
+    events = await _events(engine, "refund my order to a different address")
+    assert store.refund_count == 0
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert not engine.pending_interrupt()
+
+
 async def test_refund_in_band_reaches_readback(config_root: Path) -> None:
     # $150 <= require_human_above (200) -> agent processes behind the readback.
     engine, store, _, _ = _refund_engine(config_root, 150.0, "original", thread_id="amt-1")
@@ -1040,7 +1082,13 @@ async def test_cancel_after_a_partial_refund_declines_without_voiding(config_roo
     # The reverse double-dip: a partial refund exists, then a cancel request — a void would
     # return the full charge ON TOP of the refund. Declines to support, order untouched.
     engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="steer-5")
-    store.issue_refund("prior-refund", order_id="ORD-1002", amount_usd=30.0, destination="original")
+    store.issue_refund(
+        "prior-refund",
+        order_id="ORD-1002",
+        amount_usd=30.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     events = await _events(engine, "cancel my rain jacket order")
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert store.cancel_count == 0

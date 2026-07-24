@@ -926,6 +926,7 @@ def build_frontline_graph(
         policy,
         profile_store,
         recent_orders,
+        customers,
         identity_store=identity_store,
         display_name=display_name,
     )

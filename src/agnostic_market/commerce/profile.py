@@ -19,6 +19,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agnostic_market.commerce.identity import CustomersFixture
+from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.confirmation import ProfileField
 
@@ -63,6 +64,20 @@ class ProfileError(ValueError):
     """A profile change the store refused."""
 
 
+def _profile_change_matches(
+    record: ProfileChangeRecord,
+    *,
+    customer_ref: str,
+    field: ProfileField,
+    new_value: str,
+) -> bool:
+    return (
+        record.customer_ref == customer_ref
+        and record.field == field
+        and record.new_value == new_value.strip()
+    )
+
+
 def load_profile_fixture(config_root: Path, merchant_id: str) -> ProfileFixture:
     """Load + validate the merchant's profile fixture. Fails loudly (build time, not mid-call)."""
     path = config_root / "fixtures" / "profiles" / f"{merchant_id}.yaml"
@@ -72,9 +87,7 @@ def load_profile_fixture(config_root: Path, merchant_id: str) -> ProfileFixture:
         raise ConfigError(f"profile fixture {path} failed validation:\n{exc}") from exc
 
 
-def assert_profiles_have_customers(
-    profiles: ProfileFixture, customers: CustomersFixture
-) -> None:
+def assert_profiles_have_customers(profiles: ProfileFixture, customers: CustomersFixture) -> None:
     """Every profile owner must exist in the customer directory.
 
     This is a build-time fixture integrity check, not a runtime authorization decision. Only
@@ -143,6 +156,13 @@ class ProfileStore:
         key = (customer_ref, idempotency_key)
         existing = self._changes_by_key.get(key)
         if existing is not None:
+            if not _profile_change_matches(
+                existing,
+                customer_ref=customer_ref,
+                field=field,
+                new_value=new_value,
+            ):
+                raise ProfileError("profile idempotency key was reused with different parameters")
             return existing
         cleaned = new_value.strip()
         if not cleaned:
@@ -150,6 +170,25 @@ class ProfileStore:
         record = ProfileChangeRecord(customer_ref=customer_ref, field=field, new_value=cleaned)
         self._changes_by_key[key] = record
         return record
+
+    def profile_change_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        customer_ref: str,
+        field: ProfileField,
+        new_value: str,
+    ) -> ReceiptLookup[ProfileChangeRecord]:
+        """Read one customer-scoped profile-change result without searching other scopes."""
+        return classify_receipt(
+            self._changes_by_key.get((customer_ref, idempotency_key)),
+            lambda record: _profile_change_matches(
+                record,
+                customer_ref=customer_ref,
+                field=field,
+                new_value=new_value,
+            ),
+        )
 
     @property
     def change_count(self) -> int:

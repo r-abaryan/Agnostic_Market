@@ -61,6 +61,7 @@ from agnostic_market.agents.support.prompt import compose_support_prompt
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
+    CustomerDirectory,
     order_mutation_allowed,
     order_read_allowed,
 )
@@ -121,10 +122,6 @@ from agnostic_market.dtos.state import (
 )
 
 logger = logging.getLogger("agnostic_market.agents.support")
-
-# A masked instrument reference is all voice ever handles — never a raw PAN (PCI, SECURITY
-# §6). The fixture "new card on file" for the build phase; a real stored-instrument ref later.
-_NEW_INSTRUMENT_REF = "card ending 4471"
 
 # Sentinel: the mutation authorization needs the caller to verify their identity (OTP) first.
 # An UNBOUND caller's mutation can never authorize this turn (a rung-1 contact grant is
@@ -420,16 +417,17 @@ def build_support_nodes(
     policy: PolicyContext,
     profile_store: ProfileStore,
     recent_orders: RecentOrderContext,
+    customers: CustomerDirectory,
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
 ) -> SupportNodes:
-    """Build the support flow's nodes, closed over the session's stores + providers + policy
-    (§A5: tenant/policy/verification bound in code at build time — never carried in state).
-    `identity_store` MUST be the same instance the voice tools + identity flow use (split-brain
-    rule) — the assemble gate reads rung-2 binding through it. No `customers` here: the support
-    gate no longer grants by contact (rung-1 contact grants are READ-only, Fix 2); guest
-    mutations detour into the identity flow, which owns the contact match."""
+    """Build Support around session-bound stores, providers, and policy.
+
+    `identity_store` is the same instance used by tools and Identity. `customers` supplies only
+    the authorized account's masked payment-instrument reference; Support never contact-matches
+    or accepts a customer ref from the model.
+    """
 
     @tool
     def propose_refund(order_key: str, amount_usd: float, destination: str) -> str:
@@ -587,13 +585,27 @@ def build_support_nodes(
                 }
             if chosen is not None:
                 assert request.amount_usd is not None and request.destination is not None
+                pending = _mint_refund(
+                    chosen,
+                    amount_usd=request.amount_usd,
+                    destination=request.destination,
+                )
+                if pending is None:
+                    write_event(
+                        {"event": "refund_destination_unavailable", "reason": request.destination}
+                    )
+                    return {
+                        **base,
+                        "active_flow": None,
+                        "handover": HandoffRequest(
+                            destination="human",
+                            reason_code="refund",
+                            source="gate",
+                        ),
+                    }
                 return {
                     **base,
-                    "pending_refund": _mint_refund(
-                        chosen,
-                        amount_usd=request.amount_usd,
-                        destination=request.destination,
-                    ),
+                    "pending_refund": pending,
                 }
 
         if isinstance(request, ReturnOrder) and isinstance(request.target, ExplicitOrderTarget):
@@ -735,15 +747,30 @@ def build_support_nodes(
 
     def _mint_refund(
         chosen: OrderCandidate, *, amount_usd: float, destination: RefundDestination
-    ) -> PendingRefund:
+    ) -> PendingRefund | None:
+        if destination == "original":
+            instrument_ref = "original payment method"
+        elif destination == "new_instrument":
+            customer_ref = order_store.order_owner(chosen.order_id)
+            if customer_ref is None:
+                bound = identity_store.current()
+                customer_ref = bound.customer_ref if bound is not None else None
+            instrument_ref = (
+                customers.new_payment_instrument_ref(customer_ref)
+                if customer_ref is not None
+                else None
+            )
+            if instrument_ref is None:
+                return None
+        else:
+            # There is no typed payout-address reference in this build.
+            return None
         return PendingRefund(
             order_id=chosen.order_id,
             summary=chosen.summary,
             amount_usd=round(amount_usd, 2),
             destination=destination,
-            instrument_ref=(
-                _NEW_INSTRUMENT_REF if destination != "original" else "original payment method"
-            ),
+            instrument_ref=instrument_ref,
             idempotency_key=uuid.uuid4().hex,
             attempt_key=uuid.uuid4().hex,
             created_at=time.time(),
@@ -1132,6 +1159,20 @@ def build_support_nodes(
                     amount_usd=proposal.amount_usd,
                     destination=proposal.destination,
                 )
+                if pending is None:
+                    write_event(
+                        {"event": "refund_destination_unavailable", "reason": proposal.destination}
+                    )
+                    return {
+                        "messages": new_messages,
+                        "pending_refund": None,
+                        "active_flow": None,
+                        "handover": HandoffRequest(
+                            destination="human",
+                            reason_code="refund",
+                            source="gate",
+                        ),
+                    }
                 return {"messages": new_messages, "pending_refund": pending}
 
             if call["name"] not in bound_tool_names:
@@ -1397,6 +1438,7 @@ def build_support_nodes(
                 order_id=pending.order_id,
                 amount_usd=pending.amount_usd,
                 destination=pending.destination,
+                instrument_ref=pending.instrument_ref,
             )
         except RefundError as exc:
             logger.warning("refund refused by store: %s", exc)
@@ -1416,7 +1458,7 @@ def build_support_nodes(
                     destination="human", reason_code="refund", source="gate"
                 ),
             }
-        recent_orders.record([pending.order_id], operation="refund")
+        recent_orders.record([record.order_id], operation="refund")
         write_event(
             {
                 "event": "refund_confirmed",
@@ -1431,7 +1473,7 @@ def build_support_nodes(
             "messages": [
                 AIMessage(
                     f"Done - your ${record.amount_usd:.2f} refund is on its way to your "
-                    f"{pending.instrument_ref}. Your reference is {record.refund_id}."
+                    f"{record.instrument_ref}. Your reference is {record.refund_id}."
                 )
             ],
         }

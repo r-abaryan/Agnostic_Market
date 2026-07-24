@@ -23,6 +23,7 @@ from agnostic_market.dtos.confirmation import (
 from agnostic_market.dtos.state import CartLine
 
 _TEST_OTP = "482913"
+_ORIGINAL_INSTRUMENT = "original payment method"
 
 
 def _store(config_root: Path) -> OrderStore:
@@ -158,8 +159,20 @@ def test_risk_provider_reports_flag() -> None:
 
 def test_refund_is_idempotent_per_intent_key(config_root: Path) -> None:
     store = _store(config_root)
-    r1 = store.issue_refund("i1", order_id="ORD-1002", amount_usd=50.0, destination="original")
-    r2 = store.issue_refund("i1", order_id="ORD-1002", amount_usd=50.0, destination="original")
+    r1 = store.issue_refund(
+        "i1",
+        order_id="ORD-1002",
+        amount_usd=50.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
+    r2 = store.issue_refund(
+        "i1",
+        order_id="ORD-1002",
+        amount_usd=50.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     assert r1.refund_id == r2.refund_id  # a replay returns the SAME refund
     assert store.refund_count == 1
 
@@ -167,25 +180,55 @@ def test_refund_is_idempotent_per_intent_key(config_root: Path) -> None:
 def test_second_legitimate_partial_refund_is_not_deduped(config_root: Path) -> None:
     # An order_id-derived key would silently dedupe this; the per-INTENT key must not.
     store = _store(config_root)
-    store.issue_refund("intent-1", order_id="ORD-1002", amount_usd=50.0, destination="original")
-    store.issue_refund("intent-2", order_id="ORD-1002", amount_usd=40.0, destination="original")
+    store.issue_refund(
+        "intent-1",
+        order_id="ORD-1002",
+        amount_usd=50.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
+    store.issue_refund(
+        "intent-2",
+        order_id="ORD-1002",
+        amount_usd=40.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     assert store.refund_count == 2
     assert store.refunded_so_far("ORD-1002") == 90.0
 
 
 def test_cumulative_cap_refuses_over_refund(config_root: Path) -> None:
     store = _store(config_root)  # ORD-1002 captured $129.00
-    store.issue_refund("i1", order_id="ORD-1002", amount_usd=100.0, destination="original")
+    store.issue_refund(
+        "i1",
+        order_id="ORD-1002",
+        amount_usd=100.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     with pytest.raises(RefundError):
         # 100 + 40 = 140 > 129 -> refused (the join two partials could otherwise slip)
-        store.issue_refund("i2", order_id="ORD-1002", amount_usd=40.0, destination="original")
+        store.issue_refund(
+            "i2",
+            order_id="ORD-1002",
+            amount_usd=40.0,
+            destination="original",
+            instrument_ref=_ORIGINAL_INSTRUMENT,
+        )
     assert store.refunded_so_far("ORD-1002") == 100.0  # the refused one did not land
 
 
 def test_refund_against_unknown_order_is_refused(config_root: Path) -> None:
     store = _store(config_root)
     with pytest.raises(RefundError):
-        store.issue_refund("i1", order_id="NOPE-404", amount_usd=1.0, destination="original")
+        store.issue_refund(
+            "i1",
+            order_id="NOPE-404",
+            amount_usd=1.0,
+            destination="original",
+            instrument_ref=_ORIGINAL_INSTRUMENT,
+        )
 
 
 def test_refund_against_a_cancelled_order_is_refused(config_root: Path) -> None:
@@ -194,7 +237,13 @@ def test_refund_against_a_cancelled_order_is_refused(config_root: Path) -> None:
     store = _store(config_root)
     store.cancel_order("ck-1", order_id="ORD-1002")
     with pytest.raises(RefundError):
-        store.issue_refund("i1", order_id="ORD-1002", amount_usd=50.0, destination="original")
+        store.issue_refund(
+            "i1",
+            order_id="ORD-1002",
+            amount_usd=50.0,
+            destination="original",
+            instrument_ref=_ORIGINAL_INSTRUMENT,
+        )
     assert store.refund_count == 0
 
 
@@ -206,7 +255,11 @@ def test_refund_can_target_a_just_placed_order(config_root: Path) -> None:
         total_usd=129.0,
     )
     rec = store.issue_refund(
-        "i1", order_id=placed.order_id, amount_usd=129.0, destination="original"
+        "i1",
+        order_id=placed.order_id,
+        amount_usd=129.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
     )
     assert rec.order_id == placed.order_id
     assert store.refunded_so_far(placed.order_id) == 129.0

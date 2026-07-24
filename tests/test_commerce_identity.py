@@ -59,13 +59,9 @@ def test_spoken_digit_phone_matches(config_root: Path) -> None:
     # A phone number spoken as words ("five five five ... oh one one nine") must match.
     d = _directory(config_root)
     assert (
-        d.match_contact("five five five zero one zero zero one one nine").customer_ref
-        == "CUST-001"
+        d.match_contact("five five five zero one zero zero one one nine").customer_ref == "CUST-001"
     )
-    assert (
-        d.match_contact("five five five, oh one oh, oh one one nine").customer_ref
-        == "CUST-001"
-    )
+    assert d.match_contact("five five five, oh one oh, oh one one nine").customer_ref == "CUST-001"
 
 
 def test_no_cross_type_and_no_short_match(config_root: Path) -> None:
@@ -114,7 +110,8 @@ def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
     assert not order_read_allowed("ORD-1002", store=store, identity=identity)  # CUST-002's
     # Session-placed: readable with NO identity at all (placed-by-this-caller).
     placed = store.place_cart(
-        "k1", lines=[CartLine(sku="SKU-GRN-15", name="socks", price_usd=14.5, quantity=1)],
+        "k1",
+        lines=[CartLine(sku="SKU-GRN-15", name="socks", price_usd=14.5, quantity=1)],
         total_usd=14.5,
     )
     assert order_read_allowed(placed.order_id, store=store, identity=CallerIdentityStore())
@@ -126,6 +123,18 @@ def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
 def test_customers_fixture_loads_from_config(config_root: Path) -> None:
     fixture = load_customers_fixture(config_root, "acme_store")
     assert set(fixture.customers) == {"CUST-001", "CUST-002"}
+    refs = [entry.new_payment_instrument_ref for entry in fixture.customers.values()]
+    assert all(refs)
+    assert len(set(refs)) == len(refs)
+
+
+def test_customer_fixture_rejects_an_unmasked_payment_instrument() -> None:
+    with pytest.raises(ValueError, match="must be masked"):
+        CustomerEntry(
+            contact="person@example.com",
+            masked_contact="email ending example dot com",
+            new_payment_instrument_ref="4111 1111 1111 1111",
+        )
 
 
 def test_missing_customers_fixture_fails_loudly(config_root: Path) -> None:

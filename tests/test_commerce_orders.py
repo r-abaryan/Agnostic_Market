@@ -17,6 +17,8 @@ from agnostic_market.commerce.orders import (
 )
 from agnostic_market.dtos.state import CartLine
 
+_ORIGINAL_INSTRUMENT = "original payment method"
+
 
 def _store(config_root: Path) -> OrderStore:
     return OrderStore(load_orders_fixture(config_root, "acme_store"))
@@ -29,8 +31,9 @@ def _line(sku: str, name: str, price: float, qty: int) -> CartLine:
 def _place1(store: OrderStore, key: str, sku: str, name: str, qty: int, total: float):
     """Place a single-line order via the multi-line place_cart (Group B): tests that only
     need 'an order exists' express it as one line."""
-    return store.place_cart(key, lines=[_line(sku, name, round(total / qty, 2), qty)],
-                            total_usd=total)
+    return store.place_cart(
+        key, lines=[_line(sku, name, round(total / qty, 2), qty)], total_usd=total
+    )
 
 
 def test_recent_order_context_marks_a_bounded_set_incomplete() -> None:
@@ -66,8 +69,10 @@ def test_place_cart_places_one_multi_line_order(config_root: Path) -> None:
     store = _store(config_root)
     order = store.place_cart(
         "k1",
-        lines=[_line("SKU-BLU-07", "rain jacket", 129.0, 2),
-               _line("SKU-GRN-15", "pair of socks", 14.5, 1)],
+        lines=[
+            _line("SKU-BLU-07", "rain jacket", 129.0, 2),
+            _line("SKU-GRN-15", "pair of socks", 14.5, 1),
+        ],
         total_usd=272.5,
     )
     assert len(order.lines) == 2
@@ -187,7 +192,13 @@ def test_cancel_refuses_an_order_with_refunds_issued(config_root: Path) -> None:
     # A void reverses the FULL charge; on top of a prior partial refund that returns money
     # twice — the mixed case belongs to a person, never an automatic void.
     store = _store(config_root)
-    store.issue_refund("r1", order_id="ORD-1002", amount_usd=50.0, destination="original")
+    store.issue_refund(
+        "r1",
+        order_id="ORD-1002",
+        amount_usd=50.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     with pytest.raises(CancelError):
         store.cancel_order("ck-1", order_id="ORD-1002")
     assert store.cancel_count == 0
@@ -229,15 +240,18 @@ def test_create_return_is_idempotent_by_key(config_root: Path) -> None:
 def test_create_return_refuses_unshipped_cancelled_and_unknown(config_root: Path) -> None:
     store = _store(config_root)
     with pytest.raises(ReturnError, match="processing"):
-        store.create_return("rk-1", order_id="ORD-1002", refund_due_usd=10.0,
-                            destination="original")
+        store.create_return(
+            "rk-1", order_id="ORD-1002", refund_due_usd=10.0, destination="original"
+        )
     store.cancel_order("ck-1", order_id="ORD-1002")
     with pytest.raises(ReturnError, match="cancelled"):
-        store.create_return("rk-2", order_id="ORD-1002", refund_due_usd=10.0,
-                            destination="original")
+        store.create_return(
+            "rk-2", order_id="ORD-1002", refund_due_usd=10.0, destination="original"
+        )
     with pytest.raises(ReturnError, match="unknown"):
-        store.create_return("rk-3", order_id="ORD-9999", refund_due_usd=10.0,
-                            destination="original")
+        store.create_return(
+            "rk-3", order_id="ORD-9999", refund_due_usd=10.0, destination="original"
+        )
     assert store.return_count == 0
 
 
@@ -247,20 +261,29 @@ def test_second_return_on_same_order_is_refused_naming_the_open_rma(config_root:
         "rk-1", order_id="ORD-1001", refund_due_usd=100.0, destination="original"
     )
     with pytest.raises(ReturnError, match=first.rma_id):
-        store.create_return("rk-2", order_id="ORD-1001", refund_due_usd=50.0,
-                            destination="original")
+        store.create_return(
+            "rk-2", order_id="ORD-1001", refund_due_usd=50.0, destination="original"
+        )
     assert store.return_count == 1
 
 
 def test_return_promise_cannot_exceed_refundable_balance(config_root: Path) -> None:
     # $80 already refunded on the $179.98 order: a return may promise at most the remainder.
     store = _store(config_root)
-    store.issue_refund("i1", order_id="ORD-1001", amount_usd=80.0, destination="original")
+    store.issue_refund(
+        "i1",
+        order_id="ORD-1001",
+        amount_usd=80.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     with pytest.raises(ReturnError, match="exceeds refundable balance"):
-        store.create_return("rk-1", order_id="ORD-1001", refund_due_usd=179.98,
-                            destination="original")
-    ok = store.create_return("rk-2", order_id="ORD-1001", refund_due_usd=99.98,
-                             destination="original")
+        store.create_return(
+            "rk-1", order_id="ORD-1001", refund_due_usd=179.98, destination="original"
+        )
+    ok = store.create_return(
+        "rk-2", order_id="ORD-1001", refund_due_usd=99.98, destination="original"
+    )
     assert ok.refund_due_usd == 99.98
 
 
@@ -268,10 +291,15 @@ def test_open_return_promise_blocks_a_refund_on_the_same_dollars(config_root: Pa
     # The store is the arbiter (§A4c): a refund paid alongside an open return's recorded
     # promise would double-return the same money (refund now + release at Phase 4).
     store = _store(config_root)
-    store.create_return("rk-1", order_id="ORD-1001", refund_due_usd=179.98,
-                        destination="original")
+    store.create_return("rk-1", order_id="ORD-1001", refund_due_usd=179.98, destination="original")
     with pytest.raises(RefundError, match="promised on open returns"):
-        store.issue_refund("i1", order_id="ORD-1001", amount_usd=10.0, destination="original")
+        store.issue_refund(
+            "i1",
+            order_id="ORD-1001",
+            amount_usd=10.0,
+            destination="original",
+            instrument_ref=_ORIGINAL_INSTRUMENT,
+        )
     assert store.refund_count == 0
 
 
@@ -292,7 +320,10 @@ def test_delivered_fixture_entry_requires_delivered_at() -> None:
 
     with pytest.raises(ValueError, match="delivered_at"):
         _OrderEntry(
-            status="delivered", summary="x", eta="2026-07-01", total_usd=10.0,
+            status="delivered",
+            summary="x",
+            eta="2026-07-01",
+            total_usd=10.0,
             customer_ref="CUST-001",
         )
 
@@ -359,8 +390,11 @@ def test_render_past_eta_frames_as_past_and_is_terminal() -> None:
     # ("was expected by"), never "arriving" — AND must NOT promise a follow-up check (F-11.1:
     # the model said "let me check the latest status" then ended the turn without checking).
     line = render_order_status_line(
-        order_id="ORD-1001", status="shipped",
-        items="2 pairs of trail running shoes", eta="2026-07-09", today=_TODAY,
+        order_id="ORD-1001",
+        status="shipped",
+        items="2 pairs of trail running shoes",
+        eta="2026-07-09",
+        today=_TODAY,
     )
     assert "was expected by" in line
     assert "arriv" not in line.lower()  # no "arriving"/"arrive" for a past date
@@ -371,8 +405,11 @@ def test_render_past_eta_frames_as_past_and_is_terminal() -> None:
 
 def test_render_future_eta_frames_as_upcoming() -> None:
     line = render_order_status_line(
-        order_id="ORD-1001", status="shipped",
-        items="2 pairs of trail running shoes", eta="2026-07-20", today=_TODAY,
+        order_id="ORD-1001",
+        status="shipped",
+        items="2 pairs of trail running shoes",
+        eta="2026-07-20",
+        today=_TODAY,
     )
     assert "expected to arrive by" in line
     assert "was expected" not in line
@@ -381,7 +418,11 @@ def test_render_future_eta_frames_as_upcoming() -> None:
 def test_render_today_eta_frames_as_today() -> None:
     # Midnight boundary: eta == today is NOT past.
     line = render_order_status_line(
-        order_id="ORD-1001", status="shipped", items="shoes", eta="2026-07-15", today=_TODAY,
+        order_id="ORD-1001",
+        status="shipped",
+        items="shoes",
+        eta="2026-07-15",
+        today=_TODAY,
     )
     assert "today" in line.lower()
     assert "was expected" not in line
@@ -389,8 +430,11 @@ def test_render_today_eta_frames_as_today() -> None:
 
 def test_render_duration_eta_has_no_date_logic() -> None:
     line = render_order_status_line(
-        order_id="ORD-9001", status="processing", items="a rain jacket",
-        eta="3-5 business days", today=_TODAY,
+        order_id="ORD-9001",
+        status="processing",
+        items="a rain jacket",
+        eta="3-5 business days",
+        today=_TODAY,
     )
     assert "3 to 5 business days" in line
     assert "expected by" not in line  # no absolute-date framing for a duration
@@ -398,7 +442,11 @@ def test_render_duration_eta_has_no_date_logic() -> None:
 
 def test_render_malformed_eta_is_omitted_not_spoken_raw() -> None:
     line = render_order_status_line(
-        order_id="ORD-1001", status="shipped", items="shoes", eta="soon-ish", today=_TODAY,
+        order_id="ORD-1001",
+        status="shipped",
+        items="shoes",
+        eta="soon-ish",
+        today=_TODAY,
     )
     assert "soon-ish" not in line  # never speak an unparseable raw ETA
     assert "on its way" in line  # the status still renders
@@ -407,7 +455,11 @@ def test_render_malformed_eta_is_omitted_not_spoken_raw() -> None:
 def test_render_unknown_status_fails_closed() -> None:
     # A status not in the phrase map must NOT get an invented phrase — speak the raw word.
     line = render_order_status_line(
-        order_id="ORD-1001", status="returned", items="shoes", eta=None, today=_TODAY,
+        order_id="ORD-1001",
+        status="returned",
+        items="shoes",
+        eta=None,
+        today=_TODAY,
     )
     assert "returned" in line
     assert "on its way" not in line  # no wrong-status humanization
@@ -416,11 +468,19 @@ def test_render_unknown_status_fails_closed() -> None:
 def test_render_delivered_and_cancelled_omit_eta() -> None:
     # An ETA is meaningless for a delivered (already arrived) or cancelled (won't arrive) order.
     delivered = render_order_status_line(
-        order_id="ORD-1003", status="delivered", items="socks", eta="2026-07-01", today=_TODAY,
+        order_id="ORD-1003",
+        status="delivered",
+        items="socks",
+        eta="2026-07-01",
+        today=_TODAY,
     )
     assert "delivered" in delivered and "expected" not in delivered
     cancelled = render_order_status_line(
-        order_id="ORD-9001", status="cancelled", items="jacket", eta="2026-07-20", today=_TODAY,
+        order_id="ORD-9001",
+        status="cancelled",
+        items="jacket",
+        eta="2026-07-20",
+        today=_TODAY,
     )
     assert "cancelled" in cancelled and "arrive" not in cancelled
 
@@ -529,10 +589,20 @@ def test_render_order_list_line_speaks_ids_items_status_only() -> None:
 
     line = render_order_list_line(
         [
-            OrderCandidate(key="1", order_id="ORD-1001", summary="2 pairs of shoes",
-                           total_usd=179.98, status="shipped"),
-            OrderCandidate(key="2", order_id="ORD-1003", summary="3 pairs of socks",
-                           total_usd=43.50, status="delivered"),
+            OrderCandidate(
+                key="1",
+                order_id="ORD-1001",
+                summary="2 pairs of shoes",
+                total_usd=179.98,
+                status="shipped",
+            ),
+            OrderCandidate(
+                key="2",
+                order_id="ORD-1003",
+                summary="3 pairs of socks",
+                total_usd=43.50,
+                status="delivered",
+            ),
         ]
     )
     assert "You've got 2 orders" in line
@@ -545,8 +615,15 @@ def test_render_order_list_line_session_scope_discloses_this_call() -> None:
     # Fix 3: the guest/session scope must NOT sound like a complete account history.
     from agnostic_market.commerce.orders import OrderCandidate
 
-    one = [OrderCandidate(key="1", order_id="ORD-9001", summary="2 rain jackets",
-                          total_usd=258.0, status="processing")]
+    one = [
+        OrderCandidate(
+            key="1",
+            order_id="ORD-9001",
+            summary="2 rain jackets",
+            total_usd=258.0,
+            status="processing",
+        )
+    ]
     assert "on this call" in render_order_list_line(one, scope="session")
     assert "You've got" not in render_order_list_line(one, scope="session")
     assert "You've got 1 order" in render_order_list_line(one)  # account default unchanged
@@ -585,8 +662,11 @@ def test_render_order_list_line_empty_and_unknown_status() -> None:
 
     assert render_order_list_line([]) == "I don't see any orders on your account."
     line = render_order_list_line(
-        [OrderCandidate(key="1", order_id="ORD-1", summary="a thing",
-                        total_usd=1.0, status="returned")]
+        [
+            OrderCandidate(
+                key="1", order_id="ORD-1", summary="a thing", total_usd=1.0, status="returned"
+            )
+        ]
     )
     assert "You've got 1 order" in line
     assert "returned" in line  # fail-closed: the raw status word, no invented phrase
@@ -626,7 +706,13 @@ def test_clear_session_placed_never_undoes_committed_effects(config_root: Path) 
     voided = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)  # ORD-9001 -> cancelled
     refunded = _place1(store, "k2", "SKU-RED-42", "shoes", 1, 89.99)  # ORD-9002 -> refunded
     store.cancel_order("c1", order_id=voided.order_id)
-    store.issue_refund("r1", order_id=refunded.order_id, amount_usd=20.0, destination="original")
+    store.issue_refund(
+        "r1",
+        order_id=refunded.order_id,
+        amount_usd=20.0,
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
     before_cancels, before_refunds = store.cancel_count, store.refund_count
     store.clear_session_placed()
     assert store.cancel_count == before_cancels  # committed cancel record retained
