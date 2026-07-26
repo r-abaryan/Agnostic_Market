@@ -208,8 +208,26 @@ def _cancel_outcome_clause(o: BatchCancelOutcome) -> str:
             f"your order for {o.summary} ({o.order_id}) already has a refund, so our support "
             "team needs to sort out the rest"
         )
-    # store_refused — an effect-time refusal with no typed reason; honest, promises nothing.
-    return f"I couldn't cancel your order for {o.summary} ({o.order_id}) - nothing changed on it"
+    if o.outcome == "store_refused":
+        # Effect-time refusal with no typed reason; honest, promises nothing.
+        return (
+            f"I couldn't cancel your order for {o.summary} ({o.order_id}) - nothing changed on it"
+        )
+    # Recovery checked the exact intent and found no committed receipt, or deliberately
+    # stopped before attempting this remainder. Do not claim the order is globally unchanged.
+    return (
+        f"the cancellation request for your order for {o.summary} ({o.order_id}) did not complete"
+    )
+
+
+def cancelled_batch_outcome(record: CancelRecord) -> BatchCancelOutcome:
+    """Convert one authoritative cancellation record into its checkpointed outcome."""
+    return BatchCancelOutcome(
+        order_id=record.order_id,
+        summary=record.summary,
+        outcome="cancelled",
+        amount_usd=record.total_usd,
+    )
 
 
 def render_batch_cancel_outcome(outcomes: Sequence[BatchCancelOutcome]) -> str:
@@ -387,6 +405,7 @@ class ReturnRecord(BaseModel):
 
     rma_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
     refund_due_usd: float = Field(ge=0)
     destination: str = Field(min_length=1)
 
@@ -1035,6 +1054,7 @@ class OrderStore:
         record = ReturnRecord(
             rma_id=f"RMA-{self._next_return_seq}",
             order_id=normalized,
+            summary=self.order_item_summary(normalized),
             refund_due_usd=refund_due_usd,
             destination=destination,
         )

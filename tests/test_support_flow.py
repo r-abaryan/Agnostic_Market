@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.agents.recovery import RECOVERY_NODE_NAME
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.orders import OrderStore
 from agnostic_market.commerce.payment_instruments import (
@@ -670,20 +671,15 @@ async def test_engine_recovers_cancel_after_write_before_checkpoint(
         return record
 
     monkeypatch.setattr(store, "cancel_order", write_then_crash)
-    failed = await _events(engine, "yes")
-    assert store.cancel_count == 1
-    assert any(
-        isinstance(event, SpokenMessageEvent) and event.node == "turn_fallback" for event in failed
-    )
-
-    recovered = await _events(engine, "please try that again")
+    recovered = await _events(engine, "yes")
     assert store.cancel_count == 1
     result_lines = [
         event
         for event in recovered
-        if isinstance(event, SpokenMessageEvent) and event.node == "support_cancel_void"
+        if isinstance(event, SpokenMessageEvent) and event.node == RECOVERY_NODE_NAME
     ]
     assert len(result_lines) == 1 and "cancelled" in result_lines[0].text.lower()
+    assert engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}}).next == ()
 
 
 async def test_concurrent_double_resume_has_n_effects_and_one_result_line(

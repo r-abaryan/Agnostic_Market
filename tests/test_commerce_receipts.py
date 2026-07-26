@@ -185,6 +185,7 @@ def test_return_receipt_distinguishes_absent_exact_and_conflicting_intents(
         destination="original",
     )
     assert record.rma_id == "RMA-3001"
+    assert record.summary == "2 pairs of trail running shoes"
     receipt = store.return_receipt(
         "return-key",
         order_id="ord-1001",

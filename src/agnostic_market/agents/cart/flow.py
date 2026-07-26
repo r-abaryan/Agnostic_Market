@@ -49,6 +49,7 @@ from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
     OrderStore,
+    PlacedOrder,
     RecentOrderContext,
     resolve_candidates,
     speak_lines,
@@ -159,6 +160,7 @@ class CartNodes:
     guardrail: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
+    finish_placement: Callable[[PlacedOrder], dict[str, object]]
     abort: Callable[[ReasoningState], dict[str, object]]
     escape_human: Callable[[ReasoningState], dict[str, object]]
     # After assemble: "place" (guardrail) | "ack" | "leave" (gate) | "clarify".
@@ -592,20 +594,9 @@ def build_cart_nodes(
             }
         return {}  # yes: pending survives; the router sends us to place
 
-    def place_node(state: ReasoningState) -> dict[str, object]:
-        """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
-        key dedup: a replay returns the ORIGINAL order. Clears the cart on success."""
-        pending = state.pending_placement
-        assert pending is not None
-        placed = order_store.place_cart(
-            pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd
-        )
-        cart_store.clear()
-        recent_orders.record([placed.order_id], operation="place")
-        write_event(
-            {"event": "checkout_confirmed", "order_id": placed.order_id, "total": placed.total_usd}
-        )
-        return {
+    def finish_placement(placed: PlacedOrder) -> dict[str, object]:
+        """Finish one authoritative placement; safe to re-run after receipt reconciliation."""
+        update = {
             "pending_placement": None,
             "active_flow": None,
             "messages": [
@@ -615,6 +606,22 @@ def build_cart_nodes(
                 )
             ],
         }
+        cart_store.clear()
+        recent_orders.record([placed.order_id], operation="place")
+        write_event(
+            {"event": "checkout_confirmed", "order_id": placed.order_id, "total": placed.total_usd}
+        )
+        return update
+
+    def place_node(state: ReasoningState) -> dict[str, object]:
+        """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
+        key dedup: a replay returns the ORIGINAL order. Clears the cart on success."""
+        pending = state.pending_placement
+        assert pending is not None
+        placed = order_store.place_cart(
+            pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd
+        )
+        return finish_placement(placed)
 
     def abort_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: explicit abort mid-flow. Drops the pending PLACEMENT but
@@ -660,6 +667,7 @@ def build_cart_nodes(
         guardrail=guardrail_node,
         confirm=confirm_node,
         place=place_node,
+        finish_placement=finish_placement,
         abort=abort_node,
         escape_human=escape_human_node,
         route_after_assemble=route_after_assemble,

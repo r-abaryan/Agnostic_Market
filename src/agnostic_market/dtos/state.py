@@ -185,6 +185,8 @@ CancelOutcomeCode = Literal[
     "has_refunds",  # preflight: a refund already exists — a void would double-return; a person
     "store_refused",  # effect-time refusal (stale since preflight); CancelError carries no
     # typed reason, so a rare effect-time refusal collapses to this generic honest code
+    "not_completed",  # recovery: this target was not committed or was never attempted after
+    # an earlier target failed; makes no claim about the order's global/current state
 ]
 
 

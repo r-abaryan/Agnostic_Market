@@ -72,12 +72,15 @@ from agnostic_market.commerce.orders import (
     OrderStore,
     RecentOrderContext,
     RefundError,
+    RefundRecord,
     ReturnError,
+    ReturnRecord,
+    cancelled_batch_outcome,
     render_batch_cancel_outcome,
     render_order_list_line,
 )
 from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
-from agnostic_market.commerce.profile import ProfileError, ProfileStore
+from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileError, ProfileStore
 from agnostic_market.commerce.spoken import (
     caller_stated_order_id,
     caller_stated_phone,
@@ -361,9 +364,11 @@ class SupportNodes:
     collect: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
+    finish_refund: Callable[[RefundRecord], dict[str, object]]
     cancel_guardrail: Callable[[ReasoningState], dict[str, object]]
     cancel_confirm: Callable[[ReasoningState], dict[str, object]]
     cancel_void: Callable[[ReasoningState], dict[str, object]]
+    finish_cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
     # Resolve a CancellableOrderScope into a batch after authorization. Reached from the typed
     # continuation or directly from an already-bound caller's assemble, and never speaks a list.
     resolve: Callable[[ReasoningState], dict[str, object]]
@@ -390,6 +395,7 @@ class SupportNodes:
     return_guardrail: Callable[[ReasoningState], dict[str, object]]
     return_confirm: Callable[[ReasoningState], dict[str, object]]
     return_place: Callable[[ReasoningState], dict[str, object]]
+    finish_return: Callable[[ReturnRecord], dict[str, object]]
     # "confirm" (eligible) | "cancel" (unshipped steer) | "declined" (guardrail spoke + ends).
     route_after_return_guardrail: Callable[[ReasoningState], str]
     # Profile-change sub-path (Group C): guardrail -> [step-up chain] -> confirm -> place.
@@ -401,6 +407,7 @@ class SupportNodes:
     profile_collect: Callable[[ReasoningState], dict[str, object]]
     profile_confirm: Callable[[ReasoningState], dict[str, object]]
     profile_place: Callable[[ReasoningState], dict[str, object]]
+    finish_profile_change: Callable[[ProfileChangeRecord], dict[str, object]]
     # "confirm" (level sufficient) | "stepup" (needs the OTP loop on the OLD factor).
     route_after_profile_guardrail: Callable[[ReasoningState], str]
     # "confirm" | "dispatch" (re-collect) | "handover" — the factory's decision router.
@@ -1414,6 +1421,30 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
+    def finish_refund(record: RefundRecord) -> dict[str, object]:
+        """Finish one authoritative refund; safe to re-run after receipt reconciliation."""
+        update = {
+            "pending_refund": None,
+            "active_flow": None,
+            "messages": [
+                AIMessage(
+                    f"Done - your ${record.amount_usd:.2f} refund is on its way to your "
+                    f"{record.instrument_ref}. Your reference is {record.refund_id}."
+                )
+            ],
+        }
+        verification = [grant.method for grant in verification_store.grants]
+        recent_orders.record([record.order_id], operation="refund")
+        write_event(
+            {
+                "event": "refund_confirmed",
+                "refund_id": record.refund_id,
+                "amount": record.amount_usd,
+                "verification": verification,
+            }
+        )
+        return update
+
     def place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
         per-intent key dedup + cumulative-cap enforcement; re-validates the LIVE level (§A4c
@@ -1458,25 +1489,7 @@ def build_support_nodes(
                     destination="human", reason_code="refund", source="gate"
                 ),
             }
-        recent_orders.record([record.order_id], operation="refund")
-        write_event(
-            {
-                "event": "refund_confirmed",
-                "refund_id": record.refund_id,
-                "amount": record.amount_usd,
-                "verification": [grant.method for grant in verification_store.grants],
-            }
-        )
-        return {
-            "pending_refund": None,
-            "active_flow": None,
-            "messages": [
-                AIMessage(
-                    f"Done - your ${record.amount_usd:.2f} refund is on its way to your "
-                    f"{record.instrument_ref}. Your reference is {record.refund_id}."
-                )
-            ],
-        }
+        return finish_refund(record)
 
     # --- cancel sub-path (F-16.2 batch; single = batch-of-one: guardrail -> confirm -> void)
 
@@ -1614,6 +1627,53 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> void
 
+    def finish_cancel(
+        pending: PendingCancelBatch,
+        outcome: BatchCancelOutcome,
+        abort_remainder: bool,
+    ) -> dict[str, object]:
+        """Checkpoint one target result, or close the batch after recovery."""
+        done = len(pending.outcomes)
+        if done >= len(pending.targets) or outcome.order_id != pending.targets[done].order_id:
+            raise ValueError("cancel finisher received an outcome for the wrong target")
+        outcomes = (*pending.outcomes, outcome)
+        if abort_remainder:
+            outcomes = (
+                *outcomes,
+                *(
+                    BatchCancelOutcome(
+                        order_id=target.order_id,
+                        summary=target.summary,
+                        outcome="not_completed",
+                    )
+                    for target in pending.targets[done + 1 :]
+                ),
+            )
+        if not abort_remainder and done + 1 < len(pending.targets):
+            update: dict[str, object] = {
+                "pending_cancel": pending.model_copy(update={"outcomes": outcomes})
+            }
+        else:
+            all_outcomes = [*pending.ineligible, *outcomes]
+            update = {
+                "pending_cancel": None,
+                "active_flow": None,
+                "messages": [AIMessage(render_batch_cancel_outcome(all_outcomes))],
+            }
+            recent_orders.record(
+                [result.order_id for result in all_outcomes],
+                operation="cancel",
+                focused_order_ref=all_outcomes[-1].order_id,
+                outcomes=[(result.order_id, result.outcome) for result in all_outcomes],
+            )
+        if outcome.outcome == "cancelled":
+            write_event({"event": "cancel_confirmed", "order_id": outcome.order_id})
+        elif outcome.outcome == "store_refused":
+            write_event(
+                {"event": "cancel_denied", "reason": "store_refused", "order_id": outcome.order_id}
+            )
+        return update
+
     def cancel_void_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Voids ONE eligible target
         per node completion, recording its outcome, then returns — the router loops back here
@@ -1626,45 +1686,18 @@ def build_support_nodes(
         per-target result and ends."""
         pending = state.pending_cancel
         assert isinstance(pending, PendingCancelBatch)
-        done = len(pending.outcomes)
-        target = pending.targets[done]
+        target = pending.targets[len(pending.outcomes)]
         try:
             record = order_store.cancel_order(target.idempotency_key, order_id=target.order_id)
-            outcome = BatchCancelOutcome(
-                order_id=record.order_id,
-                summary=record.summary,
-                outcome="cancelled",
-                amount_usd=record.total_usd,
-            )
-            write_event({"event": "cancel_confirmed", "order_id": record.order_id})
+            outcome = cancelled_batch_outcome(record)
         except CancelError as exc:
             # No typed reason on CancelError, and parsing its text is forbidden — a rare
             # effect-time (stale-since-preflight) refusal is the honest generic store_refused.
             logger.warning("cancel refused by store: %s", exc)
-            write_event(
-                {"event": "cancel_denied", "reason": "store_refused", "order_id": target.order_id}
-            )
             outcome = BatchCancelOutcome(
                 order_id=target.order_id, summary=target.summary, outcome="store_refused"
             )
-        outcomes = (*pending.outcomes, outcome)
-        if done + 1 < len(pending.targets):
-            # More targets remain: checkpoint progress, loop back (router -> void).
-            return {"pending_cancel": pending.model_copy(update={"outcomes": outcomes})}
-        # Last target done: speak the whole truth from the collected records (+ any ineligible
-        # ones stated at the readback) and end.
-        all_outcomes = [*pending.ineligible, *outcomes]
-        recent_orders.record(
-            [outcome.order_id for outcome in all_outcomes],
-            operation="cancel",
-            focused_order_ref=all_outcomes[-1].order_id,
-            outcomes=[(outcome.order_id, outcome.outcome) for outcome in all_outcomes],
-        )
-        return {
-            "pending_cancel": None,
-            "active_flow": None,
-            "messages": [AIMessage(render_batch_cancel_outcome(all_outcomes))],
-        }
+        return finish_cancel(pending, outcome, False)
 
     def resolve_node(state: ReasoningState) -> dict[str, object]:
         """Resolve a retained CancellableOrderScope after the account is bound (Milestone
@@ -1921,6 +1954,30 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
+    def finish_return(record: ReturnRecord) -> dict[str, object]:
+        """Finish one authoritative return; safe to re-run after receipt reconciliation."""
+        update = {
+            "pending_return": None,
+            "active_flow": None,
+            "messages": [
+                AIMessage(
+                    f"Done - your return for {record.summary} is set up; your reference is "
+                    f"{record.rma_id}. Send the items back, and once we receive them the "
+                    f"${record.refund_due_usd:.2f} refund goes to your original payment method."
+                )
+            ],
+        }
+        recent_orders.record([record.order_id], operation="return")
+        write_event(
+            {
+                "event": "return_confirmed",
+                "rma_id": record.rma_id,
+                "order_id": record.order_id,
+                "refund_due": record.refund_due_usd,
+            }
+        )
+        return update
+
     def return_place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the
         store's per-intent key; the store RE-VALIDATES eligibility (§A4c) so a proposal
@@ -1950,26 +2007,7 @@ def build_support_nodes(
                     destination="human", reason_code="refund", source="gate"
                 ),
             }
-        recent_orders.record([record.order_id], operation="return")
-        write_event(
-            {
-                "event": "return_confirmed",
-                "rma_id": record.rma_id,
-                "order_id": record.order_id,
-                "refund_due": record.refund_due_usd,
-            }
-        )
-        return {
-            "pending_return": None,
-            "active_flow": None,
-            "messages": [
-                AIMessage(
-                    f"Done - your return for {pending.summary} is set up; your reference is "
-                    f"{record.rma_id}. Send the items back, and once we receive them the "
-                    f"${record.refund_due_usd:.2f} refund goes to your original payment method."
-                )
-            ],
-        }
+        return finish_return(record)
 
     # --- profile-change sub-path (Group C; the refund T3 shape minus money:
     # ---  guardrail -> [risk_check -> dispatch -> collect(INT)] -> confirm(INT) -> place) --
@@ -2054,6 +2092,26 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
+    def finish_profile_change(record: ProfileChangeRecord) -> dict[str, object]:
+        """Finish one authoritative profile update; safe to re-run after reconciliation."""
+        noun = "delivery address" if record.field == "address" else "contact number"
+        update = {
+            "pending_profile_change": None,
+            "active_flow": None,
+            "messages": [
+                AIMessage(f"Done - the {noun} on your account is updated to {record.new_value}.")
+            ],
+        }
+        verification = [grant.method for grant in verification_store.grants]
+        write_event(
+            {
+                "event": "profile_change_confirmed",
+                "field": record.field,
+                "verification": verification,
+            }
+        )
+        return update
+
     def profile_place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Re-validates the LIVE
         level FIRST (§A4c — the change must not apply if the L2 grant lapsed between collect
@@ -2104,21 +2162,7 @@ def build_support_nodes(
                     source="gate",
                 ),
             }
-        write_event(
-            {
-                "event": "profile_change_confirmed",
-                "field": record.field,
-                "verification": [grant.method for grant in verification_store.grants],
-            }
-        )
-        noun = "delivery address" if record.field == "address" else "contact number"
-        return {
-            "pending_profile_change": None,
-            "active_flow": None,
-            "messages": [
-                AIMessage(f"Done - the {noun} on your account is updated to {record.new_value}.")
-            ],
-        }
+        return finish_profile_change(record)
 
     def abort_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: explicit abort while support was in flight. The copy names
@@ -2224,9 +2268,11 @@ def build_support_nodes(
         collect=refund_stepup.collect,
         confirm=confirm_node,
         place=place_node,
+        finish_refund=finish_refund,
         cancel_guardrail=cancel_guardrail_node,
         cancel_confirm=cancel_confirm_node,
         cancel_void=cancel_void_node,
+        finish_cancel=finish_cancel,
         resolve=resolve_node,
         abort=abort_node,
         escape_human=escape_human_node,
@@ -2238,6 +2284,7 @@ def build_support_nodes(
         return_guardrail=return_guardrail_node,
         return_confirm=return_confirm_node,
         return_place=return_place_node,
+        finish_return=finish_return,
         route_after_return_guardrail=route_after_return_guardrail,
         profile_guardrail=profile_guardrail_node,
         profile_risk_check=profile_stepup.risk_check,
@@ -2245,6 +2292,7 @@ def build_support_nodes(
         profile_collect=profile_stepup.collect,
         profile_confirm=profile_confirm_node,
         profile_place=profile_place_node,
+        finish_profile_change=finish_profile_change,
         route_after_profile_guardrail=route_after_profile_guardrail,
         route_after_profile_collect=profile_stepup.route_after_collect,
         speakable_nodes=frozenset(

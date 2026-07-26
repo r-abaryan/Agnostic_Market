@@ -231,19 +231,9 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     assert len(policies) == 54
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.recovery_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
-    assert len(graph.recovery_handled_nodes) == 48
+    assert len(graph.recovery_handled_nodes) == 53
     assert set(policies) == set().union(*expected_exception.values())
-    assert graph.recovery_handled_nodes == frozenset(
-        set(policies)
-        - {
-            "cart_place",
-            "support_place",
-            "support_cancel_void",
-            "support_return_place",
-            "support_profile_place",
-            "identity_apply",
-        }
-    )
+    assert graph.recovery_handled_nodes == frozenset(set(policies) - {"identity_apply"})
     assert Counter(policy.on_abandonment for policy in policies.values()) == {
         kind: len(nodes) for kind, nodes in expected_abandonment.items()
     }

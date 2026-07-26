@@ -366,11 +366,13 @@ def test_render_batch_cancel_states_each_target_from_its_outcome() -> None:
         ),
         BatchCancelOutcome(order_id="ORD-1001", summary="the shoes", outcome="not_cancellable"),
         BatchCancelOutcome(order_id="ORD-9", summary="the boots", outcome="store_refused"),
+        BatchCancelOutcome(order_id="ORD-8", summary="the hat", outcome="not_completed"),
     ]
     line = render_batch_cancel_outcome(out)
     assert "ORD-1002" in line and "$129.00" in line
     assert "ORD-1001" in line and "already shipped" in line.lower()
     assert "ORD-9" in line and "couldn't cancel" in line.lower()
+    assert "ORD-8" in line and "request" in line.lower() and "did not complete" in line.lower()
 
 
 def test_batch_cancel_outcome_requires_amount_exactly_for_cancelled() -> None:

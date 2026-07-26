@@ -13,9 +13,27 @@ from langgraph.types import Command
 
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.orders import render_cart_line
+from agnostic_market.commerce.orders import (
+    CancelRecord,
+    OrderStore,
+    PlacedOrder,
+    RefundRecord,
+    ReturnRecord,
+    cancelled_batch_outcome,
+    render_cart_line,
+)
+from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileStore
+from agnostic_market.commerce.receipts import CommittedReceipt, NotCommittedReceipt
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction, PendingRecovery
-from agnostic_market.dtos.state import ReasoningState
+from agnostic_market.dtos.state import (
+    BatchCancelOutcome,
+    PendingCancelBatch,
+    PendingPlacement,
+    PendingProfileChange,
+    PendingRefund,
+    PendingReturn,
+    ReasoningState,
+)
 
 TURN_FALLBACK_LINE = "Sorry - I hit a snag on my end just now. Could you say that again?"
 TURN_FALLBACK_AUTHOR = "turn_fallback"
@@ -25,13 +43,17 @@ AUTOMATION_TERMINAL_LINE = (
 )
 RECOVERY_NODE_NAME = "recover_node_exception"
 
-_DEFERRED_EXCEPTION_ACTIONS = frozenset(
+_COMMERCE_RECONCILE_ACTIONS = frozenset(
     {
         ExceptionAction.RECONCILE_PLACEMENT,
         ExceptionAction.RECONCILE_REFUND,
         ExceptionAction.RECONCILE_CANCEL,
         ExceptionAction.RECONCILE_RETURN,
         ExceptionAction.RECONCILE_PROFILE_CHANGE,
+    }
+)
+_DEFERRED_EXCEPTION_ACTIONS = frozenset(
+    {
         ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION,
     }
 )
@@ -67,12 +89,26 @@ _ACTION_LINES: Mapping[ExceptionAction, str] = MappingProxyType(
         ),
     }
 )
+_NOT_COMMITTED_LINES: Mapping[ExceptionAction, str] = MappingProxyType(
+    {
+        ExceptionAction.RECONCILE_PLACEMENT: (
+            "That order placement request did not complete. Your cart is still saved for review."
+        ),
+        ExceptionAction.RECONCILE_REFUND: "That refund request did not complete.",
+        ExceptionAction.RECONCILE_RETURN: "That return request did not complete.",
+        ExceptionAction.RECONCILE_PROFILE_CHANGE: ("That profile update request did not complete."),
+    }
+)
 _ORDINARY_EXCEPTION_ACTIONS = frozenset(ExceptionAction) - _DEFERRED_EXCEPTION_ACTIONS
-_RENDERED_EXCEPTION_ACTIONS = frozenset(_ACTION_LINES) | {
-    ExceptionAction.SAFE_ABORT,
-    ExceptionAction.CART_REVIEW,
-    ExceptionAction.TERMINAL,
-}
+_RENDERED_EXCEPTION_ACTIONS = (
+    frozenset(_ACTION_LINES)
+    | _COMMERCE_RECONCILE_ACTIONS
+    | {
+        ExceptionAction.SAFE_ABORT,
+        ExceptionAction.CART_REVIEW,
+        ExceptionAction.TERMINAL,
+    }
+)
 if _RENDERED_EXCEPTION_ACTIONS != _ORDINARY_EXCEPTION_ACTIONS:
     raise RuntimeError("ordinary recovery actions do not have a complete rendering")
 
@@ -81,6 +117,17 @@ if _RENDERED_EXCEPTION_ACTIONS != _ORDINARY_EXCEPTION_ACTIONS:
 class NodeRecoveryPolicy:
     on_exception: ExceptionAction
     on_abandonment: AbandonmentKind
+
+
+@dataclass(frozen=True, slots=True)
+class CommerceEffectFinishers:
+    """The complete flow-owned post-commit projection boundary used by normal and recovery."""
+
+    placement: Callable[[PlacedOrder], dict[str, object]]
+    refund: Callable[[RefundRecord], dict[str, object]]
+    cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
+    return_: Callable[[ReturnRecord], dict[str, object]]
+    profile_change: Callable[[ProfileChangeRecord], dict[str, object]]
 
 
 NodeErrorHandler = Callable[[ReasoningState, NodeError], Command]
@@ -228,10 +275,22 @@ def build_recovery_node(
     policies: Callable[[], Mapping[str, NodeRecoveryPolicy]],
     handled_nodes: Callable[[], frozenset[str]],
     cart_store: CartStore,
+    order_store: OrderStore,
+    profile_store: ProfileStore,
+    finishers: CommerceEffectFinishers,
 ) -> Callable[[ReasoningState], dict[str, object]]:
-    def terminal_result() -> dict[str, object]:
+    def node_failure_event(marker: PendingRecovery) -> dict[str, object]:
+        return {
+            "event": "turn_failed",
+            "reason": "node_exception",
+            "node": marker.origin_node,
+            "action": marker.action,
+        }
+
+    def terminal_result(event: dict[str, object] | None = None) -> dict[str, object]:
         write_event(
-            {
+            event
+            or {
                 "event": "turn_failed",
                 "reason": "recovery_contract_invalid",
                 "action": ExceptionAction.TERMINAL,
@@ -242,6 +301,118 @@ def build_recovery_node(
             "automation_terminal": True,
             "messages": [AIMessage(AUTOMATION_TERMINAL_LINE)],
         }
+
+    def complete(update: dict[str, object]) -> dict[str, object]:
+        return {**clear_automation_state(), **update}
+
+    def not_committed(marker: PendingRecovery) -> dict[str, object]:
+        line = _NOT_COMMITTED_LINES.get(marker.action)
+        if line is None:
+            return terminal_result(node_failure_event(marker))
+        write_event(node_failure_event(marker))
+        return {**clear_automation_state(), "messages": [AIMessage(line)]}
+
+    def reconcile_effect(marker: PendingRecovery, state: ReasoningState) -> dict[str, object]:
+        action = marker.action
+        if action == ExceptionAction.RECONCILE_PLACEMENT:
+            pending = state.pending_placement
+            if not isinstance(pending, PendingPlacement):
+                return terminal_result(node_failure_event(marker))
+            receipt = order_store.placement_receipt(
+                pending.idempotency_key,
+                lines=pending.lines,
+                total_usd=pending.total_usd,
+            )
+            if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, PlacedOrder):
+                write_event(node_failure_event(marker))
+                return complete(finishers.placement(receipt.record))
+            if isinstance(receipt, NotCommittedReceipt):
+                return not_committed(marker)
+            return terminal_result(node_failure_event(marker))
+
+        if action == ExceptionAction.RECONCILE_REFUND:
+            pending = state.pending_refund
+            if not isinstance(pending, PendingRefund):
+                return terminal_result(node_failure_event(marker))
+            receipt = order_store.refund_receipt(
+                pending.idempotency_key,
+                order_id=pending.order_id,
+                amount_usd=pending.amount_usd,
+                destination=pending.destination,
+                instrument_ref=pending.instrument_ref,
+            )
+            if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, RefundRecord):
+                write_event(node_failure_event(marker))
+                return complete(finishers.refund(receipt.record))
+            if isinstance(receipt, NotCommittedReceipt):
+                return not_committed(marker)
+            return terminal_result(node_failure_event(marker))
+
+        if action == ExceptionAction.RECONCILE_CANCEL:
+            pending = state.pending_cancel
+            if not isinstance(pending, PendingCancelBatch):
+                return terminal_result(node_failure_event(marker))
+            done = len(pending.outcomes)
+            if done >= len(pending.targets) or any(
+                outcome.order_id != target.order_id
+                for outcome, target in zip(pending.outcomes, pending.targets, strict=False)
+            ):
+                return terminal_result(node_failure_event(marker))
+            target = pending.targets[done]
+            receipt = order_store.cancel_receipt(
+                target.idempotency_key,
+                order_id=target.order_id,
+            )
+            if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, CancelRecord):
+                outcome = cancelled_batch_outcome(receipt.record)
+            elif isinstance(receipt, NotCommittedReceipt):
+                outcome = BatchCancelOutcome(
+                    order_id=target.order_id,
+                    summary=target.summary,
+                    outcome="not_completed",
+                )
+            else:
+                return terminal_result(node_failure_event(marker))
+            write_event(node_failure_event(marker))
+            return complete(finishers.cancel(pending, outcome, True))
+
+        if action == ExceptionAction.RECONCILE_RETURN:
+            pending = state.pending_return
+            if not isinstance(pending, PendingReturn):
+                return terminal_result(node_failure_event(marker))
+            receipt = order_store.return_receipt(
+                pending.idempotency_key,
+                order_id=pending.order_id,
+                refund_due_usd=pending.refund_due_usd,
+                destination="original",
+            )
+            if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, ReturnRecord):
+                write_event(node_failure_event(marker))
+                return complete(finishers.return_(receipt.record))
+            if isinstance(receipt, NotCommittedReceipt):
+                return not_committed(marker)
+            return terminal_result(node_failure_event(marker))
+
+        if action == ExceptionAction.RECONCILE_PROFILE_CHANGE:
+            pending = state.pending_profile_change
+            if not isinstance(pending, PendingProfileChange):
+                return terminal_result(node_failure_event(marker))
+            receipt = profile_store.profile_change_receipt(
+                pending.idempotency_key,
+                customer_ref=pending.customer_ref,
+                field=pending.field,
+                new_value=pending.new_value,
+            )
+            if isinstance(receipt, CommittedReceipt) and isinstance(
+                receipt.record, ProfileChangeRecord
+            ):
+                write_event(node_failure_event(marker))
+                return complete(finishers.profile_change(receipt.record))
+            if isinstance(receipt, NotCommittedReceipt):
+                return not_committed(marker)
+            return terminal_result(node_failure_event(marker))
+
+        return terminal_result(node_failure_event(marker))
 
     def recover(state: ReasoningState) -> dict[str, object]:
         marker = state.pending_recovery
@@ -258,19 +429,14 @@ def build_recovery_node(
 
         update = clear_automation_state()
         if marker.action == ExceptionAction.TERMINAL:
-            write_event(
-                {
-                    "event": "turn_failed",
-                    "reason": "node_exception",
-                    "node": marker.origin_node,
-                    "action": marker.action,
-                }
-            )
+            write_event(node_failure_event(marker))
             return {
                 **update,
                 "automation_terminal": True,
                 "messages": [AIMessage(AUTOMATION_TERMINAL_LINE)],
             }
+        if marker.action in _COMMERCE_RECONCILE_ACTIONS:
+            return reconcile_effect(marker, state)
         if marker.action == ExceptionAction.SAFE_ABORT:
             line = TURN_FALLBACK_LINE
         elif marker.action == ExceptionAction.CART_REVIEW:
@@ -283,14 +449,7 @@ def build_recovery_node(
             line = _ACTION_LINES.get(marker.action)
             if line is None:
                 return terminal_result()
-        write_event(
-            {
-                "event": "turn_failed",
-                "reason": "node_exception",
-                "node": marker.origin_node,
-                "action": marker.action,
-            }
-        )
+        write_event(node_failure_event(marker))
         return {**update, "messages": [AIMessage(line)]}
 
     return recover

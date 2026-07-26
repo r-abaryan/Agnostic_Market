@@ -63,6 +63,7 @@ from agnostic_market.agents.identity import build_identity_nodes
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
+    CommerceEffectFinishers,
     NodePolicyRegistry,
     build_node_error_handler,
     build_recovery_node,
@@ -1410,6 +1411,15 @@ def build_frontline_graph(
             node_registry.validated_policies,
             node_registry.validated_handled_nodes,
             cart_store,
+            store,
+            profile_store,
+            CommerceEffectFinishers(
+                placement=cart.finish_placement,
+                refund=support.finish_refund,
+                cancel=support.finish_cancel,
+                return_=support.finish_return,
+                profile_change=support.finish_profile_change,
+            ),
         ),
     )
 
