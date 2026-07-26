@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Annotated
 
@@ -60,13 +60,17 @@ from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
+from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
+    RECOVERY_TERMINALIZER_NODE_NAME,
     CommerceEffectFinishers,
     NodePolicyRegistry,
     build_node_error_handler,
+    build_recovery_infrastructure_handler,
     build_recovery_node,
+    build_recovery_terminalizer,
     clear_automation_state,
     validate_automation_state_clear,
 )
@@ -74,7 +78,6 @@ from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
-    BoundIdentity,
     CallerIdentityStore,
     CustomerDirectory,
     order_read_allowed,
@@ -89,13 +92,7 @@ from agnostic_market.commerce.orders import (
 from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
-from agnostic_market.dtos.orchestration import (
-    IntentRequest,
-    ListOrders,
-    PrincipalTransition,
-    SwitchAccount,
-    VerificationProof,
-)
+from agnostic_market.dtos.orchestration import ListOrders, SwitchAccount
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
     ActiveFlow,
@@ -259,10 +256,7 @@ def build_frontline_graph(
     identity_store: CallerIdentityStore | None = None,
     customers: CustomerDirectory,
     payment_instruments: PaymentInstrumentDirectory,
-    transition_principal: Callable[
-        [BoundIdentity, VerificationProof, IntentRequest | None], PrincipalTransition
-    ],
-    principal_state_will_be_discarded: Callable[[], bool],
+    lifecycle: PrincipalTransitionLifecycle,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
@@ -818,7 +812,7 @@ def build_frontline_graph(
             if state.active_flow == "identity" and state.pending_request is not None:
                 return (
                     "principal_warning"
-                    if principal_state_will_be_discarded()
+                    if lifecycle.has_discardable_state()
                     else "identity_assemble"
                 )
             if state.active_flow == "cart":
@@ -924,7 +918,7 @@ def build_frontline_graph(
         customers,
         identity_store,
         policy,
-        transition_principal,
+        lifecycle.transition_principal,
         display_name=display_name,
     )
 
@@ -977,9 +971,7 @@ def build_frontline_graph(
         # clarify.
         decision = support.route_after_assemble(state)
         if decision == "needs_identity":
-            return (
-                "principal_warning" if principal_state_will_be_discarded() else "identity_assemble"
-            )
+            return "principal_warning" if lifecycle.has_discardable_state() else "identity_assemble"
         return {
             "refund": "support_guardrail",
             "cancel": "support_cancel_guardrail",
@@ -1147,7 +1139,7 @@ def build_frontline_graph(
     node_registry.register(
         "automation_terminal_response",
         automation_terminal_response_node,
-        ExceptionAction.TERMINAL,
+        ExceptionAction.ENGINE_LAST_RESORT,
         AbandonmentKind.TERMINAL,
     )
     node_registry.register(
@@ -1420,7 +1412,14 @@ def build_frontline_graph(
                 return_=support.finish_return,
                 profile_change=support.finish_profile_change,
             ),
+            lifecycle.inspect_principal_transition,
+            lifecycle.invalidate_principal_transition,
         ),
+        error_handler=build_recovery_infrastructure_handler,
+    )
+    node_registry.register_infrastructure(
+        RECOVERY_TERMINALIZER_NODE_NAME,
+        build_recovery_terminalizer,
     )
 
     def route_after_tools(state: ReasoningState) -> str:
@@ -1717,6 +1716,7 @@ def build_frontline_graph(
     graph.add_edge("identity_abort", END)
     graph.add_edge("identity_escape_human", "handover")
     graph.add_edge(RECOVERY_NODE_NAME, END)
+    graph.add_edge(RECOVERY_TERMINALIZER_NODE_NAME, "automation_terminal_response")
     graph.add_edge("automation_terminal_response", END)
     graph.add_edge("finalize", END)
     graph.add_edge("forced_status", END)
@@ -1725,6 +1725,7 @@ def build_frontline_graph(
     node_recovery_policies = node_registry.validated_policies()
     infrastructure_nodes = node_registry.validated_infrastructure_nodes()
     handled_nodes = node_registry.validated_handled_nodes()
+    handled_infrastructure_nodes = node_registry.validated_handled_infrastructure_nodes()
     compiled = graph.compile(checkpointer=checkpointer)
     # Stashed for tests/introspection + the engine (single source of truth for which
     # node-authored messages are caller-facing — the voice side never hard-codes names).
@@ -1739,6 +1740,10 @@ def build_frontline_graph(
     compiled.node_recovery_policies = node_recovery_policies  # type: ignore[attr-defined]
     compiled.recovery_infrastructure_nodes = infrastructure_nodes  # type: ignore[attr-defined]
     compiled.recovery_handled_nodes = handled_nodes  # type: ignore[attr-defined]
+    compiled.recovery_handled_infrastructure_nodes = (  # type: ignore[attr-defined]
+        handled_infrastructure_nodes
+    )
+    compiled.terminal_takeover_node = "automation_terminal_response"  # type: ignore[attr-defined]
     overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")

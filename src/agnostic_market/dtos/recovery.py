@@ -27,6 +27,7 @@ class ExceptionAction(StrEnum):
     ABORT_IDENTITY_VERIFICATION = "abort_identity_verification"
     RECONCILE_PRINCIPAL_TRANSITION = "reconcile_principal_transition"
     TERMINAL = "terminal"
+    ENGINE_LAST_RESORT = "engine_last_resort"
 
 
 class AbandonmentKind(StrEnum):

@@ -35,7 +35,6 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
-from typing import Protocol
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -43,7 +42,13 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
-from agnostic_market.agents.recovery import TURN_FALLBACK_AUTHOR, TURN_FALLBACK_LINE
+from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
+from agnostic_market.agents.recovery import (
+    AUTOMATION_TERMINAL_LINE,
+    TURN_FALLBACK_AUTHOR,
+    TURN_FALLBACK_LINE,
+    clear_automation_state,
+)
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.dtos.events import (
     InterruptEvent,
@@ -98,10 +103,8 @@ from agnostic_market.dtos.state import (
 logger = logging.getLogger("agnostic_market.agents.engine")
 
 
-class PrincipalTransitionLifecycle(Protocol):
-    def pending_transition(self) -> PrincipalTransition | None: ...
-
-    def complete_transition(self, transition_id: str) -> None: ...
+def _new_thread_id() -> str:
+    return uuid.uuid4().hex
 
 
 # The custom (non-message) types we checkpoint into graph state. langgraph's default
@@ -344,6 +347,11 @@ class ReasoningEngine:
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
         self._lifecycle = lifecycle
+        terminal_node = getattr(graph, "terminal_takeover_node", None)
+        if not isinstance(terminal_node, str) or not terminal_node:
+            raise ValueError("ReasoningEngine requires a graph-declared terminal takeover node")
+        self._terminal_takeover_node = terminal_node
+        self._terminal_latched = False
 
     @property
     def thread_id(self) -> str:
@@ -351,32 +359,125 @@ class ReasoningEngine:
 
     def pending_interrupt(self) -> bool:
         """True if the thread is paused at a HITL interrupt (next turn must resume it)."""
+        if self._terminal_latched:
+            return False
         return bool(self._graph.get_state(self._config).interrupts)
 
     def _rotate_pending_transition(self) -> PrincipalTransition | None:
         if self._lifecycle is None:
             return None
-        transition = self._lifecycle.pending_transition()
-        if transition is None:
+        inspection = self._lifecycle.inspect_principal_transition()
+        if inspection.outcome == "none":
             return None
+        transition = inspection.transition
+        assert transition is not None
+        current = self._graph.get_state(self._config)
+        if current.values.get("automation_terminal", False):
+            self._lifecycle.invalidate_principal_transition(transition.transition_id)
+            return None
+        if inspection.outcome != "coherent":
+            self._lifecycle.invalidate_principal_transition(transition.transition_id)
+            raise RuntimeError("principal transition is inconsistent")
+
         old_thread_id = self._thread_id
-        self._graph.checkpointer.delete_thread(old_thread_id)
-        self._thread_id = uuid.uuid4().hex
-        self._config = {"configurable": {"thread_id": self._thread_id}}
-        if transition.continuation is not None:
+        new_thread_id = _new_thread_id()
+        new_config = {"configurable": {"thread_id": new_thread_id}}
+        switched = False
+        try:
+            if transition.continuation is not None:
+                self._graph.update_state(
+                    new_config,
+                    {"pending_request": transition.continuation},
+                    as_node="__start__",
+                )
+                seeded = self._graph.get_state(new_config)
+                seeded_state = ReasoningState.model_validate(seeded.values)
+                expected_clear = clear_automation_state()
+                contaminated = bool(
+                    seeded_state.pending_request != transition.continuation
+                    or seeded_state.messages
+                    or seeded_state.automation_terminal
+                    or any(
+                        getattr(seeded_state, field) != expected
+                        for field, expected in expected_clear.items()
+                        if field != "pending_request"
+                    )
+                )
+                if contaminated:
+                    raise RuntimeError("fresh principal thread seed is contaminated")
+            rechecked = self._lifecycle.inspect_principal_transition()
+            if rechecked.outcome != "coherent" or rechecked.transition != transition:
+                raise RuntimeError("principal transition changed during rotation")
+            self._graph.checkpointer.delete_thread(old_thread_id)
+            self._thread_id = new_thread_id
+            self._config = new_config
+            switched = True
+            self._lifecycle.complete_transition(transition.transition_id)
+        except Exception:
+            self._lifecycle.invalidate_principal_transition(transition.transition_id)
+            if not switched:
+                try:
+                    self._graph.checkpointer.delete_thread(new_thread_id)
+                except Exception:
+                    logger.critical(
+                        "failed to discard an incomplete principal-rotation seed",
+                        exc_info=True,
+                    )
+            raise
+        try:
+            write_event(
+                {
+                    "event": "reasoning_context_rotated",
+                    "transition_id": transition.transition_id,
+                }
+            )
+        except Exception:
+            logger.critical("principal rotation telemetry failed", exc_info=True)
+        return transition
+
+    def _invalidate_pending_transition_for_terminal(self) -> None:
+        if self._lifecycle is None:
+            return
+        try:
+            inspection = self._lifecycle.inspect_principal_transition()
+            if inspection.transition is not None:
+                self._lifecycle.invalidate_principal_transition(inspection.transition.transition_id)
+        except Exception:
+            logger.critical(
+                "failed to inspect principal transition during terminal takeover",
+                exc_info=True,
+            )
+            try:
+                self._lifecycle.invalidate_principal_transition()
+            except Exception:
+                logger.critical(
+                    "failed to invalidate caller authority during terminal takeover",
+                    exc_info=True,
+                )
+
+    def _enter_last_resort(self) -> SpokenMessageEvent:
+        self._terminal_latched = True
+        self._invalidate_pending_transition_for_terminal()
+        try:
+            write_event({"event": "turn_failed", "reason": "engine_last_resort"})
+        except Exception:
+            logger.critical("last-resort telemetry failed", exc_info=True)
+        try:
             self._graph.update_state(
                 self._config,
-                {"pending_request": transition.continuation},
-                as_node="__start__",
+                {
+                    **clear_automation_state(),
+                    "automation_terminal": True,
+                    "messages": [AIMessage(AUTOMATION_TERMINAL_LINE)],
+                },
+                as_node=self._terminal_takeover_node,
             )
-        self._lifecycle.complete_transition(transition.transition_id)
-        write_event(
-            {
-                "event": "reasoning_context_rotated",
-                "transition_id": transition.transition_id,
-            }
+        except Exception:
+            logger.critical("last-resort checkpoint takeover failed", exc_info=True)
+        return SpokenMessageEvent(
+            text=AUTOMATION_TERMINAL_LINE,
+            node=self._terminal_takeover_node,
         )
-        return transition
 
     async def stream_turn(self, user_text: str, facts: TurnFacts) -> AsyncIterator[TurnEvent]:
         """Run one committed user turn; yield the caller-audible events it produces.
@@ -386,39 +487,67 @@ class ReasoningEngine:
         recovery-infrastructure failure; it logs, telemeters, and prevents dead air without
         claiming that an unfinished checkpoint is safe to abandon.
         """
+        if self._terminal_latched:
+            yield SpokenMessageEvent(
+                text=AUTOMATION_TERMINAL_LINE,
+                node=self._terminal_takeover_node,
+            )
+            return
         arrived_thread_id = self._thread_id
-        arrived = self._graph.get_state(self._config)
+        try:
+            arrived = self._graph.get_state(self._config)
+        except Exception:
+            logger.exception("initial checkpoint read failed; terminalizing the session")
+            yield self._enter_last_resort()
+            return
         arrived_during_continuation = bool(arrived.interrupts or arrived.next)
         async with self._turn_lock:
-            transition = self._rotate_pending_transition()
-            snapshot = self._graph.get_state(self._config)
-            if (
-                transition is None
-                and arrived_thread_id == self._thread_id
-                and arrived_during_continuation
-                and not (snapshot.interrupts or snapshot.next)
-            ):
-                write_event({"event": "duplicate_turn_ignored", "reason": "continuation_done"})
-                return
-            if snapshot.interrupts:
-                # The graph's confirm node classifies consent; the engine only relays facts.
-                payload: object = Command(
-                    resume={
-                        "text": user_text,
-                        "readback_interrupted": facts.readback_interrupted,
-                    }
-                )
-            elif snapshot.next:
-                # A prior attempt died after a checkpointed step, potentially after an
-                # idempotent write. Continue that task with no new message; treating the
-                # caller's repeat as a fresh turn would strand or duplicate the old intent.
-                payload = None
-                write_event({"event": "turn_recovering", "reason": "unfinished_checkpoint"})
-            else:
-                payload = {"messages": [HumanMessage(user_text)]}
-            speech = _TurnSpeech(self._speakable, self._model_speech)
-            spans = _GraphSpans()
             try:
+                if self._terminal_latched:
+                    yield SpokenMessageEvent(
+                        text=AUTOMATION_TERMINAL_LINE,
+                        node=self._terminal_takeover_node,
+                    )
+                    return
+                transition = self._rotate_pending_transition()
+                snapshot = self._graph.get_state(self._config)
+                if arrived_thread_id != self._thread_id:
+                    write_event({"event": "cross_thread_turn_consumed"})
+                    if snapshot.interrupts:
+                        yield InterruptEvent(prompt=str(snapshot.interrupts[0].value))
+                        return
+                    if not snapshot.next:
+                        yield SpokenMessageEvent(
+                            text=TURN_FALLBACK_LINE,
+                            node=TURN_FALLBACK_AUTHOR,
+                        )
+                        return
+                    payload: object = None
+                elif (
+                    transition is None
+                    and arrived_during_continuation
+                    and not (snapshot.interrupts or snapshot.next)
+                ):
+                    write_event({"event": "duplicate_turn_ignored", "reason": "continuation_done"})
+                    return
+                elif snapshot.interrupts:
+                    # The graph's confirm node classifies consent; the engine only relays facts.
+                    payload = Command(
+                        resume={
+                            "text": user_text,
+                            "readback_interrupted": facts.readback_interrupted,
+                        }
+                    )
+                elif snapshot.next:
+                    # A prior attempt died after a checkpointed step, potentially after an
+                    # idempotent write. Continue that task with no new message; treating the
+                    # caller's repeat as a fresh turn would strand or duplicate the old intent.
+                    payload = None
+                    write_event({"event": "turn_recovering", "reason": "unfinished_checkpoint"})
+                else:
+                    payload = {"messages": [HumanMessage(user_text)]}
+                speech = _TurnSpeech(self._speakable, self._model_speech)
+                spans = _GraphSpans()
                 while True:
                     # LangGraph 1.2.7 re-raises an already-handled node exception when
                     # `messages` participates in an async stream. Its update-only path
@@ -448,16 +577,16 @@ class ReasoningEngine:
                         break
                     payload = None
             except Exception:
-                # The degradation boundary, not error-swallowing: the full traceback is logged
-                # and the event telemetered (exception CLASS only — provider error messages are
-                # free text, not for telemetry); the caller hears the fallback instead of
-                # nothing. CancelledError is BaseException and passes through untouched.
-                logger.exception("turn failed mid-graph; speaking the fallback line")
-                write_event({"event": "turn_failed", "reason": "graph_exception"})
-                yield SpokenMessageEvent(text=TURN_FALLBACK_LINE, node=TURN_FALLBACK_AUTHOR)
+                logger.exception("unhandled turn failure; terminalizing the session")
+                yield self._enter_last_resort()
                 return
             finally:
-                self._rotate_pending_transition()
+                if not self._terminal_latched:
+                    try:
+                        self._rotate_pending_transition()
+                    except Exception:
+                        logger.exception("close-stream principal rotation failed")
+                        self._enter_last_resort()
             for flushed in speech.flush():
                 yield flushed
             spans.log()

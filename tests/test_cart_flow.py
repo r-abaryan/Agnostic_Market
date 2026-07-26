@@ -116,8 +116,7 @@ def _build(
         ),
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=_POLICY,
-        transition_principal=caller_context.transition_principal,
-        principal_state_will_be_discarded=caller_context.has_discardable_state,
+        lifecycle=caller_context,
         checkpointer=build_checkpointer(),
     )
     return graph, store, cart

@@ -350,3 +350,18 @@ class PrincipalTransition(BaseModel):
     masked_contact: NonEmptyText
     fresh_proof: VerificationProof
     continuation: IntentRequest | None = None
+
+
+class PrincipalTransitionInspection(BaseModel):
+    """Live, non-checkpointed verdict over a published principal transition."""
+
+    model_config = _FROZEN
+
+    outcome: Literal["none", "coherent", "inconsistent"]
+    transition: PrincipalTransition | None = None
+
+    @model_validator(mode="after")
+    def _transition_matches_outcome(self) -> PrincipalTransitionInspection:
+        if (self.outcome == "none") != (self.transition is None):
+            raise ValueError("only the none outcome may omit a transition")
+        return self

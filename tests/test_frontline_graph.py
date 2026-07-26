@@ -11,7 +11,11 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
 from agnostic_market.agents.frontline import build_frontline_graph
-from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, clear_automation_state
+from agnostic_market.agents.recovery import (
+    RECOVERY_NODE_NAME,
+    RECOVERY_TERMINALIZER_NODE_NAME,
+    clear_automation_state,
+)
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -110,8 +114,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
         policy=policy,
-        transition_principal=caller_context.transition_principal,
-        principal_state_will_be_discarded=caller_context.has_discardable_state,
+        lifecycle=caller_context,
         **kwargs,
     )
 
@@ -224,16 +227,23 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "identity_collect",
         },
         ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION: {"identity_apply"},
-        ExceptionAction.TERMINAL: expected_abandonment[AbandonmentKind.TERMINAL],
+        ExceptionAction.TERMINAL: expected_abandonment[AbandonmentKind.TERMINAL]
+        - {"automation_terminal_response"},
+        ExceptionAction.ENGINE_LAST_RESORT: {"automation_terminal_response"},
     }
 
     assert isinstance(policies, MappingProxyType)
     assert len(policies) == 54
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
-    assert graph.recovery_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
+    assert graph.recovery_infrastructure_nodes == frozenset(
+        {RECOVERY_NODE_NAME, RECOVERY_TERMINALIZER_NODE_NAME}
+    )
     assert len(graph.recovery_handled_nodes) == 53
     assert set(policies) == set().union(*expected_exception.values())
-    assert graph.recovery_handled_nodes == frozenset(set(policies) - {"identity_apply"})
+    assert graph.recovery_handled_nodes == frozenset(
+        set(policies) - {"automation_terminal_response"}
+    )
+    assert graph.recovery_handled_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
     assert Counter(policy.on_abandonment for policy in policies.values()) == {
         kind: len(nodes) for kind, nodes in expected_abandonment.items()
     }

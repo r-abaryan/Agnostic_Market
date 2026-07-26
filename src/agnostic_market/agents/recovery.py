@@ -24,10 +24,15 @@ from agnostic_market.commerce.orders import (
 )
 from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileStore
 from agnostic_market.commerce.receipts import CommittedReceipt, NotCommittedReceipt
+from agnostic_market.dtos.orchestration import (
+    PrincipalTransitionInspection,
+    SwitchAccount,
+)
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
     PendingCancelBatch,
+    PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
     PendingRefund,
@@ -42,6 +47,8 @@ AUTOMATION_TERMINAL_LINE = (
     "Please contact the store directly for further help."
 )
 RECOVERY_NODE_NAME = "recover_node_exception"
+RECOVERY_TERMINALIZER_NODE_NAME = "terminalize_recovery_failure"
+PRINCIPAL_TRANSITION_FAILURE_LINE = "I couldn't finish that account request; please try it again."
 
 _COMMERCE_RECONCILE_ACTIONS = frozenset(
     {
@@ -54,7 +61,7 @@ _COMMERCE_RECONCILE_ACTIONS = frozenset(
 )
 _DEFERRED_EXCEPTION_ACTIONS = frozenset(
     {
-        ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION,
+        ExceptionAction.ENGINE_LAST_RESORT,
     }
 )
 _ACTION_LINES: Mapping[ExceptionAction, str] = MappingProxyType(
@@ -87,6 +94,7 @@ _ACTION_LINES: Mapping[ExceptionAction, str] = MappingProxyType(
         ExceptionAction.ABORT_IDENTITY_VERIFICATION: (
             "Account verification did not complete. Please try that request again."
         ),
+        ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION: PRINCIPAL_TRANSITION_FAILURE_LINE,
     }
 )
 _NOT_COMMITTED_LINES: Mapping[ExceptionAction, str] = MappingProxyType(
@@ -148,6 +156,7 @@ class NodePolicyRegistry:
         self._policies: dict[str, NodeRecoveryPolicy] = {}
         self._infrastructure: set[str] = set()
         self._handled: set[str] = set()
+        self._handled_infrastructure: set[str] = set()
         self._validated: Mapping[str, NodeRecoveryPolicy] | None = None
 
     def _ensure_open_and_unique(self, name: str) -> None:
@@ -190,10 +199,18 @@ class NodePolicyRegistry:
         if handler is not None:
             self._handled.add(name)
 
-    def register_infrastructure(self, name: str, node: object) -> None:
+    def register_infrastructure(
+        self,
+        name: str,
+        node: object,
+        *,
+        error_handler: NodeErrorHandler | None = None,
+    ) -> None:
         self._ensure_open_and_unique(name)
-        self._add_node(name, node)
+        self._add_node(name, node, error_handler=error_handler)
         self._infrastructure.add(name)
+        if error_handler is not None:
+            self._handled_infrastructure.add(name)
 
     def validated_policies(self) -> Mapping[str, NodeRecoveryPolicy]:
         registered = frozenset(self._policies)
@@ -204,7 +221,8 @@ class NodePolicyRegistry:
         actual_handlers = frozenset(
             name for name, spec in self._graph.nodes.items() if spec.is_error_handler
         )
-        handler_links = {name: self._graph.nodes[name].error_handler_node for name in self._handled}
+        all_handled = self._handled | self._handled_infrastructure
+        handler_links = {name: self._graph.nodes[name].error_handler_node for name in all_handled}
         missing_handler_links = frozenset(
             name for name, handler_name in handler_links.items() if handler_name is None
         )
@@ -236,6 +254,10 @@ class NodePolicyRegistry:
     def validated_handled_nodes(self) -> frozenset[str]:
         self.validated_policies()
         return frozenset(self._handled)
+
+    def validated_handled_infrastructure_nodes(self) -> frozenset[str]:
+        self.validated_policies()
+        return frozenset(self._handled_infrastructure)
 
 
 def ordinary_exception_handler_enabled(action: ExceptionAction) -> bool:
@@ -271,6 +293,20 @@ def build_node_error_handler(
     return handle
 
 
+def build_recovery_infrastructure_handler(
+    _state: ReasoningState,
+    _error: NodeError,
+) -> Command:
+    return Command(goto=RECOVERY_TERMINALIZER_NODE_NAME)
+
+
+def build_recovery_terminalizer(_state: ReasoningState) -> dict[str, object]:
+    return {
+        **clear_automation_state(),
+        "automation_terminal": True,
+    }
+
+
 def build_recovery_node(
     policies: Callable[[], Mapping[str, NodeRecoveryPolicy]],
     handled_nodes: Callable[[], frozenset[str]],
@@ -278,6 +314,8 @@ def build_recovery_node(
     order_store: OrderStore,
     profile_store: ProfileStore,
     finishers: CommerceEffectFinishers,
+    inspect_principal_transition: Callable[[], PrincipalTransitionInspection],
+    invalidate_principal_transition: Callable[[str | None], bool],
 ) -> Callable[[ReasoningState], dict[str, object]]:
     def node_failure_event(marker: PendingRecovery) -> dict[str, object]:
         return {
@@ -414,6 +452,45 @@ def build_recovery_node(
 
         return terminal_result(node_failure_event(marker))
 
+    def reconcile_principal_transition(
+        state: ReasoningState,
+    ) -> dict[str, object]:
+        inspection = inspect_principal_transition()
+        transition = inspection.transition
+        event: dict[str, object] = {
+            "event": "principal_transition_reconciled",
+            "outcome": inspection.outcome,
+        }
+        if transition is not None:
+            event["transition_id"] = transition.transition_id
+        if inspection.outcome == "none":
+            write_event(event)
+            return {
+                **clear_automation_state(),
+                "messages": [AIMessage(PRINCIPAL_TRANSITION_FAILURE_LINE)],
+            }
+        assert transition is not None
+        pending_identity = state.pending_identity
+        identity_matches = bool(
+            isinstance(pending_identity, PendingIdentity)
+            and pending_identity.customer_ref == transition.customer_ref
+            and pending_identity.masked_contact == transition.masked_contact
+        )
+        request_matches = (
+            state.pending_request == transition.continuation
+            if transition.continuation is not None
+            else isinstance(state.pending_request, SwitchAccount)
+        )
+        if inspection.outcome == "coherent" and identity_matches and request_matches:
+            write_event(event)
+            update = clear_automation_state()
+            if transition.continuation is None:
+                update["messages"] = [AIMessage("You're now verified on the new account.")]
+            return update
+        invalidate_principal_transition(transition.transition_id)
+        event["outcome"] = "inconsistent"
+        return terminal_result(event)
+
     def recover(state: ReasoningState) -> dict[str, object]:
         marker = state.pending_recovery
         if not isinstance(marker, PendingRecovery):
@@ -437,6 +514,8 @@ def build_recovery_node(
             }
         if marker.action in _COMMERCE_RECONCILE_ACTIONS:
             return reconcile_effect(marker, state)
+        if marker.action == ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION:
+            return reconcile_principal_transition(state)
         if marker.action == ExceptionAction.SAFE_ABORT:
             line = TURN_FALLBACK_LINE
         elif marker.action == ExceptionAction.CART_REVIEW:

@@ -104,8 +104,7 @@ def _engine(
         ),
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=policy,
-        transition_principal=caller_context.transition_principal,
-        principal_state_will_be_discarded=caller_context.has_discardable_state,
+        lifecycle=caller_context,
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(graph, thread_id=thread_id, lifecycle=caller_context)

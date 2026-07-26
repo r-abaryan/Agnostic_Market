@@ -27,6 +27,7 @@ from agnostic_market.commerce.verification import VerificationStore
 from agnostic_market.dtos.orchestration import (
     IntentRequest,
     PrincipalTransition,
+    PrincipalTransitionInspection,
     VerificationProof,
 )
 
@@ -104,6 +105,41 @@ class CallerContext:
 
     def pending_transition(self) -> PrincipalTransition | None:
         return self._pending_transition
+
+    def inspect_principal_transition(self) -> PrincipalTransitionInspection:
+        transition = self._pending_transition
+        if transition is None:
+            return PrincipalTransitionInspection(outcome="none")
+        expected_identity = BoundIdentity(
+            customer_ref=transition.customer_ref,
+            masked_contact=transition.masked_contact,
+        )
+        coherent = bool(
+            self.identity_store.current() == expected_identity
+            and not self.identity_store.has_residual_order_authority()
+            and self.verification_store.current_level() == transition.fresh_proof.raised_to
+            and self.verification_store.grants == [transition.fresh_proof]
+            and self.cart_store.is_empty()
+            and not self.recent_orders.snapshot().order_refs
+            and not self.order_store.session_placed_orders()
+        )
+        return PrincipalTransitionInspection(
+            outcome="coherent" if coherent else "inconsistent",
+            transition=transition,
+        )
+
+    def invalidate_principal_transition(self, expected_transition_id: str | None = None) -> bool:
+        """Destroy all caller authority after an ambiguous or inconsistent transition."""
+        pending = self._pending_transition
+        matched = bool(
+            expected_transition_id is None
+            or (pending is not None and pending.transition_id == expected_transition_id)
+        )
+        self._clear_ephemeral()
+        self.identity_store.clear()
+        self.verification_store.clear()
+        self._pending_transition = None
+        return matched
 
     def complete_transition(self, transition_id: str) -> None:
         pending = self._pending_transition

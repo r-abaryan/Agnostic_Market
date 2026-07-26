@@ -222,6 +222,10 @@ class CallerIdentityStore:
     def mutation_granted_for_test(self, order_id: str) -> bool:
         return order_id.strip().upper() in self._mutation_granted_for_test
 
+    def has_residual_order_authority(self) -> bool:
+        """Whether per-order authority survived a principal boundary."""
+        return bool(self._granted_orders or self._mutation_granted_for_test)
+
     def clear(self) -> None:
         self._bound = None
         self._granted_orders.clear()

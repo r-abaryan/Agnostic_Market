@@ -203,8 +203,7 @@ def build_voice_loop(
         identity_store=identity_store,
         customers=customers,
         payment_instruments=payment_instruments,
-        transition_principal=caller_context.transition_principal,
-        principal_state_will_be_discarded=caller_context.has_discardable_state,
+        lifecycle=caller_context,
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.

@@ -477,8 +477,7 @@ async def _run(*, preflight_only: bool = False) -> int:
         # The ONE config->runtime policy mapping — identical to production (F1). The old
         # hand-built copy here had drifted (it silently omitted spoken_policy_extra).
         policy=policy,
-        transition_principal=caller_context.transition_principal,
-        principal_state_will_be_discarded=caller_context.has_discardable_state,
+        lifecycle=caller_context,
         # An utterance that reaches the confirm readback pauses at an interrupt, which
         # needs a checkpointer even in the text eval (fresh thread per utterance).
         checkpointer=InMemorySaver(),
