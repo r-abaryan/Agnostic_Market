@@ -1,0 +1,151 @@
+"""Milestone 6C-a architecture contracts for recovery policy and state clearing."""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+from langgraph.graph import StateGraph
+
+from agnostic_market.agents.recovery import (
+    NodePolicyRegistry,
+    clear_automation_state,
+    validate_automation_state_clear,
+)
+from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
+from agnostic_market.dtos.state import ReasoningState
+
+_ROOT = Path(__file__).parents[1]
+_PRODUCTION_ROOT = _ROOT / "src" / "agnostic_market"
+_MUTATORS = frozenset(
+    {
+        "place_cart",
+        "issue_refund",
+        "cancel_order",
+        "create_return",
+        "update_profile",
+    }
+)
+
+
+class _CallVisitor(ast.NodeVisitor):
+    def __init__(self, names: frozenset[str]) -> None:
+        self._names = names
+        self._functions: list[str] = []
+        self.calls: list[tuple[str | None, str]] = []
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self._functions.append(node.name)
+        self.generic_visit(node)
+        self._functions.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute) and node.func.attr in self._names:
+            owner = self._functions[-1] if self._functions else None
+            self.calls.append((owner, node.func.attr))
+        self.generic_visit(node)
+
+
+def _production_calls(names: frozenset[str]) -> set[tuple[str, str | None, str]]:
+    found: set[tuple[str, str | None, str]] = set()
+    for path in _PRODUCTION_ROOT.rglob("*.py"):
+        visitor = _CallVisitor(names)
+        visitor.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        relative = path.relative_to(_PRODUCTION_ROOT).as_posix()
+        found.update((relative, owner, name) for owner, name in visitor.calls)
+    return found
+
+
+def test_all_production_graph_nodes_use_the_registration_seam() -> None:
+    assert _production_calls(frozenset({"add_node"})) == {
+        ("agents/recovery.py", "register", "add_node")
+    }
+
+
+def test_authoritative_mutators_remain_in_the_five_reconcile_nodes() -> None:
+    assert _production_calls(_MUTATORS) == {
+        ("agents/cart/flow.py", "place_node", "place_cart"),
+        ("agents/support/flow.py", "place_node", "issue_refund"),
+        ("agents/support/flow.py", "cancel_void_node", "cancel_order"),
+        ("agents/support/flow.py", "return_place_node", "create_return"),
+        ("agents/support/flow.py", "profile_place_node", "update_profile"),
+    }
+
+
+def test_automation_state_clear_is_total_and_preserves_persistent_state() -> None:
+    validate_automation_state_clear()
+    assert clear_automation_state() == {
+        "handover": None,
+        "pending_placement": None,
+        "pending_refund": None,
+        "pending_cancel": None,
+        "pending_return": None,
+        "pending_profile_change": None,
+        "pending_identity": None,
+        "pending_request": None,
+        "identity_claim_misses": 0,
+        "active_flow": None,
+        "pending_ack": None,
+        "pending_clarification": None,
+        "clarification_progress": None,
+    }
+    assert {"messages", "automation_terminal"}.isdisjoint(clear_automation_state())
+
+
+def test_new_pending_state_fails_the_clear_contract() -> None:
+    class ExpandedReasoningState(ReasoningState):
+        pending_future_action: str | None = None
+
+    with pytest.raises(RuntimeError, match=r"missing=\['pending_future_action'\]"):
+        validate_automation_state_clear(ExpandedReasoningState)
+
+
+def test_node_registry_rejects_duplicates_and_bypasses() -> None:
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+    registry.register(
+        "entry",
+        lambda _state: {},
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    with pytest.raises(RuntimeError, match="duplicate recovery policy registration"):
+        registry.register(
+            "entry",
+            lambda _state: {},
+            ExceptionAction.SAFE_ABORT,
+            AbandonmentKind.PURE_ABORT,
+        )
+
+    graph.add_node("bypass", lambda _state: {})
+    with pytest.raises(RuntimeError, match=r"unregistered=\['bypass'\]"):
+        registry.validated_policies()
+
+
+def test_validated_policy_mapping_is_immutable() -> None:
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+    registry.register(
+        "entry",
+        lambda _state: {},
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    policies = registry.validated_policies()
+
+    with pytest.raises(TypeError):
+        policies["entry"] = policies["entry"]  # type: ignore[index]
+    with pytest.raises(RuntimeError, match="registry is already finalized"):
+        registry.register(
+            "late",
+            lambda _state: {},
+            ExceptionAction.SAFE_ABORT,
+            AbandonmentKind.PURE_ABORT,
+        )

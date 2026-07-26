@@ -21,6 +21,7 @@ def _append(left: list[str] | None, right: list[str] | None) -> list[str]:
 
 class _ContractState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
+    automation_terminal: bool
     pending_recovery: str | None
     prior_intent: str | None
     disposition: str | None
@@ -306,3 +307,38 @@ def test_interrupt_is_not_intercepted_by_node_error_handler() -> None:
     assert result["visited"] == ["confirm", "effect"]
     assert handled == []
     assert graph.get_state(config).next == ()
+
+
+def test_terminal_node_takeover_supersedes_a_failed_checkpoint() -> None:
+    def explode(_state: _ContractState) -> dict:
+        raise RuntimeError("contract failure")
+
+    def terminal(_state: _ContractState) -> dict:
+        return {"disposition": "terminal"}
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("explode", explode)
+    builder.add_node("terminal", terminal)
+    builder.add_edge(START, "explode")
+    builder.add_edge("terminal", END)
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("terminal-takeover")
+
+    with pytest.raises(RuntimeError, match="contract failure"):
+        graph.invoke({}, config)
+    failed = graph.get_state(config)
+    assert failed.next == ("explode",)
+    assert len(failed.tasks) == 1
+    assert failed.tasks[0].error is not None
+
+    graph.update_state(
+        config,
+        {"automation_terminal": True, "disposition": "terminal"},
+        as_node="terminal",
+    )
+    snapshot = graph.get_state(config)
+
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.values["disposition"] == "terminal"
+    assert snapshot.next == ()
+    assert snapshot.tasks == ()

@@ -60,6 +60,11 @@ from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
+from agnostic_market.agents.recovery import (
+    NodePolicyRegistry,
+    clear_automation_state,
+    validate_automation_state_clear,
+)
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
@@ -86,6 +91,7 @@ from agnostic_market.dtos.orchestration import (
     SwitchAccount,
     VerificationProof,
 )
+from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
     ActiveFlow,
     HandoffDestination,
@@ -620,22 +626,7 @@ def build_frontline_graph(
                     "source": handover.source,
                 }
             )
-            return {
-                "automation_terminal": True,
-                "active_flow": None,
-                "handover": None,
-                "pending_placement": None,
-                "pending_refund": None,
-                "pending_cancel": None,
-                "pending_return": None,
-                "pending_profile_change": None,
-                "pending_identity": None,
-                "pending_request": None,
-                "identity_claim_misses": 0,
-                "pending_ack": None,
-                "pending_clarification": None,
-                "clarification_progress": None,
-            }
+            return {**clear_automation_state(), "automation_terminal": True}
         # A cart/support handover ENTERS the flow (3b/3c/Group B) instead of speaking a
         # deferral: set the sticky flow marker, clear the handover signal, and let routing
         # carry us into the flow's assemble in this same turn. EXCEPT when that flow was
@@ -751,18 +742,7 @@ def build_frontline_graph(
             }
         )
         return {
-            "active_flow": None,
-            "pending_placement": None,
-            "pending_refund": None,
-            "pending_cancel": None,
-            "pending_return": None,
-            "pending_profile_change": None,
-            "pending_request": None,
-            "pending_identity": None,
-            "identity_claim_misses": 0,
-            "pending_ack": None,
-            "pending_clarification": None,
-            "clarification_progress": None,
+            **clear_automation_state(),
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
             ),
@@ -1138,60 +1118,287 @@ def build_frontline_graph(
     tool_node = ToolNode(all_tools)
 
     graph = StateGraph(ReasoningState)
-    graph.add_node("entry", entry_node)
-    graph.add_node("cross_switch", cross_switch_node)
-    graph.add_node("gate", gate_node)
-    graph.add_node("model", model_node)
-    graph.add_node("tools", tool_node)
-    graph.add_node("handover", handover_node)
-    graph.add_node("automation_terminal_response", automation_terminal_response_node)
-    graph.add_node("principal_warning", principal_warning_node)
-    graph.add_node("finalize", finalize_node)
-    graph.add_node("read_render", read_render_node)
-    graph.add_node("forced_status", forced_status_node)
-    graph.add_node("enumeration_gate", enumeration_gate_node)
-    graph.add_node("cart_assemble", cart.assemble)
-    graph.add_node("cart_ack", cart.ack)
-    graph.add_node("cart_clarify", cart.clarify)
-    graph.add_node("cart_guardrail", cart.guardrail)
-    graph.add_node("cart_confirm", cart.confirm)
-    graph.add_node("cart_place", cart.place)
-    graph.add_node("cart_abort", cart.abort)
-    graph.add_node("cart_escape_human", cart.escape_human)
-    graph.add_node("support_assemble", support.assemble)
-    graph.add_node("support_continuation", support.continuation)
-    graph.add_node("support_clarify", support.clarify)
-    graph.add_node("support_guardrail", support.guardrail)
-    graph.add_node("support_risk_check", support.risk_check)
-    graph.add_node("support_dispatch", support.dispatch)
-    graph.add_node("support_collect", support.collect)
-    graph.add_node("support_confirm", support.confirm)
-    graph.add_node("support_place", support.place)
-    graph.add_node("support_cancel_guardrail", support.cancel_guardrail)
-    graph.add_node("support_cancel_confirm", support.cancel_confirm)
-    graph.add_node("support_cancel_void", support.cancel_void)
-    graph.add_node("support_resolve", support.resolve)
-    graph.add_node("support_return_guardrail", support.return_guardrail)
-    graph.add_node("support_return_confirm", support.return_confirm)
-    graph.add_node("support_return_place", support.return_place)
-    graph.add_node("support_profile_guardrail", support.profile_guardrail)
-    graph.add_node("support_profile_risk_check", support.profile_risk_check)
-    graph.add_node("support_profile_dispatch", support.profile_dispatch)
-    graph.add_node("support_profile_collect", support.profile_collect)
-    graph.add_node("support_profile_confirm", support.profile_confirm)
-    graph.add_node("support_profile_place", support.profile_place)
-    graph.add_node("support_abort", support.abort)
-    graph.add_node("support_escape_human", support.escape_human)
-    graph.add_node("identity_assemble", identity.assemble)
-    graph.add_node("identity_ask_contact", identity.ask_contact)
-    graph.add_node("identity_reask", identity.reask)
-    graph.add_node("identity_guardrail", identity.guardrail)
-    graph.add_node("identity_risk_check", identity.risk_check)
-    graph.add_node("identity_dispatch", identity.dispatch)
-    graph.add_node("identity_collect", identity.collect)
-    graph.add_node("identity_apply", identity.apply)
-    graph.add_node("identity_abort", identity.abort)
-    graph.add_node("identity_escape_human", identity.escape_human)
+    validate_automation_state_clear()
+    node_registry = NodePolicyRegistry(graph)
+    node_registry.register(
+        "entry", entry_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "cross_switch", cross_switch_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "gate", gate_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "model", model_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "tools", tool_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.LIFECYCLE_SPECIAL
+    )
+    node_registry.register(
+        "handover", handover_node, ExceptionAction.TERMINAL, AbandonmentKind.TERMINAL
+    )
+    node_registry.register(
+        "automation_terminal_response",
+        automation_terminal_response_node,
+        ExceptionAction.TERMINAL,
+        AbandonmentKind.TERMINAL,
+    )
+    node_registry.register(
+        "principal_warning",
+        principal_warning_node,
+        ExceptionAction.ABORT_PRINCIPAL_WARNING,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "finalize", finalize_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "read_render", read_render_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "forced_status", forced_status_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "enumeration_gate",
+        enumeration_gate_node,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "cart_assemble",
+        cart.assemble,
+        ExceptionAction.CART_REVIEW,
+        AbandonmentKind.CART_REVIEW,
+    )
+    node_registry.register(
+        "cart_ack", cart.ack, ExceptionAction.CART_REVIEW, AbandonmentKind.CART_REVIEW
+    )
+    node_registry.register(
+        "cart_clarify", cart.clarify, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "cart_guardrail", cart.guardrail, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "cart_confirm",
+        cart.confirm,
+        ExceptionAction.ABORT_PLACEMENT_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "cart_place",
+        cart.place,
+        ExceptionAction.RECONCILE_PLACEMENT,
+        AbandonmentKind.AUTHORITATIVE_RECONCILE,
+    )
+    node_registry.register(
+        "cart_abort", cart.abort, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "cart_escape_human",
+        cart.escape_human,
+        ExceptionAction.TERMINAL,
+        AbandonmentKind.TERMINAL,
+    )
+    node_registry.register(
+        "support_assemble",
+        support.assemble,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_continuation",
+        support.continuation,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_clarify",
+        support.clarify,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_guardrail",
+        support.guardrail,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_risk_check",
+        support.risk_check,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_dispatch",
+        support.dispatch,
+        ExceptionAction.ABORT_REFUND_VERIFICATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_collect",
+        support.collect,
+        ExceptionAction.ABORT_REFUND_VERIFICATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_confirm",
+        support.confirm,
+        ExceptionAction.ABORT_REFUND_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_place",
+        support.place,
+        ExceptionAction.RECONCILE_REFUND,
+        AbandonmentKind.AUTHORITATIVE_RECONCILE,
+    )
+    node_registry.register(
+        "support_cancel_guardrail",
+        support.cancel_guardrail,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_cancel_confirm",
+        support.cancel_confirm,
+        ExceptionAction.ABORT_CANCEL_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_cancel_void",
+        support.cancel_void,
+        ExceptionAction.RECONCILE_CANCEL,
+        AbandonmentKind.AUTHORITATIVE_RECONCILE,
+    )
+    node_registry.register(
+        "support_resolve",
+        support.resolve,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_return_guardrail",
+        support.return_guardrail,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_return_confirm",
+        support.return_confirm,
+        ExceptionAction.ABORT_RETURN_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_return_place",
+        support.return_place,
+        ExceptionAction.RECONCILE_RETURN,
+        AbandonmentKind.AUTHORITATIVE_RECONCILE,
+    )
+    node_registry.register(
+        "support_profile_guardrail",
+        support.profile_guardrail,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_profile_risk_check",
+        support.profile_risk_check,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "support_profile_dispatch",
+        support.profile_dispatch,
+        ExceptionAction.ABORT_PROFILE_VERIFICATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_profile_collect",
+        support.profile_collect,
+        ExceptionAction.ABORT_PROFILE_VERIFICATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_profile_confirm",
+        support.profile_confirm,
+        ExceptionAction.ABORT_PROFILE_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "support_profile_place",
+        support.profile_place,
+        ExceptionAction.RECONCILE_PROFILE_CHANGE,
+        AbandonmentKind.AUTHORITATIVE_RECONCILE,
+    )
+    node_registry.register(
+        "support_abort", support.abort, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "support_escape_human",
+        support.escape_human,
+        ExceptionAction.TERMINAL,
+        AbandonmentKind.TERMINAL,
+    )
+    node_registry.register(
+        "identity_assemble",
+        identity.assemble,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "identity_ask_contact",
+        identity.ask_contact,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "identity_reask",
+        identity.reask,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "identity_guardrail",
+        identity.guardrail,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "identity_risk_check",
+        identity.risk_check,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        "identity_dispatch",
+        identity.dispatch,
+        ExceptionAction.ABORT_IDENTITY_VERIFICATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "identity_collect",
+        identity.collect,
+        ExceptionAction.ABORT_IDENTITY_VERIFICATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "identity_apply",
+        identity.apply,
+        ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "identity_abort", identity.abort, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "identity_escape_human",
+        identity.escape_human,
+        ExceptionAction.TERMINAL,
+        AbandonmentKind.TERMINAL,
+    )
 
     def route_after_tools(state: ReasoningState) -> str:
         # request_handover's Command sets `handover` AND targets the handover node; but the
@@ -1490,6 +1697,7 @@ def build_frontline_graph(
     graph.add_edge("forced_status", END)
     graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
 
+    node_recovery_policies = node_registry.validated_policies()
     compiled = graph.compile(checkpointer=checkpointer)
     # Stashed for tests/introspection + the engine (single source of truth for which
     # node-authored messages are caller-facing — the voice side never hard-codes names).
@@ -1501,6 +1709,7 @@ def build_frontline_graph(
         | identity.speakable_nodes
     )
     compiled.model_speech_nodes = MODEL_SPEECH_NODES  # type: ignore[attr-defined]
+    compiled.node_recovery_policies = node_recovery_policies  # type: ignore[attr-defined]
     overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")

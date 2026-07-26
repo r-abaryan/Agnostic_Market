@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
+from types import MappingProxyType
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.recovery import clear_automation_state
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
+    BoundIdentity,
     CallerIdentityStore,
     CustomerDirectory,
     load_customers_fixture,
@@ -23,8 +27,15 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
-from agnostic_market.dtos.orchestration import CancelOrders
-from agnostic_market.dtos.state import PolicyContext
+from agnostic_market.dtos.orchestration import CancelOrders, ListOrders, SwitchAccount
+from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
+from agnostic_market.dtos.state import (
+    HandoffDestination,
+    HandoffReasonCode,
+    HandoffRequest,
+    PolicyContext,
+    ReasoningState,
+)
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
@@ -118,6 +129,207 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
         "catalog_search",
         "view_cart",
     }
+
+
+def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    policies = graph.node_recovery_policies
+    expected_abandonment = {
+        AbandonmentKind.PURE_ABORT: {
+            "entry",
+            "cross_switch",
+            "gate",
+            "model",
+            "finalize",
+            "read_render",
+            "forced_status",
+            "enumeration_gate",
+            "cart_clarify",
+            "cart_guardrail",
+            "cart_abort",
+            "support_assemble",
+            "support_continuation",
+            "support_clarify",
+            "support_guardrail",
+            "support_risk_check",
+            "support_cancel_guardrail",
+            "support_resolve",
+            "support_return_guardrail",
+            "support_profile_guardrail",
+            "support_profile_risk_check",
+            "support_abort",
+            "identity_assemble",
+            "identity_ask_contact",
+            "identity_reask",
+            "identity_guardrail",
+            "identity_risk_check",
+            "identity_abort",
+        },
+        AbandonmentKind.CART_REVIEW: {"cart_assemble", "cart_ack"},
+        AbandonmentKind.AUTHORITATIVE_RECONCILE: {
+            "cart_place",
+            "support_place",
+            "support_cancel_void",
+            "support_return_place",
+            "support_profile_place",
+        },
+        AbandonmentKind.LIFECYCLE_SPECIAL: {
+            "tools",
+            "principal_warning",
+            "cart_confirm",
+            "support_dispatch",
+            "support_collect",
+            "support_confirm",
+            "support_cancel_confirm",
+            "support_return_confirm",
+            "support_profile_dispatch",
+            "support_profile_collect",
+            "support_profile_confirm",
+            "identity_dispatch",
+            "identity_collect",
+            "identity_apply",
+        },
+        AbandonmentKind.TERMINAL: {
+            "handover",
+            "automation_terminal_response",
+            "cart_escape_human",
+            "support_escape_human",
+            "identity_escape_human",
+        },
+    }
+    expected_exception = {
+        ExceptionAction.SAFE_ABORT: {
+            *expected_abandonment[AbandonmentKind.PURE_ABORT],
+            "tools",
+        },
+        ExceptionAction.CART_REVIEW: {"cart_assemble", "cart_ack"},
+        ExceptionAction.RECONCILE_PLACEMENT: {"cart_place"},
+        ExceptionAction.RECONCILE_REFUND: {"support_place"},
+        ExceptionAction.RECONCILE_CANCEL: {"support_cancel_void"},
+        ExceptionAction.RECONCILE_RETURN: {"support_return_place"},
+        ExceptionAction.RECONCILE_PROFILE_CHANGE: {"support_profile_place"},
+        ExceptionAction.ABORT_PRINCIPAL_WARNING: {"principal_warning"},
+        ExceptionAction.ABORT_PLACEMENT_CONFIRMATION: {"cart_confirm"},
+        ExceptionAction.ABORT_REFUND_VERIFICATION: {"support_dispatch", "support_collect"},
+        ExceptionAction.ABORT_REFUND_CONFIRMATION: {"support_confirm"},
+        ExceptionAction.ABORT_CANCEL_CONFIRMATION: {"support_cancel_confirm"},
+        ExceptionAction.ABORT_RETURN_CONFIRMATION: {"support_return_confirm"},
+        ExceptionAction.ABORT_PROFILE_VERIFICATION: {
+            "support_profile_dispatch",
+            "support_profile_collect",
+        },
+        ExceptionAction.ABORT_PROFILE_CONFIRMATION: {"support_profile_confirm"},
+        ExceptionAction.ABORT_IDENTITY_VERIFICATION: {
+            "identity_dispatch",
+            "identity_collect",
+        },
+        ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION: {"identity_apply"},
+        ExceptionAction.TERMINAL: expected_abandonment[AbandonmentKind.TERMINAL],
+    }
+
+    regular_nodes = set(graph.get_graph().nodes) - {"__start__", "__end__"}
+    assert isinstance(policies, MappingProxyType)
+    assert len(policies) == 54
+    assert set(policies) == regular_nodes
+    assert Counter(policy.on_abandonment for policy in policies.values()) == {
+        kind: len(nodes) for kind, nodes in expected_abandonment.items()
+    }
+    for kind, names in expected_abandonment.items():
+        assert {name for name, policy in policies.items() if policy.on_abandonment == kind} == names
+    for action, names in expected_exception.items():
+        assert {name for name, policy in policies.items() if policy.on_exception == action} == names
+
+
+def _handover_update(
+    graph,
+    destination: HandoffDestination,
+    reason_code: HandoffReasonCode,
+) -> dict[str, object]:
+    state = ReasoningState(
+        handover=HandoffRequest(
+            destination=destination,
+            reason_code=reason_code,
+            source="gate",
+        )
+    )
+    return graph.nodes["handover"].invoke(state)
+
+
+def test_total_clear_is_used_only_for_terminal_handover_and_cross_switch(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    assert _handover_update(graph, "human", "other") == {
+        **clear_automation_state(),
+        "automation_terminal": True,
+    }
+
+    cross_switch = graph.nodes["cross_switch"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("refund my order")],
+            active_flow="cart",
+        )
+    )
+    assert cross_switch == {
+        **clear_automation_state(),
+        "handover": HandoffRequest(
+            destination="support",
+            reason_code="refund",
+            source="gate",
+        ),
+    }
+
+
+def test_non_human_handover_entries_remain_partial_updates(config_root: Path) -> None:
+    graph = _graph(config_root, FakeChatModel())
+
+    assert _handover_update(graph, "checkout", "cart_write") == {
+        "active_flow": "cart",
+        "handover": None,
+        "clarification_progress": None,
+    }
+    assert _handover_update(graph, "support", "switch_account") == {
+        "active_flow": "identity",
+        "handover": None,
+        "identity_claim_misses": 0,
+        "clarification_progress": None,
+        "pending_request": SwitchAccount(),
+    }
+    assert _handover_update(graph, "support", "list_orders") == {
+        "active_flow": "identity",
+        "handover": None,
+        "identity_claim_misses": 0,
+        "clarification_progress": None,
+        "pending_request": ListOrders(scope="account"),
+    }
+    for reason_code in ("refund", "cancel_order", "address_change", "contact_change"):
+        assert _handover_update(graph, "support", reason_code) == {
+            "active_flow": "support",
+            "handover": None,
+            "clarification_progress": None,
+        }
+
+
+def test_bound_and_session_list_readbacks_remain_partial_updates(config_root: Path) -> None:
+    identity = CallerIdentityStore()
+    identity.bind(
+        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
+    )
+    bound_graph = _graph(config_root, FakeChatModel(), identity=identity)
+    bound = _handover_update(bound_graph, "support", "list_orders")
+
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    _place_two_session_orders(store)
+    session_graph = _graph(config_root, FakeChatModel(), store=store)
+    session = _handover_update(session_graph, "support", "list_orders")
+
+    expected_keys = {"messages", "active_flow", "handover", "identity_claim_misses"}
+    assert set(bound) == expected_keys
+    assert set(session) == expected_keys
+    for update in (bound, session):
+        assert update["active_flow"] is None
+        assert update["handover"] is None
+        assert update["identity_claim_misses"] == 0
 
 
 # --- routing paths -------------------------------------------------------------------
