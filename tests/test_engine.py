@@ -56,9 +56,6 @@ from agnostic_market.voice.tools import build_voice_tools
 _PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
 _TEST_OTP = "482913"
-_XFAIL_FAILURE_ADMISSION = (
-    "unfinished checkpoint recovery still discards the next committed caller utterance"
-)
 
 
 def _engine(
@@ -128,7 +125,7 @@ async def _pause_at_confirmation(engine: ReasoningEngine) -> list:
 # --- the turn-failure boundary (live call #13 F-13.1: a 529 died in SILENCE) -------------
 
 
-async def test_failed_turn_speaks_the_fallback_never_silence(
+async def test_failed_turn_recovers_with_the_fallback_never_silence(
     config_root: Path,
 ) -> None:
     import json
@@ -142,7 +139,7 @@ async def test_failed_turn_speaks_the_fallback_never_silence(
     )
     events = await _events(engine, "hi there")  # the graph dies mid-turn...
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert len(spoken) == 1 and spoken[0].node == "turn_fallback"
+    assert len(spoken) == 1 and spoken[0].node == "recover_node_exception"
     assert "say that again" in spoken[0].text  # ...but the caller hears the fallback
     lines = [
         json.loads(line)
@@ -154,7 +151,6 @@ async def test_failed_turn_speaks_the_fallback_never_silence(
     assert any(isinstance(e, TokenEvent) and e.text for e in retry)
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_FAILURE_ADMISSION)
 async def test_failed_cart_turn_admits_changed_intent_instead_of_resuming_old_work(
     config_root: Path,
 ) -> None:
@@ -166,9 +162,9 @@ async def test_failed_cart_turn_admits_changed_intent_instead_of_resuming_old_wo
 
     failed = await _events(engine, "checkout now please")
     assert [event.node for event in failed if isinstance(event, SpokenMessageEvent)] == [
-        "turn_fallback"
+        "recover_node_exception"
     ]
-    assert engine._graph.get_state(engine._config).next
+    assert engine._graph.get_state(engine._config).next == ()
 
     await _events(engine, "never mind")
     snapshot = engine._graph.get_state(engine._config)

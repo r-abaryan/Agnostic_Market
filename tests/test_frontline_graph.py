@@ -11,7 +11,7 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
 from agnostic_market.agents.frontline import build_frontline_graph
-from agnostic_market.agents.recovery import clear_automation_state
+from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, clear_automation_state
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -227,10 +227,23 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         ExceptionAction.TERMINAL: expected_abandonment[AbandonmentKind.TERMINAL],
     }
 
-    regular_nodes = set(graph.get_graph().nodes) - {"__start__", "__end__"}
     assert isinstance(policies, MappingProxyType)
     assert len(policies) == 54
-    assert set(policies) == regular_nodes
+    assert RECOVERY_NODE_NAME in graph.get_graph().nodes
+    assert graph.recovery_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
+    assert len(graph.recovery_handled_nodes) == 48
+    assert set(policies) == set().union(*expected_exception.values())
+    assert graph.recovery_handled_nodes == frozenset(
+        set(policies)
+        - {
+            "cart_place",
+            "support_place",
+            "support_cancel_void",
+            "support_return_place",
+            "support_profile_place",
+            "identity_apply",
+        }
+    )
     assert Counter(policy.on_abandonment for policy in policies.values()) == {
         kind: len(nodes) for kind, nodes in expected_abandonment.items()
     }

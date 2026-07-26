@@ -6,10 +6,13 @@ import ast
 from pathlib import Path
 
 import pytest
+from langgraph.errors import NodeError
 from langgraph.graph import StateGraph
 
 from agnostic_market.agents.recovery import (
     NodePolicyRegistry,
+    NodeRecoveryPolicy,
+    build_node_error_handler,
     clear_automation_state,
     validate_automation_state_clear,
 )
@@ -65,7 +68,7 @@ def _production_calls(names: frozenset[str]) -> set[tuple[str, str | None, str]]
 
 def test_all_production_graph_nodes_use_the_registration_seam() -> None:
     assert _production_calls(frozenset({"add_node"})) == {
-        ("agents/recovery.py", "register", "add_node")
+        ("agents/recovery.py", "_add_node", "add_node")
     }
 
 
@@ -90,6 +93,7 @@ def test_automation_state_clear_is_total_and_preserves_persistent_state() -> Non
         "pending_profile_change": None,
         "pending_identity": None,
         "pending_request": None,
+        "pending_recovery": None,
         "identity_claim_misses": 0,
         "active_flow": None,
         "pending_ack": None,
@@ -149,3 +153,23 @@ def test_validated_policy_mapping_is_immutable() -> None:
             ExceptionAction.SAFE_ABORT,
             AbandonmentKind.PURE_ABORT,
         )
+
+
+def test_handler_origin_mismatch_mints_a_marker_the_consumer_must_reject() -> None:
+    policy = NodeRecoveryPolicy(
+        on_exception=ExceptionAction.SAFE_ABORT,
+        on_abandonment=AbandonmentKind.PURE_ABORT,
+    )
+    handler = build_node_error_handler("model", policy)
+    assert handler is not None
+
+    command = handler(
+        ReasoningState(),
+        NodeError(node="different_node", error=RuntimeError("not persisted")),
+    )
+    marker = command.update["pending_recovery"]
+
+    assert marker.origin_node == "model"
+    assert marker.action == ExceptionAction.TERMINAL
+    assert marker.trigger == "node_exception"
+    assert "not persisted" not in marker.model_dump_json()

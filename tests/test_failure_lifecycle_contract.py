@@ -45,7 +45,7 @@ def test_node_error_handler_receives_typed_context_and_completes() -> None:
         return Command(update={"disposition": "recovered"}, goto=END)
 
     builder = StateGraph(_ContractState)
-    builder.add_node("explode", explode, error_handler=recover, destinations=(END,))
+    builder.add_node("explode", explode, error_handler=recover)
     builder.add_edge(START, "explode")
     graph = builder.compile(checkpointer=build_checkpointer())
     config = _config("exception-handler")
@@ -57,6 +57,56 @@ def test_node_error_handler_receives_typed_context_and_completes() -> None:
     assert handled[0].node == "explode"
     assert isinstance(handled[0].error, RuntimeError)
     assert graph.get_state(config).next == ()
+
+
+async def test_node_error_handler_completes_under_update_streaming() -> None:
+    def explode(_state: _ContractState) -> dict:
+        raise RuntimeError("contract failure")
+
+    def recover(_state: _ContractState, error: NodeError) -> Command:
+        assert error.node == "explode"
+        return Command(update={"disposition": "recovered"}, goto=END)
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("explode", explode, error_handler=recover)
+    builder.add_edge(START, "explode")
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("exception-handler-streaming")
+
+    updates = [
+        item
+        async for item in graph.astream(
+            {},
+            config,
+            stream_mode="updates",
+        )
+    ]
+
+    assert updates
+    assert graph.get_state(config).values["disposition"] == "recovered"
+    assert graph.get_state(config).next == ()
+
+
+async def test_message_stream_rethrows_a_handled_error_on_langgraph_1_2_7() -> None:
+    def explode(_state: _ContractState) -> dict:
+        raise RuntimeError("contract failure")
+
+    def recover(_state: _ContractState, error: NodeError) -> Command:
+        assert error.node == "explode"
+        return Command(update={"disposition": "recovered"}, goto=END)
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("explode", explode, error_handler=recover)
+    builder.add_edge(START, "explode")
+    graph = builder.compile(checkpointer=build_checkpointer())
+
+    with pytest.raises(RuntimeError, match="contract failure"):
+        async for _ in graph.astream(
+            {},
+            _config("message-stream-handler-defect"),
+            stream_mode="messages",
+        ):
+            pass
 
 
 async def test_external_stream_cancellation_bypasses_node_error_handler() -> None:

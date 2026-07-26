@@ -121,7 +121,7 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
     )
 
 
-async def test_evaluator_detects_failed_turn_discarding_the_next_utterance(
+async def test_evaluator_confirms_failed_turn_recovery_admits_the_next_utterance(
     config_root: Path,
 ) -> None:
     reasoning = ExplodingOnceFakeChatModel(emit_tool_calls=False)
@@ -150,15 +150,15 @@ async def test_evaluator_detects_failed_turn_discarding_the_next_utterance(
         automation_terminal=False,
     )
 
-    assert [part.node for part in observation.turns[0].audible] == ["turn_fallback"]
-    assert _score_safety_observation(
-        observation,
-        expected_effects=observation.before,
-        expected_state=expected_state,
-        expected_admitted_user_messages=("checkout now please", "never mind"),
-    ) == (
-        "next-turn graph state observation differed",
-        "admitted caller-message history differed",
+    assert [part.node for part in observation.turns[0].audible] == ["recover_node_exception"]
+    assert (
+        _score_safety_observation(
+            observation,
+            expected_effects=observation.before,
+            expected_state=expected_state,
+            expected_admitted_user_messages=("checkout now please", "never mind"),
+        )
+        == ()
     )
 
 

@@ -1,6 +1,11 @@
-"""Closed failure-lifecycle policy values shared with checkpointed recovery state."""
+"""Closed failure-lifecycle policy and checkpoint state."""
 
 from enum import StrEnum
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+_FROZEN = ConfigDict(extra="forbid", frozen=True)
 
 
 class ExceptionAction(StrEnum):
@@ -30,3 +35,13 @@ class AbandonmentKind(StrEnum):
     AUTHORITATIVE_RECONCILE = "authoritative_reconcile"
     LIFECYCLE_SPECIAL = "lifecycle_special"
     TERMINAL = "terminal"
+
+
+class PendingRecovery(BaseModel):
+    """PII-free instruction minted by a registered node-error handler."""
+
+    model_config = _FROZEN
+
+    origin_node: str = Field(min_length=1)
+    action: ExceptionAction
+    trigger: Literal["node_exception", "stream_cancelled"]

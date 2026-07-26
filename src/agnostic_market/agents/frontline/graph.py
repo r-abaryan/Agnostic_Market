@@ -61,7 +61,11 @@ from agnostic_market.agents.frontline.prompt import compose_system_prompt, resol
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
 from agnostic_market.agents.recovery import (
+    AUTOMATION_TERMINAL_LINE,
+    RECOVERY_NODE_NAME,
     NodePolicyRegistry,
+    build_node_error_handler,
+    build_recovery_node,
     clear_automation_state,
     validate_automation_state_clear,
 )
@@ -117,6 +121,7 @@ FRONTLINE_SPEAKABLE_NODES = frozenset(
         "principal_warning",
         "read_render",
         "forced_status",
+        RECOVERY_NODE_NAME,
     }
 )
 
@@ -161,11 +166,6 @@ _DEFERRAL: dict[HandoffDestination, str] = {
     ),
     "planner": "That's a bit more than I can handle here yet, but I'll make sure it's picked up.",
 }
-
-_AUTOMATION_TERMINAL_LINE = (
-    "I can't continue with automated assistance on this call. "
-    "Please contact the store directly for further help."
-)
 
 
 def _build_handover_tool() -> BaseTool:
@@ -716,7 +716,7 @@ def build_frontline_graph(
 
     def automation_terminal_response_node(_state: ReasoningState) -> dict[str, object]:
         write_event({"event": "automation_terminal_response"})
-        return {"messages": [AIMessage(_AUTOMATION_TERMINAL_LINE)]}
+        return {"messages": [AIMessage(AUTOMATION_TERMINAL_LINE)]}
 
     def cross_switch_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: while sticky in one gated flow, the caller voiced a
@@ -759,6 +759,8 @@ def build_frontline_graph(
         # in checkout) reaches the checkout model, which cannot serve it.
         if state.automation_terminal:
             return "automation_terminal_response"
+        if state.pending_recovery is not None:
+            return RECOVERY_NODE_NAME
         if state.pending_request is not None and state.active_flow is None:
             return "support_continuation"
         text = _last_user_text(state)
@@ -1119,7 +1121,10 @@ def build_frontline_graph(
 
     graph = StateGraph(ReasoningState)
     validate_automation_state_clear()
-    node_registry = NodePolicyRegistry(graph)
+    node_registry = NodePolicyRegistry(
+        graph,
+        error_handler_factory=build_node_error_handler,
+    )
     node_registry.register(
         "entry", entry_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
     )
@@ -1399,6 +1404,14 @@ def build_frontline_graph(
         ExceptionAction.TERMINAL,
         AbandonmentKind.TERMINAL,
     )
+    node_registry.register_infrastructure(
+        RECOVERY_NODE_NAME,
+        build_recovery_node(
+            node_registry.validated_policies,
+            node_registry.validated_handled_nodes,
+            cart_store,
+        ),
+    )
 
     def route_after_tools(state: ReasoningState) -> str:
         # request_handover's Command sets `handover` AND targets the handover node; but the
@@ -1422,6 +1435,7 @@ def build_frontline_graph(
         route_after_entry,
         {
             "automation_terminal_response": "automation_terminal_response",
+            RECOVERY_NODE_NAME: RECOVERY_NODE_NAME,
             "gate": "gate",
             "cross_switch": "cross_switch",
             "cart_assemble": "cart_assemble",
@@ -1692,12 +1706,15 @@ def build_frontline_graph(
     )
     graph.add_edge("identity_abort", END)
     graph.add_edge("identity_escape_human", "handover")
+    graph.add_edge(RECOVERY_NODE_NAME, END)
     graph.add_edge("automation_terminal_response", END)
     graph.add_edge("finalize", END)
     graph.add_edge("forced_status", END)
     graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
 
     node_recovery_policies = node_registry.validated_policies()
+    infrastructure_nodes = node_registry.validated_infrastructure_nodes()
+    handled_nodes = node_registry.validated_handled_nodes()
     compiled = graph.compile(checkpointer=checkpointer)
     # Stashed for tests/introspection + the engine (single source of truth for which
     # node-authored messages are caller-facing — the voice side never hard-codes names).
@@ -1710,6 +1727,8 @@ def build_frontline_graph(
     )
     compiled.model_speech_nodes = MODEL_SPEECH_NODES  # type: ignore[attr-defined]
     compiled.node_recovery_policies = node_recovery_policies  # type: ignore[attr-defined]
+    compiled.recovery_infrastructure_nodes = infrastructure_nodes  # type: ignore[attr-defined]
+    compiled.recovery_handled_nodes = handled_nodes  # type: ignore[attr-defined]
     overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")

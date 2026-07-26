@@ -20,6 +20,7 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     IntentRequest,
 )
+from agnostic_market.dtos.recovery import PendingRecovery
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
@@ -441,6 +442,9 @@ class ReasoningState(BaseModel):
     pending_identity: PendingIdentity | None = None
     # Sole cross-identity continuation: caller-stated intent only, never resolved authority.
     pending_request: IntentRequest | None = None
+    # PII-free failure disposition. Ordinary node handlers consume it in-graph; the engine
+    # may seed the same channel after an externally abandoned stream in Milestone 6D.
+    pending_recovery: PendingRecovery | None = None
     # Bounded re-ask counter for the identity flow's contact claim (P7 decision 4: ONE
     # softened re-ask on a no-match — STT mishears emails constantly — then a silent human
     # handover). Spans turns WITHIN the sticky flow; cleared on every flow exit (apply,

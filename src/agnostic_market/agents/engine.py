@@ -18,13 +18,13 @@ is the seam's documented purpose.
 
 Speakable filtering + buffer-before-speak: the compiled graph carries two disjoint source
 sets — `speakable_nodes` for code-authored lines and `model_speech_nodes` for approved
-model prose. Model tokens are NEVER relayed as they stream: they buffer per message and
-speak only once the completed message is known to carry no tool calls and an approved,
+model prose. The engine consumes completed node updates, not provider token chunks, so text
+speaks only once the completed message is known to carry no tool calls and an approved,
 unambiguous source (`_TurnSpeech`). A tool-call message's narration is dropped outright:
 the downstream node (guardrail decline, readback, outcome line) is the one author of what
-the caller hears, so streamed narration can never contradict the validation that runs
-after it (live call #9 P2: "shall I refund?" streamed over the guardrail's return-first
-decline). ToolMessages never surface.
+the caller hears, so narration can never contradict the validation that runs after it
+(live call #9 P2: "shall I refund?" streamed over the guardrail's return-first decline).
+ToolMessages never surface.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from agnostic_market.agents.recovery import TURN_FALLBACK_AUTHOR, TURN_FALLBACK_LINE
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.dtos.events import (
     InterruptEvent,
@@ -75,6 +76,7 @@ from agnostic_market.dtos.orchestration import (
     VerifyOrderStatus,
     ViewCart,
 )
+from agnostic_market.dtos.recovery import PendingRecovery
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
     CancelTarget,
@@ -125,6 +127,7 @@ _CHECKPOINTED_DTOS = (
     PendingReturn,
     PendingProfileChange,
     PendingIdentity,
+    PendingRecovery,
     IdentityClarification,
     SupportClarification,
     CartClarification,
@@ -151,14 +154,6 @@ _CHECKPOINTED_DTOS = (
     SwitchAccount,
     RequestPerson,
 )
-
-
-# The turn-failure fallback (F-13.1). EXCEPTION to the one-author rule (the graph authors
-# all caller-facing text): when the GRAPH ITSELF is what died, there is no graph author —
-# a fixed platform failure line is the only alternative to dead air. Honest (admits the
-# hiccup, asks to repeat), promises nothing.
-_TURN_FALLBACK_LINE = "Sorry - I hit a snag on my end just now. Could you say that again?"
-_TURN_FALLBACK_NODE = "turn_fallback"  # not a graph node; names the author in the event
 
 
 def build_checkpointer() -> InMemorySaver:
@@ -273,7 +268,8 @@ class _GraphSpans:
     whether a slow turn is model generation, a second model pass after a tool read, or
     graph orchestration (live call #10). This measures the boundaries the graph stream
     exposes, from turn start:
-      - `ttf_model`: to the first model output (chunk or message) — generation-start delay;
+      - `ttf_model`: to the completed model update. The historical key is retained for log
+        continuity, but update-only streaming cannot observe provider generation-start;
       - `tools`: how many tool calls ran (0 = single pass; >=1 = a read/mutation loop);
       - `tool_to_next_model`: from the last tool result to the model activity AFTER it — the
         cost of the second reasoning pass that renders a tool result into speech. STAYS None
@@ -385,12 +381,10 @@ class ReasoningEngine:
     async def stream_turn(self, user_text: str, facts: TurnFacts) -> AsyncIterator[TurnEvent]:
         """Run one committed user turn; yield the caller-audible events it produces.
 
-        A turn that DIES mid-graph (provider outage, a bug) must never leave the caller in
-        silence (live call #13 F-13.1: an Anthropic 529 survived the SDK retries, the turn
-        errored into a log line, and the caller sat in dead air until they re-asked). The
-        failure boundary here logs + telemeters loudly, then speaks ONE fixed fallback line
-        and ends the turn cleanly — the thread stays usable (nothing mid-node was
-        committed; a pending interrupt stays paused and the next turn resumes it).
+        Registered ordinary node failures recover inside the graph. This outer boundary is
+        the last resort for the six deliberately unhandled effect/principal nodes and for
+        recovery-infrastructure failure; it logs, telemeters, and prevents dead air without
+        claiming that an unfinished checkpoint is safe to abandon.
         """
         arrived_thread_id = self._thread_id
         arrived = self._graph.get_state(self._config)
@@ -426,16 +420,29 @@ class ReasoningEngine:
             spans = _GraphSpans()
             try:
                 while True:
-                    async for mode, item in self._graph.astream(
-                        payload, config=self._config, stream_mode=["messages", "updates"]
+                    # LangGraph 1.2.7 re-raises an already-handled node exception when
+                    # `messages` participates in an async stream. Its update-only path
+                    # completes the handler correctly, so speech is relayed from the same
+                    # completed message deltas that are committed to state.
+                    async for item in self._graph.astream(
+                        payload,
+                        config=self._config,
+                        stream_mode="updates",
                     ):
-                        if mode == "messages":
-                            token, meta = item
-                            spans.observe(token, meta)
-                            if (event := speech.feed(token, meta)) is not None:
-                                yield event
-                        elif mode == "updates" and "__interrupt__" in item:
+                        if "__interrupt__" in item:
                             yield InterruptEvent(prompt=str(item["__interrupt__"][0].value))
+                            continue
+                        for node, update in item.items():
+                            if not isinstance(update, dict):
+                                continue
+                            messages = update.get("messages", ())
+                            if not isinstance(messages, list | tuple):
+                                messages = (messages,)
+                            meta = {"langgraph_node": node}
+                            for token in messages:
+                                spans.observe(token, meta)
+                                if (event := speech.feed(token, meta)) is not None:
+                                    yield event
                     transition = self._rotate_pending_transition()
                     if transition is None or transition.continuation is None:
                         break
@@ -447,7 +454,7 @@ class ReasoningEngine:
                 # nothing. CancelledError is BaseException and passes through untouched.
                 logger.exception("turn failed mid-graph; speaking the fallback line")
                 write_event({"event": "turn_failed", "reason": "graph_exception"})
-                yield SpokenMessageEvent(text=_TURN_FALLBACK_LINE, node=_TURN_FALLBACK_NODE)
+                yield SpokenMessageEvent(text=TURN_FALLBACK_LINE, node=TURN_FALLBACK_AUTHOR)
                 return
             finally:
                 self._rotate_pending_transition()
