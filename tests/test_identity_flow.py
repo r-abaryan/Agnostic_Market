@@ -11,7 +11,9 @@ from langchain_core.messages import ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
+from turn_helpers import engine_events, next_committed_turn
 
+from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.orchestration import ListOrders
@@ -110,7 +112,7 @@ def _seed_cart(harness: SupportHarness) -> None:
 
 
 async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
-    return [e async for e in engine.stream_turn(text, facts)]
+    return await engine_events(engine, text, facts)
 
 
 def _telemetry(tmp_path: Path) -> str:
@@ -348,6 +350,8 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(config_root: Pat
     assert h.verification.current_level() == 2
     assert h.engine.thread_id != old_thread_id
     assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    new_state = h.engine._graph.get_state(h.engine._config)
+    assert tuple(new_state.values["consumed_turn_ids"]) == ("test-turn-1", "test-turn-2")
     lines = [e for e in _spoken(events) if e.node == "support_continuation"]
     assert len(lines) == 1
     # THE privacy property: CUST-001 hears 1001 + 1003 and NEVER CUST-002's 1002.
@@ -412,6 +416,14 @@ async def test_verified_account_switch_rotates_all_principal_context(
     old_state = h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}})
     assert old_state.values == {}
     assert old_state.interrupts == ()
+    new_state = h.engine._graph.get_state(h.engine._config)
+    assert tuple(new_state.values["consumed_turn_ids"]) == (
+        "test-turn-1",
+        "test-turn-2",
+        "test-turn-3",
+    )
+    assert new_state.values.get("messages", []) == []
+    assert new_state.next == ()
 
 
 async def test_failed_account_switch_preserves_original_principal(
@@ -474,7 +486,7 @@ async def test_closing_turn_stream_completes_a_pending_context_rotation(
     dispatched = await _events(h.engine, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
 
-    stream = h.engine.stream_turn(_VALID_OTP, _FACTS)
+    stream = h.engine.stream_turn(next_committed_turn(h.engine, _VALID_OTP), _FACTS)
     try:
         while True:
             event = await anext(stream)
@@ -488,6 +500,51 @@ async def test_closing_turn_stream_completes_a_pending_context_rotation(
     assert h.engine.thread_id != old_thread_id
     assert h.identity.current().customer_ref == _CUST2_REF
     assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+
+
+async def test_rotation_failure_during_stream_close_latches_terminal_for_next_turn(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _switch_harness(
+        config_root,
+        claim=_CUST2_EMAIL,
+        thread_id="switch-stream-close-failure",
+    )
+    _establish_customer_one(h)
+    old_thread_id = h.engine.thread_id
+    dispatched = await _events(h.engine, "switch my account")
+    assert any(isinstance(event, InterruptEvent) for event in dispatched)
+
+    stream = h.engine.stream_turn(next_committed_turn(h.engine, _VALID_OTP), _FACTS)
+    try:
+        while True:
+            event = await anext(stream)
+            if isinstance(event, SpokenMessageEvent) and event.node == "identity_apply":
+                break
+        assert h.caller_context.pending_transition() is not None
+
+        real_delete = h.engine._graph.checkpointer.delete_thread
+
+        def fail_old_thread_delete(thread_id: str) -> None:
+            if thread_id == old_thread_id:
+                raise RuntimeError("injected close-stream rotation failure")
+            real_delete(thread_id)
+
+        monkeypatch.setattr(h.engine._graph.checkpointer, "delete_thread", fail_old_thread_delete)
+    finally:
+        await stream.aclose()
+
+    next_turn = await _events(h.engine, "try again")
+    snapshot = h.engine._graph.get_state(h.engine._config)
+
+    assert [event.text for event in _spoken(next_turn)] == [AUTOMATION_TERMINAL_LINE]
+    assert h.engine.thread_id == old_thread_id
+    assert h.caller_context.pending_transition() is None
+    assert h.identity.current() is None
+    assert h.verification.current_level() == 1
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
 
 
 async def test_session_placed_order_appears_in_the_identified_list(config_root: Path) -> None:

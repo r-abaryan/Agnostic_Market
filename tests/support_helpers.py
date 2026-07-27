@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from llm_fakes import FakeChatModel
+from turn_helpers import TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS
 
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
@@ -126,7 +127,12 @@ def build_support_engine(
         lifecycle=caller_context,
         checkpointer=build_checkpointer(),
     )
-    engine = ReasoningEngine(graph, thread_id=thread_id, lifecycle=caller_context)
+    engine = ReasoningEngine(
+        graph,
+        thread_id=thread_id,
+        cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
+        lifecycle=caller_context,
+    )
     caller_context.attach_engine(engine)
     return SupportHarness(
         engine,

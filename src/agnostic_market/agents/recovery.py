@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any
 
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langgraph.errors import NodeError
 from langgraph.graph import StateGraph
 from langgraph.types import Command
@@ -39,6 +43,8 @@ from agnostic_market.dtos.state import (
     PendingReturn,
     ReasoningState,
 )
+
+logger = logging.getLogger(__name__)
 
 TURN_FALLBACK_LINE = "Sorry - I hit a snag on my end just now. Could you say that again?"
 TURN_FALLBACK_AUTHOR = "turn_fallback"
@@ -138,6 +144,96 @@ class CommerceEffectFinishers:
     profile_change: Callable[[ProfileChangeRecord], dict[str, object]]
 
 
+class NodeExecutionTracker:
+    """Tracks mutable graph callables for their complete in-worker lifetime.
+
+    Async task cancellation can unwind LangGraph while a synchronous node is still running
+    in a worker thread. Wrapping the runnable invocation itself keeps the tracker active
+    until that worker actually exits. The policy registry is the sole wrapper owner.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active_by_node: dict[str, int] = {}
+        self._tracked_node_names: set[str] = set()
+        self._idle_callbacks: list[Callable[[], None]] = []
+
+    @property
+    def active_count(self) -> int:
+        with self._condition:
+            return sum(self._active_by_node.values())
+
+    @property
+    def active_node_names(self) -> frozenset[str]:
+        with self._condition:
+            return frozenset(self._active_by_node)
+
+    @property
+    def tracked_node_names(self) -> frozenset[str]:
+        with self._condition:
+            return frozenset(self._tracked_node_names)
+
+    def _run(
+        self,
+        node_name: str,
+        operation: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        with self._condition:
+            self._active_by_node[node_name] = self._active_by_node.get(node_name, 0) + 1
+        callbacks: tuple[Callable[[], None], ...] = ()
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            with self._condition:
+                remaining = self._active_by_node[node_name] - 1
+                if remaining:
+                    self._active_by_node[node_name] = remaining
+                else:
+                    del self._active_by_node[node_name]
+                if not self._active_by_node:
+                    callbacks = tuple(self._idle_callbacks)
+                    self._idle_callbacks.clear()
+                    self._condition.notify_all()
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception:
+                    logger.critical("deferred quiescence callback failed", exc_info=True)
+
+    def wrap(self, node_name: str, node: object) -> Callable[[object, RunnableConfig], Any]:
+        with self._condition:
+            if node_name in self._tracked_node_names:
+                raise RuntimeError(f"node is already tracked: {node_name!r}")
+            self._tracked_node_names.add(node_name)
+        runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
+
+        def run(state: object, config: RunnableConfig) -> Any:
+            return self._run(node_name, runnable.invoke, state, config)
+
+        return run
+
+    def wait_until_idle(self, timeout_seconds: float) -> bool:
+        if timeout_seconds <= 0:
+            raise ValueError("quiescence timeout must be positive")
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: not self._active_by_node,
+                timeout=timeout_seconds,
+            )
+
+    def defer_until_idle(self, callback: Callable[[], None]) -> None:
+        run_now = False
+        with self._condition:
+            if self._active_by_node:
+                self._idle_callbacks.append(callback)
+            else:
+                run_now = True
+        if run_now:
+            callback()
+
+
 NodeErrorHandler = Callable[[ReasoningState, NodeError], Command]
 NodeErrorHandlerFactory = Callable[[str, NodeRecoveryPolicy], NodeErrorHandler | None]
 
@@ -157,6 +253,7 @@ class NodePolicyRegistry:
         self._infrastructure: set[str] = set()
         self._handled: set[str] = set()
         self._handled_infrastructure: set[str] = set()
+        self._execution_tracker = NodeExecutionTracker()
         self._validated: Mapping[str, NodeRecoveryPolicy] | None = None
 
     def _ensure_open_and_unique(self, name: str) -> None:
@@ -194,7 +291,12 @@ class NodePolicyRegistry:
             if self._error_handler_factory is not None
             else None
         )
-        self._add_node(name, node, error_handler=handler)
+        registered_node = (
+            node
+            if on_abandonment == AbandonmentKind.PURE_ABORT
+            else self._execution_tracker.wrap(name, node)
+        )
+        self._add_node(name, registered_node, error_handler=handler)
         self._policies[name] = policy
         if handler is not None:
             self._handled.add(name)
@@ -229,11 +331,18 @@ class NodePolicyRegistry:
         expected_handlers = frozenset(
             handler_name for handler_name in handler_links.values() if handler_name is not None
         )
+        expected_tracked = frozenset(
+            name
+            for name, policy in self._policies.items()
+            if policy.on_abandonment != AbandonmentKind.PURE_ABORT
+        )
+        actual_tracked = self._execution_tracker.tracked_node_names
         expected = registered | infrastructure
         if (
             expected != actual_regular
             or missing_handler_links
             or expected_handlers != actual_handlers
+            or expected_tracked != actual_tracked
         ):
             raise RuntimeError(
                 "graph nodes bypassed the recovery-policy registry: "
@@ -241,7 +350,9 @@ class NodePolicyRegistry:
                 f"missing={sorted(expected - actual_regular)!r}, "
                 f"missing_handler_links={sorted(missing_handler_links)!r}, "
                 f"unexpected_handlers={sorted(actual_handlers - expected_handlers)!r}, "
-                f"missing_handlers={sorted(expected_handlers - actual_handlers)!r}"
+                f"missing_handlers={sorted(expected_handlers - actual_handlers)!r}, "
+                f"untracked_mutable={sorted(expected_tracked - actual_tracked)!r}, "
+                f"unexpected_tracked={sorted(actual_tracked - expected_tracked)!r}"
             )
         if self._validated is None:
             self._validated = MappingProxyType(dict(self._policies))
@@ -258,6 +369,10 @@ class NodePolicyRegistry:
     def validated_handled_infrastructure_nodes(self) -> frozenset[str]:
         self.validated_policies()
         return frozenset(self._handled_infrastructure)
+
+    def validated_execution_tracker(self) -> NodeExecutionTracker:
+        self.validated_policies()
+        return self._execution_tracker
 
 
 def ordinary_exception_handler_enabled(action: ExceptionAction) -> bool:

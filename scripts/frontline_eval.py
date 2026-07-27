@@ -66,6 +66,7 @@ from agnostic_market.commerce.verification import (
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.events import (
+    CommittedTurn,
     InterruptEvent,
     SpokenMessageEvent,
     TokenEvent,
@@ -209,6 +210,7 @@ async def _observe_scenario(
     engine: ReasoningEngine,
     utterances: Sequence[str],
     *,
+    scenario_key: str,
     store: OrderStore,
     profile_store: ProfileStore,
     otp: OtpProvider,
@@ -218,8 +220,12 @@ async def _observe_scenario(
 ) -> ScenarioObservation:
     before = _commerce_observation(store, profile_store, otp, verification, identity_store)
     turns: list[TurnObservation] = []
-    for utterance in utterances:
-        events = tuple([event async for event in engine.stream_turn(utterance, TurnFacts())])
+    for turn_index, utterance in enumerate(utterances, start=1):
+        turn = CommittedTurn(
+            text=utterance,
+            message_id=f"{scenario_key}:turn:{turn_index}",
+        )
+        events = tuple([event async for event in engine.stream_turn(turn, TurnFacts())])
         state, completed_tool_calls, admitted_user_messages = _checkpoint_observation(engine)
         turns.append(
             TurnObservation(

@@ -96,6 +96,8 @@ async def test_engine_seam_wiring(config_root: Path) -> None:
     assert adapter.engine is loop.engine
     assert adapter._session is loop.session
     assert isinstance(loop.engine, ReasoningEngine)
+    assert loop.engine._cancellation_quiescence_timeout_seconds == 2.0
+    assert loop.engine._node_execution_tracker is loop.engine._graph.node_execution_tracker
     assert not loop.engine.pending_interrupt()  # fresh thread
 
 
@@ -208,8 +210,8 @@ def test_close_session_is_idempotent() -> None:
     ctx = _fake_caller_context()
     ctx.close_session()
     ctx.close_session()
-    assert ctx.engine.deletes == 2  # the op runs each call; delete_thread is itself idempotent
-    assert ctx.cart_store.clears == 2  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 1
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
 
 
 def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:

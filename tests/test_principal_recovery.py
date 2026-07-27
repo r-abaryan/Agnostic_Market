@@ -11,6 +11,7 @@ import pytest
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
+from turn_helpers import engine_events
 
 from agnostic_market.agents import engine as engine_module
 from agnostic_market.agents import recovery
@@ -59,7 +60,7 @@ def _identity_harness(
 
 
 async def _events(harness: SupportHarness, text: str) -> list:
-    return [event async for event in harness.engine.stream_turn(text, _FACTS)]
+    return await engine_events(harness.engine, text, _FACTS)
 
 
 def _spoken(events: list) -> list[SpokenMessageEvent]:
@@ -340,9 +341,20 @@ async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
     assert len(prompts) == 1 and "ORD-1002" in prompts[0]
     assert prompts == first_prompts
     assert engine.pending_interrupt()
+    assert tuple(engine._graph.get_state(engine._config).values["consumed_turn_ids"]) == (
+        "test-turn-1",
+        "test-turn-2",
+        "test-turn-3",
+    )
 
     await _events(harness, "yes")
     assert harness.store.cancel_count == 1
+    assert tuple(engine._graph.get_state(engine._config).values["consumed_turn_ids"]) == (
+        "test-turn-1",
+        "test-turn-2",
+        "test-turn-3",
+        "test-turn-4",
+    )
     consumed = [
         event
         for event in _telemetry(tmp_path)

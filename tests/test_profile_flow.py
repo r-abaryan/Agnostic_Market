@@ -11,6 +11,7 @@ import pytest
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
+from turn_helpers import engine_events
 
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileError, ProfileStore, load_profile_fixture
@@ -66,7 +67,7 @@ def _profile_harness(
 
 
 async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
-    return [e async for e in engine.stream_turn(text, facts)]
+    return await engine_events(engine, text, facts)
 
 
 def _telemetry(tmp_path: Path) -> str:

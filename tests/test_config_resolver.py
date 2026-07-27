@@ -13,7 +13,12 @@ from agnostic_market.config.resolver import (
 
 def _base() -> dict:
     return {
-        "_safety_locked": ["_platform", "schema_version", "policies.cancel_batch_max"],
+        "_safety_locked": [
+            "_platform",
+            "schema_version",
+            "policies.cancel_batch_max",
+            "runtime.cancellation_quiescence_timeout_seconds",
+        ],
         "_platform": {
             "payment": {"out_of_band_only": True},
             "limits": {
@@ -33,6 +38,7 @@ def _base() -> dict:
             },
         },
         "schema_version": "0.2",
+        "runtime": {"cancellation_quiescence_timeout_seconds": 2.0},
         "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
         "policies": {
             "cancel_batch_max": 10,
@@ -139,6 +145,19 @@ def test_cancel_batch_max_is_safety_locked_from_merchant_override() -> None:
 def test_cancel_batch_max_comes_from_locked_base() -> None:
     config = resolve_merchant_config(_base(), _template(), _override())
     assert config.policies.cancel_batch_max == 10
+
+
+def test_runtime_quiescence_timeout_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.cancellation_quiescence_timeout_seconds == 2.0
+
+    bad = _override()
+    bad["runtime"] = {"cancellation_quiescence_timeout_seconds": 10.0}
+    with pytest.raises(
+        SafetyLockViolationError,
+        match="cancellation_quiescence_timeout_seconds",
+    ):
+        resolve_merchant_config(_base(), _template(), bad)
 
 
 def test_platform_block_not_leaked_into_effective_config() -> None:

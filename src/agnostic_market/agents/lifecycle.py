@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 from agnostic_market.commerce.identity import BoundIdentity
@@ -13,7 +14,15 @@ from agnostic_market.dtos.orchestration import (
 )
 
 
+class ExecutionQuiescence(Protocol):
+    """Minimal lifecycle-facing view of the graph's mutable-node tracker."""
+
+    def defer_until_idle(self, callback: Callable[[], None]) -> None: ...
+
+
 class PrincipalTransitionLifecycle(Protocol):
+    def attach_execution_quiescence(self, tracker: ExecutionQuiescence) -> None: ...
+
     def transition_principal(
         self,
         new_identity: BoundIdentity,

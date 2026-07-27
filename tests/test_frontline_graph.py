@@ -236,7 +236,11 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     assert len(policies) == 54
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.recovery_infrastructure_nodes == frozenset(
-        {RECOVERY_NODE_NAME, RECOVERY_TERMINALIZER_NODE_NAME}
+        {
+            RECOVERY_NODE_NAME,
+            RECOVERY_TERMINALIZER_NODE_NAME,
+            graph.principal_seed_complete_node,
+        }
     )
     assert len(graph.recovery_handled_nodes) == 53
     assert set(policies) == set().union(*expected_exception.values())
@@ -244,6 +248,9 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         set(policies) - {"automation_terminal_response"}
     )
     assert graph.recovery_handled_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
+    assert graph.node_execution_tracker.tracked_node_names == frozenset(
+        set(policies) - expected_abandonment[AbandonmentKind.PURE_ABORT]
+    )
     assert Counter(policy.on_abandonment for policy in policies.values()) == {
         kind: len(nodes) for kind, nodes in expected_abandonment.items()
     }

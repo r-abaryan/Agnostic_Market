@@ -12,6 +12,7 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from pydantic import ValidationError
 from support_helpers import build_support_engine
+from turn_helpers import engine_events
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.cart import flow as cart_flow
@@ -24,7 +25,7 @@ from agnostic_market.agents.recovery import (
 )
 from agnostic_market.agents.support import _stepup as support_stepup
 from agnostic_market.commerce.orders import render_cart_line
-from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent
 from agnostic_market.dtos.orchestration import ListOrders
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import PendingRefund, ReasoningState
@@ -92,7 +93,7 @@ def _telemetry_records() -> list[dict[str, object]]:
 
 
 async def _events(engine, text: str) -> list:
-    return [event async for event in engine.stream_turn(text, TurnFacts())]
+    return await engine_events(engine, text)
 
 
 def _commerce_counts(harness) -> tuple[int, int, int, int, int]:

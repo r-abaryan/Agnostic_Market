@@ -29,6 +29,7 @@ from langchain_core.messages import ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import TEST_OTP, SupportHarness, build_support_engine
+from turn_helpers import engine_events
 
 from agnostic_market.agents.support.flow import (
     _SUPPORT_COMBINED_NOT_FOUND,
@@ -70,7 +71,7 @@ def _harness(
 
 
 async def _events(engine, text: str) -> list:
-    return [e async for e in engine.stream_turn(text, _FACTS)]
+    return await engine_events(engine, text, _FACTS)
 
 
 def _telemetry(tmp_path: Path) -> list[dict]:

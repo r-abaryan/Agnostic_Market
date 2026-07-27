@@ -16,9 +16,11 @@ the call and is not this module's job.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.agents.lifecycle import ExecutionQuiescence
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore
@@ -46,6 +48,18 @@ class CallerContext:
     order_store: OrderStore
     engine: ReasoningEngine | None = None
     _pending_transition: PrincipalTransition | None = field(default=None, init=False)
+    _execution_quiescence: ExecutionQuiescence | None = field(default=None, init=False, repr=False)
+    _close_started: bool = field(default=False, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def attach_execution_quiescence(self, tracker: ExecutionQuiescence) -> None:
+        with self._close_lock:
+            if self._close_started:
+                raise RuntimeError("cannot attach graph execution tracking after close starts")
+            if self._execution_quiescence is not None and self._execution_quiescence is not tracker:
+                raise RuntimeError("caller context already has a different execution tracker")
+            self._execution_quiescence = tracker
 
     def attach_engine(self, engine: ReasoningEngine) -> None:
         if self.engine is not None and self.engine is not engine:
@@ -147,14 +161,10 @@ class CallerContext:
             raise RuntimeError("principal transition completion does not match pending marker")
         self._pending_transition = None
 
-    def close_session(self) -> None:
-        """Total teardown at session end (Clock B, AGENTS §A10 rule 4): every caller-scoped
-        store is cleared and the reasoning thread deleted, so a reattaching session can never
-        inherit a stale level, cart, recent-order context, verified identity, or guest order.
-        Idempotent —
-        safe to call more than once (a double-fired close, or a close racing a future
-        transition). Durable business outcomes (committed cancels/refunds/returns) are NOT
-        cleared (see `OrderStore.clear_session_placed`)."""
+    def _complete_close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
         self._clear_ephemeral()
         self.verification_store.clear()
         self.identity_store.clear()
@@ -162,3 +172,22 @@ class CallerContext:
         if self.engine is not None:
             self.engine.delete_thread()
         write_event({"event": "caller_context_closed"})
+        with self._close_lock:
+            self._closed = True
+
+    def close_session(self) -> None:
+        """Total teardown at session end (Clock B, AGENTS §A10 rule 4): every caller-scoped
+        store is cleared and the reasoning thread deleted, so a reattaching session can never
+        inherit a stale level, cart, recent-order context, verified identity, or guest order.
+        Idempotent: a double-fired close schedules or runs the total teardown exactly once.
+        Durable business outcomes (committed cancels/refunds/returns) are NOT cleared (see
+        `OrderStore.clear_session_placed`)."""
+        with self._close_lock:
+            if self._close_started:
+                return
+            self._close_started = True
+            tracker = self._execution_quiescence
+        if tracker is None:
+            self._complete_close()
+            return
+        tracker.defer_until_idle(self._complete_close)

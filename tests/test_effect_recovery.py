@@ -12,6 +12,7 @@ import pytest
 from langchain_core.messages import AIMessage
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
+from turn_helpers import engine_events
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.recovery import (
@@ -20,7 +21,7 @@ from agnostic_market.agents.recovery import (
 )
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.commerce.receipts import CommittedReceipt, IndeterminateReceipt
-from agnostic_market.dtos.events import SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.events import SpokenMessageEvent
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
@@ -71,7 +72,7 @@ def _records() -> list[dict[str, object]]:
 
 
 async def _events(harness: SupportHarness) -> list:
-    return [event async for event in harness.engine.stream_turn("continue", TurnFacts())]
+    return await engine_events(harness.engine, "continue")
 
 
 def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:

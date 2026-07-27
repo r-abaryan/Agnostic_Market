@@ -19,6 +19,7 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from pydantic import ValidationError
 from support_helpers import authorize_fixture_orders, build_support_engine
+from turn_helpers import engine_events
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME
@@ -85,7 +86,7 @@ def _engine(
 
 
 async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS) -> list:
-    return [event async for event in engine.stream_turn(text, facts)]
+    return await engine_events(engine, text, facts)
 
 
 def _telemetry_events(tmp_path: Path) -> list[dict]:

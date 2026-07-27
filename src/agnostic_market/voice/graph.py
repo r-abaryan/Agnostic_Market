@@ -9,7 +9,7 @@ Per turn it:
   - gathers the §4a perception fact: whether the caller barged over the pending
     confirmation readback (`ChatMessage.interrupted` on the last assistant history item —
     consent over a truncated readback is not consent, VOICE_PIPELINE §4a);
-  - calls `engine.stream_turn(text, TurnFacts(...))` and renders TurnEvents as plain
+  - calls `engine.stream_turn(CommittedTurn(...), TurnFacts(...))` and renders TurnEvents as plain
     strings (LLMAdapter's `_to_chat_chunk` accepts str — verified from plugin source).
 
 ALL LiveKit knowledge lives here; the engine imports nothing from the voice plane. The
@@ -26,7 +26,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from agnostic_market.agents.engine import ReasoningEngine
-from agnostic_market.dtos.events import TurnFacts
+from agnostic_market.dtos.events import CommittedTurn, TurnFacts
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +46,14 @@ class GraphVoiceAdapter:
     def engine(self) -> ReasoningEngine:
         return self._engine
 
-    def _last_user_text(self, state: dict[str, Any]) -> str:
+    def _last_user_turn(self, state: dict[str, Any]) -> CommittedTurn | None:
         for msg in reversed(state.get("messages", [])):
             if isinstance(msg, HumanMessage):
-                return str(msg.content)
-        return ""
+                return CommittedTurn(
+                    text=str(msg.content),
+                    message_id=msg.id,
+                )
+        return None
 
     def _readback_interrupted(self) -> bool:
         """§4a fact: was the last agent utterance (the pending readback) barged over?
@@ -73,10 +76,10 @@ class GraphVoiceAdapter:
     def astream(self, state: dict[str, Any], *args: Any, **kwargs: Any) -> AsyncIterator[str]:
         """The LLMAdapter entry point. `state` is the chat_ctx-derived message dict; the
         adapter's config/stream_mode args are ignored — the engine owns thread + modes."""
-        user_text = self._last_user_text(state)
+        turn = self._last_user_turn(state)
 
         async def _events() -> AsyncIterator[str]:
-            if not user_text:
+            if turn is None:
                 logger.warning("voice adapter: no user message in transport input; empty turn")
                 return
             facts = TurnFacts(
@@ -84,7 +87,7 @@ class GraphVoiceAdapter:
                     self._engine.pending_interrupt() and self._readback_interrupted()
                 )
             )
-            async for event in self._engine.stream_turn(user_text, facts):
+            async for event in self._engine.stream_turn(turn, facts):
                 # Token / spoken-message / interrupt prompt — all graph-authored text.
                 yield event.text if event.kind != "interrupt" else event.prompt
 

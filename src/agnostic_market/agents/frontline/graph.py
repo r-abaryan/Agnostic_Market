@@ -1421,6 +1421,16 @@ def build_frontline_graph(
         RECOVERY_TERMINALIZER_NODE_NAME,
         build_recovery_terminalizer,
     )
+    # Checkpoint-only lifecycle seam: the engine uses this declared completed node to seed
+    # replay-defense metadata onto a fresh principal thread when there is no continuation.
+    # ``update_state(as_node=...)`` records the update without executing this callable, and
+    # its END edge leaves no pending graph work. LangGraph does not accept END itself as an
+    # update-state author on the installed version.
+    principal_seed_complete_node = "principal_seed_complete"
+    node_registry.register_infrastructure(
+        principal_seed_complete_node,
+        lambda _state: {},
+    )
 
     def route_after_tools(state: ReasoningState) -> str:
         # request_handover's Command sets `handover` AND targets the handover node; but the
@@ -1717,6 +1727,7 @@ def build_frontline_graph(
     graph.add_edge("identity_escape_human", "handover")
     graph.add_edge(RECOVERY_NODE_NAME, END)
     graph.add_edge(RECOVERY_TERMINALIZER_NODE_NAME, "automation_terminal_response")
+    graph.add_edge(principal_seed_complete_node, END)
     graph.add_edge("automation_terminal_response", END)
     graph.add_edge("finalize", END)
     graph.add_edge("forced_status", END)
@@ -1726,6 +1737,7 @@ def build_frontline_graph(
     infrastructure_nodes = node_registry.validated_infrastructure_nodes()
     handled_nodes = node_registry.validated_handled_nodes()
     handled_infrastructure_nodes = node_registry.validated_handled_infrastructure_nodes()
+    node_execution_tracker = node_registry.validated_execution_tracker()
     compiled = graph.compile(checkpointer=checkpointer)
     # Stashed for tests/introspection + the engine (single source of truth for which
     # node-authored messages are caller-facing — the voice side never hard-codes names).
@@ -1744,6 +1756,8 @@ def build_frontline_graph(
         handled_infrastructure_nodes
     )
     compiled.terminal_takeover_node = "automation_terminal_response"  # type: ignore[attr-defined]
+    compiled.principal_seed_complete_node = principal_seed_complete_node  # type: ignore[attr-defined]
+    compiled.node_execution_tracker = node_execution_tracker  # type: ignore[attr-defined]
     overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")

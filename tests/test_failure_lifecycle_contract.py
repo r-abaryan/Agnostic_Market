@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, TypedDict
+import threading
+from collections.abc import Callable
+from typing import Annotated, Any, TypedDict
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
+from langchain_core.tools import tool
 from langgraph.errors import NodeError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, interrupt
+from livekit.agents.llm import ChatContext
+from livekit.plugins.langchain import LLMAdapter
 
 from agnostic_market.agents.engine import build_checkpointer
+
+_WAIT_TIMEOUT_SECONDS = 5.0
 
 
 def _append(left: list[str] | None, right: list[str] | None) -> list[str]:
@@ -27,11 +36,55 @@ class _ContractState(TypedDict, total=False):
     disposition: str | None
     effect_count: int
     normal_count: int
+    consumed_turn_ids: tuple[str, ...]
     visited: Annotated[list[str], _append]
 
 
 def _config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
+
+
+class _ExecutionTracker:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = 0
+        self.entered_threads: list[int] = []
+        self.exited_threads: list[int] = []
+
+    @property
+    def active(self) -> int:
+        with self._condition:
+            return self._active
+
+    def run(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        thread_id = threading.get_ident()
+        with self._condition:
+            self._active += 1
+            self.entered_threads.append(thread_id)
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            with self._condition:
+                self.exited_threads.append(thread_id)
+                self._active -= 1
+                if self._active == 0:
+                    self._condition.notify_all()
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        with self._condition:
+            return self._condition.wait_for(lambda: self._active == 0, timeout=timeout)
+
+
+def _tracked_sync_node(
+    tracker: _ExecutionTracker,
+    node: Runnable | Callable[..., Any],
+) -> Callable[[_ContractState, RunnableConfig], Any]:
+    runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
+
+    def run(state: _ContractState, config: RunnableConfig) -> Any:
+        return tracker.run(runnable.invoke, state, config)
+
+    return run
 
 
 def test_node_error_handler_receives_typed_context_and_completes() -> None:
@@ -144,6 +197,308 @@ async def test_external_stream_cancellation_bypasses_node_error_handler() -> Non
     assert snapshot.next == ("slow",)
     assert len(snapshot.tasks) == 1
     assert snapshot.tasks[0].error is None
+
+
+async def test_livekit_langgraph_stream_preserves_the_committed_message_id() -> None:
+    captured: dict[str, object] = {}
+
+    class CaptureGraph:
+        async def astream(self, state: dict[str, object], *_args: object, **_kwargs: object):
+            captured.update(state)
+            yield "acknowledged"
+
+    chat_context = ChatContext.empty()
+    committed = chat_context.add_message(
+        role="user",
+        content="cancel my order",
+        id="transport-turn-1",
+    )
+    stream = LLMAdapter(CaptureGraph()).chat(chat_ctx=chat_context)  # type: ignore[arg-type]
+
+    response = await stream.collect()
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert response.text == "acknowledged"
+    assert len(messages) == 1
+    assert isinstance(messages[0], HumanMessage)
+    assert messages[0].id == committed.id == "transport-turn-1"
+
+
+async def test_livekit_langgraph_stream_cancellation_reaches_the_graph_generator() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    finalized = asyncio.Event()
+    release = asyncio.Event()
+
+    class CancellationGraph:
+        async def astream(self, _state: object, *_args: object, **_kwargs: object):
+            started.set()
+            try:
+                await release.wait()
+                yield "unexpected"
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                finalized.set()
+
+    chat_context = ChatContext.empty()
+    chat_context.add_message(role="user", content="cancel my order", id="transport-turn-2")
+    stream = LLMAdapter(CancellationGraph()).chat(chat_ctx=chat_context)  # type: ignore[arg-type]
+
+    await asyncio.wait_for(started.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
+    await stream.aclose()
+
+    assert cancelled.is_set()
+    assert finalized.is_set()
+
+
+async def test_cancelled_sync_node_continues_after_the_astream_task_unwinds() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    external_writes: list[str] = []
+
+    def slow_write(_state: _ContractState) -> dict[str, object]:
+        started.set()
+        try:
+            if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release the synchronous node")
+            external_writes.append("committed-after-cancel")
+            return {"effect_count": 1}
+        finally:
+            finished.set()
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("slow_write", slow_write)
+    builder.add_edge(START, "slow_write")
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("sync-worker-outlives-cancel")
+
+    async def drain() -> None:
+        async for _ in graph.astream({}, config, stream_mode="updates"):
+            pass
+
+    task = asyncio.create_task(drain())
+    assert await asyncio.to_thread(started.wait, _WAIT_TIMEOUT_SECONDS)
+    try:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not finished.is_set()
+        assert external_writes == []
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+
+    snapshot = graph.get_state(config)
+    assert external_writes == ["committed-after-cancel"]
+    assert snapshot.values.get("effect_count") is None
+    assert snapshot.next == ("slow_write",)
+
+
+async def test_in_worker_tracker_remains_active_until_the_sync_node_exits() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    tracker = _ExecutionTracker()
+    event_loop_thread = threading.get_ident()
+
+    def slow(_state: _ContractState) -> dict[str, object]:
+        started.set()
+        try:
+            if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release the tracked node")
+            return {"disposition": "completed"}
+        finally:
+            finished.set()
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("slow", _tracked_sync_node(tracker, slow))
+    builder.add_edge(START, "slow")
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("in-worker-tracker")
+
+    async def drain() -> None:
+        async for _ in graph.astream({}, config, stream_mode="updates"):
+            pass
+
+    task = asyncio.create_task(drain())
+    assert await asyncio.to_thread(started.wait, _WAIT_TIMEOUT_SECONDS)
+    try:
+        assert tracker.active == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert tracker.active == 1
+        assert not finished.is_set()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+        assert await asyncio.to_thread(tracker.wait_until_idle, _WAIT_TIMEOUT_SECONDS)
+
+    assert tracker.entered_threads == tracker.exited_threads
+    assert tracker.entered_threads[0] != event_loop_thread
+
+
+def test_in_worker_tracker_wraps_a_real_tool_node() -> None:
+    tracker = _ExecutionTracker()
+
+    @tool
+    def order_label(order_id: str) -> str:
+        """Return a deterministic label for one order."""
+        return f"order:{order_id}"
+
+    tools = ToolNode([order_label])
+    builder = StateGraph(_ContractState)
+    builder.add_node("tools", _tracked_sync_node(tracker, tools))
+    builder.add_edge(START, "tools")
+    graph = builder.compile(checkpointer=build_checkpointer())
+
+    result = graph.invoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "order_label",
+                            "args": {"order_id": "ORD-1002"},
+                            "id": "tool-call-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        },
+        _config("tracked-tool-node"),
+    )
+
+    tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
+    assert [message.content for message in tool_messages] == ["order:ORD-1002"]
+    assert tracker.active == 0
+    assert tracker.entered_threads == tracker.exited_threads
+    assert len(tracker.entered_threads) == 1
+
+
+async def test_runnable_error_listener_fires_before_the_sync_worker_exits() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    listener_called = threading.Event()
+
+    def slow(_state: _ContractState) -> dict[str, object]:
+        started.set()
+        try:
+            if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release the listened node")
+            return {"disposition": "completed"}
+        finally:
+            finished.set()
+
+    listened = RunnableLambda(slow).with_listeners(
+        on_error=lambda _run: listener_called.set(),
+    )
+    builder = StateGraph(_ContractState)
+    builder.add_node("slow", listened)
+    builder.add_edge(START, "slow")
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("listener-is-not-quiescence")
+
+    async def drain() -> None:
+        async for _ in graph.astream({}, config, stream_mode="updates"):
+            pass
+
+    task = asyncio.create_task(drain())
+    assert await asyncio.to_thread(started.wait, _WAIT_TIMEOUT_SECONDS)
+    try:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(listener_called.wait, _WAIT_TIMEOUT_SECONDS)
+        assert not finished.is_set()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+
+
+async def test_start_takeover_waits_for_tracked_sync_work_to_be_quiescent() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    wait_started = asyncio.Event()
+    external_writes: list[str] = []
+    tracker = _ExecutionTracker()
+
+    def entry(_state: _ContractState) -> dict[str, object]:
+        return {"visited": ["entry"]}
+
+    def route_after_entry(state: _ContractState) -> str:
+        return "recover" if state.get("pending_recovery") else "slow_write"
+
+    def slow_write(_state: _ContractState) -> dict[str, object]:
+        started.set()
+        try:
+            if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release the takeover node")
+            external_writes.append("committed")
+            return {"effect_count": 1}
+        finally:
+            finished.set()
+
+    def recover(_state: _ContractState) -> dict[str, object]:
+        return {"disposition": "recovered"}
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("entry", entry)
+    builder.add_node("slow_write", _tracked_sync_node(tracker, slow_write))
+    builder.add_node("recover", recover)
+    builder.add_edge(START, "entry")
+    builder.add_conditional_edges(
+        "entry",
+        route_after_entry,
+        {"recover": "recover", "slow_write": "slow_write"},
+    )
+    builder.add_edge("slow_write", END)
+    builder.add_edge("recover", END)
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("takeover-after-quiescence")
+
+    async def drain() -> None:
+        async for _ in graph.astream({}, config, stream_mode="updates"):
+            pass
+
+    async def takeover() -> None:
+        wait_started.set()
+        idle = await asyncio.to_thread(tracker.wait_until_idle, _WAIT_TIMEOUT_SECONDS)
+        if not idle:
+            raise TimeoutError("tracked node did not become quiescent")
+        graph.update_state(
+            config,
+            {"pending_recovery": "safe_abort"},
+            as_node=START,
+        )
+
+    task = asyncio.create_task(drain())
+    assert await asyncio.to_thread(started.wait, _WAIT_TIMEOUT_SECONDS)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    takeover_task = asyncio.create_task(takeover())
+    await asyncio.wait_for(wait_started.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
+    try:
+        assert not takeover_task.done()
+        assert graph.get_state(config).next == ("slow_write",)
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+
+    await asyncio.wait_for(takeover_task, timeout=_WAIT_TIMEOUT_SECONDS)
+    snapshot = graph.get_state(config)
+    assert external_writes == ["committed"]
+    assert snapshot.values["pending_recovery"] == "safe_abort"
+    assert snapshot.next == ("entry",)
 
 
 async def test_cancellation_after_external_write_leaves_ambiguous_checkpoint() -> None:
@@ -357,6 +712,80 @@ def test_interrupt_is_not_intercepted_by_node_error_handler() -> None:
     assert result["visited"] == ["confirm", "effect"]
     assert handled == []
     assert graph.get_state(config).next == ()
+
+
+def test_interrupt_resume_atomically_updates_the_consumed_turn_ledger() -> None:
+    def confirm(_state: _ContractState) -> dict[str, object]:
+        decision = interrupt({"ask": "continue?"})
+        return {"disposition": str(decision), "visited": ["confirm"]}
+
+    def effect(state: _ContractState) -> dict[str, object]:
+        return {
+            "effect_count": state.get("effect_count", 0) + 1,
+            "visited": ["effect"],
+        }
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("confirm", confirm)
+    builder.add_node("effect", effect)
+    builder.add_edge(START, "confirm")
+    builder.add_edge("confirm", "effect")
+    builder.add_edge("effect", END)
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("interrupt-ledger-update")
+
+    graph.invoke({"consumed_turn_ids": ("transport-turn-1",)}, config)
+    paused = graph.get_state(config)
+    assert paused.next == ("confirm",)
+    assert len(paused.interrupts) == 1
+
+    result = graph.invoke(
+        Command(
+            resume="yes",
+            update={"consumed_turn_ids": ("transport-turn-1", "transport-turn-2")},
+        ),
+        config,
+    )
+    snapshot = graph.get_state(config)
+
+    assert result["disposition"] == "yes"
+    assert result["effect_count"] == 1
+    assert tuple(snapshot.values["consumed_turn_ids"]) == (
+        "transport-turn-1",
+        "transport-turn-2",
+    )
+    assert snapshot.next == ()
+
+
+def test_interrupt_update_without_resume_consumes_id_and_preserves_interrupt() -> None:
+    def confirm(_state: _ContractState) -> dict[str, object]:
+        decision = interrupt({"ask": "continue?"})
+        return {"disposition": str(decision)}
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("confirm", confirm)
+    builder.add_edge(START, "confirm")
+    builder.add_edge("confirm", END)
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("interrupt-ledger-only-update")
+
+    graph.invoke({"consumed_turn_ids": ("transport-turn-1",)}, config)
+    before = graph.get_state(config)
+    assert before.next == ("confirm",)
+    interrupt_id = before.interrupts[0].id
+
+    graph.invoke(
+        Command(update={"consumed_turn_ids": ("transport-turn-1", "transport-turn-2")}),
+        config,
+    )
+    after = graph.get_state(config)
+
+    assert tuple(after.values["consumed_turn_ids"]) == (
+        "transport-turn-1",
+        "transport-turn-2",
+    )
+    assert after.next == ("confirm",)
+    assert after.interrupts[0].id == interrupt_id
 
 
 def test_terminal_node_takeover_supersedes_a_failed_checkpoint() -> None:

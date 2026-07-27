@@ -16,6 +16,7 @@ from support_helpers import (
     authorize_fixture_orders,
     build_support_engine,
 )
+from turn_helpers import engine_events
 
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileStore
@@ -55,7 +56,7 @@ def _return_harness(
 
 
 async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
-    return [e async for e in engine.stream_turn(text, facts)]
+    return await engine_events(engine, text, facts)
 
 
 def _telemetry_events(tmp_path: Path) -> list[dict]:

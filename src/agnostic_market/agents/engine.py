@@ -47,10 +47,12 @@ from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     TURN_FALLBACK_AUTHOR,
     TURN_FALLBACK_LINE,
+    NodeExecutionTracker,
     clear_automation_state,
 )
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.dtos.events import (
+    CommittedTurn,
     InterruptEvent,
     SpokenMessageEvent,
     TokenEvent,
@@ -98,6 +100,7 @@ from agnostic_market.dtos.state import (
     PendingReturn,
     ReasoningState,
     SupportClarification,
+    merge_consumed_turn_ids,
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
@@ -331,6 +334,7 @@ class ReasoningEngine:
         graph: CompiledStateGraph,
         *,
         thread_id: str,
+        cancellation_quiescence_timeout_seconds: float,
         lifecycle: PrincipalTransitionLifecycle | None = None,
     ) -> None:
         if graph.checkpointer is None:
@@ -347,10 +351,23 @@ class ReasoningEngine:
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
         self._lifecycle = lifecycle
+        if cancellation_quiescence_timeout_seconds <= 0:
+            raise ValueError("cancellation quiescence timeout must be positive")
+        self._cancellation_quiescence_timeout_seconds = cancellation_quiescence_timeout_seconds
         terminal_node = getattr(graph, "terminal_takeover_node", None)
         if not isinstance(terminal_node, str) or not terminal_node:
             raise ValueError("ReasoningEngine requires a graph-declared terminal takeover node")
         self._terminal_takeover_node = terminal_node
+        principal_seed_node = getattr(graph, "principal_seed_complete_node", None)
+        if not isinstance(principal_seed_node, str) or not principal_seed_node:
+            raise ValueError("ReasoningEngine requires a graph-declared principal seed node")
+        self._principal_seed_complete_node = principal_seed_node
+        execution_tracker = getattr(graph, "node_execution_tracker", None)
+        if not isinstance(execution_tracker, NodeExecutionTracker):
+            raise ValueError("ReasoningEngine requires a graph-declared node execution tracker")
+        self._node_execution_tracker = execution_tracker
+        if lifecycle is not None:
+            lifecycle.attach_execution_quiescence(execution_tracker)
         self._terminal_latched = False
 
     @property
@@ -363,7 +380,10 @@ class ReasoningEngine:
             return False
         return bool(self._graph.get_state(self._config).interrupts)
 
-    def _rotate_pending_transition(self) -> PrincipalTransition | None:
+    def _rotate_pending_transition(
+        self,
+        arriving_message_id: str,
+    ) -> PrincipalTransition | None:
         if self._lifecycle is None:
             return None
         inspection = self._lifecycle.inspect_principal_transition()
@@ -372,7 +392,8 @@ class ReasoningEngine:
         transition = inspection.transition
         assert transition is not None
         current = self._graph.get_state(self._config)
-        if current.values.get("automation_terminal", False):
+        current_state = ReasoningState.model_validate(current.values)
+        if current_state.automation_terminal:
             self._lifecycle.invalidate_principal_transition(transition.transition_id)
             return None
         if inspection.outcome != "coherent":
@@ -382,29 +403,38 @@ class ReasoningEngine:
         old_thread_id = self._thread_id
         new_thread_id = _new_thread_id()
         new_config = {"configurable": {"thread_id": new_thread_id}}
+        carried_turn_ids = merge_consumed_turn_ids(
+            current_state.consumed_turn_ids,
+            (arriving_message_id,),
+        )
         switched = False
         try:
+            seed: dict[str, object] = {"consumed_turn_ids": carried_turn_ids}
             if transition.continuation is not None:
-                self._graph.update_state(
-                    new_config,
-                    {"pending_request": transition.continuation},
-                    as_node="__start__",
+                seed["pending_request"] = transition.continuation
+                seed_author = "__start__"
+            else:
+                seed_author = self._principal_seed_complete_node
+            self._graph.update_state(new_config, seed, as_node=seed_author)
+            seeded = self._graph.get_state(new_config)
+            seeded_state = ReasoningState.model_validate(seeded.values)
+            expected_clear = clear_automation_state()
+            expected_request = transition.continuation
+            expected_next = ("entry",) if transition.continuation is not None else ()
+            contaminated = bool(
+                seeded_state.pending_request != expected_request
+                or seeded_state.consumed_turn_ids != carried_turn_ids
+                or seeded_state.messages
+                or seeded_state.automation_terminal
+                or seeded.next != expected_next
+                or any(
+                    getattr(seeded_state, field) != expected
+                    for field, expected in expected_clear.items()
+                    if field != "pending_request"
                 )
-                seeded = self._graph.get_state(new_config)
-                seeded_state = ReasoningState.model_validate(seeded.values)
-                expected_clear = clear_automation_state()
-                contaminated = bool(
-                    seeded_state.pending_request != transition.continuation
-                    or seeded_state.messages
-                    or seeded_state.automation_terminal
-                    or any(
-                        getattr(seeded_state, field) != expected
-                        for field, expected in expected_clear.items()
-                        if field != "pending_request"
-                    )
-                )
-                if contaminated:
-                    raise RuntimeError("fresh principal thread seed is contaminated")
+            )
+            if contaminated:
+                raise RuntimeError("fresh principal thread seed is contaminated")
             rechecked = self._lifecycle.inspect_principal_transition()
             if rechecked.outcome != "coherent" or rechecked.transition != transition:
                 raise RuntimeError("principal transition changed during rotation")
@@ -479,7 +509,11 @@ class ReasoningEngine:
             node=self._terminal_takeover_node,
         )
 
-    async def stream_turn(self, user_text: str, facts: TurnFacts) -> AsyncIterator[TurnEvent]:
+    async def stream_turn(
+        self,
+        turn: CommittedTurn,
+        facts: TurnFacts,
+    ) -> AsyncIterator[TurnEvent]:
         """Run one committed user turn; yield the caller-audible events it produces.
 
         Registered ordinary node failures recover inside the graph. This outer boundary is
@@ -491,6 +525,17 @@ class ReasoningEngine:
             yield SpokenMessageEvent(
                 text=AUTOMATION_TERMINAL_LINE,
                 node=self._terminal_takeover_node,
+            )
+            return
+        message_id = turn.message_id
+        if message_id is None:
+            try:
+                write_event({"event": "ingress_turn_rejected", "reason": "missing_message_id"})
+            except Exception:
+                logger.critical("missing-message-id telemetry failed", exc_info=True)
+            yield SpokenMessageEvent(
+                text=TURN_FALLBACK_LINE,
+                node=TURN_FALLBACK_AUTHOR,
             )
             return
         arrived_thread_id = self._thread_id
@@ -509,20 +554,31 @@ class ReasoningEngine:
                         node=self._terminal_takeover_node,
                     )
                     return
-                transition = self._rotate_pending_transition()
+                transition = self._rotate_pending_transition(message_id)
                 snapshot = self._graph.get_state(self._config)
+                snapshot_state = ReasoningState.model_validate(snapshot.values)
                 if arrived_thread_id != self._thread_id:
                     write_event({"event": "cross_thread_turn_consumed"})
-                    if snapshot.interrupts:
-                        yield InterruptEvent(prompt=str(snapshot.interrupts[0].value))
-                        return
                     if not snapshot.next:
+                        self._graph.update_state(
+                            self._config,
+                            {"consumed_turn_ids": (message_id,)},
+                            as_node=self._principal_seed_complete_node,
+                        )
                         yield SpokenMessageEvent(
                             text=TURN_FALLBACK_LINE,
                             node=TURN_FALLBACK_AUTHOR,
                         )
                         return
-                    payload: object = None
+                    # A Command carrying only an update advances an unfinished node without
+                    # supplying resume data. On an interrupt LangGraph checkpoints the ID and
+                    # re-emits the same interrupt; on a non-interrupt continuation it runs the
+                    # exact pending node. This avoids update_state(), whose inferred author can
+                    # rewrite the pending route.
+                    payload: object = Command(update={"consumed_turn_ids": (message_id,)})
+                elif message_id in snapshot_state.consumed_turn_ids:
+                    write_event({"event": "duplicate_turn_ignored", "reason": "consumed_turn_id"})
+                    return
                 elif (
                     transition is None
                     and arrived_during_continuation
@@ -534,18 +590,22 @@ class ReasoningEngine:
                     # The graph's confirm node classifies consent; the engine only relays facts.
                     payload = Command(
                         resume={
-                            "text": user_text,
+                            "text": turn.text,
                             "readback_interrupted": facts.readback_interrupted,
-                        }
+                        },
+                        update={"consumed_turn_ids": (message_id,)},
                     )
                 elif snapshot.next:
                     # A prior attempt died after a checkpointed step, potentially after an
                     # idempotent write. Continue that task with no new message; treating the
                     # caller's repeat as a fresh turn would strand or duplicate the old intent.
-                    payload = None
+                    payload = Command(update={"consumed_turn_ids": (message_id,)})
                     write_event({"event": "turn_recovering", "reason": "unfinished_checkpoint"})
                 else:
-                    payload = {"messages": [HumanMessage(user_text)]}
+                    payload = {
+                        "messages": [HumanMessage(content=turn.text, id=message_id)],
+                        "consumed_turn_ids": (message_id,),
+                    }
                 speech = _TurnSpeech(self._speakable, self._model_speech)
                 spans = _GraphSpans()
                 while True:
@@ -572,7 +632,7 @@ class ReasoningEngine:
                                 spans.observe(token, meta)
                                 if (event := speech.feed(token, meta)) is not None:
                                     yield event
-                    transition = self._rotate_pending_transition()
+                    transition = self._rotate_pending_transition(message_id)
                     if transition is None or transition.continuation is None:
                         break
                     payload = None
@@ -583,9 +643,11 @@ class ReasoningEngine:
             finally:
                 if not self._terminal_latched:
                     try:
-                        self._rotate_pending_transition()
+                        self._rotate_pending_transition(message_id)
                     except Exception:
                         logger.exception("close-stream principal rotation failed")
+                        # Generator close has no remaining consumer for a yielded event.
+                        # Last resort persists and latches the terminal response for a later turn.
                         self._enter_last_resort()
             for flushed in speech.flush():
                 yield flushed

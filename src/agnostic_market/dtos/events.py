@@ -12,9 +12,37 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
+
+
+class CommittedTurn(BaseModel):
+    """One transport-committed caller turn at the voice/reasoning boundary.
+
+    ``message_id`` is deliberately required even though it may be ``None``: the adapter
+    must state honestly whether the transport supplied a stable identity. The engine never
+    invents one, and a missing identity is rejected before graph execution.
+    """
+
+    model_config = _FROZEN
+
+    text: str
+    message_id: str | None
+
+    @field_validator("text")
+    @classmethod
+    def text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("committed turn text must not be blank")
+        return value
+
+    @field_validator("message_id")
+    @classmethod
+    def message_id_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("committed turn message_id must not be blank")
+        return value
 
 
 class TokenEvent(BaseModel):

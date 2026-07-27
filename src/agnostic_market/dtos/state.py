@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 from agnostic_market.dtos.orchestration import (
@@ -23,6 +23,21 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import PendingRecovery
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
+
+
+def merge_consumed_turn_ids(
+    existing: tuple[str, ...],
+    update: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Ordered-set reducer for atomic turn admission across repeated interrupt resumes."""
+    merged = list(existing)
+    seen = set(existing)
+    for message_id in update:
+        if message_id not in seen:
+            merged.append(message_id)
+            seen.add(message_id)
+    return tuple(merged)
+
 
 # Handover destinations (tiers). Only "support"/"human" have a spoken sink in 3a; the rest
 # are declared now so the tool schema is stable, and get real flows in 3b/3c/3d.
@@ -432,6 +447,10 @@ class ReasoningState(BaseModel):
     """
 
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
+    # Stable transport IDs admitted or explicitly consumed in this caller session. This is
+    # replay-defense metadata, not an automation channel: ordinary flow cleanup preserves it,
+    # and principal rotation carries only this tuple plus an allowed typed continuation.
+    consumed_turn_ids: Annotated[tuple[str, ...], merge_consumed_turn_ids] = ()
     handover: HandoffRequest | None = None
     # Session-terminal automation state. Set only by the shared human handover and retained
     # until the caller lifecycle deletes the checkpoint; it is never an identity/account block.
@@ -464,3 +483,15 @@ class ReasoningState(BaseModel):
     # Engagement-scoped liveness tracker. Entry preserves it while the same sticky flow
     # continues; real progress and every lifecycle exit clear it.
     clarification_progress: ClarificationProgress | None = None
+
+    @field_validator("consumed_turn_ids")
+    @classmethod
+    def consumed_turn_ids_are_unique_and_nonblank(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("consumed turn IDs must not be blank")
+        if len(value) != len(set(value)):
+            raise ValueError("consumed turn IDs must be unique")
+        return value

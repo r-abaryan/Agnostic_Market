@@ -209,7 +209,14 @@ def build_voice_loop(
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
         checkpointer=build_checkpointer(),
     )
-    engine = ReasoningEngine(graph, thread_id=uuid.uuid4().hex, lifecycle=caller_context)
+    engine = ReasoningEngine(
+        graph,
+        thread_id=uuid.uuid4().hex,
+        cancellation_quiescence_timeout_seconds=(
+            config.runtime.cancellation_quiescence_timeout_seconds
+        ),
+        lifecycle=caller_context,
+    )
     caller_context.attach_engine(engine)
     adapter = GraphVoiceAdapter(engine)
 

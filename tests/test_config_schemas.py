@@ -42,6 +42,7 @@ def _valid_merchant_dict() -> dict:
             "catalog": {"source": "ingested", "freshness_sla_min": 10},
         },
         "isolation": {"tier": "shared"},
+        "runtime": {"cancellation_quiescence_timeout_seconds": 2.0},
         "vector_namespace": "m1",
         "secrets_ref": "vault://m1",
     }
@@ -51,6 +52,19 @@ def test_valid_config_validates() -> None:
     config = MerchantConfig.model_validate(_valid_merchant_dict())
     assert config.merchant_id == "m1"
     assert config.isolation.tier == "shared"
+    assert config.runtime.cancellation_quiescence_timeout_seconds == 2.0
+
+
+def test_runtime_quiescence_timeout_is_required_and_positive() -> None:
+    missing = _valid_merchant_dict()
+    del missing["runtime"]
+    with pytest.raises(ValidationError, match="runtime"):
+        MerchantConfig.model_validate(missing)
+
+    invalid = _valid_merchant_dict()
+    invalid["runtime"]["cancellation_quiescence_timeout_seconds"] = 0
+    with pytest.raises(ValidationError, match="cancellation_quiescence_timeout_seconds"):
+        MerchantConfig.model_validate(invalid)
 
 
 def test_stt_tuning_is_strict_and_rejects_bad_keyterms() -> None:

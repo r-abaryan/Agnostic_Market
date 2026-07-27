@@ -223,6 +223,7 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
                 "catalog": {"source": "ingested", "freshness_sla_min": 15},
             },
             "isolation": {"tier": "shared"},
+            "runtime": {"cancellation_quiescence_timeout_seconds": 2.0},
             "vector_namespace": "m1",
             "secrets_ref": "vault://m1",
         }

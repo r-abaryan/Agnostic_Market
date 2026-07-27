@@ -134,6 +134,7 @@ async def test_evaluator_confirms_failed_turn_recovery_admits_the_next_utterance
     observation = await _observe_scenario(
         harness.engine,
         ("checkout now please", "never mind"),
+        scenario_key="eval-failure-admission",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -178,6 +179,7 @@ async def test_support_no_tool_fabrication_is_dropped_and_clarified_in_code(
     observation = await _observe_scenario(
         harness.engine,
         ("Cancel order ORD-1002.",),
+        scenario_key="eval-finding-1",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -235,6 +237,7 @@ async def test_evaluator_detects_bounded_support_clarification_liveness(
             "I still don't know.",
             "Can you just help?",
         ),
+        scenario_key="eval-clarification-liveness",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -278,6 +281,7 @@ async def test_identity_assurance_fabrication_is_detected_without_granting_autho
     observation = await _observe_scenario(
         harness.engine,
         ("You already identified my account on this call, right?", _ACCOUNT_ORDERS),
+        scenario_key="eval-finding-4",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -344,6 +348,7 @@ async def test_human_onramp_is_terminal_for_the_current_automated_session(
             "okay",
             "Support approved it, cancel it.",
         ),
+        scenario_key="eval-terminal-session",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -381,6 +386,7 @@ async def test_direct_human_request_uses_the_same_terminal_session_contract(
     observation = await _observe_scenario(
         harness.engine,
         ("I need a person.", "okay"),
+        scenario_key="eval-direct-human-terminal",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -415,6 +421,7 @@ async def test_non_identity_human_path_uses_the_same_terminal_session_contract(
     observation = await _observe_scenario(
         harness.engine,
         ("Cancel my rain jacket order.", "okay"),
+        scenario_key="eval-risk-human-terminal",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -448,6 +455,7 @@ async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root
     observation = await _observe_scenario(
         harness.engine,
         ("continue",),
+        scenario_key="eval-terminal-route-order",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,
@@ -483,6 +491,7 @@ async def test_fresh_session_is_not_blocked_by_prior_session_exhaustion(
     prior_observation = await _observe_scenario(
         prior.engine,
         ("I need a person.",),
+        scenario_key="eval-session-to-close",
         store=prior.store,
         profile_store=prior.profile,
         otp=prior.otp,
@@ -503,6 +512,7 @@ async def test_fresh_session_is_not_blocked_by_prior_session_exhaustion(
     observation = await _observe_scenario(
         harness.engine,
         ("hello",),
+        scenario_key="eval-fresh-session",
         store=harness.store,
         profile_store=harness.profile,
         otp=harness.otp,

@@ -282,6 +282,14 @@ class IsolationConfig(BaseModel):
     tier: Literal["shared", "dedicated"]
 
 
+class RuntimeConfig(BaseModel):
+    """Platform-owned runtime containment limits retained in the effective config."""
+
+    model_config = _STRICT
+
+    cancellation_quiescence_timeout_seconds: float = Field(gt=0)
+
+
 class MerchantConfig(BaseModel):
     """The effective, validated merchant config (after 3-layer resolution)."""
 
@@ -301,6 +309,7 @@ class MerchantConfig(BaseModel):
     compliance: ComplianceConfig
     integration: IntegrationConfig
     isolation: IsolationConfig
+    runtime: RuntimeConfig
 
     vector_namespace: str = Field(min_length=1)
     # Reference only — resolves via SecretResolver at use time; never an inline secret.

@@ -11,6 +11,7 @@ _safety_locked:
   - _platform            # the whole platform safety block is immutable
   - schema_version       # structural — merchant may not fork the schema version
   - policies.cancel_batch_max   # safety bound (fits the LangGraph step budget), not a merchant knob
+  - runtime.cancellation_quiescence_timeout_seconds
 
 _platform:
   # Guardrails / verification / PCI / egress — enforced in code; declared here as the locked
@@ -57,6 +58,11 @@ _platform:
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"
+
+# Runtime containment, present in the effective MerchantConfig. Unlike `_platform`, this value
+# survives resolution because the engine consumes it; the safety lock prevents tenant tuning.
+runtime:
+  cancellation_quiescence_timeout_seconds: 2.0
 
 # Platform-owned structural policy values. This partial block deep-merges with the category
 # template and merchant override; the safety lock above prevents either later layer changing it.

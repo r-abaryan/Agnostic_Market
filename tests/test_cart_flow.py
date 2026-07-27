@@ -18,6 +18,11 @@ from langgraph.types import Command
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from pydantic import ValidationError
+from turn_helpers import (
+    TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
+    engine_events,
+    next_committed_turn,
+)
 
 from agnostic_market.agents._copy import all_closes
 from agnostic_market.agents.cart import flow as cart_flow
@@ -131,7 +136,15 @@ def _ai_texts(out) -> list[str]:
 
 
 async def _events(engine: ReasoningEngine, text: str) -> list:
-    return [event async for event in engine.stream_turn(text, TurnFacts())]
+    return await engine_events(engine, text)
+
+
+def _reasoning_engine(graph) -> ReasoningEngine:
+    return ReasoningEngine(
+        graph,
+        thread_id="t1",
+        cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
+    )
 
 
 def _assert_tool_calls_paired(state: dict) -> None:
@@ -209,7 +222,7 @@ async def test_cart_clarification_tool_selects_one_code_authored_line(
         tool_call_limit=1,
     )
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    events = await _events(_reasoning_engine(graph), "checkout now please")
     _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES[detail])
 
 
@@ -257,7 +270,7 @@ async def test_cart_no_tool_prose_falls_back_to_code_authored_action_question(
     raw_model_text = "I added the item and placed your order."
     reasoning = FakeChatModel(emit_tool_calls=False, text_response=raw_model_text)
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    events = await _events(_reasoning_engine(graph), "checkout now please")
     _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
     assert reasoning.emitted_messages[0].content == raw_model_text
     state = graph.get_state(_CFG).values
@@ -276,7 +289,7 @@ async def test_repeated_cart_clarification_returns_to_frontline_without_mutation
         frontline=frontline,
         reasoning=FakeChatModel(emit_tool_calls=False),
     )
-    engine = ReasoningEngine(graph, thread_id="t1")
+    engine = _reasoning_engine(graph)
 
     first = await _events(engine, "checkout now please")
     second = await _events(engine, "What do you have?")
@@ -322,7 +335,7 @@ async def test_valid_cart_mutation_clears_prior_clarification_progress(
         ]
     )
     graph, _, cart = _build(config_root, reasoning=reasoning)
-    engine = ReasoningEngine(graph, thread_id="t1")
+    engine = _reasoning_engine(graph)
 
     await _events(engine, "checkout now please")
     before = graph.get_state(_CFG).values
@@ -348,7 +361,7 @@ async def test_two_malformed_cart_clarifications_are_paired_and_stay_sticky(
     ]
     reasoning = FakeChatModel(scripted_calls=[malformed, malformed])
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    events = await _events(_reasoning_engine(graph), "checkout now please")
     _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
     assert reasoning.invoke_count == 2
     state = graph.get_state(_CFG).values
@@ -389,7 +402,7 @@ async def test_malformed_item_proposal_cannot_reach_cart_or_placement(
     ]
     reasoning = FakeChatModel(scripted_calls=[malformed, malformed])
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    events = await _events(_reasoning_engine(graph), "checkout now please")
     _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["action"])
     _assert_tool_calls_paired(graph.get_state(_CFG).values)
 
@@ -406,7 +419,7 @@ async def test_clarification_leading_a_mutation_response_does_not_mutate(
         ]
     )
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    events = await _events(_reasoning_engine(graph), "checkout now please")
     _assert_cart_clarification(graph, store, cart, events, _CART_CLARIFICATION_LINES["item"])
     _assert_tool_calls_paired(graph.get_state(_CFG).values)
 
@@ -423,7 +436,7 @@ async def test_mutation_leading_a_clarification_response_keeps_batch_contract(
         ]
     )
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    events = await _events(ReasoningEngine(graph, thread_id="t1"), "checkout now please")
+    events = await _events(_reasoning_engine(graph), "checkout now please")
     assert cart.line_count == 1
     assert store.placed_count == 0
     assert not any(
@@ -721,16 +734,22 @@ async def test_barged_readback_reconfirms_before_placing(config_root: Path) -> N
     graph, store, _ = _build(
         config_root, reasoning=_tool_fake("buy_now", {"candidate_key": "2", "quantity": 2})
     )
-    engine = ReasoningEngine(graph, thread_id="t1")
-    [_ async for _ in engine.stream_turn("buy it now", TurnFacts())]
-    events = [e async for e in engine.stream_turn("yes", TurnFacts(readback_interrupted=True))]
+    engine = _reasoning_engine(graph)
+    [_ async for _ in engine.stream_turn(next_committed_turn(engine, "buy it now"), TurnFacts())]
+    events = [
+        e
+        async for e in engine.stream_turn(
+            next_committed_turn(engine, "yes"),
+            TurnFacts(readback_interrupted=True),
+        )
+    ]
     assert store.placed_count == 0
     reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(reconfirms) == 1
     assert "yes or no" in reconfirms[0].prompt.lower()
     assert "2 waterproof rain jackets" in reconfirms[0].prompt
     assert "$258.00" in reconfirms[0].prompt
-    [_ async for _ in engine.stream_turn("yes", TurnFacts())]
+    [_ async for _ in engine.stream_turn(next_committed_turn(engine, "yes"), TurnFacts())]
     assert store.placed_count == 1
 
 
@@ -786,7 +805,7 @@ async def test_unknown_cart_tool_uses_bounded_correction_without_an_effect(
         ]
     )
     graph, store, cart = _build(config_root, reasoning=reasoning)
-    engine = ReasoningEngine(graph, thread_id="t1")
+    engine = _reasoning_engine(graph)
 
     events = await _events(engine, "checkout now please")
 
@@ -825,7 +844,7 @@ async def test_unknown_cart_browse_tool_can_correct_to_leave_and_frontline_answe
         text_response="We have trail running shoes available.",
     )
     graph, store, cart = _build(config_root, frontline=frontline, reasoning=reasoning)
-    engine = ReasoningEngine(graph, thread_id="t1")
+    engine = _reasoning_engine(graph)
     await _events(engine, "checkout now please")
 
     events = await _events(engine, "I'm only asking what shoes are available.")

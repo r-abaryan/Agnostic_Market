@@ -5,7 +5,13 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
+from agnostic_market.dtos.events import (
+    CommittedTurn,
+    InterruptEvent,
+    SpokenMessageEvent,
+    TokenEvent,
+    TurnFacts,
+)
 from agnostic_market.voice.graph import GraphVoiceAdapter
 
 
@@ -15,13 +21,13 @@ class ScriptedEngine:
     def __init__(self, events: list, *, pending: bool = False) -> None:
         self._events = events
         self._pending = pending
-        self.calls: list[tuple[str, TurnFacts]] = []
+        self.calls: list[tuple[CommittedTurn, TurnFacts]] = []
 
     def pending_interrupt(self) -> bool:
         return self._pending
 
-    async def stream_turn(self, user_text: str, facts: TurnFacts):
-        self.calls.append((user_text, facts))
+    async def stream_turn(self, turn: CommittedTurn, facts: TurnFacts):
+        self.calls.append((turn, facts))
         for event in self._events:
             yield event
 
@@ -58,7 +64,7 @@ async def test_adapter_renders_all_event_kinds_as_text() -> None:
         ]
     )
     adapter = GraphVoiceAdapter(engine)
-    out = await _spoken(adapter, {"messages": [HumanMessage("where is it")]})
+    out = await _spoken(adapter, {"messages": [HumanMessage("where is it", id="turn-1")]})
     assert out == [
         "Your order ",
         "shipped.",
@@ -77,13 +83,15 @@ async def test_adapter_feeds_only_the_last_user_turn() -> None:
         {
             "messages": [
                 SystemMessage("sys"),
-                HumanMessage("first turn"),
+                HumanMessage("first turn", id="turn-1"),
                 AIMessage("answer"),
-                HumanMessage("second turn"),
+                HumanMessage("second turn", id="turn-2"),
             ]
         },
     )
-    assert [call[0] for call in engine.calls] == ["second turn"]
+    assert [call[0] for call in engine.calls] == [
+        CommittedTurn(text="second turn", message_id="turn-2")
+    ]
 
 
 async def test_empty_transport_input_is_an_empty_turn() -> None:
@@ -104,7 +112,7 @@ async def test_4a_fact_set_when_pending_and_readback_barged() -> None:
             ]
         )
     )
-    await _spoken(adapter, {"messages": [HumanMessage("yes")]})
+    await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
     assert engine.calls[0][1].readback_interrupted is True
 
 
@@ -114,7 +122,10 @@ async def test_4a_fact_false_when_no_pending_interrupt() -> None:
     engine = ScriptedEngine([], pending=False)
     adapter = GraphVoiceAdapter(engine)
     adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=True)]))
-    await _spoken(adapter, {"messages": [HumanMessage("what's the status")]})
+    await _spoken(
+        adapter,
+        {"messages": [HumanMessage("what's the status", id="turn-1")]},
+    )
     assert engine.calls[0][1].readback_interrupted is False
 
 
@@ -122,7 +133,7 @@ async def test_4a_fact_false_when_readback_played_out() -> None:
     engine = ScriptedEngine([], pending=True)
     adapter = GraphVoiceAdapter(engine)
     adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=False)]))
-    await _spoken(adapter, {"messages": [HumanMessage("yes")]})
+    await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
     assert engine.calls[0][1].readback_interrupted is False
 
 
@@ -133,9 +144,20 @@ async def test_unconsumed_turn_never_reaches_the_engine() -> None:
     # not have run at all. astream is lazy: creating the iterator is not execution.
     engine = ScriptedEngine([TokenEvent(text="never spoken")])
     adapter = GraphVoiceAdapter(engine)
-    adapter.astream({"messages": [HumanMessage("yes")]}, None)  # created, never iterated
+    adapter.astream(
+        {"messages": [HumanMessage("yes", id="turn-1")]},
+        None,
+    )  # created, never iterated
     assert engine.calls == []  # nothing reached the engine
     # The next, consumed turn runs normally against untouched state.
-    spoken = await _spoken(adapter, {"messages": [HumanMessage("no, wait")]})
-    assert engine.calls == [("no, wait", TurnFacts(readback_interrupted=False))]
+    spoken = await _spoken(
+        adapter,
+        {"messages": [HumanMessage("no, wait", id="turn-2")]},
+    )
+    assert engine.calls == [
+        (
+            CommittedTurn(text="no, wait", message_id="turn-2"),
+            TurnFacts(readback_interrupted=False),
+        )
+    ]
     assert spoken == ["never spoken"]
