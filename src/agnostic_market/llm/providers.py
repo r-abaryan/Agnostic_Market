@@ -11,7 +11,9 @@ Three-outcome result model (transport != verdict): a shape-valid-but-wrong respo
 check (-> chat-only); a transport/auth error raises `ConformanceRunError` and NO verdict is
 recorded — infrastructure failure is never converted into a capability verdict.
 
-Checks run async (`ainvoke`/`astream`) because that is the production voice-loop path.
+Checks use async APIs (`ainvoke`/`astream`) to certify async tool, structured-output, and
+incremental-delivery capabilities. Production graph model nodes currently use synchronous
+`.invoke()`; exact production transport-path failure behavior is a separate certification concern.
 The structured-output check uses the real routing contract and the gateway-selected native
 transport. This pins the configured commerce model to the nested/discriminated shape production
 routing will consume.

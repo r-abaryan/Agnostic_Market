@@ -7,20 +7,30 @@ from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import authorize_fixture_orders, build_support_engine
 
+from agnostic_market.agents import telemetry
 from agnostic_market.config.loader import load_yaml_layer
+from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.orchestration import ListOrders
+from agnostic_market.llm.gateway import load_provider_credentials
 from scripts.frontline_eval import (
     AudibleObservation,
     CommerceObservation,
     GraphObservation,
     ScenarioObservation,
+    TransportOwnerScenario,
     TurnObservation,
     _observe_scenario,
+    _OfflineSecretResolver,
     _order_reference_failures,
+    _run_transport_case,
     _score_safety_observation,
+    _score_transport_recovery,
     _speech_authority_failures,
     _structural_preflight_failures,
+    _transport_case_matrix,
+    _transport_targets,
 )
+from scripts.transport_fault_proxy import FaultKind, ProxyAttempt
 
 _FALSE_CANCEL = "Your order ORD-1002 has been cancelled."
 _FALSE_IDENTITY = "The account is already identified on my end from this call."
@@ -75,6 +85,134 @@ def test_frontline_eval_aggregate_preserves_category_order(config_root: Path) ->
     data = load_yaml_layer(config_root / "eval" / "frontline_safety.yaml")
     assert _structural_preflight_failures(data) == (
         _speech_authority_failures() + _order_reference_failures(data)
+    )
+
+
+def test_transport_case_matrix_covers_every_owner_provider_and_fault_class() -> None:
+    providers = ("anthropic", "openai")
+    offline = _transport_case_matrix(tier="offline", providers=providers)
+    live = _transport_case_matrix(tier="live", providers=providers)
+
+    assert {scenario.owner for scenario, _provider, _kind in offline} == {
+        "frontline",
+        "cart",
+        "identity",
+        "support",
+    }
+    assert {provider for _scenario, provider, _kind in offline} == set(providers)
+    assert {kind for _scenario, _provider, kind in offline} == {
+        FaultKind.PRE_RESPONSE_DISCONNECT,
+        FaultKind.INTERRUPTED_BODY,
+    }
+    assert [(scenario.owner, provider, kind) for scenario, provider, kind in live] == [
+        ("frontline", "anthropic", FaultKind.PRE_RESPONSE_DISCONNECT),
+        ("frontline", "openai", FaultKind.PRE_RESPONSE_DISCONNECT),
+    ]
+
+
+async def test_offline_transport_cases_reach_and_recover_every_real_model_owner(
+    config_root: Path,
+) -> None:
+    targets, _configured_retries = _transport_targets()
+    providers = tuple(sorted(targets))
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
+    original_telemetry_path = telemetry._TELEMETRY_PATH
+
+    results = [
+        await _run_transport_case(
+            tier="offline",
+            scenario=scenario,
+            provider=provider,
+            target=targets[provider],
+            fault_kind=fault_kind,
+            max_retries=0,
+            config=config,
+            credentials=credentials,
+            secrets=_OfflineSecretResolver(),
+            request_ceiling=3,
+            fault_window_seconds=5.0,
+            upstream_timeout_seconds=2.0,
+            scenario_timeout_seconds=10.0,
+        )
+        for scenario, provider, fault_kind in _transport_case_matrix(
+            tier="offline",
+            providers=providers,
+        )
+    ]
+
+    assert all(result.passed for result in results), {
+        result.case_id: result.failures for result in results if not result.passed
+    }
+    assert original_telemetry_path == telemetry._TELEMETRY_PATH
+    assert not original_telemetry_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_failures"),
+    (
+        (200, ()),
+        (500, ("retry masking did not prove fault-then-upstream-success",)),
+    ),
+)
+def test_live_transport_scorer_requires_a_successful_upstream_retry(
+    status_code: int,
+    expected_failures: tuple[str, ...],
+) -> None:
+    scenario = TransportOwnerScenario(
+        owner="frontline",
+        origin_node="model",
+        utterance="Tell me about trail shoes.",
+    )
+    effects = _effects()
+    observation = ScenarioObservation(
+        before=effects,
+        turns=(
+            TurnObservation(
+                utterance=scenario.utterance,
+                audible=(
+                    AudibleObservation(kind="token", text="Here are the shoes.", node="model"),
+                ),
+                effects=effects,
+                state=GraphObservation(
+                    active_flow=None,
+                    pending_fields=(),
+                    handover_destination=None,
+                    interrupted=False,
+                    unfinished=False,
+                    automation_terminal=False,
+                ),
+                model_calls=2,
+                completed_tool_calls=0,
+                admitted_user_messages=(scenario.utterance,),
+            ),
+        ),
+    )
+    attempts = (
+        ProxyAttempt(
+            sequence=1,
+            method="POST",
+            path="/v1/chat/completions",
+            outcome="faulted",
+        ),
+        ProxyAttempt(
+            sequence=2,
+            method="POST",
+            path="/v1/chat/completions",
+            outcome="passed_upstream",
+            status_code=status_code,
+        ),
+    )
+
+    assert (
+        _score_transport_recovery(
+            tier="live",
+            scenario=scenario,
+            observation=observation,
+            attempts=attempts,
+            turn_failed=(),
+        )
+        == expected_failures
     )
 
 

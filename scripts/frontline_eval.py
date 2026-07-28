@@ -2,7 +2,11 @@
 
 Run: uv run python scripts/frontline_eval.py
 Structural gate only: uv run python scripts/frontline_eval.py --preflight-only
-Needs ANTHROPIC_API_KEY (the acme routing model) in .env. Text-only — no voice.
+Offline 6E gate: uv run python scripts/frontline_eval.py --recovery-certification offline
+Live retry gate: uv run python scripts/frontline_eval.py --recovery-certification live
+The routing eval needs the merchant model credentials; the live recovery tier needs every
+configured provider credential. The offline recovery tier uses a test-only resolver and no
+upstream access. Text-only — no voice.
 
 Invokes the SAME graph production uses (prompt inside the graph, F1), one utterance per
 turn. The MODEL is the primary escalation decider; the slim gate is a high-certainty
@@ -11,24 +15,34 @@ irreversible-only floor. Pre-registered:
     triaged (a real answer-instead-of-escalate is a judgment gap to fix in prompt/few-shot).
   - Gate coverage REPORTED informationally (the free fast-path share) — never a mandate.
   - over-escalation on should_answer REPORTED (over-escalating is cheap, AGENTS §A2).
-This is NOT an overall commerce, speech, continuation, or voice-transport certification. The
-live-call #18 structural preflight runs before provider access and blocks the routing score while
-the shared speech-authority or exact-STT contracts are broken. The routing section then measures
-escalation QUALITY only. Exit 1 if either the structural gate or routing bar is missed.
+The default routing mode is NOT an overall commerce, speech, continuation, or voice-transport
+certification. The live-call #18 structural preflight runs before provider access and blocks the
+routing score while the shared speech-authority or exact-STT contracts are broken. The routing
+section then measures escalation QUALITY only. The separate 6E modes certify provider transport
+failure against the production graph and existing effect/speech/state observer. Exit 1 when the
+selected gate fails.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+import tempfile
+import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.state import CompiledStateGraph
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
@@ -38,6 +52,7 @@ from agnostic_market.agents.frontline import (
     TRANSACTIONAL_MODEL_NODES,
     build_frontline_graph,
 )
+from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -65,6 +80,7 @@ from agnostic_market.commerce.verification import (
 )
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
+from agnostic_market.dtos.config import MerchantConfig, ProviderModel
 from agnostic_market.dtos.events import (
     CommittedTurn,
     InterruptEvent,
@@ -73,16 +89,46 @@ from agnostic_market.dtos.events import (
     TurnEvent,
     TurnFacts,
 )
+from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
+from agnostic_market.llm.providers import load_conformance_targets
+from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
+
+if __package__:
+    from .transport_fault_proxy import (
+        PROVIDER_TRANSPORT_CONTRACTS,
+        TRANSPORT_CONTRACT_VERSION,
+        FaultKind,
+        FaultMode,
+        ProxyAttempt,
+        TransportFaultProxy,
+    )
+else:
+    from transport_fault_proxy import (
+        PROVIDER_TRANSPORT_CONTRACTS,
+        TRANSPORT_CONTRACT_VERSION,
+        FaultKind,
+        FaultMode,
+        ProxyAttempt,
+        TransportFaultProxy,
+    )
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 _EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_t1.yaml"
 _SAFETY_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_safety.yaml"
 _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
+_TRANSPORT_REPORT_PATHS = {
+    "offline": _CONFIG_ROOT / "telemetry" / "transport_recovery_offline_report.json",
+    "live": _CONFIG_ROOT / "telemetry" / "transport_recovery_live_report.json",
+}
+_TRANSPORT_REQUEST_CEILING = 8
+_TRANSPORT_FAULT_WINDOW_SECONDS = 30.0
+_TRANSPORT_UPSTREAM_TIMEOUT_SECONDS = 60.0
+_TRANSPORT_SCENARIO_TIMEOUT_SECONDS = 90.0
 
 _PENDING_FIELDS = (
     "pending_placement",
@@ -150,6 +196,43 @@ class ScenarioObservation:
         return self.turns[-1]
 
 
+@dataclass(frozen=True)
+class EvalRuntime:
+    graph: CompiledStateGraph
+    engine: ReasoningEngine
+    store: OrderStore
+    profile_store: ProfileStore
+    otp: OtpProvider
+    verification: VerificationStore
+    identity_store: CallerIdentityStore
+    caller_context: CallerContext
+
+
+@dataclass(frozen=True)
+class TransportOwnerScenario:
+    owner: Literal["frontline", "cart", "identity", "support"]
+    origin_node: str
+    utterance: str
+
+
+@dataclass(frozen=True)
+class TransportCaseResult:
+    case_id: str
+    tier: Literal["offline", "live"]
+    provider: str
+    model: str
+    owner: str
+    fault_kind: str
+    passed: bool
+    failures: tuple[str, ...]
+    attempts: tuple[dict[str, object], ...]
+    audible: tuple[dict[str, object], ...]
+    before: dict[str, object]
+    after: dict[str, object]
+    state: dict[str, object]
+    turn_failed: tuple[dict[str, object], ...]
+
+
 def _audible_observation(event: TurnEvent) -> AudibleObservation:
     if isinstance(event, InterruptEvent):
         return AudibleObservation(kind=event.kind, text=event.prompt, node="__interrupt__")
@@ -203,6 +286,87 @@ def _checkpoint_observation(
             for message in values.get("messages", ())
             if isinstance(message, HumanMessage)
         ),
+    )
+
+
+def _build_eval_runtime(
+    config: MerchantConfig,
+    routing_model: BaseChatModel,
+    reasoning_model: BaseChatModel,
+    *,
+    thread_id: str,
+) -> EvalRuntime:
+    store = OrderStore(load_orders_fixture(_CONFIG_ROOT, config.merchant_id))
+    cart_store = CartStore()
+    customers_fixture = load_customers_fixture(_CONFIG_ROOT, config.merchant_id)
+    payment_instruments_fixture = load_payment_instruments_fixture(_CONFIG_ROOT, config.merchant_id)
+    profile_fixture = load_profile_fixture(_CONFIG_ROOT, config.merchant_id)
+    assert_orders_have_customers(store.fixture, customers_fixture)
+    assert_profiles_have_customers(profile_fixture, customers_fixture)
+    assert_payment_instruments_have_customers(payment_instruments_fixture, customers_fixture)
+    customers = CustomerDirectory(customers_fixture)
+    payment_instruments = PaymentInstrumentDirectory(payment_instruments_fixture)
+    profile_store = ProfileStore(profile_fixture)
+    identity_store = CallerIdentityStore()
+    policy = config.policies.to_policy_context()
+    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
+    verification_fixture = load_verification_fixture(_CONFIG_ROOT, config.merchant_id)
+    otp = OtpProvider(valid_code=verification_fixture.otp_code)
+    verification = VerificationStore(otp)
+    caller_context = CallerContext(
+        verification_store=verification,
+        cart_store=cart_store,
+        recent_orders=recent_orders,
+        identity_store=identity_store,
+        order_store=store,
+    )
+    tools = [
+        wrap_readonly_tool(t, config.merchant_id)
+        for t in build_voice_tools(
+            store,
+            cart_store,
+            recent_orders,
+            identity_store,
+            customers,
+        )
+    ]
+    graph = build_frontline_graph(
+        routing_model,
+        tools,
+        display_name=config.display_name,
+        tenant_id=config.merchant_id,
+        reasoning_model=reasoning_model,
+        store=store,
+        otp=otp,
+        verification_store=verification,
+        cart_store=cart_store,
+        recent_orders=recent_orders,
+        identity_store=identity_store,
+        customers=customers,
+        payment_instruments=payment_instruments,
+        profile_store=profile_store,
+        policy=policy,
+        lifecycle=caller_context,
+        checkpointer=InMemorySaver(),
+    )
+    engine = ReasoningEngine(
+        graph,
+        thread_id=thread_id,
+        cancellation_quiescence_timeout_seconds=(
+            config.runtime.cancellation_quiescence_timeout_seconds
+        ),
+        lifecycle=caller_context,
+    )
+    caller_context.attach_engine(engine)
+    return EvalRuntime(
+        graph=graph,
+        engine=engine,
+        store=store,
+        profile_store=profile_store,
+        otp=otp,
+        verification=verification,
+        identity_store=identity_store,
+        caller_context=caller_context,
     )
 
 
@@ -372,6 +536,356 @@ def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
     return _speech_authority_failures() + _order_reference_failures(data)
 
 
+_TRANSPORT_OWNER_SCENARIOS = (
+    TransportOwnerScenario(
+        owner="frontline",
+        origin_node="model",
+        utterance="Tell me about trail shoes.",
+    ),
+    TransportOwnerScenario(
+        owner="cart",
+        origin_node="cart_assemble",
+        utterance="Checkout now please.",
+    ),
+    TransportOwnerScenario(
+        owner="identity",
+        origin_node="identity_assemble",
+        utterance="What orders are on my account?",
+    ),
+    TransportOwnerScenario(
+        owner="support",
+        origin_node="support_assemble",
+        utterance="Cancel order ORD-1002.",
+    ),
+)
+_EMPTY_RECOVERY_STATE = GraphObservation(
+    active_flow=None,
+    pending_fields=(),
+    handover_destination=None,
+    interrupted=False,
+    unfinished=False,
+    automation_terminal=False,
+)
+
+
+class _OfflineSecretResolver:
+    def resolve(self, _ref: str) -> str:
+        return "offline-not-a-secret"
+
+
+def _transport_targets() -> tuple[dict[str, ProviderModel], int]:
+    targets_config = load_conformance_targets(_CONFIG_ROOT / "conformance" / "targets.yaml")
+    by_provider: dict[str, ProviderModel] = {}
+    for target in targets_config.targets:
+        by_provider.setdefault(target.provider, target)
+    missing_contracts = sorted(set(by_provider) - set(PROVIDER_TRANSPORT_CONTRACTS))
+    if missing_contracts:
+        raise RuntimeError(
+            f"transport certification has no endpoint contract for providers: {missing_contracts!r}"
+        )
+    return by_provider, targets_config.max_retries
+
+
+def _transport_case_matrix(
+    *,
+    tier: Literal["offline", "live"],
+    providers: Sequence[str],
+) -> tuple[tuple[TransportOwnerScenario, str, FaultKind], ...]:
+    if not providers:
+        raise RuntimeError("transport certification has no configured providers")
+    if tier == "live":
+        frontline = _TRANSPORT_OWNER_SCENARIOS[0]
+        return tuple(
+            (frontline, provider, FaultKind.PRE_RESPONSE_DISCONNECT) for provider in providers
+        )
+
+    cases = [
+        (scenario, providers[index % len(providers)], FaultKind.PRE_RESPONSE_DISCONNECT)
+        for index, scenario in enumerate(_TRANSPORT_OWNER_SCENARIOS)
+    ]
+    cases.extend(
+        (
+            _TRANSPORT_OWNER_SCENARIOS[index],
+            providers[index % len(providers)],
+            FaultKind.INTERRUPTED_BODY,
+        )
+        for index in (0, 1)
+    )
+    return tuple(cases)
+
+
+def _read_telemetry(path: Path) -> tuple[dict[str, object], ...]:
+    if not path.is_file():
+        return ()
+    return tuple(
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    )
+
+
+def _attempt_dict(attempt: ProxyAttempt) -> dict[str, object]:
+    return {
+        "sequence": attempt.sequence,
+        "method": attempt.method,
+        "path": attempt.path,
+        "outcome": attempt.outcome,
+        "status_code": attempt.status_code,
+    }
+
+
+def _write_transport_report(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+def _score_transport_recovery(
+    *,
+    tier: Literal["offline", "live"],
+    scenario: TransportOwnerScenario,
+    observation: ScenarioObservation,
+    attempts: tuple[ProxyAttempt, ...],
+    turn_failed: tuple[dict[str, object], ...],
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    final = observation.final
+    if final.effects != observation.before:
+        failures.append("authoritative commerce/identity state changed")
+    if final.state != _EMPTY_RECOVERY_STATE:
+        failures.append("graph did not finish in a clean non-terminal state")
+    if final.admitted_user_messages != (scenario.utterance,):
+        failures.append("committed caller turn was not admitted exactly once")
+
+    outcomes = tuple(attempt.outcome for attempt in attempts)
+    forbidden_outcomes = {"unexpected_provider_endpoint", "safety_ceiling", "upstream_error"}
+    if set(outcomes) & forbidden_outcomes:
+        failures.append("proxy reported an endpoint, safety, or upstream failure")
+    if not attempts:
+        failures.append("provider adapter made no request")
+    elif tier == "offline":
+        if set(outcomes) != {"faulted"}:
+            failures.append("offline exhaustion forwarded or accepted a provider request")
+        expected_action = "cart_review" if scenario.owner == "cart" else "safe_abort"
+        expected_failure = {
+            "event": "turn_failed",
+            "reason": "node_exception",
+            "node": scenario.origin_node,
+            "action": expected_action,
+        }
+        if turn_failed != (expected_failure,):
+            failures.append("typed recovery telemetry did not identify the owning model node")
+        if final.completed_tool_calls != 0:
+            failures.append("an incomplete provider response produced a completed tool call")
+        if len(final.audible) != 1 or final.audible[0].node != RECOVERY_NODE_NAME:
+            failures.append("recovery did not produce exactly one code-authored audible line")
+        elif scenario.owner != "cart" and final.audible[0].text != TURN_FALLBACK_LINE:
+            failures.append("safe-abort recovery line differed from the fixed contract")
+    else:
+        successful_retry = any(
+            attempt.outcome == "passed_upstream"
+            and attempt.status_code is not None
+            and HTTPStatus.OK <= attempt.status_code < HTTPStatus.MULTIPLE_CHOICES
+            for attempt in attempts[1:]
+        )
+        if outcomes[0:1] != ("faulted",) or not successful_retry:
+            failures.append("retry masking did not prove fault-then-upstream-success")
+        if turn_failed:
+            failures.append("a retry-masked provider call entered failure recovery")
+        if not final.audible:
+            failures.append("successful retry produced no caller-audible response")
+    return tuple(failures)
+
+
+def _failed_transport_case(
+    *,
+    tier: Literal["offline", "live"],
+    scenario: TransportOwnerScenario,
+    provider: str,
+    target: ProviderModel,
+    fault_kind: FaultKind,
+    failure: str,
+    attempts: tuple[ProxyAttempt, ...],
+    telemetry_path: Path,
+) -> TransportCaseResult:
+    turn_failed = tuple(
+        record for record in _read_telemetry(telemetry_path) if record.get("event") == "turn_failed"
+    )
+    return TransportCaseResult(
+        case_id=f"{tier}:{provider}:{scenario.owner}:{fault_kind}",
+        tier=tier,
+        provider=provider,
+        model=target.model,
+        owner=scenario.owner,
+        fault_kind=fault_kind,
+        passed=False,
+        failures=(failure,),
+        attempts=tuple(_attempt_dict(attempt) for attempt in attempts),
+        audible=(),
+        before={},
+        after={},
+        state={},
+        turn_failed=turn_failed,
+    )
+
+
+async def _run_transport_case(
+    *,
+    tier: Literal["offline", "live"],
+    scenario: TransportOwnerScenario,
+    provider: str,
+    target: ProviderModel,
+    fault_kind: FaultKind,
+    max_retries: int,
+    config: MerchantConfig,
+    credentials: ProviderCredentialsConfig,
+    secrets: SecretResolver,
+    request_ceiling: int,
+    fault_window_seconds: float,
+    upstream_timeout_seconds: float,
+    scenario_timeout_seconds: float,
+) -> TransportCaseResult:
+    mode = FaultMode.UNTIL_EXHAUSTED if tier == "offline" else FaultMode.RETRY_MASKED_ONCE
+    runtime: EvalRuntime | None = None
+    old_telemetry_path = telemetry._TELEMETRY_PATH
+    with tempfile.TemporaryDirectory(prefix="transport-cert-") as temp_dir:
+        telemetry_path = Path(temp_dir) / "telemetry.jsonl"
+        telemetry._TELEMETRY_PATH = telemetry_path
+        proxy = TransportFaultProxy(
+            PROVIDER_TRANSPORT_CONTRACTS[provider],
+            mode=mode,
+            fault_kind=fault_kind,
+            request_ceiling=request_ceiling,
+            fault_window_seconds=fault_window_seconds,
+            upstream_timeout_seconds=upstream_timeout_seconds,
+        )
+        try:
+            with proxy:
+                model = LLMGateway(credentials, secrets).chat_model(
+                    target,
+                    base_url=proxy.model_base_url,
+                    max_retries=max_retries,
+                    timeout=upstream_timeout_seconds,
+                )
+                runtime = _build_eval_runtime(
+                    config,
+                    model,
+                    model,
+                    thread_id=f"transport-{uuid.uuid4().hex}",
+                )
+                observation = await asyncio.wait_for(
+                    _observe_scenario(
+                        runtime.engine,
+                        (scenario.utterance,),
+                        scenario_key=f"transport-{tier}-{provider}-{scenario.owner}",
+                        store=runtime.store,
+                        profile_store=runtime.profile_store,
+                        otp=runtime.otp,
+                        verification=runtime.verification,
+                        identity_store=runtime.identity_store,
+                        model_call_count=lambda: len(proxy.attempts),
+                    ),
+                    timeout=scenario_timeout_seconds,
+                )
+        except TimeoutError:
+            return _failed_transport_case(
+                tier=tier,
+                scenario=scenario,
+                provider=provider,
+                target=target,
+                fault_kind=fault_kind,
+                failure="scenario timeout ceiling exceeded",
+                attempts=proxy.attempts,
+                telemetry_path=telemetry_path,
+            )
+        else:
+            records = _read_telemetry(telemetry_path)
+            turn_failed = tuple(
+                record for record in records if record.get("event") == "turn_failed"
+            )
+            failures = _score_transport_recovery(
+                tier=tier,
+                scenario=scenario,
+                observation=observation,
+                attempts=proxy.attempts,
+                turn_failed=turn_failed,
+            )
+            final = observation.final
+            return TransportCaseResult(
+                case_id=f"{tier}:{provider}:{scenario.owner}:{fault_kind}",
+                tier=tier,
+                provider=provider,
+                model=target.model,
+                owner=scenario.owner,
+                fault_kind=fault_kind,
+                passed=not failures,
+                failures=failures,
+                attempts=tuple(_attempt_dict(attempt) for attempt in proxy.attempts),
+                audible=tuple(asdict(item) for item in final.audible),
+                before=asdict(observation.before),
+                after=asdict(final.effects),
+                state=asdict(final.state),
+                turn_failed=turn_failed,
+            )
+        finally:
+            try:
+                if runtime is not None:
+                    runtime.caller_context.close_session()
+            finally:
+                telemetry._TELEMETRY_PATH = old_telemetry_path
+
+
+async def _run_transport_certification(
+    *,
+    tier: Literal["offline", "live"],
+    report_path: Path,
+    request_ceiling: int,
+    fault_window_seconds: float,
+    upstream_timeout_seconds: float,
+    scenario_timeout_seconds: float,
+) -> int:
+    targets, max_retries = _transport_targets()
+    providers = tuple(sorted(targets))
+    credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
+    if tier == "live":
+        load_dotenv()
+        secrets: SecretResolver = EnvSecretResolver()
+    else:
+        secrets = _OfflineSecretResolver()
+    config = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID).config
+    cases = _transport_case_matrix(tier=tier, providers=providers)
+    results: list[TransportCaseResult] = []
+    for scenario, provider, fault_kind in cases:
+        result = await _run_transport_case(
+            tier=tier,
+            scenario=scenario,
+            provider=provider,
+            target=targets[provider],
+            fault_kind=fault_kind,
+            max_retries=max_retries,
+            config=config,
+            credentials=credentials,
+            secrets=secrets,
+            request_ceiling=request_ceiling,
+            fault_window_seconds=fault_window_seconds,
+            upstream_timeout_seconds=upstream_timeout_seconds,
+            scenario_timeout_seconds=scenario_timeout_seconds,
+        )
+        results.append(result)
+        status = "PASS" if result.passed else "FAIL"
+        print(f"[{status}] {result.case_id}")
+        for failure in result.failures:
+            print(f"    {failure}")
+
+    report = {
+        "transport_contract_version": TRANSPORT_CONTRACT_VERSION,
+        "tier": tier,
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "passed": all(result.passed for result in results),
+        "cases": [asdict(result) for result in results],
+    }
+    await asyncio.to_thread(_write_transport_report, report_path, report)
+    print(f"transport recovery report: {report_path}")
+    return 0 if report["passed"] else 1
+
+
 async def _outcome(graph, utterance: str) -> str | None:
     """How the turn left the frontline, else None (answered).
 
@@ -434,60 +948,14 @@ async def _run(*, preflight_only: bool = False) -> int:
     credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
     resolved = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID)
     chat_model = LLMGateway(credentials, secrets).chat_model(resolved.config.llm.routing)
-    store = OrderStore(load_orders_fixture(_CONFIG_ROOT, _MERCHANT_ID))
-    cart_store = CartStore()
-    customers_fixture = load_customers_fixture(_CONFIG_ROOT, _MERCHANT_ID)
-    payment_instruments_fixture = load_payment_instruments_fixture(_CONFIG_ROOT, _MERCHANT_ID)
-    profile_fixture = load_profile_fixture(_CONFIG_ROOT, _MERCHANT_ID)
-    assert_orders_have_customers(store.fixture, customers_fixture)
-    assert_profiles_have_customers(profile_fixture, customers_fixture)
-    assert_payment_instruments_have_customers(payment_instruments_fixture, customers_fixture)
-    customers = CustomerDirectory(customers_fixture)
-    payment_instruments = PaymentInstrumentDirectory(payment_instruments_fixture)
-    profile_store = ProfileStore(profile_fixture)
-    identity_store = CallerIdentityStore()
     config = resolved.config
-    policy = config.policies.to_policy_context()
-    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
-    verification_fixture = load_verification_fixture(_CONFIG_ROOT, _MERCHANT_ID)
-    otp = OtpProvider(valid_code=verification_fixture.otp_code)
-    verification = VerificationStore(otp)
-    caller_context = CallerContext(
-        verification_store=verification,
-        cart_store=cart_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        order_store=store,
-    )
-    tools = [
-        wrap_readonly_tool(t, _MERCHANT_ID)
-        for t in build_voice_tools(store, cart_store, recent_orders, identity_store, customers)
-    ]
-    graph = build_frontline_graph(
+    runtime = _build_eval_runtime(
+        config,
         chat_model,
-        tools,
-        display_name=config.display_name,
-        tenant_id=config.merchant_id,
-        # The T1 eval never enters checkout (text-only escalation probes), but the graph
-        # compiles as ONE shape — same construction path as production (F1 discipline).
-        reasoning_model=LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
-        store=store,
-        otp=otp,
-        verification_store=verification,
-        cart_store=cart_store,  # SAME instance as view_cart (no split-brain)
-        recent_orders=recent_orders,
-        identity_store=identity_store,  # SAME instance as the tools' gate (P7, no split-brain)
-        customers=customers,
-        payment_instruments=payment_instruments,
-        profile_store=profile_store,
-        # The ONE config->runtime policy mapping — identical to production (F1). The old
-        # hand-built copy here had drifted (it silently omitted spoken_policy_extra).
-        policy=policy,
-        lifecycle=caller_context,
-        # An utterance that reaches the confirm readback pauses at an interrupt, which
-        # needs a checkpointer even in the text eval (fresh thread per utterance).
-        checkpointer=InMemorySaver(),
+        LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
+        thread_id=f"frontline-eval-{uuid.uuid4().hex}",
     )
+    graph = runtime.graph
     data = load_yaml_layer(_EVAL_PATH)
 
     # --- PRIMARY: escalation recall (gate OR model OR checkout-flow entry) ---
@@ -544,5 +1012,55 @@ async def _run(*, preflight_only: bool = False) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--recovery-certification",
+        choices=("offline", "live"),
+        help=(
+            "run Milestone 6E provider-transport recovery certification instead of the "
+            "routing-quality eval"
+        ),
+    )
+    parser.add_argument(
+        "--transport-report",
+        type=Path,
+        help="report destination (defaults to a tier-specific transport report)",
+    )
+    parser.add_argument(
+        "--transport-request-ceiling",
+        type=int,
+        default=_TRANSPORT_REQUEST_CEILING,
+    )
+    parser.add_argument(
+        "--transport-fault-window-seconds",
+        type=float,
+        default=_TRANSPORT_FAULT_WINDOW_SECONDS,
+    )
+    parser.add_argument(
+        "--transport-upstream-timeout-seconds",
+        type=float,
+        default=_TRANSPORT_UPSTREAM_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
+        "--transport-scenario-timeout-seconds",
+        type=float,
+        default=_TRANSPORT_SCENARIO_TIMEOUT_SECONDS,
+    )
     args = parser.parse_args()
-    sys.exit(asyncio.run(_run(preflight_only=args.preflight_only)))
+    if args.preflight_only and args.recovery_certification is not None:
+        parser.error("--preflight-only cannot be combined with --recovery-certification")
+    if args.recovery_certification is None:
+        exit_code = asyncio.run(_run(preflight_only=args.preflight_only))
+    else:
+        exit_code = asyncio.run(
+            _run_transport_certification(
+                tier=args.recovery_certification,
+                report_path=(
+                    args.transport_report or _TRANSPORT_REPORT_PATHS[args.recovery_certification]
+                ),
+                request_ceiling=args.transport_request_ceiling,
+                fault_window_seconds=args.transport_fault_window_seconds,
+                upstream_timeout_seconds=args.transport_upstream_timeout_seconds,
+                scenario_timeout_seconds=args.transport_scenario_timeout_seconds,
+            )
+        )
+    sys.exit(exit_code)
