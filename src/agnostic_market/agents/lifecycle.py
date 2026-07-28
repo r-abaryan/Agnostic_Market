@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 from agnostic_market.commerce.identity import BoundIdentity
@@ -15,13 +16,17 @@ from agnostic_market.dtos.orchestration import (
 
 
 class ExecutionQuiescence(Protocol):
-    """Minimal lifecycle-facing view of the graph's mutable-node tracker."""
+    """Minimal lifecycle-facing view of graph turn admission and full quiescence."""
 
-    def defer_until_idle(self, callback: Callable[[], None]) -> None: ...
+    def stop_turn_admission(self) -> None: ...
+
+    def defer_until_fully_idle(self, callback: Callable[[], None]) -> None: ...
 
 
 class PrincipalTransitionLifecycle(Protocol):
     def attach_execution_quiescence(self, tracker: ExecutionQuiescence) -> None: ...
+
+    def cancellation_takeover_lease(self) -> AbstractContextManager[bool]: ...
 
     def transition_principal(
         self,

@@ -33,14 +33,16 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from typing import Literal
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Command
+from langgraph.types import Command, StateSnapshot
 
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
@@ -48,6 +50,7 @@ from agnostic_market.agents.recovery import (
     TURN_FALLBACK_AUTHOR,
     TURN_FALLBACK_LINE,
     NodeExecutionTracker,
+    NodeRecoveryPolicy,
     clear_automation_state,
 )
 from agnostic_market.agents.telemetry import write_event
@@ -83,7 +86,7 @@ from agnostic_market.dtos.orchestration import (
     VerifyOrderStatus,
     ViewCart,
 )
-from agnostic_market.dtos.recovery import PendingRecovery
+from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
     CancelTarget,
@@ -110,6 +113,15 @@ def _new_thread_id() -> str:
     return uuid.uuid4().hex
 
 
+def _write_ingress_rejection(
+    reason: Literal["missing_message_id", "session_closed"],
+) -> None:
+    try:
+        write_event({"event": "ingress_turn_rejected", "reason": reason})
+    except Exception:
+        logger.critical("ingress-rejection telemetry failed", exc_info=True)
+
+
 # The custom (non-message) types we checkpoint into graph state. langgraph's default
 # msgpack serde is permissive (deserializes anything with a warning), but that path is
 # slated to be BLOCKED — an explicit allowlist registers our DTOs as trusted so the
@@ -134,6 +146,7 @@ _CHECKPOINTED_DTOS = (
     PendingProfileChange,
     PendingIdentity,
     PendingRecovery,
+    ExceptionAction,
     IdentityClarification,
     SupportClarification,
     CartClarification,
@@ -326,6 +339,102 @@ class _GraphSpans:
         logger.debug("graph spans: %s", ", ".join(parts))
 
 
+@dataclass(frozen=True, slots=True)
+class _CancellationCheckpoint:
+    outcome: Literal["complete", "interrupt", "recover", "invalid"]
+    marker: PendingRecovery | None = None
+
+
+def _task_matches(
+    snapshot: StateSnapshot,
+    node_name: str,
+    *,
+    interrupted: bool,
+) -> bool:
+    if len(snapshot.tasks) != 1:
+        return False
+    task = snapshot.tasks[0]
+    if task.name != node_name or task.error is not None:
+        return False
+    if interrupted:
+        return task.interrupts == snapshot.interrupts
+    return not task.interrupts
+
+
+def _interrupt_node(
+    snapshot: StateSnapshot,
+    policies: Mapping[str, NodeRecoveryPolicy],
+) -> str | None:
+    if len(snapshot.interrupts) != 1 or len(snapshot.tasks) != 1:
+        return None
+    task = snapshot.tasks[0]
+    if (
+        task.name not in policies
+        or task.error is not None
+        or task.interrupts != snapshot.interrupts
+        or snapshot.next not in ((), (task.name,))
+    ):
+        return None
+    return task.name
+
+
+def _classify_cancelled_checkpoint(
+    snapshot: StateSnapshot,
+    *,
+    policies: Mapping[str, NodeRecoveryPolicy],
+    infrastructure_nodes: frozenset[str],
+    active_node_names: frozenset[str],
+    abandoned_message_id: str,
+    resumed_interrupt_node: str | None,
+) -> _CancellationCheckpoint:
+    state = ReasoningState.model_validate(snapshot.values)
+    if state.pending_recovery is not None:
+        return _CancellationCheckpoint("invalid")
+    if snapshot.interrupts:
+        interrupt_node = _interrupt_node(snapshot, policies)
+        if interrupt_node is None or (
+            active_node_names and active_node_names != frozenset({interrupt_node})
+        ):
+            return _CancellationCheckpoint("invalid")
+        if resumed_interrupt_node != interrupt_node:
+            return _CancellationCheckpoint("interrupt")
+        if not state.consumed_turn_ids or state.consumed_turn_ids[-1] != abandoned_message_id:
+            return _CancellationCheckpoint("invalid")
+        return _CancellationCheckpoint(
+            "recover",
+            PendingRecovery(
+                origin_node=interrupt_node,
+                action=policies[interrupt_node].on_cancellation,
+                trigger="stream_cancelled",
+                abandoned_message_id=abandoned_message_id,
+            ),
+        )
+    if not snapshot.next:
+        return _CancellationCheckpoint("complete" if not snapshot.tasks else "invalid")
+    if len(snapshot.next) != 1:
+        return _CancellationCheckpoint("invalid")
+    origin_node = snapshot.next[0]
+    policy = policies.get(origin_node)
+    if (
+        origin_node in infrastructure_nodes
+        or policy is None
+        or not _task_matches(snapshot, origin_node, interrupted=False)
+        or (active_node_names and active_node_names != frozenset({origin_node}))
+        or not state.consumed_turn_ids
+        or state.consumed_turn_ids[-1] != abandoned_message_id
+    ):
+        return _CancellationCheckpoint("invalid")
+    return _CancellationCheckpoint(
+        "recover",
+        PendingRecovery(
+            origin_node=origin_node,
+            action=policy.on_cancellation,
+            trigger="stream_cancelled",
+            abandoned_message_id=abandoned_message_id,
+        ),
+    )
+
+
 class ReasoningEngine:
     """Per-session engine over a compiled, checkpointer-backed reasoning graph."""
 
@@ -362,6 +471,29 @@ class ReasoningEngine:
         if not isinstance(principal_seed_node, str) or not principal_seed_node:
             raise ValueError("ReasoningEngine requires a graph-declared principal seed node")
         self._principal_seed_complete_node = principal_seed_node
+        recovery_entry_node = getattr(graph, "recovery_entry_node", None)
+        if not isinstance(recovery_entry_node, str) or not recovery_entry_node:
+            raise ValueError("ReasoningEngine requires a graph-declared recovery entry node")
+        self._recovery_entry_node = recovery_entry_node
+        recovery_policies = getattr(graph, "node_recovery_policies", None)
+        if not isinstance(recovery_policies, Mapping) or not all(
+            isinstance(name, str) and isinstance(policy, NodeRecoveryPolicy)
+            for name, policy in recovery_policies.items()
+        ):
+            raise ValueError("ReasoningEngine requires graph-declared node recovery policies")
+        self._node_recovery_policies: Mapping[str, NodeRecoveryPolicy] = recovery_policies
+        infrastructure_nodes = getattr(graph, "recovery_infrastructure_nodes", None)
+        if not isinstance(infrastructure_nodes, frozenset) or not all(
+            isinstance(name, str) for name in infrastructure_nodes
+        ):
+            raise ValueError("ReasoningEngine requires graph-declared recovery infrastructure")
+        self._recovery_infrastructure_nodes: frozenset[str] = infrastructure_nodes
+        handled_nodes = getattr(graph, "recovery_handled_nodes", None)
+        if not isinstance(handled_nodes, frozenset) or not all(
+            isinstance(name, str) for name in handled_nodes
+        ):
+            raise ValueError("ReasoningEngine requires graph-declared handled recovery nodes")
+        self._recovery_handled_nodes: frozenset[str] = handled_nodes
         execution_tracker = getattr(graph, "node_execution_tracker", None)
         if not isinstance(execution_tracker, NodeExecutionTracker):
             raise ValueError("ReasoningEngine requires a graph-declared node execution tracker")
@@ -376,7 +508,7 @@ class ReasoningEngine:
 
     def pending_interrupt(self) -> bool:
         """True if the thread is paused at a HITL interrupt (next turn must resume it)."""
-        if self._terminal_latched:
+        if not self._node_execution_tracker.turn_admission_open or self._terminal_latched:
             return False
         return bool(self._graph.get_state(self._config).interrupts)
 
@@ -486,30 +618,242 @@ class ReasoningEngine:
                 )
 
     def _enter_last_resort(self) -> SpokenMessageEvent:
+        self._latch_last_resort()
+        self._finalize_last_resort_state()
+        return SpokenMessageEvent(
+            text=AUTOMATION_TERMINAL_LINE,
+            node=self._terminal_takeover_node,
+        )
+
+    def _latch_last_resort(self) -> None:
+        if self._terminal_latched:
+            return
         self._terminal_latched = True
-        self._invalidate_pending_transition_for_terminal()
         try:
             write_event({"event": "turn_failed", "reason": "engine_last_resort"})
         except Exception:
             logger.critical("last-resort telemetry failed", exc_info=True)
+
+    def _finalize_last_resort_state(self) -> None:
+        self._invalidate_pending_transition_for_terminal()
         try:
             self._graph.update_state(
                 self._config,
                 {
                     **clear_automation_state(),
                     "automation_terminal": True,
-                    "messages": [AIMessage(AUTOMATION_TERMINAL_LINE)],
+                    "messages": [
+                        AIMessage(
+                            AUTOMATION_TERMINAL_LINE,
+                            id=f"{self._terminal_takeover_node}:{self._thread_id}",
+                        )
+                    ],
                 },
                 as_node=self._terminal_takeover_node,
             )
         except Exception:
             logger.critical("last-resort checkpoint takeover failed", exc_info=True)
-        return SpokenMessageEvent(
-            text=AUTOMATION_TERMINAL_LINE,
-            node=self._terminal_takeover_node,
+
+    def _defer_last_resort_until_idle(self) -> None:
+        self._latch_last_resort()
+
+        def finalize() -> None:
+            lease = (
+                self._lifecycle.cancellation_takeover_lease()
+                if self._lifecycle is not None
+                else nullcontext(True)
+            )
+            with lease as acquired:
+                if acquired:
+                    self._finalize_last_resort_state()
+
+        try:
+            self._node_execution_tracker.defer_until_fully_idle(finalize)
+        except Exception:
+            logger.critical("failed to defer last-resort state cleanup", exc_info=True)
+
+    def _checkpoint_has_valid_interrupt(self, snapshot: StateSnapshot) -> bool:
+        return _interrupt_node(snapshot, self._node_recovery_policies) is not None
+
+    def _validated_pending_recovery(
+        self,
+        snapshot: StateSnapshot,
+        state: ReasoningState,
+    ) -> PendingRecovery | None:
+        marker = state.pending_recovery
+        if marker is None:
+            return None
+        policy = self._node_recovery_policies.get(marker.origin_node)
+        contract_valid = bool(
+            policy is not None
+            and (
+                (
+                    marker.trigger == "stream_cancelled"
+                    and marker.action == policy.on_cancellation
+                    and marker.abandoned_message_id is not None
+                    and state.consumed_turn_ids
+                    and state.consumed_turn_ids[-1] == marker.abandoned_message_id
+                )
+                or (
+                    marker.trigger == "node_exception"
+                    and marker.origin_node in self._recovery_handled_nodes
+                    and marker.action == policy.on_exception
+                )
+            )
+        )
+        valid = bool(
+            isinstance(marker, PendingRecovery)
+            and contract_valid
+            and not snapshot.interrupts
+            and snapshot.next == (self._recovery_entry_node,)
+            and _task_matches(snapshot, self._recovery_entry_node, interrupted=False)
+        )
+        if not valid:
+            raise RuntimeError("pending stream recovery checkpoint is invalid")
+        return marker
+
+    def _is_pristine_principal_continuation(
+        self,
+        snapshot: StateSnapshot,
+        state: ReasoningState,
+    ) -> bool:
+        if (
+            state.pending_request is None
+            or state.messages
+            or state.automation_terminal
+            or snapshot.interrupts
+            or snapshot.next != (self._recovery_entry_node,)
+            or not _task_matches(snapshot, self._recovery_entry_node, interrupted=False)
+        ):
+            return False
+        expected_clear = clear_automation_state()
+        return all(
+            getattr(state, field) == expected
+            for field, expected in expected_clear.items()
+            if field != "pending_request"
         )
 
+    def _seed_stream_recovery(
+        self,
+        marker: PendingRecovery,
+    ) -> None:
+        abandoned_message_id = marker.abandoned_message_id
+        assert abandoned_message_id is not None
+        self._graph.update_state(
+            self._config,
+            {
+                "pending_recovery": marker,
+                "consumed_turn_ids": (abandoned_message_id,),
+            },
+            as_node="__start__",
+        )
+        seeded = self._graph.get_state(self._config)
+        seeded_state = ReasoningState.model_validate(seeded.values)
+        if (
+            seeded_state.pending_recovery != marker
+            or not seeded_state.consumed_turn_ids
+            or seeded_state.consumed_turn_ids[-1] != abandoned_message_id
+            or seeded.interrupts
+            or seeded.next != (self._recovery_entry_node,)
+            or not _task_matches(seeded, self._recovery_entry_node, interrupted=False)
+        ):
+            raise RuntimeError("stream recovery seed did not round-trip exactly")
+        write_event(
+            {
+                "event": "turn_recovery_seeded",
+                "node": marker.origin_node,
+                "action": marker.action,
+            }
+        )
+
+    async def _await_mutable_quiescence(self) -> bool:
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._node_execution_tracker.wait_until_mutable_idle,
+                self._cancellation_quiescence_timeout_seconds,
+            )
+        )
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        return cleanup_task.result()
+
+    async def _take_over_cancelled_stream(
+        self,
+        *,
+        owned_thread_id: str,
+        abandoned_message_id: str,
+        active_node_names: frozenset[str],
+        resumed_interrupt_node: str | None,
+    ) -> None:
+        try:
+            idle = await self._await_mutable_quiescence()
+        except asyncio.CancelledError:
+            logger.critical("cancellation quiescence task was itself cancelled", exc_info=True)
+            self._defer_last_resort_until_idle()
+            return
+        except Exception:
+            logger.critical("cancellation quiescence task failed", exc_info=True)
+            self._defer_last_resort_until_idle()
+            return
+
+        if not idle:
+            logger.error("mutable graph work did not become quiescent before timeout")
+            self._defer_last_resort_until_idle()
+            return
+
+        lease = (
+            self._lifecycle.cancellation_takeover_lease()
+            if self._lifecycle is not None
+            else nullcontext(True)
+        )
+        with lease as acquired:
+            if not acquired:
+                return
+            try:
+                self._rotate_pending_transition(abandoned_message_id)
+                if owned_thread_id != self._thread_id:
+                    return
+                snapshot = self._graph.get_state(self._config)
+                disposition = _classify_cancelled_checkpoint(
+                    snapshot,
+                    policies=self._node_recovery_policies,
+                    infrastructure_nodes=self._recovery_infrastructure_nodes,
+                    active_node_names=active_node_names,
+                    abandoned_message_id=abandoned_message_id,
+                    resumed_interrupt_node=resumed_interrupt_node,
+                )
+                if disposition.outcome in {"complete", "interrupt"}:
+                    return
+                if disposition.outcome != "recover" or disposition.marker is None:
+                    self._enter_last_resort()
+                    return
+                self._seed_stream_recovery(disposition.marker)
+            except Exception:
+                logger.exception("cancelled-stream takeover failed; terminalizing the session")
+                self._enter_last_resort()
+
     async def stream_turn(
+        self,
+        turn: CommittedTurn,
+        facts: TurnFacts,
+    ) -> AsyncIterator[TurnEvent]:
+        with self._node_execution_tracker.turn_span() as admitted:
+            if not admitted:
+                _write_ingress_rejection("session_closed")
+                return
+            stream = self._stream_admitted_turn(turn, facts)
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                # Delegating with `async for` does not close the inner generator when this
+                # public stream is closed at a yield; its principal-rotation finalizer must run.
+                await stream.aclose()
+
+    async def _stream_admitted_turn(
         self,
         turn: CommittedTurn,
         facts: TurnFacts,
@@ -521,6 +865,9 @@ class ReasoningEngine:
         recovery-infrastructure failure; it logs, telemeters, and prevents dead air without
         claiming that an unfinished checkpoint is safe to abandon.
         """
+        if not self._node_execution_tracker.turn_admission_open:
+            _write_ingress_rejection("session_closed")
+            return
         if self._terminal_latched:
             yield SpokenMessageEvent(
                 text=AUTOMATION_TERMINAL_LINE,
@@ -529,10 +876,7 @@ class ReasoningEngine:
             return
         message_id = turn.message_id
         if message_id is None:
-            try:
-                write_event({"event": "ingress_turn_rejected", "reason": "missing_message_id"})
-            except Exception:
-                logger.critical("missing-message-id telemetry failed", exc_info=True)
+            _write_ingress_rejection("missing_message_id")
             yield SpokenMessageEvent(
                 text=TURN_FALLBACK_LINE,
                 node=TURN_FALLBACK_AUTHOR,
@@ -545,21 +889,53 @@ class ReasoningEngine:
             logger.exception("initial checkpoint read failed; terminalizing the session")
             yield self._enter_last_resort()
             return
-        arrived_during_continuation = bool(arrived.interrupts or arrived.next)
+        arrived_interrupt_ids = frozenset(interrupt.id for interrupt in arrived.interrupts)
         async with self._turn_lock:
+            cancelled_stream = False
+            owned_stream_thread_id: str | None = None
+            owned_resumed_interrupt_node: str | None = None
             try:
+                if not self._node_execution_tracker.turn_admission_open:
+                    _write_ingress_rejection("session_closed")
+                    return
                 if self._terminal_latched:
                     yield SpokenMessageEvent(
                         text=AUTOMATION_TERMINAL_LINE,
                         node=self._terminal_takeover_node,
                     )
                     return
-                transition = self._rotate_pending_transition(message_id)
+                self._rotate_pending_transition(message_id)
                 snapshot = self._graph.get_state(self._config)
                 snapshot_state = ReasoningState.model_validate(snapshot.values)
-                if arrived_thread_id != self._thread_id:
+                cross_thread = arrived_thread_id != self._thread_id
+                marker = self._validated_pending_recovery(snapshot, snapshot_state)
+                resumed_interrupt_node: str | None = None
+                if cross_thread:
                     write_event({"event": "cross_thread_turn_consumed"})
-                    if not snapshot.next:
+                    if marker is not None:
+                        payload: object = Command(
+                            update={
+                                "consumed_turn_ids": (
+                                    ()
+                                    if message_id in snapshot_state.consumed_turn_ids
+                                    else (message_id,)
+                                )
+                            }
+                        )
+                    elif message_id in snapshot_state.consumed_turn_ids:
+                        write_event(
+                            {
+                                "event": "duplicate_turn_ignored",
+                                "reason": "consumed_turn_id",
+                            }
+                        )
+                        return
+                    elif snapshot.interrupts:
+                        if not self._checkpoint_has_valid_interrupt(snapshot):
+                            yield self._enter_last_resort()
+                            return
+                        payload = Command(update={"consumed_turn_ids": (message_id,)})
+                    elif not snapshot.next and not snapshot.tasks:
                         self._graph.update_state(
                             self._config,
                             {"consumed_turn_ids": (message_id,)},
@@ -570,37 +946,60 @@ class ReasoningEngine:
                             node=TURN_FALLBACK_AUTHOR,
                         )
                         return
-                    # A Command carrying only an update advances an unfinished node without
-                    # supplying resume data. On an interrupt LangGraph checkpoints the ID and
-                    # re-emits the same interrupt; on a non-interrupt continuation it runs the
-                    # exact pending node. This avoids update_state(), whose inferred author can
-                    # rewrite the pending route.
-                    payload: object = Command(update={"consumed_turn_ids": (message_id,)})
+                    elif self._is_pristine_principal_continuation(snapshot, snapshot_state):
+                        payload = Command(update={"consumed_turn_ids": (message_id,)})
+                    else:
+                        yield self._enter_last_resort()
+                        return
+                elif marker is not None:
+                    already_consumed = message_id in snapshot_state.consumed_turn_ids
+                    if (
+                        marker.trigger == "stream_cancelled"
+                        and marker.action == ExceptionAction.SAFE_ABORT
+                        and not already_consumed
+                    ):
+                        payload = {
+                            "messages": [HumanMessage(content=turn.text, id=message_id)],
+                            "consumed_turn_ids": (message_id,),
+                        }
+                    else:
+                        payload = Command(
+                            update={"consumed_turn_ids": () if already_consumed else (message_id,)}
+                        )
                 elif message_id in snapshot_state.consumed_turn_ids:
                     write_event({"event": "duplicate_turn_ignored", "reason": "consumed_turn_id"})
                     return
-                elif (
-                    transition is None
-                    and arrived_during_continuation
-                    and not (snapshot.interrupts or snapshot.next)
-                ):
-                    write_event({"event": "duplicate_turn_ignored", "reason": "continuation_done"})
-                    return
                 elif snapshot.interrupts:
+                    if not self._checkpoint_has_valid_interrupt(snapshot):
+                        yield self._enter_last_resort()
+                        return
+                    interrupt_id = snapshot.interrupts[0].id
                     # The graph's confirm node classifies consent; the engine only relays facts.
-                    payload = Command(
-                        resume={
-                            "text": turn.text,
-                            "readback_interrupted": facts.readback_interrupted,
-                        },
-                        update={"consumed_turn_ids": (message_id,)},
-                    )
+                    if interrupt_id in arrived_interrupt_ids:
+                        resumed_interrupt_node = _interrupt_node(
+                            snapshot,
+                            self._node_recovery_policies,
+                        )
+                        if resumed_interrupt_node is None:
+                            yield self._enter_last_resort()
+                            return
+                        payload = Command(
+                            resume={
+                                "text": turn.text,
+                                "readback_interrupted": facts.readback_interrupted,
+                            },
+                            update={"consumed_turn_ids": (message_id,)},
+                        )
+                    else:
+                        payload = Command(update={"consumed_turn_ids": (message_id,)})
                 elif snapshot.next:
-                    # A prior attempt died after a checkpointed step, potentially after an
-                    # idempotent write. Continue that task with no new message; treating the
-                    # caller's repeat as a fresh turn would strand or duplicate the old intent.
+                    if not self._is_pristine_principal_continuation(snapshot, snapshot_state):
+                        yield self._enter_last_resort()
+                        return
                     payload = Command(update={"consumed_turn_ids": (message_id,)})
-                    write_event({"event": "turn_recovering", "reason": "unfinished_checkpoint"})
+                elif snapshot.tasks:
+                    yield self._enter_last_resort()
+                    return
                 else:
                     payload = {
                         "messages": [HumanMessage(content=turn.text, id=message_id)],
@@ -613,6 +1012,8 @@ class ReasoningEngine:
                     # `messages` participates in an async stream. Its update-only path
                     # completes the handler correctly, so speech is relayed from the same
                     # completed message deltas that are committed to state.
+                    owned_stream_thread_id = self._thread_id
+                    owned_resumed_interrupt_node = resumed_interrupt_node
                     async for item in self._graph.astream(
                         payload,
                         config=self._config,
@@ -632,16 +1033,29 @@ class ReasoningEngine:
                                 spans.observe(token, meta)
                                 if (event := speech.feed(token, meta)) is not None:
                                     yield event
+                    owned_stream_thread_id = None
+                    owned_resumed_interrupt_node = None
                     transition = self._rotate_pending_transition(message_id)
                     if transition is None or transition.continuation is None:
                         break
                     payload = None
+            except asyncio.CancelledError as original_cancellation:
+                cancelled_stream = True
+                if owned_stream_thread_id is not None:
+                    active_node_names = self._node_execution_tracker.active_node_names
+                    await self._take_over_cancelled_stream(
+                        owned_thread_id=owned_stream_thread_id,
+                        abandoned_message_id=message_id,
+                        active_node_names=active_node_names,
+                        resumed_interrupt_node=owned_resumed_interrupt_node,
+                    )
+                raise original_cancellation
             except Exception:
                 logger.exception("unhandled turn failure; terminalizing the session")
                 yield self._enter_last_resort()
                 return
             finally:
-                if not self._terminal_latched:
+                if not cancelled_stream and not self._terminal_latched:
                     try:
                         self._rotate_pending_transition(message_id)
                     except Exception:

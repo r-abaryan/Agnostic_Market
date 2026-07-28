@@ -275,6 +275,270 @@ async def test_switch_apply_failure_after_coherent_publish_preserves_acknowledge
     assert harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values == {}
 
 
+@pytest.mark.parametrize("publication", ("none", "coherent", "inconsistent"))
+async def test_cancelled_identity_apply_resolves_principal_publication_fail_closed(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publication: str,
+) -> None:
+    harness = _identity_harness(
+        config_root,
+        customer_claim="casey@example.com",
+        reason_code="switch_account",
+        thread_id=f"cancelled-principal-{publication}",
+    )
+    assert harness.verification.verify_otp(_OTP)
+    old_proof = harness.verification.grants[-1]
+    harness.identity.bind(_CUST1)
+    old_thread = harness.engine.thread_id
+    warning = await _events(harness, "switch my account")
+    assert any(isinstance(event, InterruptEvent) for event in warning)
+    dispatched = await _events(harness, "yes")
+    assert any(isinstance(event, InterruptEvent) for event in dispatched)
+
+    entered = threading.Event()
+    release = threading.Event()
+    if publication == "none":
+
+        def pause_without_publication(_grant_count: int):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release identity_apply")
+            return None
+
+        monkeypatch.setattr(
+            harness.verification,
+            "fresh_proof_since",
+            pause_without_publication,
+        )
+    else:
+        real_write = identity_flow.write_event
+
+        def pause_after_publication(record: dict[str, object]) -> None:
+            if record.get("event") == "identity_bound":
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test did not release identity_apply")
+            real_write(record)
+
+        monkeypatch.setattr(identity_flow, "write_event", pause_after_publication)
+
+    applying = asyncio.create_task(_events(harness, _OTP))
+    assert await asyncio.to_thread(entered.wait, 5)
+    if publication == "inconsistent":
+        harness.identity.grant_order("ORD-1002")
+    applying.cancel("cancelled-identity-apply")
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await applying
+    assert cancelled.value.args == ("cancelled-identity-apply",)
+
+    if publication == "none":
+        marker = harness.engine._graph.get_state(harness.engine._config).values["pending_recovery"]
+        assert marker.trigger == "stream_cancelled"
+        assert marker.origin_node == "identity_apply"
+        recovered = await _events(harness, "continue")
+        assert [event.text for event in _spoken(recovered)] == [
+            "I couldn't finish that account request; please try it again."
+        ]
+        assert harness.engine.thread_id == old_thread
+        assert harness.identity.current() == _CUST1
+        assert old_proof in harness.verification.grants
+        assert harness.caller_context.pending_transition() is None
+        assert harness.engine._graph.get_state(harness.engine._config).next == ()
+    elif publication == "coherent":
+        assert harness.engine.thread_id != old_thread
+        assert harness.identity.current() == _CUST2
+        assert harness.caller_context.pending_transition() is None
+        assert harness.engine._graph.get_state(harness.engine._config).next == ()
+        assert (
+            harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values
+            == {}
+        )
+    else:
+        terminal = await _events(harness, "continue")
+        assert [event.text for event in _spoken(terminal)] == [AUTOMATION_TERMINAL_LINE]
+        assert harness.engine.thread_id == old_thread
+        assert harness.identity.current() is None
+        assert not harness.identity.has_residual_order_authority()
+        assert harness.verification.current_level() == 1
+        assert harness.caller_context.pending_transition() is None
+        snapshot = harness.engine._graph.get_state(harness.engine._config)
+        assert snapshot.values["automation_terminal"] is True
+        assert snapshot.next == ()
+
+
+@pytest.mark.parametrize("wait_outcome", ("timeout", "failure"))
+@pytest.mark.parametrize("publication", ("before", "after"))
+async def test_unquiescent_identity_apply_defers_terminal_cleanup_until_worker_exit(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_outcome: str,
+    publication: str,
+) -> None:
+    harness = _identity_harness(
+        config_root,
+        customer_claim="casey@example.com",
+        reason_code="switch_account",
+        thread_id=f"unquiescent-principal-{wait_outcome}-{publication}",
+    )
+    assert harness.verification.verify_otp(_OTP)
+    harness.identity.bind(_CUST1)
+    await _events(harness, "switch my account")
+    await _events(harness, "yes")
+
+    entered = threading.Event()
+    release = threading.Event()
+    if publication == "before":
+        real_fresh_proof_since = harness.verification.fresh_proof_since
+
+        def pause_before_publication(grant_count: int):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release identity_apply")
+            return real_fresh_proof_since(grant_count)
+
+        monkeypatch.setattr(
+            harness.verification,
+            "fresh_proof_since",
+            pause_before_publication,
+        )
+    else:
+        real_write = identity_flow.write_event
+
+        def pause_after_publication(record: dict[str, object]) -> None:
+            if record.get("event") == "identity_bound":
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test did not release identity_apply")
+            real_write(record)
+
+        monkeypatch.setattr(identity_flow, "write_event", pause_after_publication)
+
+    if wait_outcome == "timeout":
+        monkeypatch.setattr(
+            harness.engine._node_execution_tracker,
+            "wait_until_mutable_idle",
+            lambda _timeout_seconds: False,
+        )
+    else:
+
+        def fail_wait(_timeout_seconds: float) -> bool:
+            raise RuntimeError("injected quiescence wait failure")
+
+        monkeypatch.setattr(
+            harness.engine._node_execution_tracker,
+            "wait_until_mutable_idle",
+            fail_wait,
+        )
+
+    applying = asyncio.create_task(_events(harness, _OTP))
+    assert await asyncio.to_thread(entered.wait, 5)
+    applying.cancel("unquiescent-identity-apply")
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await applying
+    assert cancelled.value.args == ("unquiescent-identity-apply",)
+
+    assert harness.engine._terminal_latched is True
+    assert harness.engine._node_execution_tracker.active_node_names == frozenset({"identity_apply"})
+    if publication == "before":
+        assert harness.identity.current() == _CUST1
+        assert harness.caller_context.pending_transition() is None
+    else:
+        assert harness.identity.current() == _CUST2
+        assert harness.caller_context.inspect_principal_transition().outcome == "coherent"
+    unstable = harness.engine._graph.get_state(harness.engine._config)
+    assert unstable.values.get("automation_terminal", False) is False
+    assert unstable.values.get("pending_recovery") is None
+    blocked = await _events(harness, "continue while cleanup is pending")
+    assert [event.text for event in _spoken(blocked)] == [AUTOMATION_TERMINAL_LINE]
+    assert harness.engine._node_execution_tracker.active_node_names == frozenset({"identity_apply"})
+    unchanged = harness.engine._graph.get_state(harness.engine._config)
+    assert unchanged.values == unstable.values
+    assert unchanged.next == unstable.next
+    assert unchanged.tasks == unstable.tasks
+    assert unchanged.interrupts == unstable.interrupts
+
+    cleanup_complete = threading.Event()
+    harness.engine._node_execution_tracker.defer_until_fully_idle(cleanup_complete.set)
+    release.set()
+    assert await asyncio.to_thread(cleanup_complete.wait, 5)
+
+    assert harness.engine._node_execution_tracker.active_node_names == frozenset()
+    assert harness.identity.current() is None
+    assert not harness.identity.has_residual_order_authority()
+    assert harness.verification.current_level() == 1
+    assert harness.verification.grants == []
+    assert harness.caller_context.pending_transition() is None
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
+    repeated = await _events(harness, "continue")
+    assert [event.text for event in _spoken(repeated)] == [AUTOMATION_TERMINAL_LINE]
+
+
+async def test_deferred_terminal_cleanup_yields_to_session_close_without_recreating_thread(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _identity_harness(
+        config_root,
+        customer_claim="casey@example.com",
+        reason_code="switch_account",
+        thread_id="unquiescent-principal-close-race",
+    )
+    assert harness.verification.verify_otp(_OTP)
+    harness.identity.bind(_CUST1)
+    await _events(harness, "switch my account")
+    await _events(harness, "yes")
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_fresh_proof_since = harness.verification.fresh_proof_since
+
+    def pause_before_publication(grant_count: int):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise RuntimeError("test did not release identity_apply")
+        return real_fresh_proof_since(grant_count)
+
+    monkeypatch.setattr(
+        harness.verification,
+        "fresh_proof_since",
+        pause_before_publication,
+    )
+    monkeypatch.setattr(
+        harness.engine._node_execution_tracker,
+        "wait_until_mutable_idle",
+        lambda _timeout_seconds: False,
+    )
+
+    applying = asyncio.create_task(_events(harness, _OTP))
+    assert await asyncio.to_thread(entered.wait, 5)
+    applying.cancel("unquiescent-close-race")
+    with pytest.raises(asyncio.CancelledError):
+        await applying
+
+    harness.caller_context.close_session()
+    assert harness.engine._node_execution_tracker.active_node_names == frozenset({"identity_apply"})
+    assert harness.engine._graph.get_state(harness.engine._config).values
+
+    close_complete = threading.Event()
+    harness.engine._node_execution_tracker.defer_until_fully_idle(close_complete.set)
+    release.set()
+    assert await asyncio.to_thread(close_complete.wait, 5)
+
+    assert harness.identity.current() is None
+    assert not harness.identity.has_residual_order_authority()
+    assert harness.verification.current_level() == 1
+    assert harness.caller_context.pending_transition() is None
+    assert harness.engine._graph.get_state(harness.engine._config).values == {}
+    terminal = await _events(harness, "continue")
+    assert _spoken(terminal) == []
+    assert harness.engine._graph.get_state(harness.engine._config).values == {}
+
+
 async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
     config_root: Path,
     tmp_path: Path,

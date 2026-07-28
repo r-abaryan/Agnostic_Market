@@ -16,6 +16,7 @@ from typing import Annotated, TypedDict
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
+from langgraph.types import PregelTask, StateSnapshot
 from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
 from policy_helpers import make_policy
 from pydantic import PrivateAttr, ValidationError
@@ -28,12 +29,13 @@ from turn_helpers import (
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
     ReasoningEngine,
+    _classify_cancelled_checkpoint,
     _GraphSpans,
     _TurnSpeech,
     build_checkpointer,
 )
 from agnostic_market.agents.frontline import MODEL_SPEECH_NODES, build_frontline_graph
-from agnostic_market.agents.recovery import TURN_FALLBACK_LINE
+from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE, TURN_FALLBACK_LINE
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -55,7 +57,7 @@ from agnostic_market.dtos.events import (
     TokenEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.recovery import PendingRecovery
+from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CartClarification,
     ClarificationProgress,
@@ -73,13 +75,6 @@ _PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
 _TEST_OTP = "482913"
 _WAIT_TIMEOUT_SECONDS = 5.0
-_XFAIL_6D_ADMISSION = (
-    "Milestone 6D-c: a turn arriving before cancellation/interrupt takeover is not yet "
-    "deterministically admitted or consumed"
-)
-_XFAIL_6D_TAKEOVER = (
-    "Milestone 6D-c: external cancellation does not yet seed typed recovery after worker quiescence"
-)
 
 
 class _BlockingFirstResponseModel(FakeChatModel):
@@ -313,6 +308,67 @@ async def test_duplicate_normal_turn_id_is_admitted_only_once(config_root: Path)
     assert frontline.invoke_count == 1
 
 
+async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        thread_id="duplicate-abandoned-turn",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    abandoned_id = "abandoned-safe-turn"
+    engine._graph.update_state(
+        engine._config,
+        {
+            "messages": [HumanMessage(content="tell me about shoes", id=abandoned_id)],
+            "consumed_turn_ids": (abandoned_id,),
+            "pending_recovery": PendingRecovery(
+                origin_node="model",
+                action=ExceptionAction.SAFE_ABORT,
+                trigger="stream_cancelled",
+                abandoned_message_id=abandoned_id,
+            ),
+        },
+        as_node="__start__",
+    )
+
+    output = await _adapter_turn(adapter, "tell me about shoes", abandoned_id)
+    snapshot = engine._graph.get_state(engine._config)
+    human_ids = [
+        message.id
+        for message in snapshot.values.get("messages", ())
+        if isinstance(message, HumanMessage)
+    ]
+
+    assert output == [TURN_FALLBACK_LINE]
+    assert human_ids == [abandoned_id]
+    assert snapshot.values["consumed_turn_ids"] == [abandoned_id]
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.next == ()
+    assert frontline.invoke_count == 0
+    import json
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [
+        record
+        for record in records
+        if record.get("event") == "turn_failed" and record.get("reason") == "stream_cancelled"
+    ] == [
+        {
+            "event": "turn_failed",
+            "reason": "stream_cancelled",
+            "node": "model",
+            "action": "safe_abort",
+        }
+    ]
+
+
 def test_committed_turn_requires_an_explicit_nonblank_transport_identity() -> None:
     assert CommittedTurn.model_fields["message_id"].is_required()
     assert CommittedTurn(text="hello", message_id=None).message_id is None
@@ -512,18 +568,13 @@ async def test_kill_mid_checkout_leaves_no_ghost_order(config_root: Path) -> Non
 # --- Milestone 6D-a: executable product-gap contracts -----------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_6D_ADMISSION)
 async def test_distinct_turn_arriving_before_cancellation_is_admitted_once(
     config_root: Path,
 ) -> None:
-    reasoning = _BlockingFirstResponseModel(
-        force_tool="buy_now",
-        canned_args=_PROPOSE,
-        tool_call_limit=1,
-    )
+    frontline = _BlockingFirstResponseModel(emit_tool_calls=False)
     engine, store = _engine(
         config_root,
-        reasoning=reasoning,
+        frontline=frontline,
         thread_id="late-distinct-turn",
     )
     adapter = GraphVoiceAdapter(engine)
@@ -536,10 +587,10 @@ async def test_distinct_turn_arriving_before_cancellation_is_admitted_once(
     )
 
     first = asyncio.create_task(
-        _adapter_turn(adapter, "checkout now please", "late-turn-1"),
+        _adapter_turn(adapter, "tell me about your shoes", "late-turn-1"),
         name="late-distinct-turn-owner",
     )
-    assert await asyncio.to_thread(reasoning.started.wait, _WAIT_TIMEOUT_SECONDS)
+    assert await asyncio.to_thread(frontline.started.wait, _WAIT_TIMEOUT_SECONDS)
     second = asyncio.create_task(
         _adapter_turn(adapter, "never mind", "late-turn-2"),
         name=second_task_name,
@@ -547,7 +598,7 @@ async def test_distinct_turn_arriving_before_cancellation_is_admitted_once(
     await asyncio.wait_for(second_arrived.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
 
     first.cancel()
-    reasoning.release()
+    frontline.release()
     with pytest.raises(asyncio.CancelledError):
         await first
     await asyncio.wait_for(second, timeout=_WAIT_TIMEOUT_SECONDS)
@@ -563,7 +614,60 @@ async def test_distinct_turn_arriving_before_cancellation_is_admitted_once(
     assert not engine.pending_interrupt()
 
 
-@pytest.mark.xfail(strict=True, reason=_XFAIL_6D_ADMISSION)
+async def test_cancelled_cart_assemble_reviews_cart_and_consumes_queued_turn(
+    config_root: Path,
+) -> None:
+    reasoning = _BlockingFirstResponseModel(
+        force_tool="buy_now",
+        canned_args=_PROPOSE,
+        tool_call_limit=1,
+    )
+    engine, store = _engine(
+        config_root,
+        reasoning=reasoning,
+        thread_id="cancelled-cart-review",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    second_arrived = asyncio.Event()
+    second_task_name = "cancelled-cart-review-waiter"
+    engine._turn_lock = _ObservedTurnLock(
+        engine._turn_lock,
+        task_name=second_task_name,
+        arrived=second_arrived,
+    )
+
+    first = asyncio.create_task(
+        _adapter_turn(adapter, "checkout now please", "cart-review-turn-1"),
+        name="cancelled-cart-review-owner",
+    )
+    assert await asyncio.to_thread(reasoning.started.wait, _WAIT_TIMEOUT_SECONDS)
+    second = asyncio.create_task(
+        _adapter_turn(adapter, "never mind", "cart-review-turn-2"),
+        name=second_task_name,
+    )
+    await asyncio.wait_for(second_arrived.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
+
+    first.cancel()
+    reasoning.release()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    output = await asyncio.wait_for(second, timeout=_WAIT_TIMEOUT_SECONDS)
+
+    snapshot = engine._graph.get_state(engine._config)
+    human_ids = [
+        message.id
+        for message in snapshot.values.get("messages", ())
+        if isinstance(message, HumanMessage)
+    ]
+    assert "cart-review-turn-2" not in human_ids
+    assert snapshot.values["consumed_turn_ids"] == ["cart-review-turn-1", "cart-review-turn-2"]
+    assert snapshot.values.get("pending_recovery") is None
+    assert engine._lifecycle is not None
+    assert engine._lifecycle.has_discardable_state()
+    assert store.placed_count == 0
+    assert len(output) == 1 and "review your cart" in output[0].lower()
+
+
 async def test_turn_arriving_before_a_new_interrupt_cannot_resume_it(
     config_root: Path,
 ) -> None:
@@ -606,7 +710,6 @@ async def test_turn_arriving_before_a_new_interrupt_cannot_resume_it(
 
 
 @pytest.mark.parametrize("after_commit", (False, True), ids=("before-commit", "after-commit"))
-@pytest.mark.xfail(strict=True, reason=_XFAIL_6D_TAKEOVER)
 async def test_cancelled_sync_effect_seeds_recovery_only_after_worker_exit(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -639,6 +742,388 @@ async def test_cancelled_sync_effect_seeds_recovery_only_after_worker_exit(
     assert isinstance(marker, PendingRecovery)
     assert marker.trigger == "stream_cancelled"
     assert store.placed_count == 1
+
+
+async def test_second_cancellation_waits_for_takeover_then_repropagates_the_original(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _store = _engine(
+        config_root,
+        thread_id="repeated-cancellation",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    await _adapter_turn(adapter, "checkout now please", "repeat-cancel-checkout")
+    entered, release, finished = _block_placement(
+        _store,
+        monkeypatch,
+        after_commit=False,
+    )
+    wait_started = threading.Event()
+    real_wait = engine._node_execution_tracker.wait_until_mutable_idle
+
+    def observed_wait(timeout_seconds: float) -> bool:
+        wait_started.set()
+        return real_wait(timeout_seconds)
+
+    monkeypatch.setattr(engine._node_execution_tracker, "wait_until_mutable_idle", observed_wait)
+    consent = asyncio.create_task(
+        _adapter_turn(adapter, "yes", "repeat-cancel-consent"),
+    )
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+
+    consent.cancel("original-cancellation")
+    assert await asyncio.to_thread(wait_started.wait, _WAIT_TIMEOUT_SECONDS)
+    consent.cancel("later-cancellation")
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await consent
+    assert cancelled.value.args == ("original-cancellation",)
+    assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+
+    snapshot = engine._graph.get_state(engine._config)
+    marker = snapshot.values.get("pending_recovery")
+    assert isinstance(marker, PendingRecovery)
+    assert marker.trigger == "stream_cancelled"
+    assert marker.abandoned_message_id == "repeat-cancel-consent"
+
+
+async def test_cancelled_confirmation_resume_aborts_without_replaying_consent(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, store = _engine(
+        config_root,
+        thread_id="cancelled-confirmation-resume",
+    )
+    await _pause_at_confirmation(engine)
+    entered = threading.Event()
+    release = threading.Event()
+    classify_calls = 0
+    real_classify = cart_flow.classify_consent
+
+    def classify_then_pause(text: str):
+        nonlocal classify_calls
+        classify_calls += 1
+        verdict = real_classify(text)
+        entered.set()
+        if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+            raise RuntimeError("test did not release consent classification")
+        return verdict
+
+    monkeypatch.setattr(cart_flow, "classify_consent", classify_then_pause)
+    confirming = asyncio.create_task(_events(engine, "yes"))
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+
+    confirming.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await confirming
+    marker = engine._graph.get_state(engine._config).values.get("pending_recovery")
+    assert isinstance(marker, PendingRecovery)
+    assert marker.origin_node == "cart_confirm"
+    assert marker.action == ExceptionAction.ABORT_PLACEMENT_CONFIRMATION
+
+    recovered = await _events(engine, "continue")
+    snapshot = engine._graph.get_state(engine._config)
+
+    assert [event.text for event in recovered if isinstance(event, SpokenMessageEvent)] == [
+        "That order placement request did not complete. Your cart is still saved for review."
+    ]
+    assert classify_calls == 1
+    assert store.placed_count == 0
+    assert engine._lifecycle is not None
+    assert not engine._lifecycle.cart_store.is_empty()
+    assert snapshot.values.get("pending_placement") is None
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.next == ()
+
+
+async def test_quiescence_timeout_terminalizes_without_an_optimistic_recovery(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, store = _engine(
+        config_root,
+        thread_id="quiescence-timeout",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    await _adapter_turn(adapter, "checkout now please", "timeout-checkout")
+    entered, release, finished = _block_placement(
+        store,
+        monkeypatch,
+        after_commit=False,
+    )
+    monkeypatch.setattr(
+        engine._node_execution_tracker,
+        "wait_until_mutable_idle",
+        lambda _timeout_seconds: False,
+    )
+    consent = asyncio.create_task(
+        _adapter_turn(adapter, "yes", "timeout-consent"),
+    )
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+
+    consent.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consent
+    unstable = engine._graph.get_state(engine._config)
+    assert engine._terminal_latched is True
+    assert unstable.values.get("pending_recovery") is None
+    assert unstable.values.get("automation_terminal", False) is False
+    assert unstable.next == ("cart_place",)
+
+    cleanup_complete = threading.Event()
+    engine._node_execution_tracker.defer_until_fully_idle(cleanup_complete.set)
+    release.set()
+    assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+    assert await asyncio.to_thread(cleanup_complete.wait, _WAIT_TIMEOUT_SECONDS)
+    snapshot = engine._graph.get_state(engine._config)
+    assert store.placed_count == 1
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
+    repeated = await _adapter_turn(adapter, "try again", "timeout-retry")
+    assert repeated == [AUTOMATION_TERMINAL_LINE]
+
+
+@pytest.mark.parametrize("failure_point", ("seed", "readback"))
+async def test_recovery_seed_or_readback_failure_terminalizes_and_preserves_cancellation(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    engine, store = _engine(
+        config_root,
+        thread_id=f"recovery-{failure_point}-failure",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    await _adapter_turn(adapter, "checkout now please", f"{failure_point}-checkout")
+    entered, release, finished = _block_placement(
+        store,
+        monkeypatch,
+        after_commit=True,
+    )
+    real_update = engine._graph.update_state
+    real_get = engine._graph.get_state
+    fail_readback = False
+
+    def intercept_update(config, values, *, as_node=None):
+        nonlocal fail_readback
+        if isinstance(values, dict) and values.get("pending_recovery") is not None:
+            if failure_point == "seed":
+                raise RuntimeError("injected recovery seed failure")
+            result = real_update(config, values, as_node=as_node)
+            fail_readback = True
+            return result
+        return real_update(config, values, as_node=as_node)
+
+    def intercept_get(config):
+        nonlocal fail_readback
+        if fail_readback:
+            fail_readback = False
+            raise RuntimeError("injected recovery readback failure")
+        return real_get(config)
+
+    monkeypatch.setattr(engine._graph, "update_state", intercept_update)
+    monkeypatch.setattr(engine._graph, "get_state", intercept_get)
+    placing = asyncio.create_task(
+        _adapter_turn(adapter, "yes", f"{failure_point}-consent"),
+    )
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+
+    placing.cancel("transport-cancelled")
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await placing
+    assert cancelled.value.args == ("transport-cancelled",)
+    assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+    snapshot = engine._graph.get_state(engine._config)
+
+    assert store.placed_count == 1
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
+    repeated = await _adapter_turn(
+        adapter,
+        "try again",
+        f"{failure_point}-retry",
+    )
+    assert repeated == [AUTOMATION_TERMINAL_LINE]
+
+
+async def test_quiescence_task_failure_latches_terminal_without_unstable_checkpoint_work(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, store = _engine(
+        config_root,
+        thread_id="quiescence-task-failure",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    await _adapter_turn(adapter, "checkout now please", "wait-failure-checkout")
+    entered, release, finished = _block_placement(
+        store,
+        monkeypatch,
+        after_commit=False,
+    )
+
+    def fail_wait(_timeout_seconds: float) -> bool:
+        raise RuntimeError("injected quiescence wait failure")
+
+    monkeypatch.setattr(engine._node_execution_tracker, "wait_until_mutable_idle", fail_wait)
+    placing = asyncio.create_task(
+        _adapter_turn(adapter, "yes", "wait-failure-consent"),
+    )
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+
+    placing.cancel("transport-cancelled")
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await placing
+    assert cancelled.value.args == ("transport-cancelled",)
+    assert engine._terminal_latched is True
+    unstable = engine._graph.get_state(engine._config)
+    assert unstable.values.get("pending_recovery") is None
+
+    cleanup_complete = threading.Event()
+    engine._node_execution_tracker.defer_until_fully_idle(cleanup_complete.set)
+    release.set()
+    assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
+    assert await asyncio.to_thread(cleanup_complete.wait, _WAIT_TIMEOUT_SECONDS)
+    assert store.placed_count == 1
+    snapshot = engine._graph.get_state(engine._config)
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
+    repeated = await _adapter_turn(adapter, "try again", "wait-failure-retry")
+    assert repeated == [AUTOMATION_TERMINAL_LINE]
+
+
+def test_repeated_last_resort_finalization_keeps_one_checkpoint_message(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(config_root, thread_id="idempotent-last-resort")
+
+    engine._enter_last_resort()
+    engine._enter_last_resort()
+    snapshot = engine._graph.get_state(engine._config)
+    terminal_messages = [
+        message
+        for message in snapshot.values.get("messages", ())
+        if isinstance(message, AIMessage) and message.content == AUTOMATION_TERMINAL_LINE
+    ]
+
+    assert len(terminal_messages) == 1
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
+
+
+def test_cancelled_checkpoint_classifier_rejects_every_ambiguous_shape(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(
+        config_root,
+        thread_id="cancellation-classifier",
+    )
+    abandoned_id = "classifier-abandoned"
+    state = ReasoningState(consumed_turn_ids=(abandoned_id,))
+
+    def task(name: str, *, error: Exception | None = None) -> PregelTask:
+        return PregelTask(
+            id=f"task-{name}",
+            name=name,
+            path=(),
+            error=error,
+            interrupts=(),
+            state=None,
+            result=None,
+        )
+
+    def snapshot(
+        next_nodes: tuple[str, ...],
+        tasks: tuple[PregelTask, ...],
+    ) -> StateSnapshot:
+        return StateSnapshot(
+            values=state,
+            next=next_nodes,
+            config=engine._config,
+            metadata=None,
+            created_at=None,
+            parent_config=None,
+            tasks=tasks,
+            interrupts=(),
+        )
+
+    valid = _classify_cancelled_checkpoint(
+        snapshot(("cart_place",), (task("cart_place"),)),
+        policies=engine._node_recovery_policies,
+        infrastructure_nodes=engine._recovery_infrastructure_nodes,
+        active_node_names=frozenset({"cart_place"}),
+        abandoned_message_id=abandoned_id,
+        resumed_interrupt_node=None,
+    )
+    assert valid.outcome == "recover"
+    assert valid.marker is not None
+    assert valid.marker.action == ExceptionAction.RECONCILE_PLACEMENT
+
+    invalid_cases = (
+        snapshot(("cart_place",), ()),
+        snapshot(("cart_place",), (task("model"),)),
+        snapshot(("cart_place",), (task("cart_place", error=RuntimeError("failed")),)),
+        snapshot(("cart_place", "model"), (task("cart_place"), task("model"))),
+        snapshot(("recover_node_exception",), (task("recover_node_exception"),)),
+    )
+    for ambiguous in invalid_cases:
+        result = _classify_cancelled_checkpoint(
+            ambiguous,
+            policies=engine._node_recovery_policies,
+            infrastructure_nodes=engine._recovery_infrastructure_nodes,
+            active_node_names=frozenset(),
+            abandoned_message_id=abandoned_id,
+            resumed_interrupt_node=None,
+        )
+        assert result.outcome == "invalid"
+
+    tracker_mismatch = _classify_cancelled_checkpoint(
+        snapshot(("cart_place",), (task("cart_place"),)),
+        policies=engine._node_recovery_policies,
+        infrastructure_nodes=engine._recovery_infrastructure_nodes,
+        active_node_names=frozenset({"support_place"}),
+        abandoned_message_id=abandoned_id,
+        resumed_interrupt_node=None,
+    )
+    assert tracker_mismatch.outcome == "invalid"
+
+
+async def test_untyped_bare_next_terminalizes_without_replaying_graph_work(
+    config_root: Path,
+) -> None:
+    frontline = FakeChatModel()
+    reasoning = FakeChatModel()
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="untyped-bare-next",
+    )
+    engine._graph.update_state(
+        engine._config,
+        {"active_flow": "cart"},
+        as_node="__start__",
+    )
+    before = engine._graph.get_state(engine._config)
+    assert before.next == ("entry",)
+
+    events = await _events(engine, "continue")
+    after = engine._graph.get_state(engine._config)
+
+    assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+        AUTOMATION_TERMINAL_LINE
+    ]
+    assert frontline.invoke_count == 0
+    assert reasoning.invoke_count == 0
+    assert store.placed_count == 0
+    assert after.values["automation_terminal"] is True
+    assert after.next == ()
 
 
 async def test_close_session_defers_teardown_until_the_mutable_worker_exits(
@@ -679,11 +1164,11 @@ async def test_close_session_defers_teardown_until_the_mutable_worker_exits(
     assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
 
     consent.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await consent
     context.close_session()
     cleared_before_worker_exit = cart_cleared.is_set()
     release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await consent
     assert await asyncio.to_thread(finished.wait, _WAIT_TIMEOUT_SECONDS)
     assert await asyncio.to_thread(cart_cleared.wait, _WAIT_TIMEOUT_SECONDS)
     assert await asyncio.to_thread(thread_deleted.wait, _WAIT_TIMEOUT_SECONDS)
@@ -691,6 +1176,168 @@ async def test_close_session_defers_teardown_until_the_mutable_worker_exits(
     assert not cleared_before_worker_exit
     assert context.cart_store.is_empty()
     assert engine._graph.get_state(engine._config).values == {}
+
+
+async def test_close_during_pure_abort_model_waits_then_deletes_permanently(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frontline = _BlockingFirstResponseModel(emit_tool_calls=False)
+    engine, _store = _engine(
+        config_root,
+        frontline=frontline,
+        thread_id="close-during-pure-abort",
+    )
+    context = engine._lifecycle
+    assert isinstance(context, CallerContext)
+    adapter = GraphVoiceAdapter(engine)
+    delete_calls = 0
+    real_delete_thread = engine.delete_thread
+
+    def observed_delete_thread() -> None:
+        nonlocal delete_calls
+        delete_calls += 1
+        real_delete_thread()
+
+    monkeypatch.setattr(engine, "delete_thread", observed_delete_thread)
+    running = asyncio.create_task(
+        _adapter_turn(adapter, "tell me about shoes", "pure-abort-close-turn")
+    )
+    assert await asyncio.to_thread(frontline.started.wait, _WAIT_TIMEOUT_SECONDS)
+
+    context.close_session()
+    assert delete_calls == 0
+    assert engine._graph.get_state(engine._config).values
+
+    frontline.release()
+    await asyncio.wait_for(running, timeout=_WAIT_TIMEOUT_SECONDS)
+
+    assert frontline.invoke_count == 1
+    assert delete_calls == 1
+    assert engine._graph.get_state(engine._config).values == {}
+
+
+async def test_queued_turn_is_rejected_once_when_close_starts(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    frontline = _BlockingFirstResponseModel(emit_tool_calls=False)
+    reasoning = FakeChatModel()
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="queued-turn-close",
+    )
+    context = engine._lifecycle
+    assert isinstance(context, CallerContext)
+    adapter = GraphVoiceAdapter(engine)
+    second_arrived = asyncio.Event()
+    second_task_name = "queued-turn-close-waiter"
+    engine._turn_lock = _ObservedTurnLock(
+        engine._turn_lock,
+        task_name=second_task_name,
+        arrived=second_arrived,
+    )
+
+    first = asyncio.create_task(
+        _adapter_turn(adapter, "tell me about shoes", "queued-close-turn-1"),
+        name="queued-turn-close-owner",
+    )
+    assert await asyncio.to_thread(frontline.started.wait, _WAIT_TIMEOUT_SECONDS)
+    second = asyncio.create_task(
+        _adapter_turn(adapter, "place an order", "queued-close-turn-2"),
+        name=second_task_name,
+    )
+    await asyncio.wait_for(second_arrived.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
+
+    context.close_session()
+    frontline.release()
+    await asyncio.wait_for(first, timeout=_WAIT_TIMEOUT_SECONDS)
+    second_output = await asyncio.wait_for(second, timeout=_WAIT_TIMEOUT_SECONDS)
+
+    assert second_output == []
+    assert frontline.invoke_count == 1
+    assert reasoning.invoke_count == 0
+    assert store.placed_count == 0
+    assert engine._graph.get_state(engine._config).values == {}
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record for record in records if record.get("event") == "ingress_turn_rejected"] == [
+        {"event": "ingress_turn_rejected", "reason": "session_closed"}
+    ]
+    closed_events = [record for record in records if record.get("event") == "caller_context_closed"]
+    assert len(closed_events) == 1
+
+
+@pytest.mark.parametrize("terminal_latched", (False, True))
+async def test_post_close_turn_stops_before_every_engine_boundary(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_latched: bool,
+) -> None:
+    import json
+
+    frontline = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel()
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id=f"post-close-boundary-{terminal_latched}",
+    )
+    if terminal_latched:
+        engine._terminal_latched = True
+    context = engine._lifecycle
+    assert isinstance(context, CallerContext)
+    context.close_session()
+    real_get_state = engine._graph.get_state
+    checkpoint_reads = 0
+    checkpoint_writes = 0
+
+    def observed_get_state(config):
+        nonlocal checkpoint_reads
+        checkpoint_reads += 1
+        return real_get_state(config)
+
+    def fail_update_state(*_args, **_kwargs):
+        nonlocal checkpoint_writes
+        checkpoint_writes += 1
+        pytest.fail("post-close turn attempted a checkpoint write")
+
+    monkeypatch.setattr(engine._graph, "get_state", observed_get_state)
+    monkeypatch.setattr(engine._graph, "update_state", fail_update_state)
+    monkeypatch.setattr(
+        engine,
+        "_enter_last_resort",
+        lambda: pytest.fail("post-close turn entered last-resort state handling"),
+    )
+
+    output = await _adapter_turn(
+        GraphVoiceAdapter(engine),
+        "late transcript",
+        f"post-close-turn-{terminal_latched}",
+    )
+
+    assert output == []
+    assert checkpoint_reads == 0
+    assert checkpoint_writes == 0
+    assert frontline.invoke_count == 0
+    assert reasoning.invoke_count == 0
+    assert store.placed_count == 0
+    assert real_get_state(engine._config).values == {}
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record for record in records if record.get("event") == "ingress_turn_rejected"] == [
+        {"event": "ingress_turn_rejected", "reason": "session_closed"}
+    ]
 
 
 # --- checkpoint serde: our DTOs are registered (no 'unregistered type' warning) ----------

@@ -20,6 +20,7 @@ from livekit.agents.llm import ChatContext
 from livekit.plugins.langchain import LLMAdapter
 
 from agnostic_market.agents.engine import build_checkpointer
+from agnostic_market.dtos.state import merge_consumed_turn_ids
 
 _WAIT_TIMEOUT_SECONDS = 5.0
 
@@ -36,7 +37,7 @@ class _ContractState(TypedDict, total=False):
     disposition: str | None
     effect_count: int
     normal_count: int
-    consumed_turn_ids: tuple[str, ...]
+    consumed_turn_ids: Annotated[tuple[str, ...], merge_consumed_turn_ids]
     visited: Annotated[list[str], _append]
 
 
@@ -85,6 +86,53 @@ def _tracked_sync_node(
         return tracker.run(runnable.invoke, state, config)
 
     return run
+
+
+async def test_shielded_quiescence_reawaits_after_a_second_cancellation() -> None:
+    tracker = _ExecutionTracker()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cleanup_started = asyncio.Event()
+    events: list[str] = []
+
+    def blocking_worker() -> None:
+        worker_started.set()
+        if not release_worker.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+            raise TimeoutError("test did not release tracked worker")
+
+    worker = asyncio.create_task(asyncio.to_thread(tracker.run, blocking_worker))
+    assert await asyncio.to_thread(worker_started.wait, _WAIT_TIMEOUT_SECONDS)
+
+    async def owned_turn() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as original:
+            cleanup_task = asyncio.create_task(
+                asyncio.to_thread(tracker.wait_until_idle, _WAIT_TIMEOUT_SECONDS)
+            )
+            cleanup_started.set()
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            assert cleanup_task.result() is True
+            events.append("takeover")
+            raise original
+
+    turn = asyncio.create_task(owned_turn())
+    await asyncio.sleep(0)
+    turn.cancel("original-cancellation")
+    await cleanup_started.wait()
+    turn.cancel("later-cancellation")
+    release_worker.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await turn
+    await worker
+
+    assert cancelled.value.args == ("original-cancellation",)
+    assert events == ["takeover"]
 
 
 def test_node_error_handler_receives_typed_context_and_completes() -> None:
@@ -586,7 +634,7 @@ def _recovery_contract_graph(
 
     builder = StateGraph(_ContractState)
     builder.add_node("entry", entry)
-    builder.add_node("recover", recover, destinations=("entry", END))
+    builder.add_node("recover", recover)
     builder.add_node("normal", normal)
     builder.add_node("old_work", old_work)
     builder.add_edge(START, "entry")
@@ -595,6 +643,7 @@ def _recovery_contract_graph(
         route_after_entry,
         {"recover": "recover", "old_work": "old_work", "normal": "normal"},
     )
+    builder.add_edge("recover", END)
     builder.add_edge("normal", END)
     builder.add_edge("old_work", END)
     return builder.compile(checkpointer=build_checkpointer())
@@ -654,7 +703,7 @@ async def test_start_seeded_safe_abort_supersedes_stranded_work_and_admits_fresh
     assert snapshot.next == ()
 
 
-def test_start_seeded_reconcile_consumes_fresh_message_before_normal_routing() -> None:
+def test_start_seeded_reconcile_consumes_fresh_turn_without_storing_text() -> None:
     graph = _recovery_contract_graph()
     config = _config("reconcile-consumption")
     graph.update_state(
@@ -663,15 +712,54 @@ def test_start_seeded_reconcile_consumes_fresh_message_before_normal_routing() -
         as_node=START,
     )
 
-    result = graph.invoke({"messages": [HumanMessage("never mind")]}, config)
+    result = graph.invoke(
+        Command(update={"consumed_turn_ids": ("fresh-reconcile-turn",)}),
+        config,
+    )
     snapshot = graph.get_state(config)
 
     assert result["disposition"] == "consumed"
     assert result.get("normal_count", 0) == 0
     assert result.get("effect_count", 0) == 0
     assert result["visited"] == ["entry", "recover"]
-    assert _human_texts(snapshot) == ("never mind",)
+    assert _human_texts(snapshot) == ()
+    assert tuple(snapshot.values["consumed_turn_ids"]) == ("fresh-reconcile-turn",)
     assert snapshot.next == ()
+
+
+def test_nonempty_noop_command_preserves_start_seeded_recovery_and_ledger() -> None:
+    graph = _recovery_contract_graph()
+    config = _config("recovery-noop-ledger")
+    graph.update_state(
+        config,
+        {
+            "pending_recovery": "reconcile",
+            "prior_intent": "refund order",
+            "consumed_turn_ids": ("abandoned-turn",),
+        },
+        as_node=START,
+    )
+
+    result = graph.invoke(Command(update={"consumed_turn_ids": ()}), config)
+    snapshot = graph.get_state(config)
+
+    assert result["disposition"] == "consumed"
+    assert result["visited"] == ["entry", "recover"]
+    assert tuple(snapshot.values["consumed_turn_ids"]) == ("abandoned-turn",)
+    assert snapshot.next == ()
+
+
+def test_empty_command_update_is_not_a_valid_recovery_advance() -> None:
+    graph = _recovery_contract_graph()
+    config = _config("empty-recovery-command")
+    graph.update_state(
+        config,
+        {"pending_recovery": "reconcile", "prior_intent": "refund order"},
+        as_node=START,
+    )
+
+    with pytest.raises(UnboundLocalError):
+        graph.invoke(Command(update={}), config)
 
 
 def test_interrupt_is_not_intercepted_by_node_error_handler() -> None:

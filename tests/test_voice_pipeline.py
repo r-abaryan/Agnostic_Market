@@ -16,6 +16,7 @@ from livekit.plugins import langchain as lk_langchain
 from llm_fakes import RecordingResolver
 
 from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.agents.recovery import NodeExecutionTracker
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentEntry,
     PaymentInstrumentsFixture,
@@ -212,6 +213,49 @@ def test_close_session_is_idempotent() -> None:
     ctx.close_session()
     assert ctx.engine.deletes == 1
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+
+
+def test_close_stops_turn_admission_and_waits_for_the_whole_turn() -> None:
+    ctx = _fake_caller_context()
+    tracker = NodeExecutionTracker()
+    ctx.attach_execution_quiescence(tracker)
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        ctx.close_session()
+        assert tracker.turn_admission_open is False
+        with tracker.turn_span() as rejected:
+            assert rejected is False
+        assert ctx.engine.deletes == 0
+
+    assert ctx.engine.deletes == 1
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+
+
+def test_close_waits_for_the_cancellation_takeover_lease_without_double_firing() -> None:
+    ctx = _fake_caller_context()
+
+    with ctx.cancellation_takeover_lease() as acquired:
+        assert acquired is True
+        ctx.close_session()
+        ctx.close_session()
+        assert ctx.engine.deletes == 0
+        assert ctx.cart_store.clears == 0  # type: ignore[attr-defined]
+
+    assert ctx.engine.deletes == 1
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+
+
+def test_cancellation_takeover_lease_is_rejected_after_close_starts() -> None:
+    ctx = _fake_caller_context()
+
+    with ctx.cancellation_takeover_lease() as acquired:
+        assert acquired is True
+        ctx.close_session()
+        with ctx.cancellation_takeover_lease() as rejected:
+            assert rejected is False
+
+    assert ctx.engine.deletes == 1
 
 
 def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:

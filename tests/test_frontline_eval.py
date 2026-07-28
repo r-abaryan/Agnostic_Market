@@ -465,7 +465,7 @@ async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root
     )
     turn = observation.final
     assert turn.state.automation_terminal is True
-    assert turn.state.pending_fields == ("pending_request",)
+    assert turn.state.pending_fields == ()
     assert not turn.state.interrupted and not turn.state.unfinished
     assert [(part.node, part.text) for part in turn.audible] == [
         ("automation_terminal_response", _TERMINAL_LINE)

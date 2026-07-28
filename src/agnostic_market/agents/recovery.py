@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langgraph.errors import NodeError
 from langgraph.graph import StateGraph
@@ -132,6 +133,12 @@ class NodeRecoveryPolicy:
     on_exception: ExceptionAction
     on_abandonment: AbandonmentKind
 
+    @property
+    def on_cancellation(self) -> ExceptionAction:
+        if self.on_abandonment == AbandonmentKind.TERMINAL:
+            return ExceptionAction.TERMINAL
+        return self.on_exception
+
 
 @dataclass(frozen=True, slots=True)
 class CommerceEffectFinishers:
@@ -145,18 +152,22 @@ class CommerceEffectFinishers:
 
 
 class NodeExecutionTracker:
-    """Tracks mutable graph callables for their complete in-worker lifetime.
+    """Tracks admitted turns and mutable callables through their complete lifetimes.
 
     Async task cancellation can unwind LangGraph while a synchronous node is still running
     in a worker thread. Wrapping the runnable invocation itself keeps the tracker active
-    until that worker actually exits. The policy registry is the sole wrapper owner.
+    until that worker actually exits. A separate whole-turn span prevents session teardown
+    from observing the zero-count gaps between nodes. The policy registry remains the sole
+    mutable-node wrapper owner.
     """
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._active_by_node: dict[str, int] = {}
+        self._active_turns = 0
+        self._turn_admission_open = True
         self._tracked_node_names: set[str] = set()
-        self._idle_callbacks: list[Callable[[], None]] = []
+        self._fully_idle_callbacks: list[Callable[[], None]] = []
 
     @property
     def active_count(self) -> int:
@@ -169,9 +180,31 @@ class NodeExecutionTracker:
             return frozenset(self._active_by_node)
 
     @property
+    def turn_admission_open(self) -> bool:
+        with self._condition:
+            return self._turn_admission_open
+
+    @property
     def tracked_node_names(self) -> frozenset[str]:
         with self._condition:
             return frozenset(self._tracked_node_names)
+
+    @staticmethod
+    def _run_callbacks(callbacks: tuple[Callable[[], None], ...]) -> None:
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.critical("deferred quiescence callback failed", exc_info=True)
+
+    def _fully_idle_callbacks_locked(self) -> tuple[Callable[[], None], ...]:
+        full_callbacks: tuple[Callable[[], None], ...] = ()
+        if not self._active_by_node:
+            if not self._active_turns:
+                full_callbacks = tuple(self._fully_idle_callbacks)
+                self._fully_idle_callbacks.clear()
+            self._condition.notify_all()
+        return full_callbacks
 
     def _run(
         self,
@@ -182,7 +215,6 @@ class NodeExecutionTracker:
     ) -> Any:
         with self._condition:
             self._active_by_node[node_name] = self._active_by_node.get(node_name, 0) + 1
-        callbacks: tuple[Callable[[], None], ...] = ()
         try:
             return operation(*args, **kwargs)
         finally:
@@ -192,15 +224,27 @@ class NodeExecutionTracker:
                     self._active_by_node[node_name] = remaining
                 else:
                     del self._active_by_node[node_name]
-                if not self._active_by_node:
-                    callbacks = tuple(self._idle_callbacks)
-                    self._idle_callbacks.clear()
-                    self._condition.notify_all()
-            for callback in callbacks:
-                try:
-                    callback()
-                except Exception:
-                    logger.critical("deferred quiescence callback failed", exc_info=True)
+                full_callbacks = self._fully_idle_callbacks_locked()
+            self._run_callbacks(full_callbacks)
+
+    @contextmanager
+    def turn_span(self) -> Iterator[bool]:
+        with self._condition:
+            admitted = self._turn_admission_open
+            if admitted:
+                self._active_turns += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._condition:
+                    self._active_turns -= 1
+                    full_callbacks = self._fully_idle_callbacks_locked()
+                self._run_callbacks(full_callbacks)
+
+    def stop_turn_admission(self) -> None:
+        with self._condition:
+            self._turn_admission_open = False
 
     def wrap(self, node_name: str, node: object) -> Callable[[object, RunnableConfig], Any]:
         with self._condition:
@@ -214,7 +258,7 @@ class NodeExecutionTracker:
 
         return run
 
-    def wait_until_idle(self, timeout_seconds: float) -> bool:
+    def wait_until_mutable_idle(self, timeout_seconds: float) -> bool:
         if timeout_seconds <= 0:
             raise ValueError("quiescence timeout must be positive")
         with self._condition:
@@ -223,11 +267,11 @@ class NodeExecutionTracker:
                 timeout=timeout_seconds,
             )
 
-    def defer_until_idle(self, callback: Callable[[], None]) -> None:
+    def defer_until_fully_idle(self, callback: Callable[[], None]) -> None:
         run_now = False
         with self._condition:
-            if self._active_by_node:
-                self._idle_callbacks.append(callback)
+            if self._active_turns or self._active_by_node:
+                self._fully_idle_callbacks.append(callback)
             else:
                 run_now = True
         if run_now:
@@ -425,17 +469,18 @@ def build_recovery_terminalizer(_state: ReasoningState) -> dict[str, object]:
 def build_recovery_node(
     policies: Callable[[], Mapping[str, NodeRecoveryPolicy]],
     handled_nodes: Callable[[], frozenset[str]],
+    safe_abort_continue_node: str,
     cart_store: CartStore,
     order_store: OrderStore,
     profile_store: ProfileStore,
     finishers: CommerceEffectFinishers,
     inspect_principal_transition: Callable[[], PrincipalTransitionInspection],
     invalidate_principal_transition: Callable[[str | None], bool],
-) -> Callable[[ReasoningState], dict[str, object]]:
+) -> Callable[[ReasoningState], dict[str, object] | Command]:
     def node_failure_event(marker: PendingRecovery) -> dict[str, object]:
         return {
             "event": "turn_failed",
-            "reason": "node_exception",
+            "reason": marker.trigger,
             "node": marker.origin_node,
             "action": marker.action,
         }
@@ -606,17 +651,24 @@ def build_recovery_node(
         event["outcome"] = "inconsistent"
         return terminal_result(event)
 
-    def recover(state: ReasoningState) -> dict[str, object]:
+    def recover(state: ReasoningState) -> dict[str, object] | Command:
         marker = state.pending_recovery
         if not isinstance(marker, PendingRecovery):
             return terminal_result()
         policy = policies().get(marker.origin_node)
-        if (
-            marker.trigger != "node_exception"
-            or marker.origin_node not in handled_nodes()
-            or policy is None
-            or marker.action != policy.on_exception
-        ):
+        node_exception_valid = bool(
+            marker.trigger == "node_exception"
+            and marker.origin_node in handled_nodes()
+            and policy is not None
+            and marker.action == policy.on_exception
+        )
+        stream_cancellation_valid = bool(
+            marker.trigger == "stream_cancelled"
+            and policy is not None
+            and marker.action == policy.on_cancellation
+            and marker.abandoned_message_id in state.consumed_turn_ids
+        )
+        if not (node_exception_valid or stream_cancellation_valid):
             return terminal_result()
 
         update = clear_automation_state()
@@ -632,6 +684,18 @@ def build_recovery_node(
         if marker.action == ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION:
             return reconcile_principal_transition(state)
         if marker.action == ExceptionAction.SAFE_ABORT:
+            if marker.trigger == "stream_cancelled":
+                turn_ids = state.consumed_turn_ids
+                latest_message = state.messages[-1] if state.messages else None
+                distinct_turn_admitted = bool(
+                    turn_ids
+                    and turn_ids[-1] != marker.abandoned_message_id
+                    and isinstance(latest_message, HumanMessage)
+                    and latest_message.id == turn_ids[-1]
+                )
+                if distinct_turn_admitted:
+                    write_event(node_failure_event(marker))
+                    return Command(update=update, goto=safe_abort_continue_node)
             line = TURN_FALLBACK_LINE
         elif marker.action == ExceptionAction.CART_REVIEW:
             lines = cart_store.view()

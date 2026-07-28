@@ -258,6 +258,13 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         assert {name for name, policy in policies.items() if policy.on_abandonment == kind} == names
     for action, names in expected_exception.items():
         assert {name for name, policy in policies.items() if policy.on_exception == action} == names
+    for name, policy in policies.items():
+        expected_cancellation = (
+            ExceptionAction.TERMINAL
+            if policy.on_abandonment == AbandonmentKind.TERMINAL
+            else policy.on_exception
+        )
+        assert policy.on_cancellation == expected_cancellation, name
 
 
 def _handover_update(

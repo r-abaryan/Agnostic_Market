@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
@@ -38,6 +41,7 @@ from agnostic_market.dtos.state import (
 EffectName = Literal["placement", "refund", "cancel", "return", "profile"]
 _EFFECTS: tuple[EffectName, ...] = ("placement", "refund", "cancel", "return", "profile")
 _OWNER = "CUST-001"
+_WAIT_TIMEOUT_SECONDS = 5.0
 _RECEIPT_NAMES: dict[EffectName, str] = {
     "placement": "placement_receipt",
     "refund": "refund_receipt",
@@ -71,8 +75,21 @@ def _records() -> list[dict[str, object]]:
     ]
 
 
-async def _events(harness: SupportHarness) -> list:
-    return await engine_events(harness.engine, "continue")
+async def _run_seeded_effect(harness: SupportHarness) -> list[str]:
+    before = harness.engine._graph.get_state(harness.engine._config)
+    message_count = len(before.values.get("messages", ()))
+    async for _update in harness.engine._graph.astream(
+        Command(update={"consumed_turn_ids": ()}),
+        harness.engine._config,
+        stream_mode="updates",
+    ):
+        pass
+    after = harness.engine._graph.get_state(harness.engine._config)
+    return [
+        str(message.content)
+        for message in after.values.get("messages", ())[message_count:]
+        if isinstance(message, AIMessage)
+    ]
 
 
 def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:
@@ -200,11 +217,17 @@ def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:
     )
 
 
-def _seed(harness: SupportHarness, case: _EffectCase) -> None:
+def _seed(
+    harness: SupportHarness,
+    case: _EffectCase,
+    *,
+    consumed_turn_ids: tuple[str, ...] = (),
+) -> None:
     harness.engine._graph.update_state(
         harness.engine._config,
         {
             case.pending_field: case.pending,
+            "consumed_turn_ids": consumed_turn_ids,
             "active_flow": "cart"
             if case.action == (ExceptionAction.RECONCILE_PLACEMENT)
             else "support",
@@ -215,6 +238,108 @@ def _seed(harness: SupportHarness, case: _EffectCase) -> None:
 
 def _effect_count(case: _EffectCase) -> int:
     return int(getattr(case.owner, case.count_name))
+
+
+@pytest.mark.parametrize("effect", _EFFECTS)
+@pytest.mark.parametrize("commits_before_cancellation", (False, True))
+async def test_external_cancellation_reconciles_every_effect_without_replaying_mutator(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    effect: EffectName,
+    commits_before_cancellation: bool,
+) -> None:
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(),
+        thread_id=f"{effect}-cancel-{'post' if commits_before_cancellation else 'pre'}",
+    )
+    case = _case(harness, effect)
+    original = getattr(case.owner, case.mutator_name)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def blocked_effect(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if commits_before_cancellation:
+            result = original(*args, **kwargs)
+            entered.set()
+            if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release committed effect")
+            return result
+        entered.set()
+        if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+            raise TimeoutError("test did not release uncommitted effect")
+        raise RuntimeError("simulated cancellation before effect commit")
+
+    monkeypatch.setattr(case.owner, case.mutator_name, blocked_effect)
+    abandoned_message_id = f"{effect}-cancelled-turn"
+    _seed(
+        harness,
+        case,
+        consumed_turn_ids=(abandoned_message_id,),
+    )
+
+    async def run_effect() -> None:
+        async for _update in harness.engine._graph.astream(
+            Command(update={"consumed_turn_ids": ()}),
+            harness.engine._config,
+            stream_mode="updates",
+        ):
+            pass
+
+    abandoned = asyncio.create_task(run_effect())
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+    active_nodes = harness.engine._node_execution_tracker.active_node_names
+    takeover = asyncio.create_task(
+        harness.engine._take_over_cancelled_stream(
+            owned_thread_id=harness.engine.thread_id,
+            abandoned_message_id=abandoned_message_id,
+            active_node_names=active_nodes,
+            resumed_interrupt_node=None,
+        )
+    )
+    release.set()
+    await asyncio.wait_for(takeover, timeout=_WAIT_TIMEOUT_SECONDS)
+
+    seeded = harness.engine._graph.get_state(harness.engine._config)
+    marker = seeded.values.get("pending_recovery")
+    assert isinstance(marker, PendingRecovery)
+    assert marker.trigger == "stream_cancelled"
+    assert marker.origin_node == case.origin_node
+    assert marker.action == case.action
+
+    events = await engine_events(harness.engine, "premature follow-up")
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
+    spoken = [event.text for event in events if isinstance(event, SpokenMessageEvent)]
+    human_texts = [
+        str(message.content)
+        for message in snapshot.values.get("messages", ())
+        if isinstance(message, HumanMessage)
+    ]
+
+    assert calls == 1
+    assert _effect_count(case) == int(commits_before_cancellation)
+    expected = case.committed_text if commits_before_cancellation else case.not_committed_text
+    assert len(spoken) == 1 and expected in spoken[0]
+    assert "premature follow-up" not in human_texts
+    assert snapshot.values.get(case.pending_field) is None
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.next == ()
+
+    failures = [record for record in _records() if record["event"] == "turn_failed"]
+    assert failures == [
+        {
+            "event": "turn_failed",
+            "reason": "stream_cancelled",
+            "node": case.origin_node,
+            "action": case.action,
+        }
+    ]
 
 
 @pytest.mark.parametrize("effect", _EFFECTS)
@@ -244,9 +369,8 @@ async def test_effect_failure_reconciles_from_receipt_without_replaying_mutator(
     monkeypatch.setattr(case.owner, case.mutator_name, fail_once)
     _seed(harness, case)
 
-    events = await _events(harness)
+    spoken = await _run_seeded_effect(harness)
     snapshot = harness.engine._graph.get_state(harness.engine._config)
-    spoken = [event.text for event in events if isinstance(event, SpokenMessageEvent)]
 
     assert calls == 1
     assert _effect_count(case) == int(commits_before_failure)
@@ -300,16 +424,13 @@ async def test_post_commit_projection_failure_reuses_finisher_and_logs_success_o
     monkeypatch.setattr(harness.recent_orders, "record", fail_first_projection)
     _seed(harness, case)
 
-    events = await _events(harness)
+    spoken = await _run_seeded_effect(harness)
 
     assert projection_calls == 2
     assert _effect_count(case) == 1
     if effect == "placement":
         assert harness.caller_context.cart_store.is_empty()
-    assert any(
-        isinstance(event, SpokenMessageEvent) and case.committed_text in event.text
-        for event in events
-    )
+    assert any(case.committed_text in text for text in spoken)
     assert len([record for record in _records() if record["event"] == case.success_event]) == 1
 
 
@@ -410,11 +531,134 @@ def test_missing_pending_effect_contract_terminalizes(
     assert harness.store.placed_count == 0
 
 
+async def test_external_cancellation_mid_batch_reconciles_current_and_aborts_remainder(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(),
+        thread_id="external-cancel-mid-batch",
+    )
+    line = CartLine(
+        sku="SKU-BLU-07",
+        name="waterproof rain jacket",
+        price_usd=129.0,
+        quantity=1,
+    )
+    current = harness.store.place_cart("placed-current", lines=(line,), total_usd=129.0)
+    remainder = harness.store.place_cart("placed-remainder", lines=(line,), total_usd=129.0)
+    prior_record = harness.store.cancel_order("cancel-prior", order_id="ORD-1002")
+    pending = PendingCancelBatch(
+        targets=(
+            CancelTarget(
+                order_id=prior_record.order_id,
+                summary=prior_record.summary,
+                idempotency_key="cancel-prior",
+            ),
+            CancelTarget(
+                order_id=current.order_id,
+                summary="1 waterproof rain jacket",
+                idempotency_key="cancel-current",
+            ),
+            CancelTarget(
+                order_id=remainder.order_id,
+                summary="1 waterproof rain jacket",
+                idempotency_key="cancel-remainder",
+            ),
+        ),
+        outcomes=(
+            BatchCancelOutcome(
+                order_id=prior_record.order_id,
+                summary=prior_record.summary,
+                outcome="cancelled",
+                amount_usd=prior_record.total_usd,
+            ),
+        ),
+        created_at=time.time(),
+    )
+    abandoned_message_id = "cancel-batch-current"
+    harness.engine._graph.update_state(
+        harness.engine._config,
+        {
+            "pending_cancel": pending,
+            "active_flow": "support",
+            "consumed_turn_ids": (abandoned_message_id,),
+        },
+        as_node="support_cancel_confirm",
+    )
+    assert harness.engine._graph.get_state(harness.engine._config).next == ("support_cancel_void",)
+    entered = threading.Event()
+    release = threading.Event()
+    real_cancel = harness.store.cancel_order
+    calls = 0
+
+    def commit_then_pause(idempotency_key: str, *, order_id: str):
+        nonlocal calls
+        calls += 1
+        record = real_cancel(idempotency_key, order_id=order_id)
+        entered.set()
+        if not release.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+            raise RuntimeError("test did not release batch cancellation")
+        return record
+
+    monkeypatch.setattr(harness.store, "cancel_order", commit_then_pause)
+
+    async def run_current_target() -> None:
+        async for _update in harness.engine._graph.astream(
+            Command(update={"consumed_turn_ids": ()}),
+            harness.engine._config,
+            stream_mode="updates",
+        ):
+            pass
+
+    abandoned = asyncio.create_task(run_current_target())
+    assert await asyncio.to_thread(entered.wait, _WAIT_TIMEOUT_SECONDS)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+    active_nodes = harness.engine._node_execution_tracker.active_node_names
+    takeover = asyncio.create_task(
+        harness.engine._take_over_cancelled_stream(
+            owned_thread_id=harness.engine.thread_id,
+            abandoned_message_id=abandoned_message_id,
+            active_node_names=active_nodes,
+            resumed_interrupt_node=None,
+        )
+    )
+    release.set()
+    await asyncio.wait_for(takeover, timeout=_WAIT_TIMEOUT_SECONDS)
+
+    events = await engine_events(harness.engine, "cancel the remainder too")
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
+    spoken = [event.text for event in events if isinstance(event, SpokenMessageEvent)]
+    human_texts = [
+        str(message.content)
+        for message in snapshot.values.get("messages", ())
+        if isinstance(message, HumanMessage)
+    ]
+
+    assert calls == 1
+    assert harness.store.cancel_count == 2
+    assert harness.store.order_status(current.order_id) == "cancelled"
+    assert harness.store.order_status(remainder.order_id) == "processing"
+    assert len(spoken) == 1
+    assert prior_record.order_id in spoken[0] and "is cancelled" in spoken[0]
+    assert current.order_id in spoken[0] and "is cancelled" in spoken[0]
+    assert remainder.order_id in spoken[0] and "did not complete" in spoken[0]
+    assert "cancel the remainder too" not in human_texts
+    assert snapshot.values.get("pending_cancel") is None
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.next == ()
+
+
+@pytest.mark.parametrize("trigger", ("node_exception", "stream_cancelled"))
 @pytest.mark.parametrize("current_committed", (False, True))
 def test_cancel_recovery_preserves_prior_outcomes_and_aborts_the_remainder(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     current_committed: bool,
+    trigger: str,
 ) -> None:
     harness = build_support_engine(
         config_root,
@@ -464,12 +708,15 @@ def test_cancel_recovery_preserves_prior_outcomes_and_aborts_the_remainder(
         "cancel_order",
         lambda *_args, **_kwargs: pytest.fail("recovery replayed cancel_order"),
     )
+    abandoned_message_id = "cancel-batch-abandoned" if trigger == "stream_cancelled" else None
     state = ReasoningState(
+        consumed_turn_ids=(abandoned_message_id,) if abandoned_message_id is not None else (),
         pending_cancel=pending,
         pending_recovery=PendingRecovery(
             origin_node="support_cancel_void",
             action=ExceptionAction.RECONCILE_CANCEL,
-            trigger="node_exception",
+            trigger=trigger,
+            abandoned_message_id=abandoned_message_id,
         ),
     )
 

@@ -1118,8 +1118,9 @@ def build_frontline_graph(
         graph,
         error_handler_factory=build_node_error_handler,
     )
+    entry_node_name = "entry"
     node_registry.register(
-        "entry", entry_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+        entry_node_name, entry_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
     )
     node_registry.register(
         "cross_switch", cross_switch_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
@@ -1402,6 +1403,7 @@ def build_frontline_graph(
         build_recovery_node(
             node_registry.validated_policies,
             node_registry.validated_handled_nodes,
+            entry_node_name,
             cart_store,
             store,
             profile_store,
@@ -1448,9 +1450,9 @@ def build_frontline_graph(
             return "enumeration_gate"
         return "model"
 
-    graph.add_edge(START, "entry")
+    graph.add_edge(START, entry_node_name)
     graph.add_conditional_edges(
-        "entry",
+        entry_node_name,
         route_after_entry,
         {
             "automation_terminal_response": "automation_terminal_response",
@@ -1757,6 +1759,7 @@ def build_frontline_graph(
     )
     compiled.terminal_takeover_node = "automation_terminal_response"  # type: ignore[attr-defined]
     compiled.principal_seed_complete_node = principal_seed_complete_node  # type: ignore[attr-defined]
+    compiled.recovery_entry_node = entry_node_name  # type: ignore[attr-defined]
     compiled.node_execution_tracker = node_execution_tracker  # type: ignore[attr-defined]
     overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
     if overlap:

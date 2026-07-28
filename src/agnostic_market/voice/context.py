@@ -17,6 +17,8 @@ the call and is not this module's job.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from agnostic_market.agents.engine import ReasoningEngine
@@ -50,6 +52,8 @@ class CallerContext:
     _pending_transition: PrincipalTransition | None = field(default=None, init=False)
     _execution_quiescence: ExecutionQuiescence | None = field(default=None, init=False, repr=False)
     _close_started: bool = field(default=False, init=False, repr=False)
+    _close_completion_scheduled: bool = field(default=False, init=False, repr=False)
+    _active_cancellation_takeovers: int = field(default=0, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -65,6 +69,44 @@ class CallerContext:
         if self.engine is not None and self.engine is not engine:
             raise RuntimeError("caller context already has a different reasoning engine")
         self.engine = engine
+
+    def _claim_close_completion_locked(
+        self,
+    ) -> tuple[bool, ExecutionQuiescence | None]:
+        if (
+            not self._close_started
+            or self._active_cancellation_takeovers
+            or self._close_completion_scheduled
+            or self._closed
+        ):
+            return False, None
+        self._close_completion_scheduled = True
+        return True, self._execution_quiescence
+
+    def _schedule_close_completion(
+        self,
+        tracker: ExecutionQuiescence | None,
+    ) -> None:
+        if tracker is None:
+            self._complete_close()
+            return
+        tracker.defer_until_fully_idle(self._complete_close)
+
+    @contextmanager
+    def cancellation_takeover_lease(self) -> Iterator[bool]:
+        with self._close_lock:
+            acquired = not self._close_started
+            if acquired:
+                self._active_cancellation_takeovers += 1
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with self._close_lock:
+                    self._active_cancellation_takeovers -= 1
+                    schedule, tracker = self._claim_close_completion_locked()
+                if schedule:
+                    self._schedule_close_completion(tracker)
 
     def _clear_ephemeral(self) -> None:
         """Clear the non-identity, non-verification caller-ephemeral state — the part a close
@@ -183,11 +225,10 @@ class CallerContext:
         Durable business outcomes (committed cancels/refunds/returns) are NOT cleared (see
         `OrderStore.clear_session_placed`)."""
         with self._close_lock:
-            if self._close_started:
-                return
-            self._close_started = True
-            tracker = self._execution_quiescence
-        if tracker is None:
-            self._complete_close()
-            return
-        tracker.defer_until_idle(self._complete_close)
+            if not self._close_started:
+                self._close_started = True
+                if self._execution_quiescence is not None:
+                    self._execution_quiescence.stop_turn_admission()
+            schedule, tracker = self._claim_close_completion_locked()
+        if schedule:
+            self._schedule_close_completion(tracker)

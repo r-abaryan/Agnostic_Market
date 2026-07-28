@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage
+from langgraph.types import Command
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from pydantic import ValidationError
@@ -21,11 +24,12 @@ from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
     TURN_FALLBACK_LINE,
+    NodeExecutionTracker,
     clear_automation_state,
 )
 from agnostic_market.agents.support import _stepup as support_stepup
 from agnostic_market.commerce.orders import render_cart_line
-from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent
+from agnostic_market.dtos.events import SpokenMessageEvent
 from agnostic_market.dtos.orchestration import ListOrders
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import PendingRefund, ReasoningState
@@ -83,6 +87,41 @@ _ACTION_CASES = (
 )
 
 
+def test_full_idle_waits_for_turn_span_across_mutable_zero_crossings() -> None:
+    tracker = NodeExecutionTracker()
+    callbacks: list[str] = []
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        tracker.defer_until_fully_idle(lambda: callbacks.append("closed"))
+        tracker._run("first", lambda: None)
+        assert callbacks == []
+        tracker._run("second", lambda: None)
+        assert callbacks == []
+
+    assert callbacks == ["closed"]
+
+
+def test_mutable_idle_does_not_wait_on_the_owning_turn_span() -> None:
+    tracker = NodeExecutionTracker()
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        assert tracker.wait_until_mutable_idle(0.01) is True
+
+
+def test_stopped_turn_admission_rejects_without_changing_full_idle() -> None:
+    tracker = NodeExecutionTracker()
+    tracker.stop_turn_admission()
+
+    with tracker.turn_span() as admitted:
+        assert admitted is False
+
+    callbacks: list[str] = []
+    tracker.defer_until_fully_idle(lambda: callbacks.append("closed"))
+    assert callbacks == ["closed"]
+
+
 def _telemetry_records() -> list[dict[str, object]]:
     if not telemetry._TELEMETRY_PATH.exists():
         return []
@@ -94,6 +133,15 @@ def _telemetry_records() -> list[dict[str, object]]:
 
 async def _events(engine, text: str) -> list:
     return await engine_events(engine, text)
+
+
+async def _run_seeded_continuation(harness) -> None:
+    async for _update in harness.engine._graph.astream(
+        Command(update={"consumed_turn_ids": ()}),
+        harness.engine._config,
+        stream_mode="updates",
+    ):
+        pass
 
 
 def _commerce_counts(harness) -> tuple[int, int, int, int, int]:
@@ -185,6 +233,7 @@ def test_every_ordinary_recovery_action_has_one_closed_result(
             origin_node="model",
             action=ExceptionAction.SAFE_ABORT,
             trigger="stream_cancelled",
+            abandoned_message_id="cancelled-turn",
         ),
         {"origin_node": "model", "action": "safe_abort", "trigger": "node_exception"},
     ),
@@ -227,26 +276,56 @@ def test_pending_recovery_is_strict_and_checkpoint_safe(
                 "exception_text": "must not be checkpointed",
             }
         )
+    with pytest.raises(ValidationError, match="requires"):
+        PendingRecovery(
+            origin_node="model",
+            action=ExceptionAction.SAFE_ABORT,
+            trigger="stream_cancelled",
+        )
+    with pytest.raises(ValidationError, match="nonblank"):
+        PendingRecovery(
+            origin_node="model",
+            action=ExceptionAction.SAFE_ABORT,
+            trigger="stream_cancelled",
+            abandoned_message_id=" ",
+        )
+    with pytest.raises(ValidationError, match="forbids"):
+        PendingRecovery(
+            origin_node="model",
+            action=ExceptionAction.SAFE_ABORT,
+            trigger="node_exception",
+            abandoned_message_id="unexpected-turn",
+        )
     harness = build_support_engine(
         config_root,
         policy=make_policy(),
         thread_id="recovery-serde",
     )
-    marker = PendingRecovery(
-        origin_node="model",
-        action=ExceptionAction.SAFE_ABORT,
-        trigger="node_exception",
+    markers = (
+        PendingRecovery(
+            origin_node="model",
+            action=ExceptionAction.SAFE_ABORT,
+            trigger="node_exception",
+        ),
+        PendingRecovery(
+            origin_node="model",
+            action=ExceptionAction.SAFE_ABORT,
+            trigger="stream_cancelled",
+            abandoned_message_id="transport-turn",
+        ),
     )
 
     with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
-        harness.engine._graph.update_state(
-            harness.engine._config,
-            {"pending_recovery": marker},
-            as_node="__start__",
-        )
-        restored = harness.engine._graph.get_state(harness.engine._config)
+        for index, marker in enumerate(markers):
+            config = {"configurable": {"thread_id": f"recovery-serde-{index}"}}
+            harness.engine._graph.update_state(
+                config,
+                {"pending_recovery": marker},
+                as_node="__start__",
+            )
+            restored = harness.engine._graph.get_state(config)
+            assert restored.values["pending_recovery"] == marker
 
-    assert restored.values["pending_recovery"] == marker
     assert not any("unregistered" in record.getMessage().lower() for record in caplog.records)
 
 
@@ -395,12 +474,12 @@ async def test_otp_dispatch_exception_does_not_retry_or_enter_collection(
 
     monkeypatch.setattr(harness.otp, "dispatch", fail_dispatch)
 
-    events = await _events(harness.engine, "continue")
+    await _run_seeded_continuation(harness)
     snapshot = harness.engine._graph.get_state(harness.engine._config)
 
     assert harness.otp.dispatch_count == 0
-    assert not any(isinstance(event, InterruptEvent) for event in events)
-    assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+    assert not snapshot.interrupts
+    assert [str(message.content) for message in snapshot.values["messages"][-1:]] == [
         "That refund request did not complete. Please try it again."
     ]
     assert snapshot.values.get("pending_refund") is None
@@ -427,16 +506,142 @@ async def test_otp_collect_exception_does_not_verify_or_redispatch(
 
     monkeypatch.setattr(support_stepup, "interrupt", fail_collection)
 
-    events = await _events(harness.engine, "continue")
+    await _run_seeded_continuation(harness)
     snapshot = harness.engine._graph.get_state(harness.engine._config)
 
     assert harness.otp.dispatch_count == 1
     assert harness.verification.current_level() == 1
-    assert not any(isinstance(event, InterruptEvent) for event in events)
-    assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+    assert not snapshot.interrupts
+    assert [str(message.content) for message in snapshot.values["messages"][-1:]] == [
         "That refund request did not complete. Please try it again."
     ]
     assert snapshot.values.get("pending_refund") is None
+    assert snapshot.next == ()
+
+
+def _identity_verification_harness(config_root: Path, *, thread_id: str):
+    return build_support_engine(
+        config_root,
+        policy=make_policy(),
+        frontline=FakeChatModel(
+            force_tool="request_handover",
+            canned_args={
+                "request_handover": {
+                    "destination": "support",
+                    "reason_code": "list_orders",
+                }
+            },
+            tool_call_limit=99,
+        ),
+        reasoning=FakeChatModel(
+            force_tool="propose_identity",
+            canned_args={"propose_identity": {"contact_claim": "+1 555 010 0119"}},
+            tool_call_limit=99,
+        ),
+        thread_id=thread_id,
+    )
+
+
+async def test_cancelled_otp_dispatch_is_not_replayed_by_recovery(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _identity_verification_harness(
+        config_root,
+        thread_id="cancelled-otp-dispatch",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    real_dispatch = harness.otp.dispatch
+
+    def dispatch_then_pause(attempt_key: str) -> None:
+        real_dispatch(attempt_key)
+        entered.set()
+        if not release.wait(timeout=5):
+            raise RuntimeError("test did not release OTP dispatch")
+
+    monkeypatch.setattr(harness.otp, "dispatch", dispatch_then_pause)
+    dispatching = asyncio.create_task(_events(harness.engine, "list my account orders"))
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    dispatching.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatching
+    marker = harness.engine._graph.get_state(harness.engine._config).values["pending_recovery"]
+    assert marker.origin_node == "identity_dispatch"
+    assert marker.trigger == "stream_cancelled"
+
+    recovered = await _events(harness.engine, "continue")
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
+
+    assert [event.text for event in recovered if isinstance(event, SpokenMessageEvent)] == [
+        "Account verification did not complete. Please try that request again."
+    ]
+    assert harness.otp.dispatch_count == 1
+    assert harness.verification.current_level() == 1
+    assert harness.verification.grants == []
+    assert harness.identity.current() is None
+    assert _commerce_counts(harness) == (0, 0, 0, 0, 0)
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.values.get("pending_identity") is None
+    assert snapshot.next == ()
+
+
+async def test_cancelled_otp_collect_does_not_reverify_bind_or_resume_the_action(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _identity_verification_harness(
+        config_root,
+        thread_id="cancelled-otp-collect",
+    )
+    await _events(harness.engine, "list my account orders")
+    assert harness.engine.pending_interrupt()
+    assert harness.otp.dispatch_count == 1
+    entered = threading.Event()
+    release = threading.Event()
+    verify_calls = 0
+    real_verify = harness.verification.verify_otp
+
+    def verify_then_pause(code: str) -> bool:
+        nonlocal verify_calls
+        verify_calls += 1
+        verified = real_verify(code)
+        entered.set()
+        if not release.wait(timeout=5):
+            raise RuntimeError("test did not release OTP verification")
+        return verified
+
+    monkeypatch.setattr(harness.verification, "verify_otp", verify_then_pause)
+    collecting = asyncio.create_task(_events(harness.engine, "482913"))
+    assert await asyncio.to_thread(entered.wait, 5)
+
+    collecting.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await collecting
+    abandoned = harness.engine._graph.get_state(harness.engine._config)
+    marker = abandoned.values.get("pending_recovery")
+    assert isinstance(marker, PendingRecovery), abandoned
+    assert marker.origin_node == "identity_collect"
+    assert marker.trigger == "stream_cancelled"
+
+    recovered = await _events(harness.engine, "continue")
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
+
+    assert [event.text for event in recovered if isinstance(event, SpokenMessageEvent)] == [
+        "Account verification did not complete. Please try that request again."
+    ]
+    assert verify_calls == 1
+    assert harness.otp.dispatch_count == 1
+    assert harness.verification.current_level() == 2
+    assert len(harness.verification.grants) == 1
+    assert harness.identity.current() is None
+    assert _commerce_counts(harness) == (0, 0, 0, 0, 0)
+    assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.values.get("pending_identity") is None
+    assert snapshot.values.get("pending_request") is None
     assert snapshot.next == ()
 
 
