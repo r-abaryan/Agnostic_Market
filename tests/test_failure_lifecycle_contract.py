@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable
-from typing import Annotated, Any, TypedDict
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Annotated, Any, TypedDict, cast
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -16,11 +19,28 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, interrupt
-from livekit.agents.llm import ChatContext
+from livekit import rtc
+from livekit.agents import Agent, AgentSession, CloseEvent, CloseReason
+from livekit.agents.llm import ChatContext, ChatMessage
+from livekit.agents.voice.audio_recognition import _EndOfTurnInfo, _EndOfTurnMetrics
+from livekit.agents.voice.room_io import RoomIO
 from livekit.plugins.langchain import LLMAdapter
+from llm_fakes import RecordingResolver
 
 from agnostic_market.agents.engine import build_checkpointer
+from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.state import merge_consumed_turn_ids
+from agnostic_market.llm.gateway import load_provider_credentials
+from agnostic_market.voice.pipeline import VoiceLoop, build_voice_loop
+from scripts.close_evidence_recorder import (
+    CLOSE_CERTIFICATION_CASE_ENV,
+    CLOSE_CERTIFICATION_REPORT_ENV,
+    CloseCaseConfig,
+    CloseCertificationError,
+    CloseCertificationRequest,
+    CloseEvidenceRecorder,
+    load_close_certification_request,
+)
 
 _WAIT_TIMEOUT_SECONDS = 5.0
 
@@ -86,6 +106,47 @@ def _tracked_sync_node(
         return tracker.run(runnable.invoke, state, config)
 
     return run
+
+
+class _BlockingProviderGraph:
+    def __init__(self, timeline: list[str]) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finalized = asyncio.Event()
+        self.cancelled = False
+        self.calls = 0
+        self._timeline = timeline
+
+    async def astream(self, _state: object, *_args: object, **_kwargs: object):
+        self.calls += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+            yield "completed"
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self._timeline.append("provider_finalized")
+            self.finalized.set()
+
+
+async def _start_blocked_livekit_session(
+    timeline: list[str],
+) -> tuple[AgentSession, _BlockingProviderGraph, list[CloseEvent]]:
+    graph = _BlockingProviderGraph(timeline)
+    session = AgentSession(llm=LLMAdapter(graph))  # type: ignore[arg-type]
+    close_events: list[CloseEvent] = []
+
+    @session.on("close")
+    def record_close(event: CloseEvent) -> None:
+        close_events.append(event)
+        timeline.append("close")
+
+    await session.start(Agent(instructions=""), record=False)
+    session.generate_reply(user_input="initial lifecycle turn")
+    await asyncio.wait_for(graph.started.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
+    return session, graph, close_events
 
 
 async def test_shielded_quiescence_reawaits_after_a_second_cancellation() -> None:
@@ -300,6 +361,412 @@ async def test_livekit_langgraph_stream_cancellation_reaches_the_graph_generator
 
     assert cancelled.is_set()
     assert finalized.is_set()
+
+
+async def test_participant_disconnect_interrupts_generation_before_close_event() -> None:
+    timeline: list[str] = []
+    session, graph, close_events = await _start_blocked_livekit_session(timeline)
+    participant = cast(
+        rtc.RemoteParticipant,
+        SimpleNamespace(
+            identity="contract-caller",
+            disconnect_reason=rtc.DisconnectReason.CLIENT_INITIATED,
+        ),
+    )
+    room = cast(
+        rtc.Room,
+        SimpleNamespace(name="contract-room"),
+    )
+    room_io = RoomIO(
+        agent_session=session,
+        room=room,
+        participant=participant.identity,
+    )
+    room_io._participant_available_fut.set_result(participant)
+    try:
+        room_io._on_participant_disconnected(participant)
+        assert session._closing_task is not None
+        await asyncio.wait_for(session._closing_task, timeout=_WAIT_TIMEOUT_SECONDS)
+
+        assert graph.cancelled is True
+        assert graph.finalized.is_set()
+        assert len(close_events) == 1
+        assert isinstance(close_events[0], CloseEvent)
+        assert close_events[0].reason == CloseReason.PARTICIPANT_DISCONNECTED
+        assert timeline == ["provider_finalized", "close"]
+    finally:
+        graph.release.set()
+        await session.aclose()
+
+
+async def test_graceful_close_retains_late_transcript_without_starting_another_turn() -> None:
+    timeline: list[str] = []
+    session, graph, close_events = await _start_blocked_livekit_session(timeline)
+    late_transcript = "late committed transcript"
+
+    @session.on("conversation_item_added")
+    def record_late_transcript(event: object) -> None:
+        item = getattr(event, "item", None)
+        if isinstance(item, ChatMessage) and item.text_content == late_transcript:
+            timeline.append("late_transcript")
+
+    activity = session._activity
+    assert activity is not None
+    assert not activity._q_updated.is_set()
+
+    try:
+        session.shutdown(drain=True)
+        assert session._closing_task is not None
+        assert not session._closing_task.done()
+        assert graph.cancelled is False
+        await asyncio.wait_for(
+            activity._q_updated.wait(),
+            timeout=_WAIT_TIMEOUT_SECONDS,
+        )
+        assert session._closing is True
+        assert activity.scheduling_paused is True
+
+        accepted = activity.on_end_of_turn(
+            _EndOfTurnInfo(
+                skip_reply=False,
+                new_transcript=late_transcript,
+                transcript_confidence=0.9,
+                metrics=_EndOfTurnMetrics(
+                    started_speaking_at=None,
+                    stopped_speaking_at=None,
+                    transcription_delay=None,
+                    end_of_turn_delay=None,
+                ),
+            )
+        )
+
+        assert accepted is True
+        assert graph.calls == 1
+        assert [
+            item.text_content
+            for item in session.history.items
+            if isinstance(item, ChatMessage)
+            and item.role == "user"
+            and item.text_content == late_transcript
+        ] == [late_transcript]
+
+        graph.release.set()
+        await asyncio.wait_for(session._closing_task, timeout=_WAIT_TIMEOUT_SECONDS)
+
+        assert graph.cancelled is False
+        assert graph.finalized.is_set()
+        assert len(close_events) == 1
+        assert isinstance(close_events[0], CloseEvent)
+        assert close_events[0].reason == CloseReason.USER_INITIATED
+        assert timeline == ["late_transcript", "provider_finalized", "close"]
+    finally:
+        graph.release.set()
+        await session.aclose()
+
+
+class _RecorderRoom:
+    def __init__(self) -> None:
+        self.handlers: dict[str, list[Callable[[object], None]]] = {}
+
+    def on(self, event: str, callback: Callable[[object], None]) -> Callable[[object], None]:
+        self.handlers.setdefault(event, []).append(callback)
+        return callback
+
+    def emit(self, event: str, value: object) -> None:
+        for callback in tuple(self.handlers.get(event, ())):
+            callback(value)
+
+
+async def _recorder_loop(config_root: Path) -> VoiceLoop:
+    resolved = ConfigRegistry(config_root).load().get("acme_store")
+    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
+    return build_voice_loop(
+        resolved,
+        credentials,
+        RecordingResolver(),
+        config_root=config_root,
+    )
+
+
+def _recorder_request(
+    report_path: Path,
+    *,
+    shutdown_mode: str = "participant_disconnect",
+) -> CloseCertificationRequest:
+    case = (
+        CloseCaseConfig(shutdown_mode="participant_disconnect")
+        if shutdown_mode == "participant_disconnect"
+        else CloseCaseConfig(
+            shutdown_mode="graceful_drain",
+            graceful_trigger="first_thinking_after_user",
+        )
+    )
+    return CloseCertificationRequest(
+        case_name=f"contract-{shutdown_mode}",
+        case=case,
+        report_path=report_path,
+        finalization_timeout_seconds=_WAIT_TIMEOUT_SECONDS,
+    )
+
+
+async def _attached_recorder(
+    config_root: Path,
+    report_path: Path,
+    *,
+    shutdown_mode: str = "participant_disconnect",
+) -> tuple[VoiceLoop, CloseEvidenceRecorder, _RecorderRoom]:
+    loop = await _recorder_loop(config_root)
+    room = _RecorderRoom()
+    recorder = CloseEvidenceRecorder(
+        _recorder_request(report_path, shutdown_mode=shutdown_mode),
+        merchant_id="acme_store",
+    )
+    recorder.attach(
+        session=loop.session,
+        room=cast(rtc.Room, room),
+        engine=loop.engine,
+        linked_participant_identity="contract-caller",
+    )
+    return loop, recorder, room
+
+
+def _disconnect(room: _RecorderRoom) -> None:
+    room.emit(
+        "participant_disconnected",
+        cast(
+            rtc.RemoteParticipant,
+            SimpleNamespace(
+                identity="contract-caller",
+                disconnect_reason=rtc.DisconnectReason.CLIENT_INITIATED,
+            ),
+        ),
+    )
+
+
+def test_close_certification_opt_in_is_complete_and_case_bound(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    assert load_close_certification_request(config_root, {}) is None
+    with pytest.raises(CloseCertificationError, match="must be set together"):
+        load_close_certification_request(
+            config_root,
+            {CLOSE_CERTIFICATION_CASE_ENV: "participant_slow_model"},
+        )
+    with pytest.raises(CloseCertificationError, match="unknown close-certification case"):
+        load_close_certification_request(
+            config_root,
+            {
+                CLOSE_CERTIFICATION_CASE_ENV: "not-a-case",
+                CLOSE_CERTIFICATION_REPORT_ENV: str(tmp_path / "unknown.json"),
+            },
+        )
+
+    request = load_close_certification_request(
+        config_root,
+        {
+            CLOSE_CERTIFICATION_CASE_ENV: "participant_stt_fragment",
+            CLOSE_CERTIFICATION_REPORT_ENV: str(tmp_path / "report.json"),
+        },
+    )
+    assert request is not None
+    assert request.case_name == "participant_stt_fragment"
+    assert request.case.shutdown_mode == "participant_disconnect"
+
+
+async def test_close_recorder_permits_only_one_active_certification_job(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    first_loop, first_recorder, _room = await _attached_recorder(
+        config_root,
+        tmp_path / "first.json",
+    )
+    second_loop = await _recorder_loop(config_root)
+    second_recorder = CloseEvidenceRecorder(
+        _recorder_request(tmp_path / "second.json"),
+        merchant_id="acme_store",
+    )
+
+    with pytest.raises(CloseCertificationError, match=r"another .* recorder is active"):
+        second_recorder.attach(
+            session=second_loop.session,
+            room=cast(rtc.Room, _RecorderRoom()),
+            engine=second_loop.engine,
+            linked_participant_identity="other-contract-caller",
+        )
+
+    assert "_complete_close" not in second_loop.engine._lifecycle.__dict__
+    first_recorder._release()
+    assert "_complete_close" not in first_loop.engine._lifecycle.__dict__
+
+
+@pytest.mark.parametrize("lifecycle_first", [False, True])
+async def test_close_recorder_is_independent_of_lifecycle_listener_order_and_redacts_content(
+    config_root: Path,
+    tmp_path: Path,
+    lifecycle_first: bool,
+) -> None:
+    report_path = tmp_path / f"order-{lifecycle_first}.json"
+    loop, recorder, room = await _attached_recorder(config_root, report_path)
+    context = loop.engine._lifecycle
+    assert context is not None
+    secret_text = "casey@example.com OTP 123456"
+    loop.session._conversation_item_added(
+        ChatMessage(id="user-contract-id", role="user", content=[secret_text])
+    )
+    loop.session._conversation_item_added(
+        ChatMessage(id="assistant-contract-id", role="assistant", content=["private reply"])
+    )
+    _disconnect(room)
+    event = CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED)
+
+    if lifecycle_first:
+        context.close_session()
+        recorder._on_close(event)
+    else:
+        recorder._on_close(event)
+        context.close_session()
+
+    assert await recorder.wait_for_completion() == report_path
+    raw_report = report_path.read_text(encoding="utf-8")
+    assert secret_text not in raw_report
+    assert "private reply" not in raw_report
+    report = json.loads(raw_report)
+    assert report["status"] == "complete"
+    assert report["telemetry"]["caller_context_closed"] == 1
+    assert report["all_observed_reasoning_threads_empty"] is True
+    assert [message["message_id"] for message in report["messages"]] == [
+        "user-contract-id",
+        "assistant-contract-id",
+    ]
+    assert report["messages"][0]["text_present"] is True
+
+
+@pytest.mark.parametrize("active_kind", ["turn", "mutable_worker"])
+async def test_close_recorder_waits_for_full_idle_before_reading_or_writing(
+    config_root: Path,
+    tmp_path: Path,
+    active_kind: str,
+) -> None:
+    report_path = tmp_path / f"idle-{active_kind}.json"
+    loop, recorder, room = await _attached_recorder(config_root, report_path)
+    tracker = loop.engine._node_execution_tracker
+    _disconnect(room)
+    event = CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED)
+
+    if active_kind == "turn":
+        with tracker.turn_span() as admitted:
+            assert admitted is True
+            recorder._on_close(event)
+            await asyncio.sleep(0)
+            assert not report_path.exists()
+    else:
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def block_worker() -> None:
+            worker_started.set()
+            if not release_worker.wait(timeout=_WAIT_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release recorder worker")
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(tracker._run, "recorder_contract", block_worker)
+        )
+        assert await asyncio.to_thread(worker_started.wait, _WAIT_TIMEOUT_SECONDS)
+        recorder._on_close(event)
+        await asyncio.sleep(0)
+        assert not report_path.exists()
+        release_worker.set()
+        await worker
+
+    assert await recorder.wait_for_completion() == report_path
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "complete"
+    assert report["telemetry"]["caller_context_closed"] == 1
+
+
+async def test_close_recorder_waits_for_cancellation_takeover_lease(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "takeover-lease.json"
+    loop, recorder, room = await _attached_recorder(config_root, report_path)
+    context = loop.engine._lifecycle
+    assert context is not None
+    _disconnect(room)
+
+    with context.cancellation_takeover_lease() as acquired:
+        assert acquired is True
+        recorder._on_close(CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED))
+        await asyncio.sleep(0)
+        assert not report_path.exists()
+
+    assert await recorder.wait_for_completion() == report_path
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "complete"
+    assert report["telemetry"]["caller_context_closed"] == 1
+
+
+async def test_close_recorder_duplicate_close_is_one_failed_report_and_one_teardown(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "duplicate.json"
+    _loop, recorder, room = await _attached_recorder(config_root, report_path)
+    _disconnect(room)
+    event = CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED)
+    recorder._on_close(event)
+    recorder._on_close(event)
+
+    with pytest.raises(CloseCertificationError, match="failed its structural gate"):
+        await recorder.wait_for_completion()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["failure_reasons"] == ["duplicate_close_event"]
+    assert report["close"]["delivery_count"] == 2
+    assert report["telemetry"]["caller_context_closed"] == 1
+
+
+async def test_close_recorder_graceful_trigger_is_one_shot(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, recorder, _room = await _attached_recorder(
+        config_root,
+        tmp_path / "graceful.json",
+        shutdown_mode="graceful_drain",
+    )
+    shutdowns: list[bool] = []
+    monkeypatch.setattr(loop.session, "shutdown", lambda *, drain: shutdowns.append(drain))
+    recorder._on_conversation_item(
+        SimpleNamespace(item=ChatMessage(id="graceful-user", role="user", content=["start"]))
+    )
+    recorder._on_agent_state_changed(SimpleNamespace(new_state="thinking"))
+    recorder._on_agent_state_changed(SimpleNamespace(new_state="thinking"))
+    assert shutdowns == [True]
+    recorder._release()
+
+
+async def test_close_recorder_write_failure_never_leaves_a_half_green_report(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import close_evidence_recorder
+
+    report_path = tmp_path / "write-failure.json"
+    _loop, recorder, room = await _attached_recorder(config_root, report_path)
+    _disconnect(room)
+
+    def fail_write(_path: Path, _report: object) -> None:
+        raise OSError("injected report write failure")
+
+    monkeypatch.setattr(close_evidence_recorder, "_write_report_atomic", fail_write)
+    recorder._on_close(CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED))
+    with pytest.raises(CloseCertificationError, match="could not be finalized"):
+        await recorder.wait_for_completion()
+    assert not report_path.exists()
 
 
 async def test_cancelled_sync_node_continues_after_the_astream_task_unwinds() -> None:

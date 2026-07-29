@@ -32,6 +32,17 @@ from agnostic_market.llm.providers import (
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.voice.pipeline import build_voice_loop
 
+if __package__:
+    from .close_evidence_recorder import (
+        CloseEvidenceRecorder,
+        load_close_certification_request,
+    )
+else:
+    from close_evidence_recorder import (
+        CloseEvidenceRecorder,
+        load_close_certification_request,
+    )
+
 # .env must be in the process env BEFORE the LiveKit worker starts (it reads LIVEKIT_URL
 # at startup) and BEFORE the module-level env read below — so load at import, not in main
 # (job subprocesses import this module without executing the __main__ block).
@@ -44,6 +55,7 @@ logger = logging.getLogger("voice_agent")
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
+    close_certification = load_close_certification_request(_CONFIG_ROOT)
     secrets = EnvSecretResolver()
     credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
     registry = ConfigRegistry(_CONFIG_ROOT).load()
@@ -64,6 +76,22 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )
 
     await ctx.connect()
+    if close_certification is not None:
+        # Certification is intentionally single-participant and opt-in. Resolve the linked
+        # participant before AgentSession.start so disconnect evidence never depends on
+        # LiveKit's set-backed close-listener ordering.
+        participant = await ctx.wait_for_participant()
+        close_recorder = CloseEvidenceRecorder(
+            close_certification,
+            merchant_id=_MERCHANT_ID,
+        )
+        close_recorder.attach(
+            session=loop.session,
+            room=ctx.room,
+            engine=loop.engine,
+            linked_participant_identity=participant.identity,
+        )
+        ctx.add_shutdown_callback(close_recorder.wait_for_completion)
     # The disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1)) plays via the agent's own
     # on_enter hook - structurally first, before any user turn can be answered.
     await loop.session.start(loop.agent, room=ctx.room)

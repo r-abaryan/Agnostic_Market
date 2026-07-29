@@ -1,0 +1,19 @@
+contract_version: "1"
+finalization_timeout_seconds: 15.0
+
+# Metadata only. Caller utterances, order/account fixtures, and expected commerce outcomes remain
+# in the live run sheet/report review; this file selects the shutdown boundary being certified.
+cases:
+  participant_slow_model:
+    shutdown_mode: participant_disconnect
+  participant_queued_turn:
+    shutdown_mode: participant_disconnect
+  participant_placement:
+    shutdown_mode: participant_disconnect
+  participant_rotation:
+    shutdown_mode: participant_disconnect
+  participant_stt_fragment:
+    shutdown_mode: participant_disconnect
+  graceful_drain:
+    shutdown_mode: graceful_drain
+    graceful_trigger: first_thinking_after_user
