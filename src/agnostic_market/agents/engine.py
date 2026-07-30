@@ -68,6 +68,7 @@ from agnostic_market.dtos.orchestration import (
     CancelOrders,
     CapabilityId,
     ChangeProfile,
+    DiscloseAiIdentity,
     ExplicitOrderSet,
     ExplicitOrderTarget,
     FocusedOrderSet,
@@ -85,6 +86,7 @@ from agnostic_market.dtos.orchestration import (
     VerifyIdentity,
     VerifyOrderStatus,
     ViewCart,
+    ViewIdentityStatus,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
@@ -171,6 +173,8 @@ _CHECKPOINTED_DTOS = (
     ChangeProfile,
     VerifyIdentity,
     SwitchAccount,
+    ViewIdentityStatus,
+    DiscloseAiIdentity,
     RequestPerson,
 )
 

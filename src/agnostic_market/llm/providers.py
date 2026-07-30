@@ -48,7 +48,7 @@ from agnostic_market.dtos.orchestration import (
 )
 
 # Bump when checks are added/changed — outstanding reports then fail closed (re-certify).
-SUITE_VERSION = "2"
+SUITE_VERSION = "3"
 
 # Prompts name the required tool explicitly: the check verifies protocol conformance
 # (parse/emit/select), not semantic routing quality (that is Phase 6's behavioral eval).

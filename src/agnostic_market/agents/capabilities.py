@@ -1,7 +1,8 @@
 """Single typed capability registry and executor contract.
 
 Milestone 1 defines and tests the seam without changing live routing or registering duplicate
-adapters for the existing flows. Per-session adapters land with direct-routing integration.
+adapters for the existing flows. Per-session adapters and dispatch land in Milestone 3B without
+activating semantic routing.
 """
 
 from __future__ import annotations
@@ -12,7 +13,12 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from agnostic_market.dtos.orchestration import CapabilityId, CapabilityOutcome, IntentRequest
+from agnostic_market.dtos.orchestration import (
+    CapabilityId,
+    CapabilityOutcome,
+    IntentRequest,
+    IntentRequestModel,
+)
 
 CapabilityAdapter = Callable[[BaseModel], Awaitable[BaseModel]]
 
@@ -24,7 +30,7 @@ class CapabilityRegistryError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class CapabilitySpec:
     capability_id: CapabilityId
-    request_type: type[BaseModel]
+    request_type: type[IntentRequestModel]
     outcome_type: type[CapabilityOutcome]
     adapter: CapabilityAdapter
     effect: Literal["read", "write"]
@@ -32,8 +38,10 @@ class CapabilitySpec:
     planner_ready: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.request_type, type) or not issubclass(self.request_type, BaseModel):
-            raise CapabilityRegistryError("request_type must be a BaseModel subclass")
+        if not isinstance(self.request_type, type) or not issubclass(
+            self.request_type, IntentRequestModel
+        ):
+            raise CapabilityRegistryError("request_type must be an IntentRequestModel subclass")
         if not isinstance(self.outcome_type, type) or not issubclass(
             self.outcome_type, CapabilityOutcome
         ):
@@ -97,10 +105,12 @@ class CapabilityRegistry:
             ) from exc
 
     async def execute(self, request: IntentRequest) -> CapabilityOutcome:
-        if not isinstance(request, BaseModel) or not isinstance(
+        if not isinstance(request, IntentRequestModel) or not isinstance(
             getattr(request, "kind", None), CapabilityId
         ):
             raise CapabilityRegistryError("executor requires a typed IntentRequest")
+        if not request.is_slot_complete():
+            raise CapabilityRegistryError("incomplete request cannot execute")
         spec = self.get(request.kind)
         if not isinstance(request, spec.request_type):
             raise CapabilityRegistryError(

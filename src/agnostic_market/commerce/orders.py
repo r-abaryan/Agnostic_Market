@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.dtos.orchestration import OrderContextOperation
 from agnostic_market.dtos.state import BatchCancelOutcome, CartLine
 
 _STRICT = ConfigDict(extra="forbid")
@@ -475,9 +476,6 @@ CANCELLED_STATUS = "cancelled"
 # Goods are (or were) on their way: a refund on these is RETURN-FIRST above the merchant's
 # returnless threshold — without it the caller keeps both the goods and the money.
 FULFILLED_STATUSES = frozenset({"shipped", "delivered"})
-
-
-OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
 
 
 @dataclass(frozen=True)

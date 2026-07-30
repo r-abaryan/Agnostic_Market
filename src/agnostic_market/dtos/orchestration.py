@@ -25,6 +25,25 @@ from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 CancelScope = Literal["all_cancellable", "both_cancellable"]
+OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
+
+
+class IntentRequestModel(BaseModel):
+    """Typed intent request; slot completeness is not authorization or effect authority."""
+
+    model_config = _FROZEN
+
+    def is_slot_complete(self) -> bool:
+        """Fail closed unless the concrete request declares its completeness rule."""
+
+        return False
+
+
+class _CompleteIntentRequest(IntentRequestModel):
+    """Request whose required Pydantic fields fully describe its non-authority slots."""
+
+    def is_slot_complete(self) -> bool:
+        return True
 
 
 class CapabilityId(StrEnum):
@@ -41,6 +60,8 @@ class CapabilityId(StrEnum):
     CHANGE_PROFILE = "change_profile"
     VERIFY_IDENTITY = "verify_identity"
     SWITCH_ACCOUNT = "switch_account"
+    VIEW_IDENTITY_STATUS = "view_identity_status"
+    DISCLOSE_AI_IDENTITY = "disclose_ai_identity"
     REQUEST_PERSON = "request_person"
 
 
@@ -102,109 +123,144 @@ CancelSelector = Annotated[
 ]
 
 
-class AnswerQuestion(BaseModel):
+class AnswerQuestion(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.ANSWER_QUESTION] = CapabilityId.ANSWER_QUESTION
     topic: Literal["policy", "general"]
 
 
-class SearchCatalog(BaseModel):
+class SearchCatalog(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.SEARCH_CATALOG] = CapabilityId.SEARCH_CATALOG
-    query: NonEmptyText
+    query: NonEmptyText | None = None
+
+    def is_slot_complete(self) -> bool:
+        return self.query is not None
 
 
-class VerifyOrderStatus(BaseModel):
+class VerifyOrderStatus(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.VERIFY_ORDER_STATUS] = CapabilityId.VERIFY_ORDER_STATUS
-    target: OrderStatusSelector
+    target: OrderStatusSelector | None = None
+
+    def is_slot_complete(self) -> bool:
+        return self.target is not None
 
 
-class ListOrders(BaseModel):
+class ListOrders(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.LIST_ORDERS] = CapabilityId.LIST_ORDERS
     scope: Literal["session", "account"]
 
 
-class ViewCart(BaseModel):
+class ViewCart(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.VIEW_CART] = CapabilityId.VIEW_CART
 
 
-class ModifyCart(BaseModel):
+class ModifyCart(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.MODIFY_CART] = CapabilityId.MODIFY_CART
     operation: Literal["add", "remove", "set_quantity"]
-    item_query: NonEmptyText
+    item_query: NonEmptyText | None = None
     quantity: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def quantity_matches_operation(self) -> ModifyCart:
         if self.operation == "remove" and self.quantity is not None:
             raise ValueError("remove must not carry a quantity")
-        if self.operation == "add" and (self.quantity is None or self.quantity < 1):
-            raise ValueError("add requires a positive quantity")
-        if self.operation == "set_quantity" and self.quantity is None:
-            raise ValueError("set_quantity requires a quantity")
+        if self.operation == "add" and self.quantity is not None and self.quantity < 1:
+            raise ValueError("add quantity must be positive")
         return self
 
+    def is_slot_complete(self) -> bool:
+        if self.item_query is None:
+            return False
+        return self.operation == "remove" or self.quantity is not None
 
-class PlaceOrder(BaseModel):
+
+class PlaceOrder(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.PLACE_ORDER] = CapabilityId.PLACE_ORDER
 
 
-class CancelOrders(BaseModel):
+class CancelOrders(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.CANCEL_ORDERS] = CapabilityId.CANCEL_ORDERS
-    target: CancelSelector
+    target: CancelSelector | None = None
+
+    def is_slot_complete(self) -> bool:
+        return self.target is not None
 
 
-class RefundOrder(BaseModel):
+class RefundOrder(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.REFUND_ORDER] = CapabilityId.REFUND_ORDER
-    target: OrderTarget
+    target: OrderTarget | None = None
     amount_usd: float | None = Field(default=None, gt=0)
     destination: RefundDestination | None = None
 
+    def is_slot_complete(self) -> bool:
+        return (
+            self.target is not None and self.amount_usd is not None and self.destination is not None
+        )
 
-class ReturnOrder(BaseModel):
+
+class ReturnOrder(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.RETURN_ORDER] = CapabilityId.RETURN_ORDER
-    target: OrderTarget
+    target: OrderTarget | None = None
+
+    def is_slot_complete(self) -> bool:
+        return self.target is not None
 
 
-class ChangeProfile(BaseModel):
+class ChangeProfile(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.CHANGE_PROFILE] = CapabilityId.CHANGE_PROFILE
     field: ProfileField
     new_value: NonEmptyText | None = None
 
+    def is_slot_complete(self) -> bool:
+        return self.new_value is not None
 
-class VerifyIdentity(BaseModel):
+
+class VerifyIdentity(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.VERIFY_IDENTITY] = CapabilityId.VERIFY_IDENTITY
 
 
-class SwitchAccount(BaseModel):
+class SwitchAccount(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.SWITCH_ACCOUNT] = CapabilityId.SWITCH_ACCOUNT
 
 
-class RequestPerson(BaseModel):
+class ViewIdentityStatus(_CompleteIntentRequest):
+    model_config = _FROZEN
+
+    kind: Literal[CapabilityId.VIEW_IDENTITY_STATUS] = CapabilityId.VIEW_IDENTITY_STATUS
+
+
+class DiscloseAiIdentity(_CompleteIntentRequest):
+    model_config = _FROZEN
+
+    kind: Literal[CapabilityId.DISCLOSE_AI_IDENTITY] = CapabilityId.DISCLOSE_AI_IDENTITY
+
+
+class RequestPerson(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.REQUEST_PERSON] = CapabilityId.REQUEST_PERSON
@@ -224,6 +280,8 @@ IntentRequest = Annotated[
     | ChangeProfile
     | VerifyIdentity
     | SwitchAccount
+    | ViewIdentityStatus
+    | DiscloseAiIdentity
     | RequestPerson,
     Field(discriminator="kind"),
 ]
@@ -234,16 +292,15 @@ ClarificationReason = Literal[
     "missing_value",
     "unsupported_workflow",
     "unsupported_capability",
-    "invalid_output",
 ]
 
 
 class RouteDecision(BaseModel):
-    """Validated Milestone-1 route: exactly one direct request or one clarification."""
+    """Model-authored semantic route: clarify, one direct request, or current-owner continuation."""
 
     model_config = _FROZEN
 
-    decision: Literal["clarify", "direct"]
+    decision: Literal["clarify", "direct", "continue"]
     request: IntentRequest | None = None
     clarification_reason: ClarificationReason | None = None
 
@@ -252,8 +309,13 @@ class RouteDecision(BaseModel):
         if self.decision == "clarify":
             if self.request is not None or self.clarification_reason is None:
                 raise ValueError("clarify requires only a clarification_reason")
-        elif self.request is None or self.clarification_reason is not None:
-            raise ValueError("direct requires only one request")
+        elif self.decision == "direct":
+            if self.request is None or self.clarification_reason is not None:
+                raise ValueError("direct requires only one request")
+            if isinstance(self.request, ChangeProfile) and self.request.new_value is not None:
+                raise ValueError("profile values are gathered by the owning capability")
+        elif self.request is not None or self.clarification_reason is not None:
+            raise ValueError("continue carries no payload")
         return self
 
     @classmethod
@@ -264,18 +326,33 @@ class RouteDecision(BaseModel):
     def direct(cls, request: IntentRequest) -> RouteDecision:
         return cls(decision="direct", request=request)
 
+    @classmethod
+    def continue_current(cls) -> RouteDecision:
+        return cls(decision="continue")
 
-def route_decision_or_clarify(value: object) -> RouteDecision:
-    """Validate model output; shape failures become a non-executable closed decision.
 
-    Transport/provider exceptions do not enter this function and must remain visible to the
-    caller. This handles only returned values whose shape is missing, invalid, or incompatible.
-    """
+RoutingFailureReason = Literal["invalid_output", "routing_unavailable"]
+
+
+class RoutingFailure(BaseModel):
+    """Code-authored, non-executable failure to obtain a trustworthy semantic route."""
+
+    model_config = _FROZEN
+
+    outcome: Literal["routing_failure"] = "routing_failure"
+    reason: RoutingFailureReason
+
+
+RouteResolution = RouteDecision | RoutingFailure
+
+
+def validate_route_output(value: object) -> RouteResolution:
+    """Validate returned model output; provider exceptions are classified by the caller."""
 
     try:
         return RouteDecision.model_validate(value)
     except ValidationError:
-        return RouteDecision.clarify("invalid_output")
+        return RoutingFailure(reason="invalid_output")
 
 
 class RoutingContext(BaseModel):
@@ -285,36 +362,23 @@ class RoutingContext(BaseModel):
 
     utterance: NonEmptyText
     bound_customer: StrictBool
-    active_flow: Literal["cart", "support", "identity"] | None = None
-    pending_action: (
-        Literal[
-            "place_order",
-            "refund_order",
-            "cancel_orders",
-            "return_order",
-            "change_profile",
-            "verify_identity",
-        ]
-        | None
-    ) = None
-    recent_effect: (
-        Literal[
-            "cart_changed",
-            "order_placed",
-            "orders_cancelled",
-            "refund_created",
-            "return_created",
-            "profile_changed",
-            "identity_bound",
-        ]
-        | None
-    ) = None
+    active_capability: CapabilityId | None = None
+    recent_order_operation: OrderContextOperation | None = None
+    recent_order_count: int = Field(default=0, ge=0)
+    cart_state: Literal["empty", "nonempty"]
     available_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def capabilities_are_unique(self) -> RoutingContext:
+    def context_is_coherent(self) -> RoutingContext:
         if len(set(self.available_capabilities)) != len(self.available_capabilities):
             raise ValueError("available_capabilities must not contain duplicates")
+        if (
+            self.active_capability is not None
+            and self.active_capability not in self.available_capabilities
+        ):
+            raise ValueError("active_capability must be available")
+        if (self.recent_order_operation is None) != (self.recent_order_count == 0):
+            raise ValueError("recent order operation and count must be present together")
         return self
 
 

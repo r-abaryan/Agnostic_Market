@@ -57,6 +57,7 @@ from agnostic_market.dtos.events import (
     TokenEvent,
     TurnFacts,
 )
+from agnostic_market.dtos.orchestration import DiscloseAiIdentity, ViewIdentityStatus
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CartClarification,
@@ -1355,6 +1356,31 @@ async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
         await _pause_at_confirmation(engine)  # writes + reads PendingAction across the interrupt
         await _events(engine, "yes")  # resume re-reads the checkpoint
     assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "pending_request",
+    (ViewIdentityStatus(), DiscloseAiIdentity()),
+)
+def test_new_intent_requests_roundtrip_through_production_checkpoint_serde(
+    config_root: Path,
+    caplog: pytest.LogCaptureFixture,
+    pending_request: ViewIdentityStatus | DiscloseAiIdentity,
+) -> None:
+    engine, _ = _engine(
+        config_root,
+        thread_id=f"serde-{pending_request.kind.value}",
+    )
+    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
+        engine._graph.update_state(
+            engine._config,
+            {"pending_request": pending_request},
+            as_node="__start__",
+        )
+        restored = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert restored.pending_request == pending_request
+    assert not any("unregistered" in record.getMessage().lower() for record in caplog.records)
 
 
 @pytest.mark.parametrize(
