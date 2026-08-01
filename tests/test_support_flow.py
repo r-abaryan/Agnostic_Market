@@ -36,7 +36,8 @@ from agnostic_market.dtos.events import (
     TokenEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.state import CartLine, PolicyContext
+from agnostic_market.dtos.orchestration import CancellableOrderScope, CancelOrders
+from agnostic_market.dtos.state import CartLine, PolicyContext, ReasoningState
 
 # returnless high on purpose (the default): the legacy amount-gate/step-up scenarios run
 # refunds against the SHIPPED ORD-1001 in isolation; the return-first tests tighten via model_copy.
@@ -756,15 +757,30 @@ def _pending_cancel(harness, thread_id):
     return snap.values.get("pending_cancel")
 
 
-def _pending_request(harness, thread_id):
+def _validated_state(harness, thread_id) -> ReasoningState:
     snap = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
-    return snap.values.get("pending_request")
+    return ReasoningState.model_validate(snap.values)
+
+
+def _active_request(harness, thread_id):
+    state = _validated_state(harness, thread_id)
+    invocation = state.active_invocation
+    if invocation is None:
+        return None
+    assert invocation.opened_turn_id in state.consumed_turn_ids
+    return invocation.request
 
 
 async def _enter_unbound_cancel_scope(harness) -> None:
     events = await _events(harness.engine, "cancel all my orders")
     warnings = [event for event in events if isinstance(event, InterruptEvent)]
     assert len(warnings) == 1 and "clear this call's" in warnings[0].prompt
+    state = _validated_state(harness, harness.engine.thread_id)
+    invocation = state.active_invocation
+    assert invocation is not None
+    assert invocation.opened_turn_id == state.consumed_turn_ids[-1]
+    assert isinstance(invocation.request, CancelOrders)
+    assert isinstance(invocation.request.target, CancellableOrderScope)
     await _events(harness.engine, "yes")
 
 
@@ -782,7 +798,20 @@ async def test_guest_context_warning_decline_preserves_guest_state(config_root: 
     assert h.engine.thread_id == old_thread_id
     assert h.identity.current() is None
     assert h.store.session_placed_orders()
-    assert _pending_request(h, old_thread_id) is None
+    assert _active_request(h, old_thread_id) is None
+    assert h.store.cancel_count == 0
+
+
+async def test_guest_context_warning_human_exit_clears_invocation(config_root: Path) -> None:
+    h = _scope_engine(config_root, thread_id="mb-warning-human")
+    events = await _events(h.engine, "cancel all my orders")
+    assert any(isinstance(event, InterruptEvent) for event in events)
+
+    await _events(h.engine, "I want a person")
+
+    state = _validated_state(h, "mb-warning-human")
+    assert state.active_invocation is None
+    assert state.automation_terminal is True
     assert h.store.cancel_count == 0
 
 
@@ -907,6 +936,7 @@ async def test_risk_after_identity_clears_scope_without_voiding(config_root: Pat
     events = await _events(h.engine, "482913")
     assert not any(isinstance(event, InterruptEvent) for event in events)
     assert _pending_cancel(h, "mb-risk") is None
+    assert _validated_state(h, "mb-risk").active_invocation is None
     assert h.store.cancel_count == 0
 
 
@@ -923,10 +953,10 @@ async def test_identity_exit_paths_clear_retained_cancel_scope(
 ) -> None:
     h = _scope_engine(config_root, thread_id=thread_id)
     await _enter_unbound_cancel_scope(h)
-    assert _pending_request(h, thread_id) is not None
+    assert _active_request(h, thread_id) is not None
 
     await _events(h.engine, utterance)
-    assert _pending_request(h, thread_id) is None
+    assert _active_request(h, thread_id) is None
     assert _pending_cancel(h, thread_id) is None
     assert h.store.cancel_count == 0
 
@@ -1606,11 +1636,13 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
     assert [event.node for event in exhausted if isinstance(event, SpokenMessageEvent)] == [
         "automation_terminal_response"
     ]
-    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
-    assert state.get("automation_terminal") is True
-    assert state.get("active_flow") is None
-    assert state.get("pending_request") is None
-    assert state.get("clarification_progress") is None
+    state = ReasoningState.model_validate(
+        engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    )
+    assert state.automation_terminal is True
+    assert state.active_flow is None
+    assert state.active_invocation is None
+    assert state.clarification_progress is None
     assert verification.current_level() == 1
     assert otp.dispatch_count == 0
     assert store.refund_count == store.return_count == store.cancel_count == 0

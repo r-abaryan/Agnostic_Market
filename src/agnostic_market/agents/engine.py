@@ -43,6 +43,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
+from pydantic import ValidationError
 
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
@@ -63,6 +64,7 @@ from agnostic_market.dtos.events import (
     TurnFacts,
 )
 from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
     AnswerQuestion,
     CancellableOrderScope,
     CancelOrders,
@@ -106,6 +108,7 @@ from agnostic_market.dtos.state import (
     ReasoningState,
     SupportClarification,
     merge_consumed_turn_ids,
+    open_active_invocation,
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
@@ -133,6 +136,7 @@ def _write_ingress_rejection(
 # PendingPlacement embeds a tuple[CartLine, ...], so CartLine must be registered too (the
 # serde allowlists by MODULE — nested custom types are checked independently).
 _CHECKPOINTED_DTOS = (
+    ActiveInvocation,
     PendingPlacement,
     CartLine,
     PendingRefund,
@@ -546,8 +550,13 @@ class ReasoningEngine:
         switched = False
         try:
             seed: dict[str, object] = {"consumed_turn_ids": carried_turn_ids}
+            expected_invocation: ActiveInvocation | None = None
             if transition.continuation is not None:
-                seed["pending_request"] = transition.continuation
+                expected_invocation = open_active_invocation(
+                    transition.continuation,
+                    consumed_turn_ids=carried_turn_ids,
+                )
+                seed["active_invocation"] = expected_invocation
                 seed_author = "__start__"
             else:
                 seed_author = self._principal_seed_complete_node
@@ -555,10 +564,9 @@ class ReasoningEngine:
             seeded = self._graph.get_state(new_config)
             seeded_state = ReasoningState.model_validate(seeded.values)
             expected_clear = clear_automation_state()
-            expected_request = transition.continuation
             expected_next = ("entry",) if transition.continuation is not None else ()
             contaminated = bool(
-                seeded_state.pending_request != expected_request
+                seeded_state.active_invocation != expected_invocation
                 or seeded_state.consumed_turn_ids != carried_turn_ids
                 or seeded_state.messages
                 or seeded_state.automation_terminal
@@ -566,7 +574,7 @@ class ReasoningEngine:
                 or any(
                     getattr(seeded_state, field) != expected
                     for field, expected in expected_clear.items()
-                    if field != "pending_request"
+                    if field != "active_invocation"
                 )
             )
             if contaminated:
@@ -640,23 +648,44 @@ class ReasoningEngine:
 
     def _finalize_last_resort_state(self) -> None:
         self._invalidate_pending_transition_for_terminal()
+        terminal_update = {
+            **clear_automation_state(),
+            "automation_terminal": True,
+            "messages": [
+                AIMessage(
+                    AUTOMATION_TERMINAL_LINE,
+                    id=f"{self._terminal_takeover_node}:{self._thread_id}",
+                )
+            ],
+        }
         try:
             self._graph.update_state(
                 self._config,
-                {
-                    **clear_automation_state(),
-                    "automation_terminal": True,
-                    "messages": [
-                        AIMessage(
-                            AUTOMATION_TERMINAL_LINE,
-                            id=f"{self._terminal_takeover_node}:{self._thread_id}",
-                        )
-                    ],
-                },
+                terminal_update,
                 as_node=self._terminal_takeover_node,
+            )
+            return
+        except ValidationError:
+            logger.critical(
+                "last-resort checkpoint is schema-incoherent; replacing it",
+                exc_info=True,
             )
         except Exception:
             logger.critical("last-resort checkpoint takeover failed", exc_info=True)
+            return
+        try:
+            # A schema-incoherent checkpoint cannot accept even a total-clear update because
+            # LangGraph validates the old state before applying the delta. The session is
+            # already terminal-latched, so replace that unusable thread with one terminal
+            # checkpoint rather than retaining corrupt continuation or authority state.
+            self._graph.checkpointer.delete_thread(self._thread_id)
+            self._graph.update_state(
+                self._config,
+                terminal_update,
+                as_node=self._terminal_takeover_node,
+            )
+        except Exception:
+            logger.critical("last-resort checkpoint replacement failed", exc_info=True)
 
     def _defer_last_resort_until_idle(self) -> None:
         self._latch_last_resort()
@@ -722,7 +751,7 @@ class ReasoningEngine:
         state: ReasoningState,
     ) -> bool:
         if (
-            state.pending_request is None
+            state.active_invocation is None
             or state.messages
             or state.automation_terminal
             or snapshot.interrupts
@@ -734,7 +763,7 @@ class ReasoningEngine:
         return all(
             getattr(state, field) == expected
             for field, expected in expected_clear.items()
-            if field != "pending_request"
+            if field != "active_invocation"
         )
 
     def _seed_stream_recovery(

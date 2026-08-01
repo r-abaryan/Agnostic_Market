@@ -32,7 +32,7 @@ class PrincipalTransitionLifecycle(Protocol):
         self,
         new_identity: BoundIdentity,
         fresh_proof: VerificationProof,
-        continuation: IntentRequest | None,
+        initiating_request: IntentRequest,
     ) -> PrincipalTransition: ...
 
     def has_discardable_state(self) -> bool: ...

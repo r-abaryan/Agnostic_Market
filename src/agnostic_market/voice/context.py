@@ -129,7 +129,7 @@ class CallerContext:
         self,
         new_identity: BoundIdentity,
         fresh_proof: VerificationProof,
-        continuation: IntentRequest | None,
+        initiating_request: IntentRequest,
     ) -> PrincipalTransition:
         """Retire old caller authority and install exactly one newly proven principal."""
         current = self.identity_store.current()
@@ -139,7 +139,7 @@ class CallerContext:
             customer_ref=new_identity.customer_ref,
             masked_contact=new_identity.masked_contact,
             fresh_proof=fresh_proof,
-            continuation=continuation,
+            initiating_request=initiating_request,
         )
         if self._pending_transition is not None:
             raise RuntimeError("a principal transition is already pending context rotation")

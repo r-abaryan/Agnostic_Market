@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
     CancellableOrderScope,
     IntentRequest,
 )
@@ -461,8 +462,8 @@ class ReasoningState(BaseModel):
     pending_return: PendingReturn | None = None
     pending_profile_change: PendingProfileChange | None = None
     pending_identity: PendingIdentity | None = None
-    # Sole cross-identity continuation: caller-stated intent only, never resolved authority.
-    pending_request: IntentRequest | None = None
+    # Sole typed continuation owner. The request is caller intent, never resolved authority.
+    active_invocation: ActiveInvocation | None = None
     # PII-free failure disposition. Ordinary node handlers consume it in-graph; the engine
     # may seed the same channel after an externally abandoned stream in Milestone 6D.
     pending_recovery: PendingRecovery | None = None
@@ -495,3 +496,27 @@ class ReasoningState(BaseModel):
         if len(value) != len(set(value)):
             raise ValueError("consumed turn IDs must be unique")
         return value
+
+    @model_validator(mode="after")
+    def invocation_opening_turn_was_admitted(self) -> ReasoningState:
+        if (
+            self.active_invocation is not None
+            and self.active_invocation.opened_turn_id not in self.consumed_turn_ids
+        ):
+            raise ValueError("active invocation opening turn was not admitted")
+        return self
+
+
+def open_active_invocation(
+    request: IntentRequest,
+    *,
+    consumed_turn_ids: tuple[str, ...],
+) -> ActiveInvocation:
+    """Open an invocation on the current engine-admitted ledger tail."""
+
+    if not consumed_turn_ids:
+        raise ValueError("cannot open an invocation without an admitted turn")
+    return ActiveInvocation(
+        request=request,
+        opened_turn_id=consumed_turn_ids[-1],
+    )

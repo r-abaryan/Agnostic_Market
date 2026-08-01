@@ -122,6 +122,7 @@ from agnostic_market.dtos.state import (
     SupportAuthorizationDetail,
     SupportClarification,
     SupportQuestionDetail,
+    open_active_invocation,
 )
 
 logger = logging.getLogger("agnostic_market.agents.support")
@@ -496,7 +497,7 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
-            "pending_request": None,
+            "active_invocation": None,
             "pending_clarification": None,
         }
 
@@ -507,10 +508,11 @@ def build_support_nodes(
         and authorized again. The request is cleared in the same checkpoint that mints any
         action-specific pending state, so no continuation can execute twice.
         """
-        request = state.pending_request
-        assert request is not None
+        invocation = state.active_invocation
+        assert invocation is not None
+        request = invocation.request
         base: dict[str, object] = {
-            "pending_request": None,
+            "active_invocation": None,
             "active_flow": "support",
         }
         full = order_store.actionable_orders()
@@ -649,7 +651,11 @@ def build_support_nodes(
             "messages": [AIMessage(_CONTINUATION_NOT_FOUND)],
         }
 
-    def _enter_identity_for_action(new_messages: list, request: IntentRequest) -> dict[str, object]:
+    def _enter_identity_for_action(
+        state: ReasoningState,
+        new_messages: list,
+        request: IntentRequest,
+    ) -> dict[str, object]:
         """Retain one caller-stated typed request across the identity detour.
 
         The request contains no resolved target or authority. A fresh context resolves and
@@ -659,7 +665,10 @@ def build_support_nodes(
         return {
             "messages": new_messages,
             "active_flow": "identity",
-            "pending_request": request,
+            "active_invocation": open_active_invocation(
+                request,
+                consumed_turn_ids=state.consumed_turn_ids,
+            ),
             "pending_clarification": None,
             "identity_claim_misses": 0,
         }
@@ -834,7 +843,7 @@ def build_support_nodes(
                 "pending_cancel": None,
                 "pending_return": None,
                 "pending_profile_change": None,
-                "pending_request": None,
+                "active_invocation": None,
                 "pending_clarification": None,
                 "handover": HandoffRequest(
                     destination="human",
@@ -936,7 +945,11 @@ def build_support_nodes(
                         # Already verified: resolve now (route_after_assemble -> resolve).
                         return {"messages": new_messages, "pending_cancel": selection}
                     # Unverified: the shared typed request is the sole continuation channel.
-                    return _enter_identity_for_action(new_messages, CancelOrders(target=selection))
+                    return _enter_identity_for_action(
+                        state,
+                        new_messages,
+                        CancelOrders(target=selection),
+                    )
                 # Resolve + AUTHORIZE every stated key, aggregating the outcome into EXACTLY ONE
                 # ToolMessage for this single tool_call_id (never one per target — F-4). An
                 # unresolved key is NOT an "invalid proposal" (that would enumerate keys): it is
@@ -982,6 +995,7 @@ def build_support_nodes(
                     validated_refs = tuple(ref for ref in stated_refs if ref is not None)
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
+                        state,
                         new_messages,
                         CancelOrders(target=ExplicitOrderSet(order_refs=validated_refs)),
                     )
@@ -1028,6 +1042,7 @@ def build_support_nodes(
                         return _clarification_result(state, new_messages, "order")
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
+                        state,
                         new_messages,
                         ReturnOrder(target=ExplicitOrderTarget(order_ref=stated_ref)),
                     )
@@ -1073,6 +1088,7 @@ def build_support_nodes(
                 if bound is None:
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
+                        state,
                         new_messages,
                         ChangeProfile(field=change.field, new_value=change.new_value.strip()),
                     )
@@ -1140,6 +1156,7 @@ def build_support_nodes(
                         return _clarification_result(state, new_messages, "order")
                     new_messages.append(ToolMessage("verification needed", tool_call_id=call["id"]))
                     return _enter_identity_for_action(
+                        state,
                         new_messages,
                         RefundOrder(
                             target=ExplicitOrderTarget(order_ref=stated_ref),
@@ -2174,7 +2191,7 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
-            "pending_request": None,
+            "active_invocation": None,
             "pending_clarification": None,
             "clarification_progress": None,
             "active_flow": None,
@@ -2191,7 +2208,7 @@ def build_support_nodes(
             "pending_cancel": None,
             "pending_return": None,
             "pending_profile_change": None,
-            "pending_request": None,
+            "active_invocation": None,
             "pending_clarification": None,
             "clarification_progress": None,
             "active_flow": None,

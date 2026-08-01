@@ -130,14 +130,14 @@ _TRANSPORT_FAULT_WINDOW_SECONDS = 30.0
 _TRANSPORT_UPSTREAM_TIMEOUT_SECONDS = 60.0
 _TRANSPORT_SCENARIO_TIMEOUT_SECONDS = 90.0
 
-_PENDING_FIELDS = (
+_AUTOMATION_CHANNELS = (
     "pending_placement",
     "pending_refund",
     "pending_cancel",
     "pending_return",
     "pending_profile_change",
     "pending_identity",
-    "pending_request",
+    "active_invocation",
     "pending_ack",
     "pending_clarification",
     "clarification_progress",
@@ -166,7 +166,7 @@ class CommerceObservation:
 @dataclass(frozen=True)
 class GraphObservation:
     active_flow: str | None
-    pending_fields: tuple[str, ...]
+    automation_channels: tuple[str, ...]
     handover_destination: str | None
     interrupted: bool
     unfinished: bool
@@ -274,7 +274,9 @@ def _checkpoint_observation(
     return (
         GraphObservation(
             active_flow=values.get("active_flow"),
-            pending_fields=tuple(name for name in _PENDING_FIELDS if values.get(name) is not None),
+            automation_channels=tuple(
+                name for name in _AUTOMATION_CHANNELS if values.get(name) is not None
+            ),
             handover_destination=getattr(handover, "destination", None),
             interrupted=bool(snapshot.interrupts),
             unfinished=bool(snapshot.next),
@@ -560,7 +562,7 @@ _TRANSPORT_OWNER_SCENARIOS = (
 )
 _EMPTY_RECOVERY_STATE = GraphObservation(
     active_flow=None,
-    pending_fields=(),
+    automation_channels=(),
     handover_destination=None,
     interrupted=False,
     unfinished=False,
@@ -901,7 +903,14 @@ async def _outcome(graph, utterance: str) -> str | None:
     global _THREAD_SEQ
     _THREAD_SEQ += 1
     config = {"configurable": {"thread_id": f"eval-{_THREAD_SEQ}"}}
-    out = await graph.ainvoke({"messages": [HumanMessage(utterance)]}, config)
+    turn_id = uuid.uuid4().hex
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content=utterance, id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+        },
+        config,
+    )
     handover = out.get("handover")
     if handover is not None:
         return handover.source

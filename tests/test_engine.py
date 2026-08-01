@@ -57,7 +57,12 @@ from agnostic_market.dtos.events import (
     TokenEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.orchestration import DiscloseAiIdentity, ViewIdentityStatus
+from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
+    DiscloseAiIdentity,
+    ListOrders,
+    ViewIdentityStatus,
+)
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CartClarification,
@@ -65,6 +70,7 @@ from agnostic_market.dtos.state import (
     IdentityClarification,
     ReasoningState,
     SupportClarification,
+    open_active_invocation,
 )
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
@@ -307,6 +313,36 @@ async def test_duplicate_normal_turn_id_is_admitted_only_once(config_root: Path)
     await _adapter_turn(adapter, "tell me about your shoes", "normal-turn-1")
 
     assert frontline.invoke_count == 1
+    assert engine._graph.get_state(engine._config).values.get("active_invocation") is None
+
+
+async def test_duplicate_list_turn_cannot_open_an_invocation(config_root: Path) -> None:
+    frontline = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="duplicate-list-turn",
+    )
+    duplicate_id = "already-consumed-list-turn"
+    engine._graph.update_state(
+        engine._config,
+        {"consumed_turn_ids": (duplicate_id,)},
+        as_node="__start__",
+    )
+
+    output = await _adapter_turn(
+        GraphVoiceAdapter(engine),
+        "list my account orders",
+        duplicate_id,
+    )
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert output == []
+    assert state.active_invocation is None
+    assert frontline.invoke_count == 0
+    assert reasoning.invoke_count == 0
 
 
 async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
@@ -324,7 +360,7 @@ async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
     engine._graph.update_state(
         engine._config,
         {
-            "messages": [HumanMessage(content="tell me about shoes", id=abandoned_id)],
+            "messages": [HumanMessage(content="list my account orders", id=abandoned_id)],
             "consumed_turn_ids": (abandoned_id,),
             "pending_recovery": PendingRecovery(
                 origin_node="model",
@@ -336,7 +372,7 @@ async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
         as_node="__start__",
     )
 
-    output = await _adapter_turn(adapter, "tell me about shoes", abandoned_id)
+    output = await _adapter_turn(adapter, "list my account orders", abandoned_id)
     snapshot = engine._graph.get_state(engine._config)
     human_ids = [
         message.id
@@ -348,6 +384,7 @@ async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
     assert human_ids == [abandoned_id]
     assert snapshot.values["consumed_turn_ids"] == [abandoned_id]
     assert snapshot.values.get("pending_recovery") is None
+    assert snapshot.values.get("active_invocation") is None
     assert snapshot.next == ()
     assert frontline.invoke_count == 0
     import json
@@ -613,6 +650,54 @@ async def test_distinct_turn_arriving_before_cancellation_is_admitted_once(
     assert human_texts.count("never mind") == 1
     assert store.placed_count == 0
     assert not engine.pending_interrupt()
+
+
+async def test_distinct_turn_after_safe_abort_opens_on_the_new_ledger_tail(
+    config_root: Path,
+) -> None:
+    frontline = _BlockingFirstResponseModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="late-list-after-safe-abort",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    second_arrived = asyncio.Event()
+    second_task_name = "late-list-waiter"
+    engine._turn_lock = _ObservedTurnLock(
+        engine._turn_lock,
+        task_name=second_task_name,
+        arrived=second_arrived,
+    )
+
+    first = asyncio.create_task(
+        _adapter_turn(adapter, "tell me about your shoes", "late-list-turn-1"),
+        name="late-list-owner",
+    )
+    assert await asyncio.to_thread(frontline.started.wait, _WAIT_TIMEOUT_SECONDS)
+    second = asyncio.create_task(
+        _adapter_turn(adapter, "what orders do I have", "late-list-turn-2"),
+        name=second_task_name,
+    )
+    await asyncio.wait_for(second_arrived.wait(), timeout=_WAIT_TIMEOUT_SECONDS)
+
+    first.cancel()
+    frontline.release()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await asyncio.wait_for(second, timeout=_WAIT_TIMEOUT_SECONDS)
+
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    invocation = state.active_invocation
+    assert invocation is not None
+    assert invocation.request == ListOrders(scope="account")
+    assert invocation.opened_turn_id == state.consumed_turn_ids[-1] == "late-list-turn-2"
+    assert store.placed_count == 0
+    assert store.cancel_count == 0
+    assert store.refund_count == 0
+    assert store.return_count == 0
 
 
 async def test_cancelled_cart_assemble_reviews_cart_and_consumes_queued_turn(
@@ -1359,28 +1444,85 @@ async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
 
 
 @pytest.mark.parametrize(
-    "pending_request",
+    "intent_request",
     (ViewIdentityStatus(), DiscloseAiIdentity()),
 )
 def test_new_intent_requests_roundtrip_through_production_checkpoint_serde(
     config_root: Path,
     caplog: pytest.LogCaptureFixture,
-    pending_request: ViewIdentityStatus | DiscloseAiIdentity,
+    intent_request: ViewIdentityStatus | DiscloseAiIdentity,
 ) -> None:
+    consumed_turn_ids = ("serde-turn",)
+    invocation = open_active_invocation(intent_request, consumed_turn_ids=consumed_turn_ids)
     engine, _ = _engine(
         config_root,
-        thread_id=f"serde-{pending_request.kind.value}",
+        thread_id=f"serde-{intent_request.kind.value}",
     )
     with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
         engine._graph.update_state(
             engine._config,
-            {"pending_request": pending_request},
+            {
+                "consumed_turn_ids": consumed_turn_ids,
+                "active_invocation": invocation,
+            },
             as_node="__start__",
         )
         restored = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
 
-    assert restored.pending_request == pending_request
+    assert restored.active_invocation == invocation
     assert not any("unregistered" in record.getMessage().lower() for record in caplog.records)
+
+
+async def test_incoherent_persisted_invocation_terminalizes_before_any_execution(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="invalid-invocation-ledger",
+    )
+    graph_stream_calls = 0
+    real_astream = engine._graph.astream
+
+    def observe_astream(*args, **kwargs):
+        nonlocal graph_stream_calls
+        graph_stream_calls += 1
+        return real_astream(*args, **kwargs)
+
+    monkeypatch.setattr(engine._graph, "astream", observe_astream)
+    engine._graph.update_state(
+        engine._config,
+        {
+            "consumed_turn_ids": ("admitted-turn",),
+            "active_invocation": ActiveInvocation(
+                request=ViewIdentityStatus(),
+                opened_turn_id="never-admitted",
+            ),
+        },
+        as_node="__start__",
+    )
+
+    events = await _events(engine, "continue")
+    snapshot = engine._graph.get_state(engine._config)
+
+    assert [
+        (event.node, event.text) for event in events if isinstance(event, SpokenMessageEvent)
+    ] == [("automation_terminal_response", AUTOMATION_TERMINAL_LINE)]
+    assert frontline.invoke_count == 0
+    assert reasoning.invoke_count == 0
+    assert graph_stream_calls == 0
+    assert store.placed_count == 0
+    assert store.cancel_count == 0
+    assert store.refund_count == 0
+    assert store.return_count == 0
+    assert snapshot.values.get("active_invocation") is None
+    assert snapshot.values["automation_terminal"] is True
+    assert snapshot.next == ()
+    assert engine._terminal_latched is True
 
 
 @pytest.mark.parametrize(

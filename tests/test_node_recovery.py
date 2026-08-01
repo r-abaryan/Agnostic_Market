@@ -32,7 +32,7 @@ from agnostic_market.commerce.orders import render_cart_line
 from agnostic_market.dtos.events import SpokenMessageEvent
 from agnostic_market.dtos.orchestration import ListOrders
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
-from agnostic_market.dtos.state import PendingRefund, ReasoningState
+from agnostic_market.dtos.state import PendingRefund, ReasoningState, open_active_invocation
 
 _ACTION_CASES = (
     ("model", ExceptionAction.SAFE_ABORT, TURN_FALLBACK_LINE),
@@ -341,6 +341,7 @@ async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(
         reasoning=reasoning,
         thread_id="recovery-route-precedence",
     )
+    consumed_turn_ids = ("seeded-continuation",)
     harness.engine._graph.update_state(
         harness.engine._config,
         {
@@ -349,7 +350,11 @@ async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(
                 action=ExceptionAction.SAFE_ABORT,
                 trigger="node_exception",
             ),
-            "pending_request": ListOrders(scope="account"),
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                ListOrders(scope="account"),
+                consumed_turn_ids=consumed_turn_ids,
+            ),
         },
         as_node="__start__",
     )
@@ -363,7 +368,7 @@ async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(
     assert frontline.invoke_count == 0
     assert reasoning.invoke_count == 0
     assert snapshot.values.get("pending_recovery") is None
-    assert snapshot.values.get("pending_request") is None
+    assert snapshot.values.get("active_invocation") is None
     assert snapshot.next == ()
 
 
@@ -641,7 +646,7 @@ async def test_cancelled_otp_collect_does_not_reverify_bind_or_resume_the_action
     assert _commerce_counts(harness) == (0, 0, 0, 0, 0)
     assert snapshot.values.get("pending_recovery") is None
     assert snapshot.values.get("pending_identity") is None
-    assert snapshot.values.get("pending_request") is None
+    assert snapshot.values.get("active_invocation") is None
     assert snapshot.next == ()
 
 

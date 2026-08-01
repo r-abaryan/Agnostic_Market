@@ -31,7 +31,12 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
-from agnostic_market.dtos.orchestration import CancelOrders, ListOrders, SwitchAccount
+from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
+    CancelOrders,
+    ListOrders,
+    SwitchAccount,
+)
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
     HandoffDestination,
@@ -117,6 +122,14 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         lifecycle=caller_context,
         **kwargs,
     )
+
+
+def _admitted_turn(text: str, *, turn_id: str, **state: object) -> dict[str, object]:
+    return {
+        "messages": [HumanMessage(content=text, id=turn_id)],
+        "consumed_turn_ids": (turn_id,),
+        **state,
+    }
 
 
 # --- the structural safety invariant (T1's structural half) --------------------------
@@ -273,11 +286,12 @@ def _handover_update(
     reason_code: HandoffReasonCode,
 ) -> dict[str, object]:
     state = ReasoningState(
+        consumed_turn_ids=("handover-turn",),
         handover=HandoffRequest(
             destination=destination,
             reason_code=reason_code,
             source="gate",
-        )
+        ),
     )
     return graph.nodes["handover"].invoke(state)
 
@@ -315,20 +329,29 @@ def test_non_human_handover_entries_remain_partial_updates(config_root: Path) ->
         "handover": None,
         "clarification_progress": None,
     }
-    assert _handover_update(graph, "support", "switch_account") == {
+    switch = _handover_update(graph, "support", "switch_account")
+    switch_invocation = switch.pop("active_invocation")
+    assert switch == {
         "active_flow": "identity",
         "handover": None,
         "identity_claim_misses": 0,
         "clarification_progress": None,
-        "pending_request": SwitchAccount(),
     }
-    assert _handover_update(graph, "support", "list_orders") == {
+    assert isinstance(switch_invocation, ActiveInvocation)
+    assert switch_invocation.request == SwitchAccount()
+    assert switch_invocation.opened_turn_id == "handover-turn"
+
+    list_orders = _handover_update(graph, "support", "list_orders")
+    list_invocation = list_orders.pop("active_invocation")
+    assert list_orders == {
         "active_flow": "identity",
         "handover": None,
         "identity_claim_misses": 0,
         "clarification_progress": None,
-        "pending_request": ListOrders(scope="account"),
     }
+    assert isinstance(list_invocation, ActiveInvocation)
+    assert list_invocation.request == ListOrders(scope="account")
+    assert list_invocation.opened_turn_id == "handover-turn"
     for reason_code in ("refund", "cancel_order", "address_change", "contact_change"):
         assert _handover_update(graph, "support", reason_code) == {
             "active_flow": "support",
@@ -389,11 +412,19 @@ async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
         tool_call_limit=1,
     )
     graph = _graph(config_root, FakeChatModel(tool_call_limit=1), reasoning_model=reasoning)
-    out = await graph.ainvoke({"messages": [HumanMessage("actually cancel order ORD-1002")]})
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage("actually cancel order ORD-1002", id="cancel-detour-turn")],
+            "consumed_turn_ids": ("cancel-detour-turn",),
+        }
+    )
     assert reasoning._tool_calls_made == 1  # the support model ran and proposed a cancel
     assert out.get("active_flow") == "identity"  # detoured to verify (rung-2 required)
     assert out.get("pending_cancel") is None  # nothing staged before the caller is bound
-    request = out.get("pending_request")
+    invocation = out.get("active_invocation")
+    assert isinstance(invocation, ActiveInvocation)
+    assert invocation.opened_turn_id == "cancel-detour-turn"
+    request = invocation.request
     assert isinstance(request, CancelOrders)
     assert request.target.order_refs == ("ORD-1002",)
 
@@ -640,7 +671,12 @@ async def test_unverified_all_orders_state_check_enters_identity_flow(
         FakeChatModel(raise_transport=True),
         reasoning_model=FakeChatModel(emit_tool_calls=False),
     )
-    out = await graph.ainvoke({"messages": [HumanMessage("are all my orders cancelled?")]})
+    out = await graph.ainvoke(
+        _admitted_turn(
+            "are all my orders cancelled?",
+            turn_id="all-orders-state-check",
+        )
+    )
     assert out.get("active_flow") == "identity"
 
 
@@ -937,7 +973,9 @@ async def test_list_orders_handover_enters_the_identity_flow(config_root: Path) 
     )
     reasoning = FakeChatModel(emit_tool_calls=False)  # identity model asks its ONE question
     graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    out = await graph.ainvoke(
+        _admitted_turn("what orders do I have", turn_id="list-orders-handover")
+    )
     assert out.get("active_flow") == "identity"  # ENTERED (sticky, awaiting the claim)
     texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
     assert not any("support team" in t for t in texts)  # no stale deferral
@@ -958,7 +996,7 @@ async def test_unverified_enumeration_diverts_without_a_relay_pass(config_root: 
     frontline = FakeChatModel(force_tool="list_orders", tool_call_limit=1)
     reasoning = FakeChatModel(emit_tool_calls=False)  # identity model asks its ONE question
     graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    out = await graph.ainvoke(_admitted_turn("what orders do I have", turn_id="enumeration-divert"))
     assert out.get("active_flow") == "identity"  # entered via the code-set handover
     assert frontline._tool_calls_made == 0
     spoken = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
@@ -972,7 +1010,10 @@ async def test_explicit_enumeration_phrase_skips_frontline_model(config_root: Pa
     reasoning = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, frontline, reasoning_model=reasoning)
     out = await graph.ainvoke(
-        {"messages": [HumanMessage("tell me what order numbers are available")]}
+        _admitted_turn(
+            "tell me what order numbers are available",
+            turn_id="explicit-enumeration",
+        )
     )
     assert out.get("active_flow") == "identity"
 
@@ -984,10 +1025,11 @@ async def test_enumeration_cross_switches_out_of_sticky_support(config_root: Pat
     reasoning = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, frontline, reasoning_model=reasoning)
     out = await graph.ainvoke(
-        {
-            "messages": [HumanMessage("tell me what orders are available")],
-            "active_flow": "support",
-        }
+        _admitted_turn(
+            "tell me what orders are available",
+            turn_id="enumeration-cross-switch",
+            active_flow="support",
+        )
     )
     assert out.get("active_flow") == "identity"
     assert out.get("pending_cancel") is None
@@ -1108,7 +1150,9 @@ async def test_guest_with_no_placed_orders_still_enters_identity(config_root: Pa
         tool_call_limit=1,
     )
     graph = _graph(config_root, frontline, reasoning_model=FakeChatModel(emit_tool_calls=False))
-    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
+    out = await graph.ainvoke(
+        _admitted_turn("what orders do I have", turn_id="guest-empty-enumeration")
+    )
     assert out.get("active_flow") == "identity"
 
 

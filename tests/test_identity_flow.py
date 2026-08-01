@@ -16,7 +16,8 @@ from turn_helpers import engine_events, next_committed_turn
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
-from agnostic_market.dtos.orchestration import ListOrders
+from agnostic_market.dtos.orchestration import ActiveInvocation, ChangeProfile, ListOrders
+from agnostic_market.dtos.state import PendingIdentity, ReasoningState, open_active_invocation
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
@@ -30,6 +31,15 @@ _UNKNOWN_CLAIM = "nobody@nowhere.example"
 _ASK_CONTACT_LINE = "What email address or phone number is on the account?"
 # Enumeration has NO gate patterns by design — entry is the MODEL's request_handover.
 _REQUEST = "what orders do I have on my account?"
+
+
+def _active_request(values: dict) -> object | None:
+    invocation = values.get("active_invocation")
+    if invocation is None:
+        return None
+    assert isinstance(invocation, ActiveInvocation)
+    assert invocation.opened_turn_id in tuple(values["consumed_turn_ids"])
+    return invocation.request
 
 
 def _identity_harness(
@@ -140,7 +150,7 @@ def _assert_identity_contact_ask(
     assert snapshot.next == ()
     assert state.get("active_flow") == "identity"
     assert state.get("identity_claim_misses") == expected_misses
-    assert state.get("pending_request") == ListOrders(scope="account")
+    assert _active_request(state) == ListOrders(scope="account")
     assert state.get("pending_clarification") is None
     for field in (
         "pending_placement",
@@ -253,7 +263,7 @@ async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover
     state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
     assert state.get("automation_terminal") is True
     assert state.get("active_flow") is None
-    assert state.get("pending_request") is None
+    assert state.get("active_invocation") is None
     assert state.get("clarification_progress") is None
     assert h.identity.current() is None
     assert h.otp.dispatch_count == 0
@@ -312,7 +322,7 @@ async def test_malformed_identity_tools_preserve_miss_budget_and_continuation(
     await _events(h.engine, _REQUEST)
     after_miss = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
     assert after_miss.get("identity_claim_misses") == 1
-    assert after_miss.get("pending_request") == ListOrders(scope="account")
+    assert _active_request(after_miss) == ListOrders(scope="account")
 
     events = await _events(h.engine, "It is the same contact I gave you.")
     _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=1)
@@ -340,10 +350,30 @@ async def test_enumeration_ask_dispatches_otp_before_naming_any_order(
     assert "ORD-" not in all_text
 
 
-async def test_committed_otp_binds_and_speaks_only_their_orders(config_root: Path) -> None:
+async def test_committed_otp_binds_and_speaks_only_their_orders(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     h = _identity_harness(config_root)
     old_thread_id = h.engine.thread_id
     await _events(h.engine, _REQUEST)
+    before_rotation = ReasoningState.model_validate(
+        h.engine._graph.get_state(h.engine._config).values
+    )
+    old_invocation = before_rotation.active_invocation
+    assert old_invocation is not None
+    rotation_seeds: list[dict[str, object]] = []
+    real_update_state = h.engine._graph.update_state
+
+    def observe_rotation_seed(config, values, *, as_node=None):
+        invocation = values.get("active_invocation")
+        if config["configurable"]["thread_id"] != old_thread_id and isinstance(
+            invocation, ActiveInvocation
+        ):
+            rotation_seeds.append(dict(values))
+        return real_update_state(config, values, as_node=as_node)
+
+    monkeypatch.setattr(h.engine._graph, "update_state", observe_rotation_seed)
     events = await _events(h.engine, _VALID_OTP)
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-001"
@@ -352,12 +382,79 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(config_root: Pat
     assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
     new_state = h.engine._graph.get_state(h.engine._config)
     assert tuple(new_state.values["consumed_turn_ids"]) == ("test-turn-1", "test-turn-2")
+    assert len(rotation_seeds) == 1
+    rotated_invocation = rotation_seeds[0]["active_invocation"]
+    assert isinstance(rotated_invocation, ActiveInvocation)
+    assert rotated_invocation.request == old_invocation.request == ListOrders(scope="account")
+    assert rotated_invocation.invocation_id != old_invocation.invocation_id
+    carried_turn_ids = tuple(rotation_seeds[0]["consumed_turn_ids"])
+    assert rotated_invocation.opened_turn_id == carried_turn_ids[-1] == "test-turn-2"
     lines = [e for e in _spoken(events) if e.node == "support_continuation"]
     assert len(lines) == 1
     # THE privacy property: CUST-001 hears 1001 + 1003 and NEVER CUST-002's 1002.
     assert "ORD-1001" in lines[0].text and "ORD-1003" in lines[0].text
     assert "ORD-1002" not in lines[0].text
     assert "CUST-" not in lines[0].text  # closed slugs never spoken
+
+
+def test_rotation_preserves_populated_profile_slots_exactly(config_root: Path) -> None:
+    h = _identity_harness(config_root, thread_id="ident-profile-slot-rotation")
+    assert h.verification.verify_otp(_VALID_OTP)
+    request = ChangeProfile(field="address", new_value="10 High Street")
+    transition = h.caller_context.transition_principal(
+        BoundIdentity(customer_ref=_CUST1_REF, masked_contact=_CUST1_MASK),
+        h.verification.grants[-1],
+        request,
+    )
+    old_thread_id = h.engine.thread_id
+
+    rotated = h.engine._rotate_pending_transition("profile-rotation-turn")
+
+    assert rotated == transition
+    assert h.engine.thread_id != old_thread_id
+    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    snapshot = h.engine._graph.get_state(h.engine._config)
+    state = ReasoningState.model_validate(snapshot.values)
+    invocation = state.active_invocation
+    assert invocation is not None
+    assert invocation.request == request
+    assert isinstance(invocation.request, ChangeProfile)
+    assert invocation.request.new_value == "10 High Street"
+    assert invocation.opened_turn_id == state.consumed_turn_ids[-1] == "profile-rotation-turn"
+    assert snapshot.next == ("entry",)
+
+
+def test_same_principal_apply_preserves_invocation_until_continuation(
+    config_root: Path,
+) -> None:
+    h = _identity_harness(config_root, thread_id="ident-same-principal-invocation")
+    h.identity.bind(BoundIdentity(customer_ref=_CUST1_REF, masked_contact=_CUST1_MASK))
+    consumed_turn_ids = ("same-principal-opening-turn",)
+    invocation = open_active_invocation(
+        ListOrders(scope="account"),
+        consumed_turn_ids=consumed_turn_ids,
+    )
+    state = ReasoningState(
+        consumed_turn_ids=consumed_turn_ids,
+        active_flow="identity",
+        active_invocation=invocation,
+        pending_identity=PendingIdentity(
+            customer_ref=_CUST1_REF,
+            masked_contact=_CUST1_MASK,
+            attempt_key="same-principal-attempt",
+            grants_at_mint=0,
+        ),
+    )
+
+    apply_update = h.engine._graph.nodes["identity_apply"].invoke(state)
+    after_apply = ReasoningState.model_validate({**state.model_dump(mode="python"), **apply_update})
+
+    assert "active_invocation" not in apply_update
+    assert after_apply.active_invocation == invocation
+    assert after_apply.active_invocation.invocation_id == invocation.invocation_id
+    assert after_apply.active_invocation.opened_turn_id == invocation.opened_turn_id
+    continuation_update = h.engine._graph.nodes["support_continuation"].invoke(after_apply)
+    assert continuation_update["active_invocation"] is None
 
 
 async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) -> None:
@@ -422,6 +519,7 @@ async def test_verified_account_switch_rotates_all_principal_context(
         "test-turn-2",
         "test-turn-3",
     )
+    assert new_state.values.get("active_invocation") is None
     assert new_state.values.get("messages", []) == []
     assert new_state.next == ()
 
@@ -448,7 +546,7 @@ async def test_failed_account_switch_preserves_original_principal(
     assert not h.caller_context.cart_store.is_empty()
     assert [proof.proof_id for proof in h.verification.grants] == [old_proof_id]
     state = h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}})
-    assert state.values.get("pending_request") is None
+    assert state.values.get("active_invocation") is None
 
 
 async def test_same_account_switch_skips_rotation_and_preserves_context(

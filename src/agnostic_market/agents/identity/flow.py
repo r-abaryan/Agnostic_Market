@@ -56,7 +56,6 @@ from agnostic_market.agents.identity.prompt import compose_identity_prompt
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore, CustomerDirectory
-from agnostic_market.commerce.orders import OrderStore, render_order_list_line
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import identity_required_level
 from agnostic_market.dtos.orchestration import (
@@ -125,7 +124,7 @@ def _flow_exit(update: dict[str, object]) -> dict[str, object]:
         "pending_identity": None,
         "identity_claim_misses": 0,
         "pending_cancel": None,
-        "pending_request": None,
+        "active_invocation": None,
         "pending_clarification": None,
         "clarification_progress": None,
         **update,
@@ -134,7 +133,6 @@ def _flow_exit(update: dict[str, object]) -> dict[str, object]:
 
 def build_identity_nodes(
     reasoning_model: BaseChatModel,
-    order_store: OrderStore,
     verification_store: VerificationStore,
     otp: OtpProvider,
     risk: RiskProvider,
@@ -142,7 +140,7 @@ def build_identity_nodes(
     identity_store: CallerIdentityStore,
     policy: PolicyContext,
     transition_principal: Callable[
-        [BoundIdentity, VerificationProof, IntentRequest | None], PrincipalTransition
+        [BoundIdentity, VerificationProof, IntentRequest], PrincipalTransition
     ],
     *,
     display_name: str,
@@ -205,7 +203,9 @@ def build_identity_nodes(
         The claim is code-matched HERE (never model-judged); a match mints PendingIdentity
         with the grants-at-mint snapshot (the binding invariant's baseline)."""
         bound = identity_store.current()
-        switching = isinstance(state.pending_request, SwitchAccount)
+        invocation = state.active_invocation
+        request = invocation.request if invocation is not None else None
+        switching = isinstance(request, SwitchAccount)
         if bound is not None and not switching:
             # Already proven this session (a misrouted second enumeration handover): mint
             # from the binding directly — no model call, no re-claim; the guardrail's
@@ -372,6 +372,10 @@ def build_identity_nodes(
         deterministic support continuation in the current thread."""
         pending = state.pending_identity
         assert pending is not None
+        invocation = state.active_invocation
+        if invocation is None:
+            raise RuntimeError("identity apply requires an active invocation")
+        request = invocation.request
         bound = identity_store.current()
         needs_bind = bound is None or bound.customer_ref != pending.customer_ref
         if needs_bind:
@@ -388,10 +392,8 @@ def build_identity_nodes(
             new_identity = BoundIdentity(
                 customer_ref=pending.customer_ref, masked_contact=pending.masked_contact
             )
-            continuation = (
-                None if isinstance(state.pending_request, SwitchAccount) else state.pending_request
-            )
-            transition_principal(new_identity, fresh_proof, continuation)
+            transition = transition_principal(new_identity, fresh_proof, request)
+            continuation = transition.continuation
             write_event(
                 {
                     "event": "identity_bound",
@@ -410,15 +412,15 @@ def build_identity_nodes(
             return {
                 "pending_identity": None,
                 "identity_claim_misses": 0,
-                "pending_request": None,
+                "active_invocation": None,
                 "active_flow": None,
                 "messages": (
                     [AIMessage("You're now verified on the new account.")]
-                    if isinstance(state.pending_request, SwitchAccount)
+                    if transition.completes_switch
                     else []
                 ),
             }
-        if isinstance(state.pending_request, SwitchAccount):
+        if isinstance(request, SwitchAccount):
             write_event({"event": "principal_transition_skipped", "reason": "same_customer"})
             return _flow_exit(
                 {
@@ -426,17 +428,12 @@ def build_identity_nodes(
                     "messages": [AIMessage("You're already verified on that account.")],
                 }
             )
-        if state.pending_request is not None:
-            write_event(
-                {"event": "identity_bound_for_action", "customer_ref": pending.customer_ref}
-            )
-            return {
-                "pending_identity": None,
-                "identity_claim_misses": 0,
-                "active_flow": "support",
-            }
-        line = render_order_list_line(order_store.owned_orders(pending.customer_ref))
-        return _flow_exit({"messages": [AIMessage(line)], "active_flow": None})
+        write_event({"event": "identity_bound_for_action", "customer_ref": pending.customer_ref})
+        return {
+            "pending_identity": None,
+            "identity_claim_misses": 0,
+            "active_flow": "support",
+        }
 
     def abort_node(state: ReasoningState) -> dict[str, object]:
         """Entry-router escape: explicit abort while identity was in flight. Names what was
@@ -499,7 +496,7 @@ def build_identity_nodes(
                 update = {
                     **update,
                     "pending_cancel": None,
-                    "pending_request": None,
+                    "active_invocation": None,
                     "pending_clarification": None,
                 }
             return update

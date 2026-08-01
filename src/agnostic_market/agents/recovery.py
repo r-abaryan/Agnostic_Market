@@ -31,7 +31,6 @@ from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileStore
 from agnostic_market.commerce.receipts import CommittedReceipt, NotCommittedReceipt
 from agnostic_market.dtos.orchestration import (
     PrincipalTransitionInspection,
-    SwitchAccount,
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
@@ -636,15 +635,14 @@ def build_recovery_node(
             and pending_identity.customer_ref == transition.customer_ref
             and pending_identity.masked_contact == transition.masked_contact
         )
-        request_matches = (
-            state.pending_request == transition.continuation
-            if transition.continuation is not None
-            else isinstance(state.pending_request, SwitchAccount)
+        invocation = state.active_invocation
+        request_matches = bool(
+            invocation is not None and invocation.request == transition.initiating_request
         )
         if inspection.outcome == "coherent" and identity_matches and request_matches:
             write_event(event)
             update = clear_automation_state()
-            if transition.continuation is None:
+            if transition.completes_switch:
                 update["messages"] = [AIMessage("You're now verified on the new account.")]
             return update
         invalidate_principal_transition(transition.transition_id)
@@ -715,6 +713,7 @@ def build_recovery_node(
 
 _NON_PREFIXED_AUTOMATION_FIELDS = frozenset(
     {
+        "active_invocation",
         "handover",
         "identity_claim_misses",
         "active_flow",
@@ -731,8 +730,8 @@ _AUTOMATION_STATE_RESET: Mapping[str, object] = MappingProxyType(
         "pending_return": None,
         "pending_profile_change": None,
         "pending_identity": None,
-        "pending_request": None,
         "pending_recovery": None,
+        "active_invocation": None,
         "identity_claim_misses": 0,
         "active_flow": None,
         "pending_ack": None,

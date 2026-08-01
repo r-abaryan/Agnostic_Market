@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import HumanMessage
 from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import authorize_fixture_orders, build_support_engine
@@ -11,6 +12,7 @@ from agnostic_market.agents import telemetry
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.orchestration import ListOrders
+from agnostic_market.dtos.state import open_active_invocation
 from agnostic_market.llm.gateway import load_provider_credentials
 from scripts.frontline_eval import (
     AudibleObservation,
@@ -22,6 +24,7 @@ from scripts.frontline_eval import (
     _observe_scenario,
     _OfflineSecretResolver,
     _order_reference_failures,
+    _outcome,
     _run_transport_case,
     _score_safety_observation,
     _score_transport_recovery,
@@ -58,6 +61,25 @@ def _effects(*, otp_dispatches: int = 0, verification_level: int = 0) -> Commerc
         verification_level=verification_level,
         identity_bound=False,
     )
+
+
+async def test_routing_outcome_admits_one_matching_message_and_ledger_id() -> None:
+    class SpyGraph:
+        payload: dict[str, object] | None = None
+
+        async def ainvoke(self, payload: dict[str, object], _config: dict[str, object]):
+            self.payload = payload
+            return {"messages": [], "active_flow": "support"}
+
+    graph = SpyGraph()
+    assert await _outcome(graph, "list my account orders") == "flow"
+    assert graph.payload is not None
+    messages = graph.payload["messages"]
+    assert isinstance(messages, list)
+    assert len(messages) == 1 and isinstance(messages[0], HumanMessage)
+    message_id = messages[0].id
+    assert isinstance(message_id, str) and message_id
+    assert graph.payload["consumed_turn_ids"] == (message_id,)
 
 
 def test_frontline_eval_speech_authority_preflight_is_green() -> None:
@@ -176,7 +198,7 @@ def test_live_transport_scorer_requires_a_successful_upstream_retry(
                 effects=effects,
                 state=GraphObservation(
                     active_flow=None,
-                    pending_fields=(),
+                    automation_channels=(),
                     handover_destination=None,
                     interrupted=False,
                     unfinished=False,
@@ -226,7 +248,7 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
                 effects=_effects(otp_dispatches=1),
                 state=GraphObservation(
                     active_flow="support",
-                    pending_fields=(),
+                    automation_channels=(),
                     handover_destination=None,
                     interrupted=False,
                     unfinished=False,
@@ -242,7 +264,7 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
         expected_effects=_effects(),
         expected_state=GraphObservation(
             active_flow=None,
-            pending_fields=(),
+            automation_channels=(),
             handover_destination=None,
             interrupted=False,
             unfinished=False,
@@ -282,7 +304,7 @@ async def test_evaluator_confirms_failed_turn_recovery_admits_the_next_utterance
     )
     expected_state = GraphObservation(
         active_flow=None,
-        pending_fields=(),
+        automation_channels=(),
         handover_destination=None,
         interrupted=False,
         unfinished=False,
@@ -327,7 +349,7 @@ async def test_support_no_tool_fabrication_is_dropped_and_clarified_in_code(
     )
     expected_state = GraphObservation(
         active_flow="support",
-        pending_fields=("clarification_progress",),
+        automation_channels=("clarification_progress",),
         handover_destination=None,
         interrupted=False,
         unfinished=False,
@@ -429,7 +451,7 @@ async def test_identity_assurance_fabrication_is_detected_without_granting_autho
     )
     expected_state = GraphObservation(
         active_flow="identity",
-        pending_fields=("pending_identity", "pending_request"),
+        automation_channels=("pending_identity", "active_invocation"),
         handover_destination=None,
         interrupted=True,
         unfinished=True,
@@ -449,7 +471,7 @@ async def test_identity_assurance_fabrication_is_detected_without_granting_autho
 def _assert_terminal_turn(turn: TurnObservation) -> None:
     assert turn.state == GraphObservation(
         active_flow=None,
-        pending_fields=(),
+        automation_channels=(),
         handover_destination=None,
         interrupted=False,
         unfinished=False,
@@ -582,11 +604,16 @@ async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root
         reasoning=reasoning,
         thread_id="eval-terminal-route-order",
     )
+    consumed_turn_ids = ("seeded-continuation",)
     harness.engine._graph.update_state(
         {"configurable": {"thread_id": harness.engine.thread_id}},
         {
             "automation_terminal": True,
-            "pending_request": ListOrders(scope="account"),
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                ListOrders(scope="account"),
+                consumed_turn_ids=consumed_turn_ids,
+            ),
         },
         as_node="__start__",
     )
@@ -603,7 +630,7 @@ async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root
     )
     turn = observation.final
     assert turn.state.automation_terminal is True
-    assert turn.state.pending_fields == ()
+    assert turn.state.automation_channels == ()
     assert not turn.state.interrupted and not turn.state.unfinished
     assert [(part.node, part.text) for part in turn.audible] == [
         ("automation_terminal_response", _TERMINAL_LINE)

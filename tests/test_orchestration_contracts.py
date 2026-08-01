@@ -13,26 +13,36 @@ from agnostic_market.agents.capabilities import (
     CapabilitySpec,
 )
 from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
     CancellableOrderScope,
     CancelOrders,
     CapabilityId,
     CapabilityOutcome,
     ChangeProfile,
     DiscloseAiIdentity,
+    ExplicitOrderSet,
     ExplicitOrderTarget,
+    FocusedOrderTarget,
     IntentRequestModel,
+    ListOrders,
     ModifyCart,
+    PrincipalTransition,
     RefundOrder,
     ReturnOrder,
     RouteDecision,
     RoutingContext,
     RoutingFailure,
     SearchCatalog,
+    SwitchAccount,
+    VerificationProof,
+    VerifyIdentity,
     VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
+    principal_transition_continuation,
     validate_route_output,
 )
+from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 
 
 class _CancelCompleted(CapabilityOutcome):
@@ -53,6 +63,109 @@ class _RogueRequest(BaseModel):
 
 def _cancel_request() -> CancelOrders:
     return CancelOrders(target=CancellableOrderScope(scope="all_cancellable"))
+
+
+def test_active_invocation_is_minimal_derived_and_freshly_identified() -> None:
+    first = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
+    second = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
+
+    assert first.capability == CapabilityId.VIEW_CART
+    assert "capability" not in first.model_dump()
+    assert first.invocation_id != second.invocation_id
+    with pytest.raises(ValidationError):
+        ActiveInvocation(request=ViewCart(), opened_turn_id=" ")
+    with pytest.raises(ValidationError):
+        ActiveInvocation.model_validate(
+            {
+                "request": {"kind": "view_cart"},
+                "opened_turn_id": "turn-1",
+                "unexpected": True,
+            }
+        )
+
+
+def test_invocation_opening_uses_only_the_admitted_ledger_tail() -> None:
+    with pytest.raises(ValueError, match="admitted turn"):
+        open_active_invocation(ViewCart(), consumed_turn_ids=())
+
+    invocation = open_active_invocation(
+        ViewCart(),
+        consumed_turn_ids=("turn-1", "turn-2"),
+    )
+    assert invocation.opened_turn_id == "turn-2"
+    assert (
+        ReasoningState(
+            consumed_turn_ids=("turn-1", "turn-2"),
+            active_invocation=invocation,
+        ).active_invocation
+        == invocation
+    )
+
+    retained = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
+    assert (
+        ReasoningState(
+            consumed_turn_ids=("turn-1", "turn-2"),
+            active_invocation=retained,
+        ).active_invocation
+        == retained
+    )
+    with pytest.raises(ValidationError, match="opening turn was not admitted"):
+        ReasoningState(
+            consumed_turn_ids=("turn-1",),
+            active_invocation=invocation,
+        )
+
+
+def test_principal_transition_projection_is_closed_and_context_free() -> None:
+    allowed = (
+        ListOrders(scope="account"),
+        CancelOrders(target=CancellableOrderScope(scope="all_cancellable")),
+        CancelOrders(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
+        RefundOrder(target=ExplicitOrderTarget(order_ref="ORD-1002")),
+        ReturnOrder(target=ExplicitOrderTarget(order_ref="ORD-1002")),
+        ChangeProfile(field="address"),
+    )
+    with pytest.raises(ValueError, match="initiating request"):
+        principal_transition_continuation(None)  # type: ignore[arg-type]
+    switch = PrincipalTransition(
+        customer_ref="CUST-001",
+        masked_contact="number ending 0119",
+        fresh_proof=VerificationProof(),
+        initiating_request=SwitchAccount(),
+    )
+    assert switch.continuation is None
+    assert switch.completes_switch
+    for request in allowed:
+        assert principal_transition_continuation(request) == request
+        transition = PrincipalTransition(
+            customer_ref="CUST-001",
+            masked_contact="number ending 0119",
+            fresh_proof=VerificationProof(),
+            initiating_request=request,
+        )
+        assert transition.continuation == request
+        assert transition.initiating_request == request
+        assert not transition.completes_switch
+
+    rejected = (
+        ListOrders(scope="session"),
+        CancelOrders(),
+        CancelOrders(target={"selector": "focused"}),
+        RefundOrder(target=FocusedOrderTarget()),
+        ReturnOrder(target=FocusedOrderTarget()),
+        ViewCart(),
+        VerifyIdentity(),
+    )
+    for request in rejected:
+        with pytest.raises(ValueError, match="cannot continue"):
+            principal_transition_continuation(request)
+        with pytest.raises(ValidationError):
+            PrincipalTransition(
+                customer_ref="CUST-001",
+                masked_contact="number ending 0119",
+                fresh_proof=VerificationProof(),
+                initiating_request=request,
+            )
 
 
 def test_every_capability_id_has_one_valid_intent_shape() -> None:

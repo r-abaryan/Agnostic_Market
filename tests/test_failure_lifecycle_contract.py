@@ -29,7 +29,12 @@ from llm_fakes import RecordingResolver
 
 from agnostic_market.agents.engine import build_checkpointer
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.dtos.state import merge_consumed_turn_ids
+from agnostic_market.dtos.orchestration import ViewCart
+from agnostic_market.dtos.state import (
+    ReasoningState,
+    merge_consumed_turn_ids,
+    open_active_invocation,
+)
 from agnostic_market.llm.gateway import load_provider_credentials
 from agnostic_market.voice.pipeline import VoiceLoop, build_voice_loop
 from scripts.close_evidence_recorder import (
@@ -1310,6 +1315,80 @@ def test_interrupt_resume_atomically_updates_the_consumed_turn_ledger() -> None:
         "transport-turn-2",
     )
     assert snapshot.next == ()
+
+
+def test_principal_seed_can_atomically_open_an_invocation_on_the_merged_ledger() -> None:
+    builder = StateGraph(ReasoningState)
+    builder.add_node("entry", lambda _state: {})
+    builder.add_edge(START, "entry")
+    builder.add_edge("entry", END)
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("active-invocation-seed")
+    consumed_turn_ids = ("identity-completion-turn",)
+    invocation = open_active_invocation(
+        ViewCart(),
+        consumed_turn_ids=consumed_turn_ids,
+    )
+
+    graph.update_state(
+        config,
+        {
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": invocation,
+        },
+        as_node="__start__",
+    )
+    snapshot = graph.get_state(config)
+    restored = ReasoningState.model_validate(snapshot.values)
+
+    assert restored.consumed_turn_ids == consumed_turn_ids
+    assert restored.active_invocation == invocation
+    assert snapshot.next == ("entry",)
+
+
+def test_resume_turn_opens_an_invocation_from_the_ledger_not_message_history() -> None:
+    def confirm(_state: ReasoningState) -> dict[str, object]:
+        interrupt({"ask": "continue?"})
+        return {}
+
+    def open_invocation(state: ReasoningState) -> dict[str, object]:
+        return {
+            "active_invocation": open_active_invocation(
+                ViewCart(),
+                consumed_turn_ids=state.consumed_turn_ids,
+            )
+        }
+
+    builder = StateGraph(ReasoningState)
+    builder.add_node("confirm", confirm)
+    builder.add_node("open_invocation", open_invocation)
+    builder.add_edge(START, "confirm")
+    builder.add_edge("confirm", "open_invocation")
+    builder.add_edge("open_invocation", END)
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("active-invocation-resume")
+
+    graph.invoke(
+        {
+            "messages": [HumanMessage(content="checkout", id="turn-A")],
+            "consumed_turn_ids": ("turn-A",),
+        },
+        config,
+    )
+    graph.invoke(
+        Command(
+            resume={"text": "cancel all instead"},
+            update={"consumed_turn_ids": ("turn-B",)},
+        ),
+        config,
+    )
+    restored = ReasoningState.model_validate(graph.get_state(config).values)
+    human_ids = [message.id for message in restored.messages if isinstance(message, HumanMessage)]
+
+    assert human_ids == ["turn-A"]
+    assert restored.consumed_turn_ids == ("turn-A", "turn-B")
+    assert restored.active_invocation is not None
+    assert restored.active_invocation.opened_turn_id == "turn-B"
 
 
 def test_interrupt_update_without_resume_consumes_id_and_preserves_interrupt() -> None:

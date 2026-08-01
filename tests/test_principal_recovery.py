@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
+from pydantic import ValidationError
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
 
@@ -17,10 +18,21 @@ from agnostic_market.agents import engine as engine_module
 from agnostic_market.agents import recovery
 from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.identity import flow as identity_flow
-from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
+from agnostic_market.agents.recovery import (
+    AUTOMATION_TERMINAL_LINE,
+    RECOVERY_NODE_NAME,
+)
 from agnostic_market.commerce.identity import BoundIdentity
+from agnostic_market.commerce.verification import RiskProvider
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
-from agnostic_market.dtos.orchestration import ListOrders
+from agnostic_market.dtos.orchestration import (
+    FocusedOrderTarget,
+    ListOrders,
+    RefundOrder,
+    SwitchAccount,
+)
+from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
+from agnostic_market.dtos.state import PendingIdentity, ReasoningState, open_active_invocation
 
 _FACTS = TurnFacts()
 _OTP = "482913"
@@ -101,6 +113,77 @@ def test_transition_inspection_requires_every_postcondition_and_invalidation_is_
     assert not harness.identity.has_residual_order_authority()
     assert harness.verification.current_level() == 1
     assert harness.verification.grants == []
+
+
+def test_rejected_initiating_request_does_not_retire_existing_principal(
+    config_root: Path,
+) -> None:
+    harness = _identity_harness(config_root, thread_id="transition-request-rejected")
+    harness.identity.bind(_CUST1)
+    assert harness.verification.verify_otp(_OTP)
+    proof = harness.verification.grants[-1]
+
+    with pytest.raises(ValidationError, match="cannot continue"):
+        harness.caller_context.transition_principal(
+            _CUST2,
+            proof,
+            RefundOrder(target=FocusedOrderTarget()),
+        )
+
+    assert harness.caller_context.pending_transition() is None
+    assert harness.identity.current() == _CUST1
+    assert harness.verification.grants == [proof]
+
+
+@pytest.mark.parametrize(
+    "invocation_request",
+    (None, RefundOrder(target=FocusedOrderTarget())),
+    ids=("missing-invocation", "unsupported-invocation"),
+)
+def test_principal_recovery_rejects_missing_or_mismatched_initiating_request(
+    config_root: Path,
+    invocation_request: RefundOrder | None,
+) -> None:
+    case = "missing" if invocation_request is None else "unsupported"
+    harness = _identity_harness(config_root, thread_id=f"transition-request-{case}")
+    assert harness.verification.verify_otp(_OTP)
+    transition = harness.caller_context.transition_principal(
+        _CUST1,
+        harness.verification.grants[-1],
+        SwitchAccount(),
+    )
+    consumed_turn_ids = ("transition-opening-turn",) if invocation_request is not None else ()
+    invocation = (
+        open_active_invocation(invocation_request, consumed_turn_ids=consumed_turn_ids)
+        if invocation_request is not None
+        else None
+    )
+    state = ReasoningState(
+        consumed_turn_ids=consumed_turn_ids,
+        active_flow="identity",
+        active_invocation=invocation,
+        pending_identity=PendingIdentity(
+            customer_ref=_CUST1.customer_ref,
+            masked_contact=_CUST1.masked_contact,
+            attempt_key="transition-request-attempt",
+            grants_at_mint=0,
+        ),
+        pending_recovery=PendingRecovery(
+            origin_node="identity_apply",
+            action=ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION,
+            trigger="node_exception",
+        ),
+    )
+
+    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+
+    assert update["automation_terminal"] is True
+    assert [message.content for message in update["messages"]] == [AUTOMATION_TERMINAL_LINE]
+    assert harness.caller_context.pending_transition() is None
+    assert harness.identity.current() is None
+    assert harness.verification.current_level() == 1
+    assert harness.verification.grants == []
+    assert transition.transition_id
 
 
 @pytest.mark.parametrize(
@@ -192,8 +275,44 @@ async def test_identity_apply_failure_before_publication_preserves_original_prin
     assert old_proof in harness.verification.grants
     assert harness.caller_context.pending_transition() is None
     assert snapshot.values.get("pending_identity") is None
-    assert snapshot.values.get("pending_request") is None
+    assert snapshot.values.get("active_invocation") is None
     assert snapshot.next == ()
+
+
+def test_identity_apply_missing_invocation_fails_before_transition_publication(
+    config_root: Path,
+) -> None:
+    harness = _identity_harness(
+        config_root,
+        thread_id="transition-missing-invocation-before-publish",
+    )
+    assert harness.verification.verify_otp(_OTP)
+    nodes = identity_flow.build_identity_nodes(
+        FakeChatModel(emit_tool_calls=False),
+        harness.verification,
+        harness.otp,
+        RiskProvider(flagged=False),
+        harness.customers,
+        harness.identity,
+        make_policy(refund_returnless_under_usd=50.0),
+        harness.caller_context.transition_principal,
+        display_name="Acme Store",
+    )
+    state = ReasoningState(
+        active_flow="identity",
+        pending_identity=PendingIdentity(
+            customer_ref=_CUST1.customer_ref,
+            masked_contact=_CUST1.masked_contact,
+            attempt_key="missing-invocation-attempt",
+            grants_at_mint=0,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="requires an active invocation"):
+        nodes.apply(state)
+
+    assert harness.caller_context.pending_transition() is None
+    assert harness.identity.current() is None
 
 
 async def test_identity_apply_failure_after_coherent_publish_rotates_and_continues_once(

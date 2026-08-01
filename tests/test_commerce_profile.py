@@ -42,11 +42,21 @@ def test_unknown_merchant_fixture_fails_loudly(config_root: Path) -> None:
         load_profile_fixture(config_root, "no_such_merchant")
 
 
-def test_profile_owners_are_cross_checked_against_customer_fixture(config_root: Path) -> None:
+def test_checked_in_profile_fixtures_are_customer_coherent(config_root: Path) -> None:
+    fixture_paths = sorted((config_root / "fixtures" / "profiles").glob("*.yaml"))
+    assert fixture_paths
+
+    for fixture_path in fixture_paths:
+        merchant_id = fixture_path.stem
+        profiles = load_profile_fixture(config_root, merchant_id)
+        customers = load_customers_fixture(config_root, merchant_id)
+        assert_profiles_have_customers(profiles, customers)
+
+
+def test_unknown_profile_owner_fails_loudly_without_pii(config_root: Path) -> None:
     loaded = load_profile_fixture(config_root, "acme_store")
     profile = next(iter(loaded.profiles.values()))
     customers = load_customers_fixture(config_root, "acme_store")
-    assert_profiles_have_customers(loaded, customers)  # the production fixture is coherent
 
     unknown = ProfileFixture(profiles={"CUST-UNKNOWN": profile})
     with pytest.raises(ConfigError, match="CUST-UNKNOWN") as exc_info:

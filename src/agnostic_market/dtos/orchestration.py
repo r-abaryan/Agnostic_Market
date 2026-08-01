@@ -286,6 +286,21 @@ IntentRequest = Annotated[
     Field(discriminator="kind"),
 ]
 
+
+class ActiveInvocation(BaseModel):
+    """One code-opened capability request retained across deterministic continuation."""
+
+    model_config = _FROZEN
+
+    invocation_id: NonEmptyText = Field(default_factory=lambda: uuid.uuid4().hex)
+    request: IntentRequest
+    opened_turn_id: NonEmptyText
+
+    @property
+    def capability(self) -> CapabilityId:
+        return self.request.kind
+
+
 ClarificationReason = Literal[
     "ambiguous_intent",
     "missing_target",
@@ -404,6 +419,29 @@ class VerificationProof(BaseModel):
     raised_to: Literal[2] = 2
 
 
+def principal_transition_continuation(
+    request: IntentRequest,
+) -> IntentRequest | None:
+    """Return the authority-free request that may survive principal rotation."""
+
+    if request is None:
+        raise ValueError("principal transition requires an initiating request")
+    if isinstance(request, SwitchAccount):
+        return None
+    if isinstance(request, ListOrders):
+        if request.scope == "account":
+            return request
+    elif isinstance(request, CancelOrders):
+        if isinstance(request.target, CancellableOrderScope | ExplicitOrderSet):
+            return request
+    elif isinstance(request, RefundOrder | ReturnOrder):
+        if isinstance(request.target, ExplicitOrderTarget):
+            return request
+    elif isinstance(request, ChangeProfile):
+        return request
+    raise ValueError(f"{request.kind.value} cannot continue across a principal transition")
+
+
 class PrincipalTransition(BaseModel):
     """Allowlisted payload carried outside the retired reasoning checkpoint."""
 
@@ -413,7 +451,20 @@ class PrincipalTransition(BaseModel):
     customer_ref: NonEmptyText
     masked_contact: NonEmptyText
     fresh_proof: VerificationProof
-    continuation: IntentRequest | None = None
+    initiating_request: IntentRequest
+
+    @property
+    def continuation(self) -> IntentRequest | None:
+        return principal_transition_continuation(self.initiating_request)
+
+    @property
+    def completes_switch(self) -> bool:
+        return isinstance(self.initiating_request, SwitchAccount)
+
+    @model_validator(mode="after")
+    def initiating_request_is_allowlisted(self) -> PrincipalTransition:
+        principal_transition_continuation(self.initiating_request)
+        return self
 
 
 class PrincipalTransitionInspection(BaseModel):

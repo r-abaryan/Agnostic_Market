@@ -92,7 +92,7 @@ def test_automation_state_clear_is_total_and_preserves_persistent_state() -> Non
         "pending_return": None,
         "pending_profile_change": None,
         "pending_identity": None,
-        "pending_request": None,
+        "active_invocation": None,
         "pending_recovery": None,
         "identity_claim_misses": 0,
         "active_flow": None,

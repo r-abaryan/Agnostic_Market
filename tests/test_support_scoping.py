@@ -39,11 +39,12 @@ from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.orchestration import (
     CancelOrders,
+    ChangeProfile,
     ExplicitOrderSet,
     RefundOrder,
     ReturnOrder,
 )
-from agnostic_market.dtos.state import CartLine
+from agnostic_market.dtos.state import CartLine, ReasoningState
 
 _POLICY = make_policy()
 _FACTS = TurnFacts()
@@ -86,6 +87,27 @@ def _telemetry(tmp_path: Path) -> list[dict]:
 
 def _state_values(harness: SupportHarness, thread_id: str) -> dict:
     return harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+
+
+def _validated_state(harness: SupportHarness, thread_id: str) -> ReasoningState:
+    return ReasoningState.model_validate(_state_values(harness, thread_id))
+
+
+def _active_request(harness: SupportHarness, thread_id: str):
+    state = _validated_state(harness, thread_id)
+    invocation = state.active_invocation
+    if invocation is None:
+        return None
+    assert invocation.opened_turn_id in state.consumed_turn_ids
+    return invocation.request
+
+
+def _fresh_active_request(harness: SupportHarness, thread_id: str):
+    state = _validated_state(harness, thread_id)
+    invocation = state.active_invocation
+    assert invocation is not None
+    assert invocation.opened_turn_id == state.consumed_turn_ids[-1]
+    return invocation.request
 
 
 def _active_flow(harness: SupportHarness, thread_id: str) -> str | None:
@@ -174,6 +196,7 @@ async def test_unbound_cancel_detours_to_identity_without_leaking_details(
     assert h.store.cancel_count == 0
     assert _no_pendings(h, "scope-1")
     assert _active_flow(h, "scope-1") == "identity"  # the detour is in flight
+    assert isinstance(_fresh_active_request(h, "scope-1"), CancelOrders)
     tel = _telemetry(tmp_path)
     assert any(e["event"] == "support_action_needs_identity" for e in tel)
     # The rung-1 grant path never runs: no order was granted, no auth-denial recorded.
@@ -193,7 +216,7 @@ async def test_model_only_order_reference_cannot_cross_identity(config_root: Pat
     )
     await _events(h.engine, "cancel my rain jacket order")
     state = _state_values(h, "scope-model-ref")
-    assert state.get("pending_request") is None
+    assert _active_request(h, "scope-model-ref") is None
     assert state.get("pending_cancel") is None
     assert state.get("active_flow") != "identity"
     assert h.identity.current() is None
@@ -283,7 +306,7 @@ async def test_strong_labelled_stt_enters_each_guest_mutation_identity_detour(
     )
     await _events(harness.engine, utterance)
     state = _state_values(harness, thread_id)
-    assert isinstance(state.get("pending_request"), request_type)
+    assert isinstance(_active_request(harness, thread_id), request_type)
     assert state.get("active_flow") == "identity"
     assert state.get("pending_cancel") is None
     assert state.get("pending_return") is None
@@ -309,7 +332,7 @@ async def test_guest_batch_requires_every_deduplicated_target_in_caller_speech(
     )
     await _events(harness.engine, "Cancel order ORD-1002.")
     state = _state_values(harness, thread_id)
-    assert state.get("pending_request") is None
+    assert _active_request(harness, thread_id) is None
     assert state.get("pending_cancel") is None
     assert state.get("active_flow") != "identity"
     assert harness.store.cancel_count == 0
@@ -329,7 +352,7 @@ async def test_guest_batch_preserves_all_exact_caller_stated_targets(
         thread_id=thread_id,
     )
     await _events(harness.engine, "Cancel order ORD-1002 and ORD-1001.")
-    request = _state_values(harness, thread_id).get("pending_request")
+    request = _active_request(harness, thread_id)
     assert isinstance(request, CancelOrders)
     assert isinstance(request.target, ExplicitOrderSet)
     assert request.target.order_refs == ("ORD-1002", "ORD-1001")
@@ -388,7 +411,7 @@ async def test_model_only_target_fails_closed_for_every_guest_mutation_consumer(
     )
     await _events(harness.engine, utterance)
     state = _state_values(harness, thread_id)
-    assert state.get("pending_request") is None
+    assert _active_request(harness, thread_id) is None
     assert state.get("pending_cancel") is None
     assert state.get("pending_return") is None
     assert state.get("pending_refund") is None
@@ -424,7 +447,7 @@ async def _drive_explicit_action_continuation(
         ),
     )
     await _events(h.engine, utterance)
-    assert _state_values(h, thread_id).get("pending_request") is not None
+    assert _active_request(h, thread_id) is not None
     dispatched = await _events(h.engine, _CONTACT_1001)
     assert any(
         isinstance(event, InterruptEvent) and "6-digit code" in event.prompt for event in dispatched
@@ -548,7 +571,7 @@ async def test_failed_otp_on_action_detour_leaves_zero_resume_intent(
     await _events(h.engine, _CONTACT_1002)  # OTP dispatched
     await _events(h.engine, "000000")  # WRONG code -> exhausted -> human handover
     assert h.store.cancel_count == 0
-    assert _state_values(h, "scope-fail").get("pending_request") is None
+    assert _active_request(h, "scope-fail") is None
     assert _state_values(h, "scope-fail").get("pending_cancel") is None
 
 
@@ -802,7 +825,7 @@ async def test_unbound_model_only_order_target_asks_for_caller_stated_number(
     assert not any(isinstance(event, (TokenEvent, InterruptEvent)) for event in events)
     state = _state_values(harness, thread_id)
     assert state["active_flow"] == "support"
-    assert state.get("pending_request") is None
+    assert _active_request(harness, thread_id) is None
     assert state.get("pending_clarification") is None
     assert harness.identity.current() is None
     assert harness.otp.dispatch_count == 0
@@ -936,6 +959,7 @@ async def test_unshipped_refund_steer_does_not_leak_for_unauthorized_order(
     events = await _events(h.engine, "I want my money back for order ORD-1002")
     assert _no_details_spoken(events)
     assert _no_pendings(h, "scope-12")
+    assert isinstance(_fresh_active_request(h, "scope-12"), RefundOrder)
     tel = _telemetry(tmp_path)
     assert not any(e["event"] == "refund_steered_to_cancel" for e in tel)
     assert any(e["event"] == "support_action_needs_identity" for e in tel)
@@ -988,6 +1012,7 @@ async def test_return_gated_at_assemble(config_root: Path, tmp_path: Path) -> No
     events = await _events(h.engine, "I need to return order ORD-1001")
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert _no_pendings(h, "scope-14")
+    assert isinstance(_fresh_active_request(h, "scope-14"), ReturnOrder)
     assert h.store.return_count == 0
     assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
@@ -1041,6 +1066,7 @@ async def test_unbound_profile_change_detours_to_identity(
     h = _profile_harness(config_root, thread_id="scope-prof-unbound")
     await _events(h.engine, "Change my phone number to 555 111 2222")
     assert _active_flow(h, "scope-prof-unbound") == "identity"
+    assert isinstance(_fresh_active_request(h, "scope-prof-unbound"), ChangeProfile)
     assert h.otp.dispatch_count == 0  # no profile OTP — we're verifying identity first
     assert h.profile.change_count == 0
     assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
@@ -1057,7 +1083,7 @@ async def test_model_only_profile_value_cannot_cross_identity(config_root: Path)
         )
     ]
     assert not any(isinstance(event, TokenEvent) for event in events)
-    assert state.get("pending_request") is None
+    assert _active_request(h, "scope-prof-model-value") is None
     assert state.get("pending_profile_change") is None
     assert state.get("active_flow") == "support"
     assert state.get("pending_clarification") is None
@@ -1075,7 +1101,7 @@ async def test_order_number_cannot_become_a_model_proposed_contact(
     )
     await _events(h.engine, "Change the contact for order 1002")
     state = _state_values(h, "scope-prof-order-number")
-    assert state.get("pending_request") is None
+    assert _active_request(h, "scope-prof-order-number") is None
     assert state.get("pending_profile_change") is None
     assert state.get("active_flow") != "identity"
     assert h.otp.dispatch_count == 0

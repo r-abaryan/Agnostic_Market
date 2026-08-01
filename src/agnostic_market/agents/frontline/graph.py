@@ -101,6 +101,7 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     PolicyContext,
     ReasoningState,
+    open_active_invocation,
 )
 
 logger = logging.getLogger("agnostic_market.agents.frontline")
@@ -644,7 +645,10 @@ def build_frontline_graph(
                 "handover": None,
                 "identity_claim_misses": 0,
                 "clarification_progress": None,
-                "pending_request": SwitchAccount(),
+                "active_invocation": open_active_invocation(
+                    SwitchAccount(),
+                    consumed_turn_ids=state.consumed_turn_ids,
+                ),
             }
         # Unbound LIST_ORDERS enters the IDENTITY flow (P7 rung 2: enumeration needs an
         # OTP-bound identity) — checked ABOVE the generic support branch since it shares
@@ -660,7 +664,10 @@ def build_frontline_graph(
                 "handover": None,
                 "identity_claim_misses": 0,
                 "clarification_progress": None,
-                "pending_request": ListOrders(scope="account"),
+                "active_invocation": open_active_invocation(
+                    ListOrders(scope="account"),
+                    consumed_turn_ids=state.consumed_turn_ids,
+                ),
             }
         # Support handles REFUND, CANCEL_ORDER (Group A), and profile changes — address +
         # contact (Group C; contact = the OTP factor itself, stepped-up on the OLD factor).
@@ -756,7 +763,7 @@ def build_frontline_graph(
             return "automation_terminal_response"
         if state.pending_recovery is not None:
             return RECOVERY_NODE_NAME
-        if state.pending_request is not None and state.active_flow is None:
+        if state.active_invocation is not None and state.active_flow is None:
             return "support_continuation"
         text = _last_user_text(state)
         if state.active_flow == "cart":
@@ -809,7 +816,7 @@ def build_frontline_graph(
         if state.automation_terminal:
             return "automation_terminal_response"
         if state.handover is None:
-            if state.active_flow == "identity" and state.pending_request is not None:
+            if state.active_flow == "identity" and state.active_invocation is not None:
                 return (
                     "principal_warning"
                     if lifecycle.has_discardable_state()
@@ -824,8 +831,9 @@ def build_frontline_graph(
         return END
 
     def principal_warning_node(state: ReasoningState) -> dict[str, object]:
-        request = state.pending_request
-        assert request is not None
+        invocation = state.active_invocation
+        assert invocation is not None
+        request = invocation.request
         switching = isinstance(request, SwitchAccount)
         prompt = (
             "If the new details belong to a different account, switching will clear this "
@@ -846,7 +854,7 @@ def build_frontline_graph(
             return {"active_flow": "identity"}
         if verdict == "human":
             return {
-                "pending_request": None,
+                "active_invocation": None,
                 "active_flow": None,
                 "handover": HandoffRequest(
                     destination="human",
@@ -860,7 +868,7 @@ def build_frontline_graph(
             else "Okay, I won't start account verification."
         )
         return {
-            "pending_request": None,
+            "active_invocation": None,
             "active_flow": None,
             "messages": [AIMessage(declined)],
         }
@@ -868,7 +876,7 @@ def build_frontline_graph(
     def route_after_principal_warning(state: ReasoningState) -> str:
         if state.handover is not None:
             return "handover"
-        if state.pending_request is not None:
+        if state.active_invocation is not None:
             return "identity_assemble"
         return END
 
@@ -911,7 +919,6 @@ def build_frontline_graph(
     )
     identity = build_identity_nodes(
         reasoning_model,
-        store,
         verification_store,
         otp,
         risk,
@@ -960,7 +967,7 @@ def build_frontline_graph(
         # Typed continuation routes to deterministic resolution; no transcript replay.
         if state.handover is not None:
             return "handover"
-        if state.pending_request is not None:
+        if state.active_invocation is not None:
             return "support_continuation"
         return END
 
