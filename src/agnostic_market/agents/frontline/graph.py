@@ -1425,6 +1425,7 @@ def build_frontline_graph(
             lifecycle.invalidate_principal_transition,
         ),
         error_handler=build_recovery_infrastructure_handler,
+        destinations=(entry_node_name, END),
     )
     node_registry.register_infrastructure(
         RECOVERY_TERMINALIZER_NODE_NAME,
@@ -1734,7 +1735,6 @@ def build_frontline_graph(
     )
     graph.add_edge("identity_abort", END)
     graph.add_edge("identity_escape_human", "handover")
-    graph.add_edge(RECOVERY_NODE_NAME, END)
     graph.add_edge(RECOVERY_TERMINALIZER_NODE_NAME, "automation_terminal_response")
     graph.add_edge(principal_seed_complete_node, END)
     graph.add_edge("automation_terminal_response", END)

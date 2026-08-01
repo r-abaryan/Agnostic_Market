@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from langgraph.errors import NodeError
-from langgraph.graph import StateGraph
+from langgraph.graph import START, StateGraph
 
 from agnostic_market.agents.recovery import (
     NodePolicyRegistry,
@@ -153,6 +153,44 @@ def test_validated_policy_mapping_is_immutable() -> None:
             ExceptionAction.SAFE_ABORT,
             AbandonmentKind.PURE_ABORT,
         )
+
+
+def test_registry_destinations_are_rendering_only() -> None:
+    visited: list[str] = []
+
+    def source(_state: ReasoningState) -> dict:
+        visited.append("source")
+        return {}
+
+    def rendered(_state: ReasoningState) -> dict:
+        visited.append("rendered")
+        return {}
+
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+    registry.register(
+        "source",
+        source,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=("rendered",),
+    )
+    registry.register_infrastructure(
+        "rendered",
+        rendered,
+    )
+    graph.add_edge(START, "source")
+    registry.validated_policies()
+
+    compiled = graph.compile()
+    compiled.invoke({})
+    rendered_edges = {(edge.source, edge.target) for edge in compiled.get_graph().edges}
+
+    assert graph.nodes["source"].ends == ("rendered",)
+    assert not any(source == "source" for source, _target in graph.edges)
+    assert "source" not in graph.branches
+    assert ("source", "rendered") in rendered_edges
+    assert visited == ["source"]
 
 
 def test_handler_origin_mismatch_mints_a_marker_the_consumer_must_reject() -> None:

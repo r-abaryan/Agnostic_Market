@@ -7,6 +7,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.graph import END
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
@@ -248,6 +249,9 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     assert isinstance(policies, MappingProxyType)
     assert len(policies) == 54
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
+    assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
+    assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
+    assert RECOVERY_NODE_NAME not in graph.builder.branches
     assert graph.recovery_infrastructure_nodes == frozenset(
         {
             RECOVERY_NODE_NAME,

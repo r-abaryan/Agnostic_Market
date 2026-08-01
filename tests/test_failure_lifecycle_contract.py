@@ -1056,6 +1056,75 @@ async def test_cancellation_after_external_write_leaves_ambiguous_checkpoint() -
     assert snapshot.tasks[0].error is None
 
 
+def test_command_goto_adds_to_a_static_edge() -> None:
+    def source(_state: _ContractState) -> Command:
+        return Command(update={"visited": ["source"]}, goto="dynamic")
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("source", source)
+    builder.add_node("static", lambda _state: {"visited": ["static"]})
+    builder.add_node("dynamic", lambda _state: {"visited": ["dynamic"]})
+    builder.add_edge(START, "source")
+    builder.add_edge("source", "static")
+
+    result = builder.compile().invoke({})
+
+    assert sorted(result["visited"]) == ["dynamic", "source", "static"]
+
+
+def test_command_goto_adds_to_a_conditional_edge() -> None:
+    def source(_state: _ContractState) -> Command:
+        return Command(update={"visited": ["source"]}, goto="dynamic")
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("source", source)
+    builder.add_node("conditional", lambda _state: {"visited": ["conditional"]})
+    builder.add_node("dynamic", lambda _state: {"visited": ["dynamic"]})
+    builder.add_edge(START, "source")
+    builder.add_conditional_edges(
+        "source",
+        lambda _state: "conditional",
+        {"conditional": "conditional"},
+    )
+
+    result = builder.compile().invoke({})
+
+    assert sorted(result["visited"]) == ["conditional", "dynamic", "source"]
+
+
+def test_command_goto_end_does_not_suppress_a_static_edge() -> None:
+    def source(_state: _ContractState) -> Command:
+        return Command(update={"visited": ["source"]}, goto=END)
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("source", source)
+    builder.add_node("static", lambda _state: {"visited": ["static"]})
+    builder.add_edge(START, "source")
+    builder.add_edge("source", "static")
+
+    result = builder.compile().invoke({})
+
+    assert result["visited"] == ["source", "static"]
+
+
+def test_destinations_render_an_edge_without_executing_it() -> None:
+    builder = StateGraph(_ContractState)
+    builder.add_node(
+        "source",
+        lambda _state: {"visited": ["source"]},
+        destinations=("rendered",),
+    )
+    builder.add_node("rendered", lambda _state: {"visited": ["rendered"]})
+    builder.add_edge(START, "source")
+    graph = builder.compile()
+
+    result = graph.invoke({})
+    rendered_edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+
+    assert result["visited"] == ["source"]
+    assert ("source", "rendered") in rendered_edges
+
+
 def _recovery_contract_graph(
     *,
     old_work_started: asyncio.Event | None = None,
@@ -1069,7 +1138,7 @@ def _recovery_contract_graph(
             return "recover"
         return "old_work" if state.get("prior_intent") else "normal"
 
-    def recover(state: _ContractState) -> Command:
+    def recover(state: _ContractState) -> dict | Command:
         if state["pending_recovery"] == "safe_abort":
             return Command(
                 update={
@@ -1080,15 +1149,12 @@ def _recovery_contract_graph(
                 },
                 goto="entry",
             )
-        return Command(
-            update={
-                "pending_recovery": None,
-                "prior_intent": None,
-                "disposition": "consumed",
-                "visited": ["recover"],
-            },
-            goto=END,
-        )
+        return {
+            "pending_recovery": None,
+            "prior_intent": None,
+            "disposition": "consumed",
+            "visited": ["recover"],
+        }
 
     def normal(state: _ContractState) -> dict:
         assert state.get("prior_intent") is None
@@ -1106,7 +1172,7 @@ def _recovery_contract_graph(
 
     builder = StateGraph(_ContractState)
     builder.add_node("entry", entry)
-    builder.add_node("recover", recover)
+    builder.add_node("recover", recover, destinations=("entry", END))
     builder.add_node("normal", normal)
     builder.add_node("old_work", old_work)
     builder.add_edge(START, "entry")
@@ -1115,7 +1181,6 @@ def _recovery_contract_graph(
         route_after_entry,
         {"recover": "recover", "old_work": "old_work", "normal": "normal"},
     )
-    builder.add_edge("recover", END)
     builder.add_edge("normal", END)
     builder.add_edge("old_work", END)
     return builder.compile(checkpointer=build_checkpointer())

@@ -311,10 +311,13 @@ class NodePolicyRegistry:
         node: object,
         *,
         error_handler: NodeErrorHandler | None = None,
+        destinations: tuple[str, ...] | None = None,
     ) -> None:
         options: dict[str, object] = {}
         if error_handler is not None:
-            options = {"error_handler": error_handler}
+            options["error_handler"] = error_handler
+        if destinations is not None:
+            options["destinations"] = destinations
         self._graph.add_node(name, node, **options)
 
     def register(
@@ -323,6 +326,8 @@ class NodePolicyRegistry:
         node: object,
         on_exception: ExceptionAction,
         on_abandonment: AbandonmentKind,
+        *,
+        destinations: tuple[str, ...] | None = None,
     ) -> None:
         self._ensure_open_and_unique(name)
         policy = NodeRecoveryPolicy(
@@ -339,7 +344,12 @@ class NodePolicyRegistry:
             if on_abandonment == AbandonmentKind.PURE_ABORT
             else self._execution_tracker.wrap(name, node)
         )
-        self._add_node(name, registered_node, error_handler=handler)
+        self._add_node(
+            name,
+            registered_node,
+            error_handler=handler,
+            destinations=destinations,
+        )
         self._policies[name] = policy
         if handler is not None:
             self._handled.add(name)
@@ -350,9 +360,15 @@ class NodePolicyRegistry:
         node: object,
         *,
         error_handler: NodeErrorHandler | None = None,
+        destinations: tuple[str, ...] | None = None,
     ) -> None:
         self._ensure_open_and_unique(name)
-        self._add_node(name, node, error_handler=error_handler)
+        self._add_node(
+            name,
+            node,
+            error_handler=error_handler,
+            destinations=destinations,
+        )
         self._infrastructure.add(name)
         if error_handler is not None:
             self._handled_infrastructure.add(name)
