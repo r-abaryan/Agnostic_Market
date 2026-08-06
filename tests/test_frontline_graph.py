@@ -35,6 +35,7 @@ from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancelOrders,
+    CapabilityId,
     ListOrders,
     SwitchAccount,
 )
@@ -122,7 +123,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         policy=policy,
         lifecycle=caller_context,
         **kwargs,
-    )
+    ).graph
 
 
 def _admitted_turn(text: str, *, turn_id: str, **state: object) -> dict[str, object]:
@@ -148,6 +149,52 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
     }
 
 
+def test_support_capability_registry_and_dispatch_topology_are_closed(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    registry = graph.capability_registry
+
+    assert registry.capability_ids == (
+        CapabilityId.LIST_ORDERS,
+        CapabilityId.CANCEL_ORDERS,
+        CapabilityId.REFUND_ORDER,
+        CapabilityId.RETURN_ORDER,
+        CapabilityId.CHANGE_PROFILE,
+    )
+    assert {spec.entry.node_name for spec in registry.specs.values()} == {
+        "support_capability_entry"
+    }
+    assert graph.builder.nodes["capability_dispatch"].ends == ("support_capability_entry",)
+    assert not any(source == "capability_dispatch" for source, _target in graph.builder.edges)
+    assert "capability_dispatch" not in graph.builder.branches
+
+
+def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: Path) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+    turn_id = "typed-session-list"
+    invocation = ActiveInvocation(
+        request=ListOrders(scope="session"),
+        opened_turn_id=turn_id,
+    )
+
+    result = graph.invoke(
+        _admitted_turn(
+            "what did I order on this call?",
+            turn_id=turn_id,
+            active_invocation=invocation,
+        )
+    )
+
+    assert reasoning.invoke_count == 0
+    assert result["active_invocation"] is None
+    assert result["active_flow"] is None
+    spoken = [message for message in result["messages"] if isinstance(message, AIMessage)]
+    assert len(spoken) == 1
+    assert "hit a snag" not in str(spoken[0].content).lower()
+
+
 def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) -> None:
     graph = _graph(config_root, FakeChatModel())
     policies = graph.node_recovery_policies
@@ -165,7 +212,9 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "cart_guardrail",
             "cart_abort",
             "support_assemble",
-            "support_continuation",
+            "capability_dispatch",
+            "support_capability_entry",
+            "support_capability_render",
             "support_clarify",
             "support_guardrail",
             "support_risk_check",
@@ -247,7 +296,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 54
+    assert len(policies) == 56
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -259,7 +308,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 53
+    assert len(graph.recovery_handled_nodes) == 55
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

@@ -30,7 +30,7 @@ from agnostic_market.agents.recovery import (
 from agnostic_market.agents.support import _stepup as support_stepup
 from agnostic_market.commerce.orders import render_cart_line
 from agnostic_market.dtos.events import SpokenMessageEvent
-from agnostic_market.dtos.orchestration import ListOrders
+from agnostic_market.dtos.orchestration import CancelOrders, ExplicitOrderSet, ListOrders
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import PendingRefund, ReasoningState, open_active_invocation
 
@@ -369,6 +369,60 @@ async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(
     assert reasoning.invoke_count == 0
     assert snapshot.values.get("pending_recovery") is None
     assert snapshot.values.get("active_invocation") is None
+    assert snapshot.next == ()
+
+
+async def test_capability_entry_exception_is_owned_by_the_destination_not_the_dispatcher(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    harness = build_support_engine(
+        config_root,
+        policy=make_policy(),
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="dispatch-destination-failure",
+    )
+    consumed_turn_ids = ("seeded-cancel",)
+    harness.engine._graph.update_state(
+        harness.engine._config,
+        {
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                CancelOrders(target=ExplicitOrderSet(order_refs=("ORD-1001",))),
+                consumed_turn_ids=consumed_turn_ids,
+            ),
+        },
+        as_node="__start__",
+    )
+
+    def unavailable_orders() -> list:
+        raise RuntimeError("order store unavailable")
+
+    monkeypatch.setattr(harness.store, "actionable_orders", unavailable_orders)
+
+    events = await _events(harness.engine, "cancel it")
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
+    records = _telemetry_records()
+
+    # The dispatcher only hands off; the DESTINATION owns its own failure. Both nodes carry
+    # the same SAFE_ABORT policy, so the origin node name (never the action) is what
+    # distinguishes correct ownership here.
+    assert [record["node"] for record in records if record["event"] == "turn_failed"] == [
+        "support_capability_entry"
+    ]
+    assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+        TURN_FALLBACK_LINE
+    ]
+    assert not any(record["event"] == "support_action_authorized" for record in records)
+    assert frontline.invoke_count == 0
+    assert reasoning.invoke_count == 0
+    assert harness.store.cancel_count == 0
+    assert snapshot.values.get("pending_cancel") is None
+    assert snapshot.values.get("active_invocation") is None
+    assert snapshot.values.get("pending_recovery") is None
     assert snapshot.next == ()
 
 

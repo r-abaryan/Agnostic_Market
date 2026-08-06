@@ -17,6 +17,12 @@ from __future__ import annotations
 
 from agnostic_market.agents._shared_prompt import compose_shared_context
 from agnostic_market.commerce.orders import OrderCandidate
+from agnostic_market.dtos.orchestration import (
+    CancelOrders,
+    ChangeProfile,
+    RefundOrder,
+    ReturnOrder,
+)
 from agnostic_market.dtos.state import PolicyContext
 
 _SUPPORT_INSTRUCTIONS = (
@@ -121,3 +127,33 @@ def compose_support_prompt(
     support role + the current order list (recent-order-context marked, Group C L4)."""
     shared = compose_shared_context(display_name, policy)
     return f"{shared}\n{_SUPPORT_INSTRUCTIONS.format(orders=render_orders(orders, last_order_id))}"
+
+
+def compose_support_capability_prompt(
+    display_name: str,
+    orders: list[OrderCandidate],
+    policy: PolicyContext,
+    request: CancelOrders | RefundOrder | ReturnOrder | ChangeProfile,
+    proposal_tool_name: str,
+    last_order_id: str | None = None,
+) -> str:
+    """Narrow slot-gathering prompt for one already-selected Support capability."""
+
+    shared = compose_shared_context(display_name, policy)
+    retained = request.model_dump_json(exclude_none=True)
+    instructions = (
+        f"{shared}\n"
+        f"You are gathering missing fields for exactly one {request.kind.value} request. "
+        f"The retained typed request is {retained}. Every field already present is fixed: never "
+        "replace its target, scope, amount, destination, or profile field. Use the caller's newest "
+        "message only to fill a missing field. When enough information is present, call exactly "
+        f"{proposal_tool_name}. If a required fact is still missing, call "
+        "request_support_clarification. "
+        "If the caller changes topic or abandons this request, call leave_support. Emit exactly "
+        "one tool call and no prose. Never claim an effect completed or ask for verification."
+    )
+    if isinstance(request, ChangeProfile):
+        # A profile change names no order, so the candidate block's "ask for the order
+        # number" placeholder would be the wrong question for this capability entirely.
+        return instructions
+    return f"{instructions}\nAuthorized order candidates:\n{render_orders(orders, last_order_id)}"

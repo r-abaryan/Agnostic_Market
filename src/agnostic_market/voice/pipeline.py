@@ -24,6 +24,7 @@ from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent
 from livekit.agents.voice.background_audio import AudioConfig, BackgroundAudioPlayer
 from livekit.plugins import langchain as lk_langchain
 
+from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import write_event
@@ -95,6 +96,7 @@ class VoiceLoop:
     session: AgentSession
     agent: DisclosureFirstAgent
     engine: ReasoningEngine
+    capability_registry: CapabilityRegistry
     # Background "thinking" earcon — a subtle typing sound while the graph works, masking the
     # LLM/tool dead-air on turns the deterministic read renderer can't shortcut (catalog
     # search, multi-intent). CONSTRUCTED here from config; STARTED in the worker entrypoint
@@ -180,7 +182,7 @@ def build_voice_loop(
         wrap_readonly_tool(t, config.merchant_id)
         for t in build_voice_tools(store, cart_store, recent_orders, identity_store, customers)
     ]
-    graph = build_frontline_graph(
+    assembly = build_frontline_graph(
         chat_model=gateway.chat_model(config.llm.routing),
         read_only_tools=tools,
         display_name=config.display_name,
@@ -210,7 +212,7 @@ def build_voice_loop(
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(
-        graph,
+        assembly.graph,
         thread_id=uuid.uuid4().hex,
         cancellation_quiescence_timeout_seconds=(
             config.runtime.cancellation_quiescence_timeout_seconds
@@ -261,6 +263,7 @@ def build_voice_loop(
         session=session,
         agent=agent,
         engine=engine,
+        capability_registry=assembly.capability_registry,
         background_audio=_build_background_audio(),
     )
 

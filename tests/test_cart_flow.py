@@ -103,7 +103,7 @@ def _build(
         identity_store=identity,
         order_store=store,
     )
-    graph = build_frontline_graph(
+    assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
         display_name="Acme Store",
@@ -124,7 +124,7 @@ def _build(
         lifecycle=caller_context,
         checkpointer=build_checkpointer(),
     )
-    return graph, store, cart
+    return assembly.graph, store, cart
 
 
 def _flow(graph) -> str | None:

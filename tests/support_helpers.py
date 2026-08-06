@@ -107,7 +107,7 @@ def build_support_engine(
         identity_store=identity,
         order_store=store,
     )
-    graph = build_frontline_graph(
+    assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
         tools,
         display_name="Acme Store",
@@ -128,7 +128,7 @@ def build_support_engine(
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(
-        graph,
+        assembly.graph,
         thread_id=thread_id,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         lifecycle=caller_context,

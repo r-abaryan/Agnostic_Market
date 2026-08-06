@@ -102,6 +102,15 @@ async def test_engine_seam_wiring(config_root: Path) -> None:
     assert not loop.engine.pending_interrupt()  # fresh thread
 
 
+async def test_voice_runtime_shares_the_graph_capability_registry(config_root: Path) -> None:
+    loop = await _loop(config_root, RecordingResolver())
+    # The dispatcher closes over the registry the compiled graph carries. The runtime must
+    # expose THAT instance; a second availability list built alongside it would drift the
+    # day a capability is registered, and the ids guard against sharing an empty one.
+    assert loop.capability_registry is loop.engine._graph.capability_registry
+    assert loop.capability_registry.capability_ids
+
+
 async def test_session_build_rejects_profile_for_unknown_customer(
     config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

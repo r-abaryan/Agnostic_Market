@@ -1,4 +1,4 @@
-"""The shared prompt context EVERY agent model reads (frontline, checkout, support).
+"""The shared prompt context EVERY agent model reads (frontline, cart, identity, support).
 
 One source of truth for knowledge that must not be tier-local (live 2026-07-10: the
 refund-policy facts lived only in the frontline prompt, so a policy question that

@@ -6,8 +6,9 @@ closure (the model can't speak what it never saw).
 the target is session-placed OR owned by the OTP-BOUND identity (`order_mutation_allowed`). A
 rung-1 contact-match grant authorizes READS only; it never authorizes a mutation. So an UNBOUND
 caller who asks to cancel/refund/return an order they can't yet mutate is routed into the
-identity OTP flow to BIND, then the action RESUMES at support_assemble (the model re-proposes,
-now the bound owner). A BOUND caller targeting a non-owned / unknown order fails closed with the
+identity OTP flow to BIND, then the retained typed request RESUMES through capability_dispatch
+into the capability entry, which re-resolves and re-authorizes the target against the new
+binding. A BOUND caller targeting a non-owned / unknown order fails closed with the
 ONE combined not-found (existence-oracle). The contact claim is no longer a mutation credential —
 `account_contact` is gone from the propose tools.
 
@@ -25,7 +26,7 @@ import json
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import TEST_OTP, SupportHarness, build_support_engine
@@ -41,10 +42,19 @@ from agnostic_market.dtos.orchestration import (
     CancelOrders,
     ChangeProfile,
     ExplicitOrderSet,
+    ExplicitOrderTarget,
+    FocusedOrderSet,
+    FocusedOrderTarget,
+    IntentRequest,
     RefundOrder,
     ReturnOrder,
 )
-from agnostic_market.dtos.state import CartLine, ReasoningState
+from agnostic_market.dtos.state import (
+    CartLine,
+    ReasoningState,
+    SupportClarification,
+    open_active_invocation,
+)
 
 _POLICY = make_policy()
 _FACTS = TurnFacts()
@@ -61,6 +71,348 @@ _FIXTURE_DETAILS = ("ORD-100", "trail running", "waterproof rain jacket", "merin
 _HANDOVER_TO_SUPPORT = {
     "request_handover": {"destination": "support", "reason_code": "cancel_order"}
 }
+
+
+def test_incomplete_refund_owner_reprompts_invalid_model_output(config_root: Path) -> None:
+    h = _harness(config_root, FakeChatModel(), thread_id="incomplete-refund-owner")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+    consumed_turn_ids = ("turn-1",)
+    state = ReasoningState(
+        messages=[HumanMessage(content="refund order ORD-1001", id="turn-1")],
+        consumed_turn_ids=consumed_turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            RefundOrder(target=ExplicitOrderTarget(order_ref="ORD-1001")),
+            consumed_turn_ids=consumed_turn_ids,
+        ),
+    )
+
+    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert update["active_invocation"] == state.active_invocation
+    assert update["pending_clarification"] == SupportClarification(detail="amount")
+
+
+def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_refund_amount", {"amount_usd": 20.0})],
+            [("provide_refund_destination", {"destination": "new_instrument"})],
+        ]
+    )
+    h = _harness(config_root, reasoning, thread_id="refund-owner-slots")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+    consumed_turn_ids = ("turn-1",)
+    state = ReasoningState(
+        messages=[HumanMessage(content="refund $20", id="turn-1")],
+        consumed_turn_ids=consumed_turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            RefundOrder(target=ExplicitOrderTarget(order_ref="ORD-1001")),
+            consumed_turn_ids=consumed_turn_ids,
+        ),
+    )
+
+    first = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    retained = first["active_invocation"]
+    assert retained.request == RefundOrder(
+        target=ExplicitOrderTarget(order_ref="ORD-1001"),
+        amount_usd=20.0,
+    )
+    assert first["pending_clarification"] == SupportClarification(detail="refund_destination")
+    second_state = state.model_copy(
+        update={
+            "messages": [
+                *state.messages,
+                *first["messages"],
+                HumanMessage(content="a different card", id="turn-2"),
+            ],
+            "consumed_turn_ids": ("turn-1", "turn-2"),
+            "active_invocation": retained,
+            "pending_clarification": None,
+            "clarification_progress": first["clarification_progress"],
+        }
+    )
+
+    second = h.engine._graph.nodes["support_capability_entry"].invoke(second_state)
+
+    assert second["active_invocation"] is None
+    assert second["pending_refund"].order_id == "ORD-1001"
+    assert second["pending_refund"].amount_usd == 20.0
+    assert second["pending_refund"].destination == "new_instrument"
+
+
+def test_profile_owner_carries_incomplete_request_then_gathers_value_after_binding(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [
+                (
+                    "propose_profile_change",
+                    {"field": "address", "new_value": "42 New Road"},
+                )
+            ]
+        ]
+    )
+    h = _harness(config_root, reasoning, thread_id="profile-owner-slots")
+    first_turn_ids = ("turn-1",)
+    request = ChangeProfile(field="address")
+    state = ReasoningState(
+        messages=[HumanMessage(content="change my address", id="turn-1")],
+        consumed_turn_ids=first_turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            request,
+            consumed_turn_ids=first_turn_ids,
+        ),
+    )
+
+    identity_entry = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert reasoning.invoke_count == 0
+    assert identity_entry["active_flow"] == "identity"
+    assert identity_entry["active_invocation"].request == request
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+    second_turn_ids = ("turn-1", "turn-2")
+    bound_state = ReasoningState(
+        messages=[HumanMessage(content="42 New Road", id="turn-2")],
+        consumed_turn_ids=second_turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            request,
+            consumed_turn_ids=second_turn_ids,
+        ),
+    )
+
+    completed = h.engine._graph.nodes["support_capability_entry"].invoke(bound_state)
+
+    assert completed["active_invocation"] is None
+    assert completed["pending_profile_change"].field == "address"
+    assert completed["pending_profile_change"].new_value == "42 New Road"
+
+
+def test_refund_owner_rejects_replacement_of_fixed_target_and_amount(
+    config_root: Path,
+) -> None:
+    replacement = {
+        "order_key": "ORD-1003",
+        "amount_usd": 30.0,
+        "destination": "original",
+    }
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_refund_destination", replacement)],
+            [("provide_refund_destination", replacement)],
+        ]
+    )
+    h = _harness(config_root, reasoning, thread_id="refund-owner-monotonic")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+    turn_ids = ("turn-1",)
+    request = RefundOrder(
+        target=ExplicitOrderTarget(order_ref="ORD-1001"),
+        amount_usd=20.0,
+    )
+    state = ReasoningState(
+        messages=[HumanMessage(content="the original payment method", id="turn-1")],
+        consumed_turn_ids=turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(request, consumed_turn_ids=turn_ids),
+    )
+
+    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert update["active_invocation"].request == request
+    assert update.get("pending_refund") is None
+    assert update["pending_clarification"] == SupportClarification(detail="refund_destination")
+
+
+@pytest.mark.parametrize(
+    ("initial_request", "tool_name", "tool_args", "pending_field"),
+    [
+        (
+            CancelOrders(target=FocusedOrderSet()),
+            "propose_cancel",
+            {"order_keys": ["ORD-1001"]},
+            "pending_cancel",
+        ),
+        (
+            RefundOrder(
+                target=FocusedOrderTarget(),
+                amount_usd=20.0,
+                destination="original",
+            ),
+            "provide_refund_order",
+            {"order_key": "ORD-1001"},
+            "pending_refund",
+        ),
+        (
+            ReturnOrder(target=FocusedOrderTarget()),
+            "propose_return",
+            {"order_key": "ORD-1001"},
+            "pending_return",
+        ),
+    ],
+)
+def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
+    config_root: Path,
+    initial_request: IntentRequest,
+    tool_name: str,
+    tool_args: dict,
+    pending_field: str,
+) -> None:
+    reasoning = FakeChatModel(scripted_calls=[[(tool_name, tool_args)]])
+    h = _harness(config_root, reasoning, thread_id=f"focused-gather-{pending_field}")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+    first_turn_ids = ("turn-1",)
+    first_state = ReasoningState(
+        messages=[HumanMessage(content="use that order", id="turn-1")],
+        consumed_turn_ids=first_turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            initial_request,
+            consumed_turn_ids=first_turn_ids,
+        ),
+    )
+
+    first = h.engine._graph.nodes["support_capability_entry"].invoke(first_state)
+
+    retained = first["active_invocation"]
+    assert retained.request.target is None
+    assert first["pending_clarification"] == SupportClarification(detail="order")
+    assert reasoning.invoke_count == 0
+
+    second_state = ReasoningState(
+        messages=[HumanMessage(content="ORD-1001", id="turn-2")],
+        consumed_turn_ids=("turn-1", "turn-2"),
+        active_flow="support",
+        active_invocation=retained,
+        clarification_progress=first["clarification_progress"],
+    )
+    second = h.engine._graph.nodes["support_capability_entry"].invoke(second_state)
+
+    assert second["active_invocation"] is None
+    assert second[pending_field] is not None
+
+
+def test_profile_owner_does_not_read_orders_or_expose_order_candidates(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reasoning = FakeChatModel(record_prompts=True)
+    h = _harness(config_root, reasoning, thread_id="profile-no-order-dependency")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+
+    def unavailable_orders() -> list:
+        raise RuntimeError("order store unavailable")
+
+    monkeypatch.setattr(h.store, "actionable_orders", unavailable_orders)
+    turn_ids = ("turn-1",)
+    state = ReasoningState(
+        messages=[HumanMessage(content="change my address", id="turn-1")],
+        consumed_turn_ids=turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            ChangeProfile(field="address"),
+            consumed_turn_ids=turn_ids,
+        ),
+    )
+
+    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert update["pending_clarification"] == SupportClarification(detail="profile_value")
+    assert reasoning._seen_prompts
+    assert "ORD-" not in reasoning._seen_prompts[-1]
+    assert "trail running" not in reasoning._seen_prompts[-1]
+
+
+def test_profile_owner_checks_availability_before_requesting_new_pii(config_root: Path) -> None:
+    reasoning = FakeChatModel(record_prompts=True)
+    h = _harness(config_root, reasoning, thread_id="profile-unavailable-before-pii")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-002", masked_contact="masked"))
+    turn_ids = ("turn-1",)
+    state = ReasoningState(
+        messages=[HumanMessage(content="change my address", id="turn-1")],
+        consumed_turn_ids=turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            ChangeProfile(field="address"),
+            consumed_turn_ids=turn_ids,
+        ),
+    )
+
+    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert reasoning.invoke_count == 0
+    assert not reasoning._seen_prompts
+    assert update["active_invocation"] is None
+    assert update["pending_profile_change"] is None
+    assert update["handover"].destination == "human"
+    assert update["handover"].reason_code == "address_change"
+
+
+def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    reasoning = FakeChatModel(scripted_calls=[[("provide_refund_amount", {"amount_usd": 20.0})]])
+    h = _harness(config_root, reasoning, thread_id="refund-one-authorization-row")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
+    turn_ids = ("turn-1",)
+    state = ReasoningState(
+        messages=[HumanMessage(content="refund $20", id="turn-1")],
+        consumed_turn_ids=turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1001"),
+                destination="original",
+            ),
+            consumed_turn_ids=turn_ids,
+        ),
+    )
+
+    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert update["pending_refund"] is not None
+    assert [
+        event
+        for event in _telemetry(tmp_path)
+        if event["event"] == "support_action_authorized" and event["order_id"] == "ORD-1001"
+    ] == [{"event": "support_action_authorized", "order_id": "ORD-1001"}]
+
+
+def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_reference(
+    config_root: Path,
+) -> None:
+    h = _harness(config_root, FakeChatModel(), thread_id="focused-owner-boundary")
+    h.recent_orders.record(
+        ("ORD-1002",),
+        operation="read",
+        focused_order_ref="ORD-1002",
+    )
+    turn_ids = ("turn-1",)
+    state = ReasoningState(
+        messages=[HumanMessage(content="refund it", id="turn-1")],
+        consumed_turn_ids=turn_ids,
+        active_flow="support",
+        active_invocation=open_active_invocation(
+            RefundOrder(
+                target=FocusedOrderTarget(),
+                amount_usd=20.0,
+                destination="original",
+            ),
+            consumed_turn_ids=turn_ids,
+        ),
+    )
+
+    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+
+    assert update["active_flow"] == "support"
+    assert update.get("pending_refund") is None
+    assert update["pending_clarification"] == SupportClarification(detail="order")
 
 
 def _harness(
@@ -260,6 +612,50 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
     assert any(e["event"] == "identity_bound_for_action" for e in tel)
 
 
+async def test_guest_profile_change_verifies_then_resumes_under_the_new_principal(
+    config_root: Path,
+) -> None:
+    # The profile triad end to end: an UNBOUND caller states a new address, detours into the
+    # identity OTP flow, and the ROTATED principal re-enters the typed owner, which mints the
+    # change against the newly bound customer. The bind OTP goes to that customer's on-file
+    # factor, which IS the profile step-up factor, so one dispatch, not two.
+    new_address = "42 New Road"
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {"destination": "support", "reason_code": "address_change"}
+        },
+        tool_call_limit=1,
+    )
+    scripted = [
+        [("propose_profile_change", {"field": "address", "new_value": new_address})],
+        [],  # identity assemble, same turn: no contact claim yet
+        [("propose_identity", {"contact_claim": _CONTACT_1001})],
+    ]
+    h = _harness(
+        config_root,
+        FakeChatModel(scripted_calls=scripted),
+        thread_id="scope-profile-resume",
+        frontline=frontline,
+    )
+
+    await _events(h.engine, f"change my address to {new_address}")
+    assert _active_flow(h, "scope-profile-resume") == "identity"
+    await _events(h.engine, _CONTACT_1001)
+    assert h.otp.dispatch_count == 1
+    events = await _events(h.engine, TEST_OTP)
+
+    interrupts = [e for e in events if isinstance(e, InterruptEvent)]
+    assert len(interrupts) == 1 and new_address in interrupts[0].prompt
+    bound = h.identity.current()
+    assert bound is not None and bound.customer_ref == "CUST-001"
+    assert h.profile.change_count == 0  # nothing changed before consent
+    assert h.otp.dispatch_count == 1
+    await _events(h.engine, "yes")
+    assert h.profile.change_count == 1
+    assert h.profile.address_on_file("CUST-001") == new_address
+
+
 @pytest.mark.xfail(
     strict=True,
     reason="strong-labelled letter-spelled order IDs do not reach guest mutation detours",
@@ -428,6 +824,7 @@ async def _drive_explicit_action_continuation(
     tool_args: dict,
     utterance: str,
     thread_id: str,
+    expect_model_free_continuation: bool = True,
 ) -> tuple[SupportHarness, FakeChatModel, list]:
     reasoning = FakeChatModel(
         scripted_calls=[
@@ -457,7 +854,8 @@ async def _drive_explicit_action_continuation(
     events = await _events(h.engine, TEST_OTP)
     assert h.identity.current() is not None
     assert h.engine.thread_id != old_thread_id
-    assert reasoning._tool_calls_made == model_calls_before_continuation
+    if expect_model_free_continuation:
+        assert reasoning._tool_calls_made == model_calls_before_continuation
     return h, reasoning, events
 
 
@@ -520,6 +918,7 @@ async def test_model_only_refund_amount_cannot_reach_confirmation(
         tool_args={"order_key": "ORD-1001", "amount_usd": 20.0, "destination": "original"},
         utterance="refund order ORD-1001",
         thread_id="scope-refund-model-amount",
+        expect_model_free_continuation=False,
     )
     assert not any(isinstance(event, InterruptEvent) for event in events)
     assert any(

@@ -389,7 +389,7 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(
     assert rotated_invocation.invocation_id != old_invocation.invocation_id
     carried_turn_ids = tuple(rotation_seeds[0]["consumed_turn_ids"])
     assert rotated_invocation.opened_turn_id == carried_turn_ids[-1] == "test-turn-2"
-    lines = [e for e in _spoken(events) if e.node == "support_continuation"]
+    lines = [e for e in _spoken(events) if e.node == "support_capability_render"]
     assert len(lines) == 1
     # THE privacy property: CUST-001 hears 1001 + 1003 and NEVER CUST-002's 1002.
     assert "ORD-1001" in lines[0].text and "ORD-1003" in lines[0].text
@@ -453,8 +453,16 @@ def test_same_principal_apply_preserves_invocation_until_continuation(
     assert after_apply.active_invocation == invocation
     assert after_apply.active_invocation.invocation_id == invocation.invocation_id
     assert after_apply.active_invocation.opened_turn_id == invocation.opened_turn_id
-    continuation_update = h.engine._graph.nodes["support_continuation"].invoke(after_apply)
-    assert continuation_update["active_invocation"] is None
+    # The tool-capable entry hands a read off untouched; only the code-only render node,
+    # which authors the caller-audible line, consumes the invocation.
+    entry_update = h.engine._graph.nodes["support_capability_entry"].invoke(after_apply)
+    assert "active_invocation" not in entry_update
+    after_entry = ReasoningState.model_validate(
+        {**after_apply.model_dump(mode="python"), **entry_update}
+    )
+    assert after_entry.active_invocation == invocation
+    render_update = h.engine._graph.nodes["support_capability_render"].invoke(after_entry)
+    assert render_update["active_invocation"] is None
 
 
 async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) -> None:
@@ -466,7 +474,7 @@ async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) 
     events = await _events(h.engine, "It should be four eight two nine one three.")
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-002"
-    line = next(e for e in _spoken(events) if e.node == "support_continuation")
+    line = next(e for e in _spoken(events) if e.node == "support_capability_render")
     assert "ORD-1002" in line.text and "ORD-1001" not in line.text
 
 
@@ -709,7 +717,7 @@ async def test_stale_l2_then_correct_otp_binds(config_root: Path) -> None:
     events = await _events(h.engine, _VALID_OTP)  # correct on the re-collect
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-001"
-    assert any(e.node == "support_continuation" for e in _spoken(events))
+    assert any(e.node == "support_capability_render" for e in _spoken(events))
 
 
 async def test_stale_l2_wrong_otp_twice_exhausts_to_human(config_root: Path) -> None:

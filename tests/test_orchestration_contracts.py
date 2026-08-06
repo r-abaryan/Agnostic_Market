@@ -1,13 +1,15 @@
-"""Milestone-1 routing DTO, capability registry, and fail-closed contract tests."""
+"""Routing/continuation DTO contracts: request shapes, invocation revalidation, registry
+resolution, and the principal-transition projection. Pure contracts: no graph, no network."""
 
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import FrozenInstanceError
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from agnostic_market.agents.capabilities import (
+    CapabilityEntry,
     CapabilityRegistry,
     CapabilityRegistryError,
     CapabilitySpec,
@@ -17,7 +19,6 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     CancelOrders,
     CapabilityId,
-    CapabilityOutcome,
     ChangeProfile,
     DiscloseAiIdentity,
     ExplicitOrderSet,
@@ -45,15 +46,6 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 
 
-class _CancelCompleted(CapabilityOutcome):
-    status: Literal["completed"] = "completed"
-    order_refs: tuple[str, ...]
-
-
-class _WrongOutcome(CapabilityOutcome):
-    status: Literal["failed"] = "failed"
-
-
 class _RogueRequest(BaseModel):
     kind: CapabilityId = CapabilityId.SEARCH_CATALOG
 
@@ -74,12 +66,70 @@ def test_active_invocation_is_minimal_derived_and_freshly_identified() -> None:
     assert first.invocation_id != second.invocation_id
     with pytest.raises(ValidationError):
         ActiveInvocation(request=ViewCart(), opened_turn_id=" ")
+
+
+def test_active_invocation_replaces_only_the_same_capability_request() -> None:
+    invocation = ActiveInvocation(request=CancelOrders(), opened_turn_id="turn-1")
+    completed = invocation.with_request(_cancel_request())
+
+    assert completed.request == _cancel_request()
+    assert completed.invocation_id == invocation.invocation_id
+    assert completed.opened_turn_id == invocation.opened_turn_id
+    with pytest.raises(ValueError, match="cannot change capability"):
+        invocation.with_request(SwitchAccount())
+    with pytest.raises(ValidationError):
+        invocation.with_request(object())  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
         ActiveInvocation.model_validate(
             {
                 "request": {"kind": "view_cart"},
                 "opened_turn_id": "turn-1",
                 "unexpected": True,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "corrupt_request",
+    [
+        RefundOrder(
+            target=ExplicitOrderTarget(order_ref="ORD-1001"),
+            amount_usd=10.0,
+            destination="original",
+        ).model_copy(update={"amount_usd": -5.0}),
+        RefundOrder(
+            target=ExplicitOrderTarget(order_ref="ORD-1001"),
+            amount_usd=10.0,
+            destination="original",
+        ).model_copy(update={"target": "not-a-target"}),
+        ChangeProfile(field="address", new_value="New address").model_copy(
+            update={"new_value": ""}
+        ),
+    ],
+)
+def test_active_invocation_revalidates_nested_request_instances(corrupt_request: object) -> None:
+    with pytest.raises(ValidationError):
+        ActiveInvocation(request=corrupt_request, opened_turn_id="turn-1")
+
+
+def test_reasoning_state_revalidates_existing_active_invocation_instance() -> None:
+    valid = ActiveInvocation(request=_cancel_request(), opened_turn_id="turn-1")
+    corrupt = valid.model_copy(
+        update={
+            "request": {
+                "kind": "refund_order",
+                "target": "not-a-target",
+                "amount_usd": -5.0,
+                "destination": None,
+            }
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        ReasoningState.model_validate(
+            {
+                "consumed_turn_ids": ("turn-1",),
+                "active_invocation": corrupt,
             }
         )
 
@@ -430,153 +480,99 @@ def test_routing_context_is_bounded_and_authority_free() -> None:
         )
 
 
-async def test_registry_execution_returns_only_the_declared_outcome() -> None:
-    seen: list[BaseModel] = []
-
-    async def adapter(request: BaseModel) -> BaseModel:
-        seen.append(request)
-        return _CancelCompleted(order_refs=("ORD-TEST-1",))
-
+def test_registry_resolves_complete_and_incomplete_requests_to_an_opaque_entry() -> None:
+    entry = CapabilityEntry("support_capability_entry")
     registry = CapabilityRegistry(
         [
             CapabilitySpec(
                 capability_id=CapabilityId.CANCEL_ORDERS,
                 request_type=CancelOrders,
-                outcome_type=_CancelCompleted,
-                adapter=adapter,
-                effect="write",
-                write_serialization_key="orders",
-                planner_ready=True,
+                entry=entry,
             )
         ]
     )
 
-    request = _cancel_request()
-    outcome = await registry.execute(request)
-
-    assert seen == [request]
-    assert outcome == _CancelCompleted(order_refs=("ORD-TEST-1",))
+    assert registry.resolve(_cancel_request()) is entry
+    assert registry.resolve(CancelOrders()) is entry
     assert registry.capability_ids == (CapabilityId.CANCEL_ORDERS,)
-    assert registry.planner_ready_ids == (CapabilityId.CANCEL_ORDERS,)
 
 
-async def test_registry_rejects_an_adapter_outcome_mismatch() -> None:
-    async def adapter(_: BaseModel) -> BaseModel:
-        return _WrongOutcome()
-
-    registry = CapabilityRegistry(
-        [
-            CapabilitySpec(
-                capability_id=CapabilityId.CANCEL_ORDERS,
-                request_type=CancelOrders,
-                outcome_type=_CancelCompleted,
-                adapter=adapter,
-                effect="write",
-                write_serialization_key="orders",
-            )
-        ]
-    )
-
-    with pytest.raises(CapabilityRegistryError, match="incompatible outcome"):
-        await registry.execute(_cancel_request())
-
-
-async def test_registry_rejects_incomplete_requests_before_calling_the_adapter() -> None:
-    seen: list[BaseModel] = []
-
-    async def adapter(request: BaseModel) -> BaseModel:
-        seen.append(request)
-        return _CancelCompleted(order_refs=("ORD-TEST-1",))
-
-    registry = CapabilityRegistry(
-        [
-            CapabilitySpec(
-                capability_id=CapabilityId.CANCEL_ORDERS,
-                request_type=CancelOrders,
-                outcome_type=_CancelCompleted,
-                adapter=adapter,
-                effect="write",
-                write_serialization_key="orders",
-            )
-        ]
-    )
-
-    with pytest.raises(CapabilityRegistryError, match="incomplete request"):
-        await registry.execute(CancelOrders())
-    assert seen == []
-
-
-async def test_registry_rejects_an_untyped_request_without_dereferencing_kind() -> None:
-    with pytest.raises(CapabilityRegistryError, match="typed IntentRequest"):
-        await CapabilityRegistry().execute(IntentRequestModel())
-
-
-def test_registry_rejects_duplicate_or_inconsistent_contracts() -> None:
-    async def adapter(_: BaseModel) -> BaseModel:
-        return _CancelCompleted(order_refs=("ORD-TEST-1",))
-
+def test_registry_is_immutable_and_exposes_no_executor_or_planner_contract() -> None:
+    entry = CapabilityEntry("support_capability_entry")
     spec = CapabilitySpec(
         capability_id=CapabilityId.CANCEL_ORDERS,
         request_type=CancelOrders,
-        outcome_type=_CancelCompleted,
-        adapter=adapter,
-        effect="write",
-        write_serialization_key="orders",
+        entry=entry,
     )
     registry = CapabilityRegistry([spec])
 
+    with pytest.raises(TypeError):
+        registry.specs[CapabilityId.CANCEL_ORDERS] = spec  # type: ignore[index]
+    with pytest.raises(FrozenInstanceError):
+        registry._capability_ids = ()
+    with pytest.raises(FrozenInstanceError):
+        registry._specs = {}  # type: ignore[assignment]
+    assert not hasattr(registry, "register")
+    assert not hasattr(registry, "execute")
+    assert not hasattr(spec, "adapter")
+    assert not hasattr(spec, "outcome_type")
+    assert not hasattr(spec, "planner_ready")
+
+
+def test_registry_rejects_duplicate_or_inconsistent_contracts() -> None:
+    entry = CapabilityEntry("support_capability_entry")
+    spec = CapabilitySpec(CapabilityId.CANCEL_ORDERS, CancelOrders, entry)
+
     with pytest.raises(CapabilityRegistryError, match="already registered"):
-        registry.register(spec)
+        CapabilityRegistry((spec, spec))
     with pytest.raises(CapabilityRegistryError, match="request_type kind"):
         CapabilitySpec(
             capability_id=CapabilityId.VIEW_CART,
             request_type=CancelOrders,
-            outcome_type=_CancelCompleted,
-            adapter=adapter,
-            effect="read",
+            entry=entry,
         )
-    with pytest.raises(CapabilityRegistryError, match="concrete"):
+    with pytest.raises(CapabilityRegistryError, match="capability_id must be"):
         CapabilitySpec(
-            capability_id=CapabilityId.VIEW_CART,
-            request_type=ViewCart,
-            outcome_type=CapabilityOutcome,
-            adapter=adapter,
-            effect="read",
+            capability_id="cancel_orders",  # type: ignore[arg-type]
+            request_type=CancelOrders,
+            entry=entry,
         )
+    with pytest.raises(CapabilityRegistryError, match="normalized node name"):
+        CapabilityEntry(" support_capability_entry ")
+    with pytest.raises(CapabilityRegistryError, match="CapabilityEntry"):
+        CapabilitySpec(
+            CapabilityId.CANCEL_ORDERS,
+            CancelOrders,
+            "support_capability_entry",  # type: ignore[arg-type]
+        )
+    with pytest.raises(CapabilityRegistryError, match="CapabilitySpec"):
+        CapabilityRegistry((object(),))  # type: ignore[arg-type]
 
 
 def test_registry_rejects_a_base_model_lookalike_that_has_a_valid_kind() -> None:
-    async def adapter(_: BaseModel) -> BaseModel:
-        return _CancelCompleted(order_refs=("ORD-TEST-1",))
-
     with pytest.raises(CapabilityRegistryError, match="IntentRequestModel subclass"):
         CapabilitySpec(
             capability_id=CapabilityId.SEARCH_CATALOG,
             request_type=_RogueRequest,  # type: ignore[arg-type]
-            outcome_type=_CancelCompleted,
-            adapter=adapter,
-            effect="read",
+            entry=CapabilityEntry("catalog_entry"),
         )
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"effect": "write", "write_serialization_key": None},
-        {"effect": "write", "write_serialization_key": "  "},
-        {"effect": "write", "write_serialization_key": " orders "},
-        {"effect": "read", "write_serialization_key": "orders"},
-    ],
-)
-def test_registry_enforces_write_serialization_contract(kwargs: dict[str, object]) -> None:
-    async def adapter(_: BaseModel) -> BaseModel:
-        return _CancelCompleted(order_refs=("ORD-TEST-1",))
-
-    with pytest.raises(CapabilityRegistryError):
-        CapabilitySpec(
-            capability_id=CapabilityId.CANCEL_ORDERS,
-            request_type=CancelOrders,
-            outcome_type=_CancelCompleted,
-            adapter=adapter,
-            **kwargs,  # type: ignore[arg-type]
+def test_registry_rejects_untyped_unregistered_and_incompatible_requests() -> None:
+    registry = CapabilityRegistry(
+        (
+            CapabilitySpec(
+                CapabilityId.CANCEL_ORDERS,
+                CancelOrders,
+                CapabilityEntry("support_capability_entry"),
+            ),
         )
+    )
+
+    with pytest.raises(CapabilityRegistryError, match="typed IntentRequest"):
+        registry.resolve(_RogueRequest())  # type: ignore[arg-type]
+    with pytest.raises(CapabilityRegistryError, match="not registered"):
+        registry.resolve(ViewCart())
+    incompatible = ViewCart().model_copy(update={"kind": CapabilityId.CANCEL_ORDERS})
+    with pytest.raises(CapabilityRegistryError, match="incompatible request type"):
+        registry.resolve(incompatible)

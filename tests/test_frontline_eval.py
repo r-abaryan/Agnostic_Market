@@ -21,6 +21,7 @@ from scripts.frontline_eval import (
     ScenarioObservation,
     TransportOwnerScenario,
     TurnObservation,
+    _build_eval_runtime,
     _observe_scenario,
     _OfflineSecretResolver,
     _order_reference_failures,
@@ -84,6 +85,20 @@ async def test_routing_outcome_admits_one_matching_message_and_ledger_id() -> No
 
 def test_frontline_eval_speech_authority_preflight_is_green() -> None:
     assert _speech_authority_failures() == ()
+
+
+def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Path) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    runtime = _build_eval_runtime(
+        config,
+        FakeChatModel(),
+        FakeChatModel(),
+        thread_id="eval-registry-identity",
+    )
+    # The evaluator scores the production graph, so it must read availability from the same
+    # registry the dispatcher resolves against, never rebuild its own alongside it.
+    assert runtime.capability_registry is runtime.graph.capability_registry
+    assert runtime.capability_registry.capability_ids
 
 
 @pytest.mark.xfail(strict=True, reason=_XFAIL_ORDER_REFERENCE)

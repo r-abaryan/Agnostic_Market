@@ -46,18 +46,22 @@ from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from agnostic_market.agents._consent import classify_cancel_consent, classify_consent
+from agnostic_market.agents._copy import guest_list_close, warm_close
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
 from agnostic_market.agents.clarification import (
     advance_clarification,
     with_clarification_lifecycle,
 )
 from agnostic_market.agents.support._stepup import build_stepup_nodes
-from agnostic_market.agents.support.prompt import compose_support_prompt
+from agnostic_market.agents.support.prompt import (
+    compose_support_capability_prompt,
+    compose_support_prompt,
+)
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -98,16 +102,20 @@ from agnostic_market.dtos.confirmation import (
     validate_confirmation_rendering,
 )
 from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
     CancellableOrderScope,
     CancelOrders,
     CancelScope,
     ChangeProfile,
     ExplicitOrderSet,
     ExplicitOrderTarget,
+    FocusedOrderSet,
+    FocusedOrderTarget,
     IntentRequest,
     ListOrders,
     RefundOrder,
     ReturnOrder,
+    principal_transition_continuation,
 )
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
@@ -156,9 +164,6 @@ _SUPPORT_CLARIFICATION_LINES: dict[SupportQuestionDetail | SupportAuthorizationD
 _ORDER_SELECTION_ACK = "order selection checked"
 _ORDER_REFERENCE_REQUIRED_ACK = "caller-stated order number required"
 _PROFILE_VALUE_REQUIRED_ACK = "caller-stated profile value required"
-_CONTINUATION_NOT_FOUND = (
-    "I couldn't find an order matching those details, so I haven't changed anything."
-)
 # The denial counter's bucket for references that never resolved to a store order — one
 # bounded key, never the caller's free text (an attacker probing random ids must not grow
 # an unbounded dict of their own strings).
@@ -299,11 +304,32 @@ def _profile_confirmation_phrase(pending: PendingProfileChange) -> str:
     return validate_confirmation_rendering(policy, rendered, phrase)
 
 
+# Two refund proposal shapes, one per caller path. `_ProposeRefund` is the broad assemble
+# tool: the caller stated everything at once. The `_ProvideRefund*` trio is the capability
+# owner gathering ONE slot at a time, so answering "amount" cannot also set the destination.
 class _ProposeRefund(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     order_key: str
     amount_usd: float
+    destination: RefundDestination
+
+
+class _ProvideRefundOrder(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    order_key: str
+
+
+class _ProvideRefundAmount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount_usd: float
+
+
+class _ProvideRefundDestination(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     destination: RefundDestination
 
 
@@ -357,7 +383,8 @@ class SupportNodes:
     """
 
     assemble: Callable[[ReasoningState], dict[str, object]]
-    continuation: Callable[[ReasoningState], dict[str, object]]
+    capability_entry: Callable[[ReasoningState], dict[str, object]]
+    capability_render: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     risk_check: Callable[[ReasoningState], dict[str, object]]
@@ -443,6 +470,21 @@ def build_support_nodes(
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
     @tool
+    def provide_refund_order(order_key: str) -> str:
+        """Supply only the missing order reference for the active refund request."""
+        raise NotImplementedError("intercepted by the capability entry; never executed")
+
+    @tool
+    def provide_refund_amount(amount_usd: float) -> str:
+        """Supply only the missing amount for the active refund request."""
+        raise NotImplementedError("intercepted by the capability entry; never executed")
+
+    @tool
+    def provide_refund_destination(destination: RefundDestination) -> str:
+        """Supply only the missing destination for the active refund request."""
+        raise NotImplementedError("intercepted by the capability entry; never executed")
+
+    @tool
     def propose_cancel(
         order_keys: list[str] | None = None,
         scope: CancelScope | None = None,
@@ -487,6 +529,43 @@ def build_support_nodes(
     bound_tool_names = frozenset(tool.name for tool in support_tools)
     model = reasoning_model.bind_tools(support_tools)
 
+    def proposal_tool_for(
+        request: CancelOrders | RefundOrder | ReturnOrder | ChangeProfile,
+    ) -> BaseTool:
+        """The ONE tool bound for whichever slot the request is currently missing.
+
+        Single source for the bind, the expected-call name, and the prompt instruction, so
+        three readings of the same mapping cannot disagree about which slot is being filled.
+        """
+        if isinstance(request, CancelOrders):
+            return propose_cancel
+        if isinstance(request, ReturnOrder):
+            return propose_return
+        if isinstance(request, ChangeProfile):
+            return propose_profile_change
+        if request.target is None:
+            return provide_refund_order
+        if request.amount_usd is None:
+            return provide_refund_amount
+        return provide_refund_destination
+
+    def _order_views() -> tuple[
+        list[OrderCandidate],
+        dict[str, OrderCandidate],
+        dict[str, OrderCandidate],
+    ]:
+        full = order_store.actionable_orders()
+        authorized = [
+            order
+            for order in full
+            if order_read_allowed(order.order_id, store=order_store, identity=identity_store)
+        ]
+        return (
+            authorized,
+            {order.order_id: order for order in full},
+            {order.key: order for order in authorized},
+        )
+
     def _leave(new_messages: list, call_id: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left support", tool_call_id=call_id))
         write_event({"event": "support_left", "reason": "left_flow"})
@@ -501,174 +580,498 @@ def build_support_nodes(
             "pending_clarification": None,
         }
 
-    def continuation_node(state: ReasoningState) -> dict[str, object]:
-        """Consume one typed post-identity request without replaying prior transcript.
-
-        Every order reference is resolved against the current principal's live candidate set
-        and authorized again. The request is cleared in the same checkpoint that mints any
-        action-specific pending state, so no continuation can execute twice.
-        """
-        invocation = state.active_invocation
-        assert invocation is not None
-        request = invocation.request
-        base: dict[str, object] = {
+    def _profile_unavailable(
+        field: ProfileField,
+        *,
+        messages: list | None = None,
+    ) -> dict[str, object]:
+        write_event({"event": "profile_change_denied", "reason": "no_profile"})
+        result: dict[str, object] = {
             "active_invocation": None,
-            "active_flow": "support",
+            "active_flow": None,
+            "pending_profile_change": None,
+            "handover": HandoffRequest(
+                destination="human",
+                reason_code="address_change" if field == "address" else "contact_change",
+                source="gate",
+            ),
         }
-        full = order_store.actionable_orders()
-        by_id = {order.order_id: order for order in full}
-        authorized = [
-            order
-            for order in full
-            if order_read_allowed(order.order_id, store=order_store, identity=identity_store)
-        ]
-        by_key = {order.key: order for order in authorized}
+        if messages is not None:
+            result["messages"] = messages
+        return result
+
+    def capability_render_node(state: ReasoningState) -> dict[str, object]:
+        """Render a completed typed read without granting the model speech authority."""
+
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, ListOrders):
+            raise TypeError("support capability render requires a list-orders invocation")
+        request = invocation.request
+        if request.scope == "session":
+            orders = order_store.session_placed_orders()
+            close = guest_list_close()
+        else:
+            bound = identity_store.current()
+            if bound is None:
+                raise TypeError("account order rendering requires a bound identity")
+            orders = order_store.owned_orders(bound.customer_ref)
+            close = warm_close()
+        if orders:
+            recent_orders.record([order.order_id for order in orders], operation="list")
+        else:
+            recent_orders.clear()
+        write_event({"event": "order_list_rendered", "order_scope": request.scope})
+        line = f"{render_order_list_line(orders, scope=request.scope)} {close}"
+        return {
+            "active_invocation": None,
+            "active_flow": None,
+            "messages": [AIMessage(line)],
+        }
+
+    def capability_entry_node(state: ReasoningState) -> dict[str, object]:
+        """Prepare one typed Support request; downstream nodes retain effect authority.
+
+        An incomplete request gathers its ONE missing slot through a tool-only model that cannot
+        speak, and this node is deliberately not caller-speakable. A complete request mints the
+        owning flow's pending state; a read is handed to `capability_render_node`, which authors
+        the spoken line; an unbound caller detours into identity with the request retained.
+        """
+
+        invocation = state.active_invocation
+        if invocation is None:
+            raise TypeError("support capability entry requires an active invocation")
+        request = invocation.request
+        if isinstance(request, ListOrders):
+            if request.scope == "account" and identity_store.current() is None:
+                return _enter_identity_for_action(state, [], request, invocation=invocation)
+            return {}
+        if isinstance(request, ChangeProfile):
+            bound = identity_store.current()
+            if bound is not None and not profile_store.has_profile(bound.customer_ref):
+                return _profile_unavailable(request.field)
+            authorized: list[OrderCandidate] = []
+            by_id: dict[str, OrderCandidate] = {}
+            by_key: dict[str, OrderCandidate] = {}
+        else:
+            authorized, by_id, by_key = _order_views()
 
         def resolve(ref: str) -> OrderCandidate | None:
             return by_key.get(ref) or by_id.get(ref.strip().upper())
 
-        def resolve_and_authorize(ref: str) -> OrderCandidate | None:
+        def canonical_ref(ref: str) -> str:
+            chosen = resolve(ref)
+            return chosen.order_id if chosen is not None else ref.strip().upper()
+
+        def resolve_and_authorize(
+            ref: str,
+        ) -> tuple[
+            OrderCandidate | None,
+            SupportAuthorizationDetail | Literal["<needs-identity>"] | None,
+        ]:
             chosen = resolve(ref)
             verdict = _authorize_target(
                 chosen.order_id if chosen else ref,
                 order_known=chosen is not None,
             )
-            return chosen if verdict is None else None
+            return chosen, verdict
 
-        if isinstance(request, ListOrders) and request.scope == "account":
-            bound = identity_store.current()
-            if bound is None:
-                return {
-                    **base,
-                    "active_flow": None,
-                    "messages": [AIMessage("I couldn't confirm your account.")],
-                }
-            orders = order_store.owned_orders(bound.customer_ref)
-            if orders:
-                recent_orders.record([order.order_id for order in orders], operation="list")
+        def clarify(
+            detail: SupportQuestionDetail | SupportAuthorizationDetail,
+            messages: list | None = None,
+        ) -> dict[str, object]:
+            result = _clarification_result(state, messages or [], detail)
+            if result.get("handover") is None:
+                result["active_invocation"] = invocation
+            return result
+
+        def normalize_focused(
+            current: IntentRequest,
+        ) -> tuple[IntentRequest, bool] | dict[str, object]:
+            nonlocal invocation
+            focused_ref = recent_orders.snapshot().focused_order_ref
+            was_focused = False
+            if isinstance(current, CancelOrders) and isinstance(current.target, FocusedOrderSet):
+                if focused_ref is None:
+                    invocation = invocation.with_request(CancelOrders())
+                    return clarify("order")
+                was_focused = True
+                current = CancelOrders(target=ExplicitOrderSet(order_refs=(focused_ref,)))
+            elif isinstance(current, RefundOrder) and isinstance(
+                current.target, FocusedOrderTarget
+            ):
+                if focused_ref is None:
+                    invocation = invocation.with_request(
+                        RefundOrder(
+                            amount_usd=current.amount_usd,
+                            destination=current.destination,
+                        )
+                    )
+                    return clarify("order")
+                was_focused = True
+                current = RefundOrder(
+                    target=ExplicitOrderTarget(order_ref=focused_ref),
+                    amount_usd=current.amount_usd,
+                    destination=current.destination,
+                )
+            elif isinstance(current, ReturnOrder) and isinstance(
+                current.target, FocusedOrderTarget
+            ):
+                if focused_ref is None:
+                    invocation = invocation.with_request(ReturnOrder())
+                    return clarify("order")
+                was_focused = True
+                current = ReturnOrder(target=ExplicitOrderTarget(order_ref=focused_ref))
+            if current is not request:
+                invocation = invocation.with_request(current)
+            return current, was_focused
+
+        normalized = normalize_focused(request)
+        if isinstance(normalized, dict):
+            return normalized
+        request, was_focused = normalized
+
+        def prepare_incomplete(
+            current: CancelOrders | RefundOrder | ReturnOrder | ChangeProfile,
+        ) -> dict[str, object] | None:
+            nonlocal invocation
+            if isinstance(current, ChangeProfile):
+                if identity_store.current() is None:
+                    return _enter_identity_for_action(state, [], current, invocation=invocation)
+                return None
+            if not isinstance(current, RefundOrder) or not isinstance(
+                current.target, ExplicitOrderTarget
+            ):
+                return None
+            _chosen, verdict = resolve_and_authorize(current.target.order_ref)
+            if verdict == _NEEDS_IDENTITY:
+                if was_focused:
+                    return clarify("order")
+                stated_ref = caller_stated_order_id(
+                    _last_user_text(state), current.target.order_ref
+                )
+                if stated_ref is None:
+                    return clarify("order")
+                current = RefundOrder(
+                    target=ExplicitOrderTarget(order_ref=stated_ref),
+                    amount_usd=current.amount_usd,
+                    destination=current.destination,
+                )
+                return _enter_identity_for_action(state, [], current, invocation=invocation)
+            if verdict is not None:
+                return clarify(verdict)
+            return None
+
+        def missing_detail(
+            current: CancelOrders | RefundOrder | ReturnOrder | ChangeProfile,
+        ) -> SupportQuestionDetail:
+            if isinstance(current, CancelOrders | ReturnOrder) and current.target is None:
+                return "order"
+            if isinstance(current, RefundOrder):
+                if current.target is None:
+                    return "order"
+                if current.amount_usd is None:
+                    return "amount"
+                return "refund_destination"
+            return "profile_value"
+
+        def merge_proposal(
+            current: CancelOrders | RefundOrder | ReturnOrder | ChangeProfile,
+            call: dict,
+        ) -> CancelOrders | RefundOrder | ReturnOrder | ChangeProfile | None:
+            try:
+                if isinstance(current, CancelOrders):
+                    proposal = _ProposeCancel.model_validate(call["args"])
+                    if current.target is not None:
+                        return None
+                    target = (
+                        CancellableOrderScope(scope=proposal.scope)
+                        if proposal.scope is not None
+                        else ExplicitOrderSet(order_refs=tuple(proposal.order_keys or ()))
+                    )
+                    return CancelOrders(target=target)
+                if isinstance(current, ReturnOrder):
+                    proposal = _ProposeReturn.model_validate(call["args"])
+                    proposed_target = ExplicitOrderTarget(order_ref=proposal.order_key)
+                    if current.target is not None and canonical_ref(
+                        current.target.order_ref
+                    ) != canonical_ref(proposed_target.order_ref):
+                        return None
+                    return ReturnOrder(target=current.target or proposed_target)
+                if isinstance(current, RefundOrder):
+                    if current.target is None:
+                        proposal = _ProvideRefundOrder.model_validate(call["args"])
+                        return RefundOrder(
+                            target=ExplicitOrderTarget(order_ref=proposal.order_key),
+                            amount_usd=current.amount_usd,
+                            destination=current.destination,
+                        )
+                    if current.amount_usd is None:
+                        proposal = _ProvideRefundAmount.model_validate(call["args"])
+                        amount_usd = _caller_stated_refund_amount(
+                            _last_user_text(state), proposal.amount_usd
+                        )
+                        if amount_usd is None:
+                            return None
+                        return RefundOrder(
+                            target=current.target,
+                            amount_usd=amount_usd,
+                            destination=current.destination,
+                        )
+                    proposal = _ProvideRefundDestination.model_validate(call["args"])
+                    destination = _caller_stated_refund_destination(
+                        _last_user_text(state), proposal.destination
+                    )
+                    if destination is None:
+                        return None
+                    return RefundOrder(
+                        target=current.target,
+                        amount_usd=current.amount_usd,
+                        destination=destination,
+                    )
+                proposal = _ProposeProfileChange.model_validate(call["args"])
+                if proposal.field != current.field or not _caller_stated_profile_value(
+                    _last_user_text(state), proposal.field, proposal.new_value
+                ):
+                    return None
+                return ChangeProfile(
+                    field=current.field,
+                    new_value=current.new_value or proposal.new_value.strip(),
+                )
+            except (TypeError, ValueError):
+                return None
+
+        if (
+            isinstance(request, CancelOrders | RefundOrder | ReturnOrder | ChangeProfile)
+            and not request.is_slot_complete()
+        ):
+            prepared = prepare_incomplete(request)
+            if prepared is not None:
+                return prepared
+            proposal_tool = proposal_tool_for(request)
+            capability_model = reasoning_model.bind_tools(
+                (proposal_tool, request_support_clarification, leave_support)
+            )
+            prompt = SystemMessage(
+                compose_support_capability_prompt(
+                    display_name,
+                    authorized,
+                    policy,
+                    request,
+                    proposal_tool.name,
+                    recent_orders.snapshot().focused_order_ref,
+                )
+            )
+            new_messages: list = []
+            messages: list = [prompt, *state.messages]
+            expected_tool = proposal_tool.name
+            for _attempt in range(2):
+                response = capability_model.invoke(messages)
+                if not response.tool_calls:
+                    return clarify(missing_detail(request), new_messages)
+                new_messages.append(response)
+                ack_extra_tool_calls(response, new_messages)
+                call = response.tool_calls[0]
+                if call["name"] == leave_support.name:
+                    return _leave(new_messages, call["id"])
+                if call["name"] == request_support_clarification.name:
+                    new_messages.append(
+                        ToolMessage("support clarification requested", tool_call_id=call["id"])
+                    )
+                    return clarify(missing_detail(request), new_messages)
+                if call["name"] == expected_tool:
+                    merged = merge_proposal(request, call)
+                    if merged is not None:
+                        new_messages.append(
+                            ToolMessage("support request completed", tool_call_id=call["id"])
+                        )
+                        request = merged
+                        invocation = invocation.with_request(request)
+                        if not request.is_slot_complete():
+                            prepared = prepare_incomplete(request)
+                            if prepared is not None:
+                                return {**prepared, "messages": new_messages}
+                            return clarify(missing_detail(request), new_messages)
+                        break
+                    new_messages.append(
+                        ToolMessage(
+                            "The proposal changed a fixed field or was invalid. "
+                            "Fill only the missing field.",
+                            tool_call_id=call["id"],
+                        )
+                    )
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                if call["name"] not in {
+                    expected_tool,
+                    request_support_clarification.name,
+                    leave_support.name,
+                }:
+                    new_messages.append(
+                        unknown_tool_result(call["id"], leave_tool=leave_support.name)
+                    )
+                    messages = [prompt, *state.messages, *new_messages]
+                    continue
+                raise ValueError(
+                    f"support capability entry: bound tool has no handler: {call['name']!r}"
+                )
             else:
-                recent_orders.clear()
-            return {
-                **base,
-                "active_flow": None,
-                "messages": [AIMessage(render_order_list_line(orders))],
-            }
+                return clarify(missing_detail(request), new_messages)
 
         if isinstance(request, CancelOrders):
             if isinstance(request.target, CancellableOrderScope):
-                return {**base, "pending_cancel": request.target}
+                if identity_store.current() is None:
+                    return _enter_identity_for_action(state, [], request, invocation=invocation)
+                return {
+                    "active_invocation": None,
+                    "active_flow": "support",
+                    "pending_cancel": request.target,
+                }
             if isinstance(request.target, ExplicitOrderSet):
                 resolved: list[OrderCandidate] = []
                 seen: set[str] = set()
                 for ref in request.target.order_refs:
-                    chosen = resolve_and_authorize(ref)
-                    if chosen is None:
-                        return {
-                            **base,
-                            "active_flow": None,
-                            "messages": [AIMessage(_CONTINUATION_NOT_FOUND)],
-                        }
+                    chosen, verdict = resolve_and_authorize(ref)
+                    if verdict == _NEEDS_IDENTITY:
+                        if was_focused:
+                            return clarify("order")
+                        stated = tuple(
+                            caller_stated_order_id(_last_user_text(state), order_ref)
+                            for order_ref in request.target.order_refs
+                        )
+                        if any(order_ref is None for order_ref in stated):
+                            return clarify("order")
+                        request = CancelOrders(
+                            target=ExplicitOrderSet(
+                                order_refs=tuple(
+                                    order_ref for order_ref in stated if order_ref is not None
+                                )
+                            )
+                        )
+                        return _enter_identity_for_action(state, [], request, invocation=invocation)
+                    if verdict is not None:
+                        return clarify(verdict)
+                    assert chosen is not None
                     if chosen.order_id not in seen:
                         seen.add(chosen.order_id)
                         resolved.append(chosen)
+                for order in resolved:
+                    _record_authorized(order.order_id)
                 return {
-                    **base,
+                    "active_invocation": None,
+                    "active_flow": "support",
                     "pending_cancel": _mint_cancel_batch(
                         [(order.order_id, order.summary) for order in resolved]
                     ),
                 }
 
         if isinstance(request, RefundOrder) and isinstance(request.target, ExplicitOrderTarget):
-            chosen = resolve_and_authorize(request.target.order_ref)
-            if chosen is not None and request.amount_usd is None:
-                return {
-                    **base,
-                    "messages": [AIMessage("What amount would you like refunded?")],
-                }
-            if chosen is not None and request.destination is None:
-                return {
-                    **base,
-                    "messages": [
-                        AIMessage("Should that refund go back to the original payment method?")
-                    ],
-                }
-            if chosen is not None:
-                assert request.amount_usd is not None and request.destination is not None
-                pending = _mint_refund(
-                    chosen,
+            chosen, verdict = resolve_and_authorize(request.target.order_ref)
+            if verdict == _NEEDS_IDENTITY:
+                if was_focused:
+                    return clarify("order")
+                stated_ref = caller_stated_order_id(
+                    _last_user_text(state), request.target.order_ref
+                )
+                if stated_ref is None:
+                    return clarify("order")
+                request = RefundOrder(
+                    target=ExplicitOrderTarget(order_ref=stated_ref),
                     amount_usd=request.amount_usd,
                     destination=request.destination,
                 )
-                if pending is None:
-                    write_event(
-                        {"event": "refund_destination_unavailable", "reason": request.destination}
-                    )
-                    return {
-                        **base,
-                        "active_flow": None,
-                        "handover": HandoffRequest(
-                            destination="human",
-                            reason_code="refund",
-                            source="gate",
-                        ),
-                    }
+                return _enter_identity_for_action(state, [], request, invocation=invocation)
+            if verdict is not None:
+                return clarify(verdict)
+            assert chosen is not None
+            _record_authorized(chosen.order_id)
+            assert request.amount_usd is not None and request.destination is not None
+            pending = _mint_refund(
+                chosen,
+                amount_usd=request.amount_usd,
+                destination=request.destination,
+            )
+            if pending is None:
+                write_event(
+                    {"event": "refund_destination_unavailable", "reason": request.destination}
+                )
                 return {
-                    **base,
-                    "pending_refund": pending,
+                    "active_invocation": None,
+                    "active_flow": None,
+                    "handover": HandoffRequest(
+                        destination="human",
+                        reason_code="refund",
+                        source="gate",
+                    ),
                 }
+            return {
+                "active_invocation": None,
+                "active_flow": "support",
+                "pending_refund": pending,
+            }
 
         if isinstance(request, ReturnOrder) and isinstance(request.target, ExplicitOrderTarget):
-            chosen = resolve_and_authorize(request.target.order_ref)
-            if chosen is not None:
-                return {**base, "pending_return": _mint_return(chosen)}
+            chosen, verdict = resolve_and_authorize(request.target.order_ref)
+            if verdict == _NEEDS_IDENTITY:
+                if was_focused:
+                    return clarify("order")
+                stated_ref = caller_stated_order_id(
+                    _last_user_text(state), request.target.order_ref
+                )
+                if stated_ref is None:
+                    return clarify("order")
+                request = ReturnOrder(target=ExplicitOrderTarget(order_ref=stated_ref))
+                return _enter_identity_for_action(state, [], request, invocation=invocation)
+            if verdict is not None:
+                return clarify(verdict)
+            assert chosen is not None
+            _record_authorized(chosen.order_id)
+            return {
+                "active_invocation": None,
+                "active_flow": "support",
+                "pending_return": _mint_return(chosen),
+            }
 
         if isinstance(request, ChangeProfile) and request.new_value is not None:
             pending = _mint_profile_change(request)
             if pending is not None:
-                return {**base, "pending_profile_change": pending}
-            return {
-                **base,
-                "active_flow": None,
-                "handover": HandoffRequest(
-                    destination="human",
-                    reason_code=(
-                        "address_change" if request.field == "address" else "contact_change"
-                    ),
-                    source="gate",
-                ),
-            }
+                return {
+                    "active_invocation": None,
+                    "active_flow": "support",
+                    "pending_profile_change": pending,
+                }
+            if identity_store.current() is None:
+                return _enter_identity_for_action(state, [], request, invocation=invocation)
+            return _profile_unavailable(request.field)
 
-        write_event(
-            {
-                "event": "identity_continuation_declined",
-                "capability": request.kind,
-                "reason": "unsupported_or_unresolved",
-            }
-        )
-        return {
-            **base,
-            "active_flow": None,
-            "messages": [AIMessage(_CONTINUATION_NOT_FOUND)],
-        }
+        raise TypeError(f"unsupported Support capability request: {type(request).__name__}")
 
     def _enter_identity_for_action(
         state: ReasoningState,
         new_messages: list,
         request: IntentRequest,
+        *,
+        invocation: ActiveInvocation | None = None,
     ) -> dict[str, object]:
-        """Retain one caller-stated typed request across the identity detour.
+        """Carry one authority-free typed request across the identity detour.
 
-        The request contains no resolved target or authority. A fresh context resolves and
-        authorizes it again; transcript replay and graph-node resume pointers are forbidden.
+        Broad Support entry opens an invocation; typed capability entry retains its invocation
+        identity while filling slots. The rotated context resolves and authorizes live;
+        transcript and graph-node-pointer replay are forbidden.
         """
+        principal_transition_continuation(request)
         write_event({"event": "support_action_needs_identity"})
+        next_invocation = (
+            open_active_invocation(
+                request,
+                consumed_turn_ids=state.consumed_turn_ids,
+            )
+            if invocation is None
+            else invocation.with_request(request)
+        )
         return {
             "messages": new_messages,
             "active_flow": "identity",
-            "active_invocation": open_active_invocation(
-                request,
-                consumed_turn_ids=state.consumed_turn_ids,
-            ),
+            "active_invocation": next_invocation,
             "pending_clarification": None,
             "identity_claim_misses": 0,
         }
@@ -720,13 +1123,12 @@ def build_support_nodes(
         `order_known` no longer drives a grant (the contact claim is not a mutation credential —
         it is not even read here). Unbound needs-identity telemetry may record whether resolution
         succeeded but never raw unresolved text; bound denials expose only the policy attempt.
+        Apart from that denial telemetry this only decides: the grant row belongs to
+        `_record_authorized` at the mint site, so re-checking costs nothing.
         """
         if order_known and order_mutation_allowed(
             order_ref, store=order_store, identity=identity_store
         ):
-            write_event(
-                {"event": "support_action_authorized", "order_id": order_ref.strip().upper()}
-            )
             return None
         known_fields: dict[str, object] = {"order_id_known": order_known}
         if order_known:
@@ -747,6 +1149,16 @@ def build_support_nodes(
             if attempt >= policy.auth_denials_before_human_offer
             else "order_match"
         )
+
+    def _record_authorized(order_ref: str) -> None:
+        """Emit the one grant row, at the point the caller's action is actually authorized.
+
+        Deliberately NOT inside `_authorize_target`: the owner re-checks authorization freely
+        (before gathering a slot, and again after model work), so a row per check would count
+        checks rather than granted authority. Callers emit once, immediately before minting
+        pending state, so a check that ends in clarification leaves no grant row behind.
+        """
+        write_event({"event": "support_action_authorized", "order_id": order_ref.strip().upper()})
 
     def _authorize_action(
         order_ref: str, call_id: str, new_messages: list, *, order_known: bool
@@ -873,14 +1285,7 @@ def build_support_nodes(
         for the guest path — the model relays the caller's id exactly as `order_status`
         already does; it still never AUTHORS one.
         """
-        full = order_store.actionable_orders()
-        by_id = {o.order_id: o for o in full}
-        orders = [
-            o
-            for o in full
-            if order_read_allowed(o.order_id, store=order_store, identity=identity_store)
-        ]
-        by_key = {o.key: o for o in orders}
+        orders, by_id, by_key = _order_views()
 
         def _resolve(stated: str) -> OrderCandidate | None:
             return by_key.get(stated) or by_id.get(stated.strip().upper())
@@ -1002,6 +1407,8 @@ def build_support_nodes(
                 if verdict is not None:
                     new_messages.append(ToolMessage(_ORDER_SELECTION_ACK, tool_call_id=call["id"]))
                     return _clarification_result(state, new_messages, verdict)
+                for order in resolved:
+                    _record_authorized(order.order_id)
                 new_messages.append(
                     ToolMessage(
                         f"proposed cancel on {len(resolved)} order(s)", tool_call_id=call["id"]
@@ -1049,6 +1456,7 @@ def build_support_nodes(
                 if verdict is not None:
                     return _clarification_result(state, new_messages, verdict)
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
+                _record_authorized(chosen.order_id)
                 new_messages.append(
                     ToolMessage(f"proposed return on order {chosen.key}", tool_call_id=call["id"])
                 )
@@ -1093,22 +1501,10 @@ def build_support_nodes(
                         ChangeProfile(field=change.field, new_value=change.new_value.strip()),
                     )
                 if not profile_store.has_profile(bound.customer_ref):
-                    write_event({"event": "profile_change_denied", "reason": "no_profile"})
                     new_messages.append(
                         ToolMessage("profile update unavailable", tool_call_id=call["id"])
                     )
-                    return {
-                        "messages": new_messages,
-                        "pending_profile_change": None,
-                        "active_flow": None,
-                        "handover": HandoffRequest(
-                            destination="human",
-                            reason_code=(
-                                "address_change" if change.field == "address" else "contact_change"
-                            ),
-                            source="gate",
-                        ),
-                    }
+                    return _profile_unavailable(change.field, messages=new_messages)
                 # NO value echo in the tool result (PII: thread history is model-visible
                 # context, but the persisted line must not carry the raw value a second
                 # time beyond the pending itself).
@@ -1171,6 +1567,7 @@ def build_support_nodes(
                 if verdict is not None:
                     return _clarification_result(state, new_messages, verdict)
                 assert chosen is not None  # unresolved never authorizes (no owner, no grant)
+                _record_authorized(chosen.order_id)
                 new_messages.append(
                     ToolMessage(
                         f"proposed refund on order {chosen.key} ${proposal.amount_usd:.2f} "
@@ -2248,7 +2645,7 @@ def build_support_nodes(
             if not isinstance(state.pending_clarification, SupportClarification):
                 raise TypeError("support assemble produced a non-support clarification")
             return "clarify"
-        return "clarify"  # support_continuation may have authored its own terminal line
+        return "done"
 
     def route_after_resolve(state: ReasoningState) -> str:
         # "confirm" (a batch was frozen -> the cancel guardrail/readback/void) | "clarify"
@@ -2277,7 +2674,8 @@ def build_support_nodes(
 
     return SupportNodes(
         assemble=with_clarification_lifecycle(assemble_node),
-        continuation=continuation_node,
+        capability_entry=with_clarification_lifecycle(capability_entry_node),
+        capability_render=capability_render_node,
         clarify=clarify_node,
         guardrail=guardrail_node,
         risk_check=refund_stepup.risk_check,
@@ -2314,7 +2712,7 @@ def build_support_nodes(
         route_after_profile_collect=profile_stepup.route_after_collect,
         speakable_nodes=frozenset(
             {
-                "support_continuation",
+                "support_capability_render",
                 "support_clarify",
                 "support_guardrail",  # authors the over-amount-threshold decline line
                 "support_risk_check",

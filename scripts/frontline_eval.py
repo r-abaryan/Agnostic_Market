@@ -45,6 +45,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
 from agnostic_market.agents import telemetry
+from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
 from agnostic_market.agents.frontline import (
     FRONTLINE_SPEAKABLE_NODES,
@@ -199,6 +200,7 @@ class ScenarioObservation:
 @dataclass(frozen=True)
 class EvalRuntime:
     graph: CompiledStateGraph
+    capability_registry: CapabilityRegistry
     engine: ReasoningEngine
     store: OrderStore
     profile_store: ProfileStore
@@ -332,7 +334,7 @@ def _build_eval_runtime(
             customers,
         )
     ]
-    graph = build_frontline_graph(
+    assembly = build_frontline_graph(
         routing_model,
         tools,
         display_name=config.display_name,
@@ -352,7 +354,7 @@ def _build_eval_runtime(
         checkpointer=InMemorySaver(),
     )
     engine = ReasoningEngine(
-        graph,
+        assembly.graph,
         thread_id=thread_id,
         cancellation_quiescence_timeout_seconds=(
             config.runtime.cancellation_quiescence_timeout_seconds
@@ -361,7 +363,8 @@ def _build_eval_runtime(
     )
     caller_context.attach_engine(engine)
     return EvalRuntime(
-        graph=graph,
+        graph=assembly.graph,
+        capability_registry=assembly.capability_registry,
         engine=engine,
         store=store,
         profile_store=profile_store,

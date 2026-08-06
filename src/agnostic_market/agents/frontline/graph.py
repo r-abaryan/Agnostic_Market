@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
 
@@ -56,6 +57,11 @@ from agnostic_market.agents._consent import (
     wants_human,
 )
 from agnostic_market.agents._copy import guest_list_close, warm_close
+from agnostic_market.agents.capabilities import (
+    CapabilityEntry,
+    CapabilityRegistry,
+    CapabilitySpec,
+)
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
@@ -92,7 +98,15 @@ from agnostic_market.commerce.orders import (
 from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
-from agnostic_market.dtos.orchestration import ListOrders, SwitchAccount
+from agnostic_market.dtos.orchestration import (
+    CancelOrders,
+    CapabilityId,
+    ChangeProfile,
+    ListOrders,
+    RefundOrder,
+    ReturnOrder,
+    SwitchAccount,
+)
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
     ActiveFlow,
@@ -107,11 +121,35 @@ from agnostic_market.dtos.state import (
 logger = logging.getLogger("agnostic_market.agents.frontline")
 
 _HANDOVER_TOOL_NAME = "request_handover"
+_CAPABILITY_DISPATCH_NODE = "capability_dispatch"
+_SUPPORT_CAPABILITY_ENTRY_NODE = "support_capability_entry"
+_SUPPORT_CAPABILITY_RENDER_NODE = "support_capability_render"
 
-# Graph topology is the source of truth for model-authored speech provenance. Identity has
-# Identity, Support, and Cart retain transactional execution/audit identity after their
-# code-authored clarification migrations, but only the frontline model may author model prose.
-TRANSACTIONAL_MODEL_NODES = frozenset({"cart_assemble", "support_assemble", "identity_assemble"})
+
+@dataclass(frozen=True, slots=True)
+class FrontlineGraphAssembly:
+    """The compiled graph plus the exact registry its dispatcher resolves against.
+
+    Returned together so runtime, evaluator, and tests share ONE instance; a second
+    availability list built alongside the graph drifts the day a capability is registered.
+    """
+
+    graph: CompiledStateGraph
+    capability_registry: CapabilityRegistry
+
+
+# Graph topology is the source of truth for model-authored speech provenance. Identity,
+# Support, and Cart retain transactional execution/audit identity after their code-authored
+# clarification migrations, but only the frontline model may author model prose. Every node
+# named here invokes a model, so none may be caller-speakable (asserted at compile).
+TRANSACTIONAL_MODEL_NODES = frozenset(
+    {
+        "cart_assemble",
+        "support_assemble",
+        _SUPPORT_CAPABILITY_ENTRY_NODE,
+        "identity_assemble",
+    }
+)
 MODEL_SPEECH_NODES = frozenset({"model"})
 FRONTLINE_SPEAKABLE_NODES = frozenset(
     {
@@ -259,8 +297,9 @@ def build_frontline_graph(
     payment_instruments: PaymentInstrumentDirectory,
     lifecycle: PrincipalTransitionLifecycle,
     checkpointer: BaseCheckpointSaver | None = None,
-) -> CompiledStateGraph:
-    """Compile the reasoning graph: frontline (routing tier) + cart + support flows.
+) -> FrontlineGraphAssembly:
+    """Compile the reasoning graph (frontline routing tier + the cart, support, and identity
+    flows) and return it with the capability registry its dispatcher resolves against.
 
     `read_only_tools` are already audit-wrapped (tooling.py). `checkpointer` is REQUIRED for
     the interrupt/resume paths (the engine passes one per session); None keeps the per-turn
@@ -764,7 +803,7 @@ def build_frontline_graph(
         if state.pending_recovery is not None:
             return RECOVERY_NODE_NAME
         if state.active_invocation is not None and state.active_flow is None:
-            return "support_continuation"
+            return _CAPABILITY_DISPATCH_NODE
         text = _last_user_text(state)
         if state.active_flow == "cart":
             if wants_human(text):
@@ -794,6 +833,8 @@ def build_frontline_graph(
                 return "cross_switch"
             if enumeration_check(text):
                 return "cross_switch"
+            if state.active_invocation is not None:
+                return _CAPABILITY_DISPATCH_NODE
             return "support_assemble"
         if state.active_flow == "identity":
             if wants_human(text):
@@ -928,6 +969,33 @@ def build_frontline_graph(
         lifecycle.transition_principal,
         display_name=display_name,
     )
+    support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
+    capability_registry = CapabilityRegistry(
+        (
+            CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
+            CapabilitySpec(CapabilityId.CANCEL_ORDERS, CancelOrders, support_entry),
+            CapabilitySpec(CapabilityId.REFUND_ORDER, RefundOrder, support_entry),
+            CapabilitySpec(CapabilityId.RETURN_ORDER, ReturnOrder, support_entry),
+            CapabilitySpec(
+                CapabilityId.CHANGE_PROFILE,
+                ChangeProfile,
+                support_entry,
+            ),
+        )
+    )
+
+    def capability_dispatch(state: ReasoningState) -> Command:
+        """Route the active request to its owning node. Nothing else.
+
+        No state update, live read, model call, render, or mutation: the owner keeps every
+        effect and speech authority. `Command` is the sole executable route (this node has no
+        outgoing edge), so an unregistered id raises here and ends the turn under this node's
+        own recovery policy rather than falling through to a broad model.
+        """
+        invocation = state.active_invocation
+        if invocation is None:
+            raise TypeError("capability dispatch requires an active invocation")
+        return Command(goto=capability_registry.resolve(invocation.request).node_name)
 
     # --- identity flow routers (the flow owns the store-dependent decisions; the graph
     #     maps them to node names — same stance as the support routers below) ---
@@ -968,14 +1036,14 @@ def build_frontline_graph(
         if state.handover is not None:
             return "handover"
         if state.active_invocation is not None:
-            return "support_continuation"
+            return _CAPABILITY_DISPATCH_NODE
         return END
 
     # --- support flow routers (state-only; the level/status-dependent branches live INSIDE
     #     the flow, closed over the store — support.route_after_* ) ---
     def _route_support_outcome(state: ReasoningState, *, clarify_target: str) -> str:
         # refund | cancel | return | profile | resolve | needs_identity | handover | leave |
-        # clarify.
+        # clarify | done.
         decision = support.route_after_assemble(state)
         if decision == "needs_identity":
             return "principal_warning" if lifecycle.has_discardable_state() else "identity_assemble"
@@ -988,15 +1056,20 @@ def build_frontline_graph(
             "handover": "handover",  # deterministic fail-closed path (for example no profile)
             "leave": "gate",  # model left; normal pipeline answers this same turn
             "clarify": clarify_target,
+            "done": END,
         }[decision]
 
     def route_after_support_assemble(state: ReasoningState) -> str:
         return _route_support_outcome(state, clarify_target="support_clarify")
 
-    def route_after_support_continuation(state: ReasoningState) -> str:
-        # Continuation owns its existing code-authored missing-field/not-found lines and
-        # deliberately carries no SupportClarification selector.
-        return _route_support_outcome(state, clarify_target=END)
+    def route_after_support_capability_entry(state: ReasoningState) -> str:
+        if (
+            state.active_flow != "identity"
+            and state.active_invocation is not None
+            and isinstance(state.active_invocation.request, ListOrders)
+        ):
+            return _SUPPORT_CAPABILITY_RENDER_NODE
+        return _route_support_outcome(state, clarify_target="support_clarify")
 
     def route_after_support_resolve(state: ReasoningState) -> str:
         # confirm (a batch was frozen -> the shared cancel guardrail) | clarify (none
@@ -1214,8 +1287,21 @@ def build_frontline_graph(
         AbandonmentKind.PURE_ABORT,
     )
     node_registry.register(
-        "support_continuation",
-        support.continuation,
+        _CAPABILITY_DISPATCH_NODE,
+        capability_dispatch,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(_SUPPORT_CAPABILITY_ENTRY_NODE,),
+    )
+    node_registry.register(
+        _SUPPORT_CAPABILITY_ENTRY_NODE,
+        support.capability_entry,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        _SUPPORT_CAPABILITY_RENDER_NODE,
+        support.capability_render,
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.PURE_ABORT,
     )
@@ -1471,7 +1557,7 @@ def build_frontline_graph(
             "cart_abort": "cart_abort",
             "cart_escape_human": "cart_escape_human",
             "support_assemble": "support_assemble",
-            "support_continuation": "support_continuation",
+            _CAPABILITY_DISPATCH_NODE: _CAPABILITY_DISPATCH_NODE,
             "support_abort": "support_abort",
             "support_escape_human": "support_escape_human",
             "identity_assemble": "identity_assemble",
@@ -1564,18 +1650,24 @@ def build_frontline_graph(
         },
     )
     graph.add_conditional_edges(
-        "support_continuation",
-        route_after_support_continuation,
+        _SUPPORT_CAPABILITY_ENTRY_NODE,
+        route_after_support_capability_entry,
         {
+            "gate": "gate",
             "support_guardrail": "support_guardrail",
             "support_cancel_guardrail": "support_cancel_guardrail",
             "support_return_guardrail": "support_return_guardrail",
             "support_profile_guardrail": "support_profile_guardrail",
             "support_resolve": "support_resolve",
+            "identity_assemble": "identity_assemble",
+            "principal_warning": "principal_warning",
+            "support_clarify": "support_clarify",
+            _SUPPORT_CAPABILITY_RENDER_NODE: _SUPPORT_CAPABILITY_RENDER_NODE,
             "handover": "handover",
             END: END,
         },
     )
+    graph.add_edge(_SUPPORT_CAPABILITY_RENDER_NODE, END)
     graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",
@@ -1729,7 +1821,7 @@ def build_frontline_graph(
         route_after_identity_apply,
         {
             "handover": "handover",
-            "support_continuation": "support_continuation",
+            _CAPABILITY_DISPATCH_NODE: _CAPABILITY_DISPATCH_NODE,
             END: END,
         },
     )
@@ -1743,6 +1835,17 @@ def build_frontline_graph(
     graph.add_edge("read_render", END)  # code-authored read line ENDs — skips the 2nd model pass
 
     node_recovery_policies = node_registry.validated_policies()
+    # A dispatch destination with no regular-node recovery policy would fail unhandled on a
+    # caller's turn; catch it at construction instead.
+    missing_entries = {
+        spec.entry.node_name
+        for spec in capability_registry.specs.values()
+        if spec.entry.node_name not in node_recovery_policies
+    }
+    if missing_entries:
+        raise RuntimeError(
+            f"capability entries lack regular-node recovery policies: {sorted(missing_entries)!r}"
+        )
     infrastructure_nodes = node_registry.validated_infrastructure_nodes()
     handled_nodes = node_registry.validated_handled_nodes()
     handled_infrastructure_nodes = node_registry.validated_handled_infrastructure_nodes()
@@ -1758,6 +1861,7 @@ def build_frontline_graph(
         | identity.speakable_nodes
     )
     compiled.model_speech_nodes = MODEL_SPEECH_NODES  # type: ignore[attr-defined]
+    compiled.capability_registry = capability_registry  # type: ignore[attr-defined]
     compiled.node_recovery_policies = node_recovery_policies  # type: ignore[attr-defined]
     compiled.recovery_infrastructure_nodes = infrastructure_nodes  # type: ignore[attr-defined]
     compiled.recovery_handled_nodes = handled_nodes  # type: ignore[attr-defined]
@@ -1771,4 +1875,14 @@ def build_frontline_graph(
     overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")
-    return compiled
+    # A model-invoking node that is ALSO speakable could put model prose in front of the
+    # caller without passing the code-authored path: the structural half of one-author.
+    transactional_overlap = (  # type: ignore[attr-defined]
+        compiled.speakable_nodes & TRANSACTIONAL_MODEL_NODES
+    )
+    if transactional_overlap:
+        raise RuntimeError(
+            "transactional model nodes cannot be caller-speakable: "
+            f"{sorted(transactional_overlap)!r}"
+        )
+    return FrontlineGraphAssembly(graph=compiled, capability_registry=capability_registry)

@@ -1,7 +1,8 @@
-"""Typed contracts shared by semantic routing, continuation, and capability execution.
+"""Typed contracts shared by routing, continuation, and capability dispatch.
 
-Milestone 1 deliberately has no planner DTOs. Dependent work is an unsupported workflow until
-Milestone 6 adds the ``plan`` route arm, ``ExecutionPlan``, and ``PlanStep``.
+A request carries caller intent, never authority: slot completeness is not authorization, and
+the owning flow re-resolves and re-authorizes every target against the live principal. There
+are no planner DTOs: a multi-step plan is an unsupported workflow, not a gap to fill here.
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ from pydantic import (
     Field,
     StrictBool,
     StringConstraints,
+    TypeAdapter,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -285,20 +288,46 @@ IntentRequest = Annotated[
     | RequestPerson,
     Field(discriminator="kind"),
 ]
+_INTENT_REQUEST_ADAPTER = TypeAdapter(IntentRequest)
 
 
 class ActiveInvocation(BaseModel):
     """One code-opened capability request retained across deterministic continuation."""
 
-    model_config = _FROZEN
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
     invocation_id: NonEmptyText = Field(default_factory=lambda: uuid.uuid4().hex)
     request: IntentRequest
     opened_turn_id: NonEmptyText
 
+    @field_validator("request", mode="before")
+    @classmethod
+    def request_is_fully_validated(cls, value: object) -> IntentRequest:
+        # A model instance may have been built past validation (`model_construct`, an
+        # unchecked copy), so re-validate the payload rather than trusting the instance.
+        if isinstance(value, IntentRequestModel):
+            payload: object = value.model_dump(warnings=False)
+        else:
+            payload = value
+        return _INTENT_REQUEST_ADAPTER.validate_python(payload)
+
     @property
     def capability(self) -> CapabilityId:
         return self.request.kind
+
+    def with_request(self, request: IntentRequest) -> ActiveInvocation:
+        """Validate a same-capability replacement while retaining invocation identity."""
+
+        replacement = ActiveInvocation.model_validate(
+            {
+                "invocation_id": self.invocation_id,
+                "request": request,
+                "opened_turn_id": self.opened_turn_id,
+            }
+        )
+        if replacement.capability != self.capability:
+            raise ValueError("active invocation request cannot change capability")
+        return replacement
 
 
 ClarificationReason = Literal[
@@ -395,18 +424,6 @@ class RoutingContext(BaseModel):
         if (self.recent_order_operation is None) != (self.recent_order_count == 0):
             raise ValueError("recent order operation and count must be present together")
         return self
-
-
-class CapabilityOutcome(BaseModel):
-    """Base for code-authored, capability-specific terminal outcome DTOs.
-
-    Registry entries must declare a concrete subclass carrying the evidence their response needs;
-    this base is not itself a registrable success result.
-    """
-
-    model_config = _FROZEN
-
-    status: Literal["completed", "needs_input", "declined", "failed", "human_required"]
 
 
 class VerificationProof(BaseModel):
