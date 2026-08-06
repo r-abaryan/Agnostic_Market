@@ -1,38 +1,93 @@
 # Agnostic Market
 
-Multi-tenant, LLM-agnostic voice commerce agent platform.
+Multi-tenant, LLM-agnostic voice commerce agent. The model proposes; code authorizes and executes.
 
-**Status: Phase 3 commerce graph — implemented and under review.** The voice loop runs the
-frontline, cart, support, returns, profile, and identity flows behind `ReasoningEngine`; the
-Phase-3d planner remains conditional on a trace proving that the direct flows are insufficient.
-The current build is intentionally fixture-backed for commerce and verification, with an
-in-memory per-session checkpointer. Real system integration, durable checkpointing, shared-store
-tenant enforcement, and production OTPs remain Phase 4 work; payments and SIP warm transfer are
-Phase 5.
+A caller talks to a voice agent that can search a catalog, build a cart, place an order, and handle
+cancellations, refunds, returns, and profile changes. Every irreversible action passes through
+deterministic guardrails, a spoken readback, and explicit consent before any effect is committed.
+The model never holds effect authority.
 
-Completed hardening in the current build: fixture-validated temporary OTP configuration (no
-source-code default), deterministic live status re-checks for “is it cancelled?” follow-ups,
-code-rendered order status, an exact `max_tool_hops` ceiling with no dangling tool calls, and
-batch-aware cancellation. A cancel request can freeze one or many authorized targets under one
-readback; an unbound “cancel all” survives identity verification as a semantic selector and is
-resolved only after binding. Effects are serialized, idempotent, server-revalidated, and resumed
-from unfinished checkpoints rather than being reinterpreted as a fresh turn.
+## Design rules
 
-Built foundations:
+Enforced in code, not by convention.
 
-- **Phase 0** — `dtos/` (single Pydantic v2 source of truth) · `config/` (3-layer resolution, safety-locked keys enforced in code) · `tenancy/` (merchant resolution + immutable session context) · `secrets/` (pluggable `SecretResolver`).
-- **Phase 1** — `llm/` (provider-agnostic gateway + fail-closed conformance gate: a model serves commerce turns only after passing certification).
-- **Phase 2** — `voice/` (config-driven STT/TTS engine factories, read-only tools, minimal graph behind LiveKit's `LLMAdapter`, call-start AI disclosure played first in code).
-- **Phase 3** — gated commerce graph: fixture-backed catalog/orders/profile, cart placement, cancel/refund/return/profile flows, risk-gated OTP step-up, object-bound order reads, OTP-bound enumeration, deterministic read rendering, and the human-on-ramp context package.
+**Two planes.** The model proposes a typed request. Code resolves the target, re-checks
+authorization against live state, and executes. A tool call is a proposal, never a command.
 
-## Develop
+**One author per turn.** Graph topology decides who may speak. A node that invokes a model cannot
+author caller-facing text, and graph construction fails if those two sets intersect.
+
+**Authorization is not authentication.** Mutating an order requires an OTP-bound identity or an
+order placed in the current session. A contact match grants reads only.
+
+**No existence oracle.** An unknown order and someone else's order produce the same response, so
+the system cannot be probed for which orders exist.
+
+**Policy within bounds.** Merchants tune refund thresholds and return windows; platform ceilings
+clamp them. The spoken policy summary is derived from the enforced values, so a model cannot state
+a threshold the guardrail would refuse.
+
+**Effects survive failure.** Pending actions are serialized, idempotent, revalidated against the
+store before commit, and resumed from a checkpoint rather than reinterpreted as a fresh turn.
+
+**Providers are swappable.** STT, TTS, and LLM providers are config-driven. A model serves commerce
+turns only after passing a fail-closed conformance gate.
+
+## Layout
+
+```
+src/agnostic_market/
+  dtos/       Pydantic contracts, the single source of truth for shared types
+  config/     three-layer merchant resolution, safety-locked keys enforced in code
+  tenancy/    merchant resolution and immutable per-session context
+  secrets/    pluggable SecretResolver; config holds env:// refs, never values
+  llm/        provider-agnostic gateway and the conformance gate
+  voice/      STT/TTS factories, read-only tools, LiveKit adapter, call-start disclosure
+  commerce/   fixture-backed catalog, orders, cart, profile, verification
+  agents/     the tiered reasoning graph and its engine
+scripts/      worker entrypoint, evaluator, conformance and smoke runners
+tests/        42 modules, zero network
+```
+
+Inside `agents/`, each gated flow is a package pairing graph logic with its model-facing prompt:
+`frontline/` routes, while `cart/`, `support/`, and `identity/` own their effects. `gate.py` is a
+deterministic pre-generation safety floor, `engine.py` the thread and resume seam, `recovery.py`
+the per-node failure policy, and `capabilities.py` the per-session capability registry the graph
+dispatcher resolves against.
+
+## Run
+
+Requires Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
+uv run python -m pytest      # zero network, no API keys needed
 uv run ruff check
 uv run ruff format --check
-uv run pytest        # zero-network; no keys needed
 ```
 
-Secrets are never committed: copy `.env.example` to `.env` and fill in keys; config
-files hold `env://NAME` refs only.
+To run the voice worker, copy `.env.example` to `.env`, fill in the provider keys, then:
+
+```bash
+uv run python scripts/voice_agent.py console   # terminal, no LiveKit room
+uv run python scripts/voice_agent.py dev       # connect to a LiveKit room
+```
+
+Secrets are never committed. Config files hold `env://NAME` references and the resolver reads the
+value at use time.
+
+## Status
+
+Phases 0 through 3 are built: config and tenancy, the LLM gateway and conformance gate, the voice
+loop, and the gated commerce graph. Routing is currently migrating from keyword gates to typed
+capability requests resolved through an immutable per-session registry.
+
+Deliberately not built yet:
+
+- Commerce, profile, and verification data are fixture-backed. There is no real system of record.
+- Checkpointing is in memory, per session.
+- No payment processing, inventory, tax, shipping, or live human transfer.
+- Tenant scoping is enforced at the tool wrapper, not yet at a shared store.
+
+Real integrations, durable checkpointing, shared-store tenant enforcement, and production OTP
+delivery are Phase 4 work. Payments and SIP warm transfer are Phase 5.
