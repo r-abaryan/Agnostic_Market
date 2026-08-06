@@ -61,10 +61,14 @@ Requires Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run python -m pytest      # zero network, no API keys needed
 uv run ruff check
 uv run ruff format --check
+uv run pytest                # no network and no API keys, but see below
 ```
+
+The suite needs merchant fixture data under `config/fixtures/`, which is not committed. Those
+files stand in for a system of record the code does not ship with, so the commerce, identity, and
+verification suites cannot run from a clean checkout.
 
 To run the voice worker, copy `.env.example` to `.env`, fill in the provider keys, then:
 
@@ -91,3 +95,9 @@ Deliberately not built yet:
 
 Real integrations, durable checkpointing, shared-store tenant enforcement, and production OTP
 delivery are Phase 4 work. Payments and SIP warm transfer are Phase 5.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
+Copyright 2026 Rasoul Abaryan.

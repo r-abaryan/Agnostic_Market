@@ -52,7 +52,8 @@ known-first-party = ["agnostic_market"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." so tests importing scripts/ (the evaluator and fault proxy) resolve without a src install.
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 
 # All dev tooling lives here (uv's native dev group — installed by plain `uv sync`).

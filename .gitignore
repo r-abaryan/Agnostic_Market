@@ -1,4 +1,4 @@
-# Secrets — never commit (SECURITY: secrets resolve via refs, never inline)
+# Secrets: never commit. Secrets resolve via env:// refs, never inline (SECURITY 5).
 .env
 .env.*
 !.env.example
@@ -17,5 +17,14 @@ dist/
 
 # OS / editor
 .DS_Store
-assets/audio/generate_thinking_beep.py
+
+# Local-only working material. Kept out of the repo deliberately: design notes and live-call
+# findings are unreviewed internal drafts, the telemetry sink is a per-call dataset, and the
+# fixture data stands in for a system of record that does not ship with the code.
+docs/
+config/telemetry/
+config/conformance/reports.json
 config/fixtures/
+.claude/
+
+assets/audio/generate_thinking_beep.py
