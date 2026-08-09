@@ -56,7 +56,7 @@ from agnostic_market.agents._consent import (
     is_support_abort,
     wants_human,
 )
-from agnostic_market.agents._copy import guest_list_close, warm_close
+from agnostic_market.agents._copy import guest_list_close, identity_status_line, warm_close
 from agnostic_market.agents.capabilities import (
     CapabilityEntry,
     CapabilityRegistry,
@@ -81,7 +81,7 @@ from agnostic_market.agents.recovery import (
     validate_automation_state_clear,
 )
 from agnostic_market.agents.support import build_support_nodes
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import write_event, write_typed_read_answered
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -106,6 +106,8 @@ from agnostic_market.dtos.orchestration import (
     RefundOrder,
     ReturnOrder,
     SwitchAccount,
+    ViewCart,
+    ViewIdentityStatus,
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
@@ -124,6 +126,11 @@ _HANDOVER_TOOL_NAME = "request_handover"
 _CAPABILITY_DISPATCH_NODE = "capability_dispatch"
 _SUPPORT_CAPABILITY_ENTRY_NODE = "support_capability_entry"
 _SUPPORT_CAPABILITY_RENDER_NODE = "support_capability_render"
+# Pure code-authored read owners: no model, no tools, no flow coupling, so they live here beside
+# the other code-authored reads rather than in the cart/identity packages. An owner that DOES
+# couple to a flow (slot gathering, HITL) belongs in that flow's package, as Support's does.
+_CART_VIEW_RENDER_NODE = "cart_view_render"
+_IDENTITY_STATUS_RENDER_NODE = "identity_status_render"
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +164,8 @@ FRONTLINE_SPEAKABLE_NODES = frozenset(
         "automation_terminal_response",
         "principal_warning",
         "read_render",
+        _CART_VIEW_RENDER_NODE,
+        _IDENTITY_STATUS_RENDER_NODE,
         "forced_status",
         RECOVERY_NODE_NAME,
     }
@@ -286,13 +295,13 @@ def build_frontline_graph(
     reasoning_model: BaseChatModel,
     store: OrderStore,
     policy: PolicyContext,
-    cart_store: CartStore | None = None,
+    cart_store: CartStore,
     otp: OtpProvider,
     verification_store: VerificationStore | None = None,
     risk: RiskProvider | None = None,
     profile_store: ProfileStore,
     recent_orders: RecentOrderContext | None = None,
-    identity_store: CallerIdentityStore | None = None,
+    identity_store: CallerIdentityStore,
     customers: CustomerDirectory,
     payment_instruments: PaymentInstrumentDirectory,
     lifecycle: PrincipalTransitionLifecycle,
@@ -307,25 +316,21 @@ def build_frontline_graph(
     (`verification_store`/`risk`) default to fresh fakes when omitted. `otp` is injected:
     production loads the merchant verification fixture; tests declare their fake code.
 
-    `cart_store` defaults to a fresh instance for frontline-only callers, BUT production and
-    any cart+view_cart test MUST pass the SAME instance here that they passed to
-    `build_voice_tools` — otherwise the frontline's `view_cart` reads a different cart than
-    the flow mutates (split-brain). The default exists only so eval/tests that never touch
-    the cart don't have to build one.
+    `cart_store` and `identity_store` are required session dependencies. They MUST be the
+    SAME instances passed to `build_voice_tools`; substituting fresh stores would make the
+    typed read owners observe different cart or authorization state (split-brain).
     """
     # A defaulted VerificationStore shares the SAME provider the dispatch node uses (else
     # dispatch and verify would talk to different fakes).
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
-    cart_store = cart_store or CartStore()
     # Session recent-order context. Production + any context test MUST pass the
     # SAME instance given to build_voice_tools (the order_status set-site) — the default
     # exists only for callers that never resolve an order reference (split-brain otherwise).
     recent_orders = recent_orders or RecentOrderContext(max_refs=policy.cancel_batch_max)
-    # Session authorization store + customer directory (P7). Same split-brain rule: the
-    # order_status tool GRANTS into `identity_store` and the render router READS it — pass
-    # the ONE instance to both build_voice_tools and here.
-    identity_store = identity_store or CallerIdentityStore()
+    # Session authorization store + customer directory (P7). The order_status tool GRANTS
+    # into `identity_store` and the render router READS it, so graph construction requires
+    # the one session-owned instance instead of manufacturing a substitute.
     handover_tool = _build_handover_tool()
     all_tools = [*read_only_tools, handover_tool]
     model_with_tools = chat_model.bind_tools(all_tools)
@@ -538,8 +543,18 @@ def build_frontline_graph(
             )
         }
 
+    def _cart_view_line(close: str) -> str:
+        """The ONE spoken cart view, shared by the tool-driven render and the typed owner.
+
+        `close` is an argument, not a `warm_close()` call: `read_render_node` computes its close
+        once before branching, so calling it here too would advance the rotation twice.
+        """
+        if cart_store.is_empty():
+            return "Your cart's empty at the moment."
+        return render_cart_line(cart_store.view(), cart_store.cart_total()) + close
+
     def read_render_node(state: ReasoningState) -> dict[str, object]:
-        """CODE-author the spoken line for a single renderable read (order_status/view_cart)
+        """CODE-author the spoken line for a single renderable read (`_RENDERABLE_READS`)
         and END — skipping the second model pass (the ~2.5s `tool_to_next_model` cost, live
         calls #9/#10/#11) AND the embellishment class it introduced (a code renderer cannot
         say "on the way" for a processing order — the phrase is derived from the store field).
@@ -558,11 +573,7 @@ def build_frontline_graph(
         # couldn't find it" is jarring — the caller needs to give the right number first).
         close = f" {warm_close()}"
         if name == "view_cart":
-            line = (
-                "Your cart's empty at the moment."
-                if cart_store.is_empty()
-                else render_cart_line(cart_store.view(), cart_store.cart_total()) + close
-            )
+            line = _cart_view_line(close)
         elif name == "list_orders":
             bound = identity_store.current()
             assert bound is not None  # _render_ready only passes list_orders when bound
@@ -587,6 +598,38 @@ def build_frontline_graph(
             }
         )
         return {"messages": [AIMessage(line)]}
+
+    def cart_view_render_node(state: ReasoningState) -> dict[str, object]:
+        """Typed `ViewCart` owner: speak the live cart. No model, no tools, no mutation.
+
+        `active_flow` is left untouched: nothing on this path sets one, so clearing would be a
+        no-op today and a silent flow-exit the day it is reachable mid-flow.
+        """
+        if state.active_invocation is None or not isinstance(
+            state.active_invocation.request, ViewCart
+        ):
+            raise TypeError("cart view render requires a view-cart invocation")
+        line = _cart_view_line(f" {warm_close()}")
+        write_typed_read_answered(_last_user_text(state), CapabilityId.VIEW_CART.value)
+        return {"active_invocation": None, "messages": [AIMessage(line)]}
+
+    def identity_status_render_node(state: ReasoningState) -> dict[str, object]:
+        """Typed `ViewIdentityStatus` owner: bound or unbound, read from the LIVE store.
+
+        Never infers verification from transcript or order knowledge, and speaks neither the
+        customer reference nor the contact on file.
+        """
+        if state.active_invocation is None or not isinstance(
+            state.active_invocation.request, ViewIdentityStatus
+        ):
+            raise TypeError("identity status render requires a view-identity-status invocation")
+        # Only the verified line takes a close; the unverified one already ends in an invitation.
+        verified = identity_store.current() is not None
+        line = identity_status_line(verified=verified)
+        if verified:
+            line = f"{line} {warm_close()}"
+        write_typed_read_answered(_last_user_text(state), CapabilityId.VIEW_IDENTITY_STATUS.value)
+        return {"active_invocation": None, "messages": [AIMessage(line)]}
 
     def handover_node(state: ReasoningState) -> dict[str, object]:
         assert state.handover is not None  # only reached with a handover set
@@ -970,6 +1013,8 @@ def build_frontline_graph(
         display_name=display_name,
     )
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
+    cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
+    identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
     capability_registry = CapabilityRegistry(
         (
             CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
@@ -980,6 +1025,12 @@ def build_frontline_graph(
                 CapabilityId.CHANGE_PROFILE,
                 ChangeProfile,
                 support_entry,
+            ),
+            CapabilitySpec(CapabilityId.VIEW_CART, ViewCart, cart_view_entry),
+            CapabilitySpec(
+                CapabilityId.VIEW_IDENTITY_STATUS,
+                ViewIdentityStatus,
+                identity_status_entry,
             ),
         )
     )
@@ -1291,7 +1342,10 @@ def build_frontline_graph(
         capability_dispatch,
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.PURE_ABORT,
-        destinations=(_SUPPORT_CAPABILITY_ENTRY_NODE,),
+        # DERIVED from the registry, never hand-listed: the rendering hint must name exactly the
+        # nodes `resolve()` can return, and a parallel tuple would silently diverge the day a
+        # capability is registered with a new owner.
+        destinations=capability_registry.entry_nodes,
     )
     node_registry.register(
         _SUPPORT_CAPABILITY_ENTRY_NODE,
@@ -1302,6 +1356,18 @@ def build_frontline_graph(
     node_registry.register(
         _SUPPORT_CAPABILITY_RENDER_NODE,
         support.capability_render,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        _CART_VIEW_RENDER_NODE,
+        cart_view_render_node,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        _IDENTITY_STATUS_RENDER_NODE,
+        identity_status_render_node,
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.PURE_ABORT,
     )
@@ -1668,6 +1734,8 @@ def build_frontline_graph(
         },
     )
     graph.add_edge(_SUPPORT_CAPABILITY_RENDER_NODE, END)
+    graph.add_edge(_CART_VIEW_RENDER_NODE, END)  # code-authored typed read ENDs, no model pass
+    graph.add_edge(_IDENTITY_STATUS_RENDER_NODE, END)
     graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",
@@ -1838,9 +1906,7 @@ def build_frontline_graph(
     # A dispatch destination with no regular-node recovery policy would fail unhandled on a
     # caller's turn; catch it at construction instead.
     missing_entries = {
-        spec.entry.node_name
-        for spec in capability_registry.specs.values()
-        if spec.entry.node_name not in node_recovery_policies
+        node for node in capability_registry.entry_nodes if node not in node_recovery_policies
     }
     if missing_entries:
         raise RuntimeError(

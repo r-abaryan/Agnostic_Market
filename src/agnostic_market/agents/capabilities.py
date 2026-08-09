@@ -72,6 +72,7 @@ class CapabilityRegistry:
 
     _specs: Mapping[CapabilityId, CapabilitySpec]
     _capability_ids: tuple[CapabilityId, ...]
+    _entry_nodes: tuple[str, ...]
 
     def __init__(self, specs: Iterable[CapabilitySpec]) -> None:
         by_id: dict[CapabilityId, CapabilitySpec] = {}
@@ -85,10 +86,20 @@ class CapabilityRegistry:
             by_id[spec.capability_id] = spec
         object.__setattr__(self, "_specs", MappingProxyType(by_id))
         object.__setattr__(self, "_capability_ids", tuple(by_id))
+        # Deduped and registration-ordered: several capabilities share one owner node.
+        object.__setattr__(
+            self,
+            "_entry_nodes",
+            tuple(dict.fromkeys(spec.entry.node_name for spec in by_id.values())),
+        )
 
     @property
     def capability_ids(self) -> tuple[CapabilityId, ...]:
         return self._capability_ids
+
+    @property
+    def entry_nodes(self) -> tuple[str, ...]:
+        return self._entry_nodes
 
     @property
     def specs(self) -> Mapping[CapabilityId, CapabilitySpec]:

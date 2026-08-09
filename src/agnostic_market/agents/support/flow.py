@@ -62,7 +62,7 @@ from agnostic_market.agents.support.prompt import (
     compose_support_capability_prompt,
     compose_support_prompt,
 )
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import write_event, write_typed_read_answered
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     order_mutation_allowed,
@@ -622,6 +622,9 @@ def build_support_nodes(
             recent_orders.clear()
         write_event({"event": "order_list_rendered", "order_scope": request.scope})
         line = f"{render_order_list_line(orders, scope=request.scope)} {close}"
+        # This node ENDs, bypassing the frontline's finalize sink, so the answered-turn record
+        # is written here rather than there.
+        write_typed_read_answered(_last_user_text(state), request.kind.value)
         return {
             "active_invocation": None,
             "active_flow": None,

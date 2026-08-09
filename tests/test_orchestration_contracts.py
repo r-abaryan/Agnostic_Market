@@ -511,6 +511,8 @@ def test_registry_is_immutable_and_exposes_no_executor_or_planner_contract() -> 
     with pytest.raises(FrozenInstanceError):
         registry._capability_ids = ()
     with pytest.raises(FrozenInstanceError):
+        registry._entry_nodes = ()
+    with pytest.raises(FrozenInstanceError):
         registry._specs = {}  # type: ignore[assignment]
     assert not hasattr(registry, "register")
     assert not hasattr(registry, "execute")

@@ -61,6 +61,7 @@ from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     DiscloseAiIdentity,
     ListOrders,
+    ViewCart,
     ViewIdentityStatus,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
@@ -127,13 +128,14 @@ def _engine(
     *,
     frontline: FakeChatModel | None = None,
     reasoning: FakeChatModel | None = None,
+    cart: CartStore | None = None,
     identity: CallerIdentityStore | None = None,
     thread_id: str = "session-1",
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     policy = make_policy(refund_returnless_under_usd=50.0)
     recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
-    cart = CartStore()
+    cart = cart if cart is not None else CartStore()
     identity = identity or CallerIdentityStore()
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     tools = [
@@ -1471,6 +1473,88 @@ def test_new_intent_requests_roundtrip_through_production_checkpoint_serde(
 
     assert restored.active_invocation == invocation
     assert not any("unregistered" in record.getMessage().lower() for record in caplog.records)
+
+
+def _seed_typed_read(engine: ReasoningEngine, request: ViewCart | ViewIdentityStatus) -> None:
+    consumed_turn_ids = (f"{request.kind.value}-origin",)
+    engine._graph.update_state(
+        engine._config,
+        {
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                request,
+                consumed_turn_ids=consumed_turn_ids,
+            ),
+        },
+        as_node="__start__",
+    )
+
+
+async def test_cart_view_owner_is_audible_once_through_the_engine(config_root: Path) -> None:
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    frontline = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="typed-cart-speech",
+    )
+    _seed_typed_read(engine, ViewCart())
+
+    events = await _events(engine, "continue")
+    spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
+
+    assert len(spoken) == 1
+    assert spoken[0].node == "cart_view_render"
+    assert spoken[0].text.startswith(
+        "You've got 1 waterproof rain jacket in your cart, $129.00 in total."
+    )
+    assert not any(isinstance(event, TokenEvent) for event in events)
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+    assert (
+        ReasoningState.model_validate(
+            engine._graph.get_state(engine._config).values
+        ).active_invocation
+        is None
+    )
+    assert len(cart.snapshot()) == 1
+
+
+async def test_identity_status_owner_is_audible_once_through_the_engine(
+    config_root: Path,
+) -> None:
+    from agnostic_market.agents._copy import IDENTITY_STATUS_UNVERIFIED
+
+    identity = CallerIdentityStore()
+    frontline = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        identity=identity,
+        thread_id="typed-identity-status-speech",
+    )
+    _seed_typed_read(engine, ViewIdentityStatus())
+
+    events = await _events(engine, "continue")
+    spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
+
+    assert [(event.node, event.text) for event in spoken] == [
+        ("identity_status_render", IDENTITY_STATUS_UNVERIFIED)
+    ]
+    assert not any(isinstance(event, TokenEvent) for event in events)
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+    assert (
+        ReasoningState.model_validate(
+            engine._graph.get_state(engine._config).values
+        ).active_invocation
+        is None
+    )
+    assert identity.current() is None
 
 
 async def test_incoherent_persisted_invocation_terminalizes_before_any_execution(

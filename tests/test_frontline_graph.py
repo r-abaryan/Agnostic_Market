@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from pathlib import Path
 from types import MappingProxyType
+from typing import NoReturn
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
     RECOVERY_NODE_NAME,
     RECOVERY_TERMINALIZER_NODE_NAME,
     clear_automation_state,
 )
+from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -36,8 +41,11 @@ from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancelOrders,
     CapabilityId,
+    IntentRequest,
     ListOrders,
     SwitchAccount,
+    ViewCart,
+    ViewIdentityStatus,
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
@@ -161,13 +169,40 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.REFUND_ORDER,
         CapabilityId.RETURN_ORDER,
         CapabilityId.CHANGE_PROFILE,
+        CapabilityId.VIEW_CART,
+        CapabilityId.VIEW_IDENTITY_STATUS,
     )
-    assert {spec.entry.node_name for spec in registry.specs.values()} == {
-        "support_capability_entry"
-    }
-    assert graph.builder.nodes["capability_dispatch"].ends == ("support_capability_entry",)
+    assert registry.entry_nodes == (
+        "support_capability_entry",
+        "cart_view_render",
+        "identity_status_render",
+    )
+    # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
+    # dispatcher must still own no executable outgoing route.
+    assert graph.builder.nodes["capability_dispatch"].ends == registry.entry_nodes
     assert not any(source == "capability_dispatch" for source, _target in graph.builder.edges)
     assert "capability_dispatch" not in graph.builder.branches
+    # An unmigrated id must be ABSENT, never resolving to some fallback owner.
+    # The unmigrated set is named, not counted: a count stays green if one id gains an owner
+    # while another is added, and it names nothing when it breaks.
+    assert set(CapabilityId) - set(registry.capability_ids) == {
+        CapabilityId.ANSWER_QUESTION,
+        CapabilityId.SEARCH_CATALOG,
+        CapabilityId.VERIFY_ORDER_STATUS,
+        CapabilityId.MODIFY_CART,
+        CapabilityId.PLACE_ORDER,
+        CapabilityId.VERIFY_IDENTITY,
+        CapabilityId.SWITCH_ACCOUNT,
+        CapabilityId.DISCLOSE_AI_IDENTITY,
+        CapabilityId.REQUEST_PERSON,
+    }
+
+
+def _only_spoken(result: dict[str, object]) -> str:
+    """The turn's single caller-facing line. Fails if a turn spoke twice, which is itself a bug."""
+    spoken = [message for message in result["messages"] if isinstance(message, AIMessage)]
+    assert len(spoken) == 1
+    return str(spoken[0].content)
 
 
 def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: Path) -> None:
@@ -190,9 +225,269 @@ def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: P
     assert reasoning.invoke_count == 0
     assert result["active_invocation"] is None
     assert result["active_flow"] is None
-    spoken = [message for message in result["messages"] if isinstance(message, AIMessage)]
-    assert len(spoken) == 1
-    assert "hit a snag" not in str(spoken[0].content).lower()
+    assert "hit a snag" not in _only_spoken(result).lower()
+
+
+# --- 3B-b: the two pure code-authored read owners ------------------------------------
+
+
+def _typed_read(graph, request: IntentRequest, *, turn_id: str, text: str) -> dict[str, object]:
+    return graph.invoke(
+        _admitted_turn(
+            text,
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(request=request, opened_turn_id=turn_id),
+        )
+    )
+
+
+def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(config_root: Path) -> None:
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    frontline = FakeChatModel()
+    reasoning = FakeChatModel()
+    graph = _graph(config_root, frontline, cart_store=cart, reasoning_model=reasoning)
+
+    result = _typed_read(graph, ViewCart(), turn_id="typed-cart", text="what's in my cart?")
+
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+    assert result["active_invocation"] is None
+    line = _only_spoken(result)
+    assert "waterproof rain jacket" in line and "129.00" in line
+    assert cart.line_count == 1  # a read mutates nothing
+
+
+def test_cart_view_owner_re_reads_the_store_on_every_turn(config_root: Path) -> None:
+    # Live-read freshness: the owner must render the CURRENT cart, never a value captured when
+    # the invocation was opened.
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    graph = _graph(config_root, FakeChatModel(), cart_store=cart)
+
+    first = _only_spoken(_typed_read(graph, ViewCart(), turn_id="cart-1", text="my cart?"))
+    cart.add_item(sku="SKU-2", name="trail running shoes", price_usd=95.0, quantity=1)
+    second = _only_spoken(_typed_read(graph, ViewCart(), turn_id="cart-2", text="and now?"))
+
+    assert "trail running shoes" not in first
+    assert "trail running shoes" in second and "waterproof rain jacket" in second
+
+
+def test_cart_view_owner_speaks_the_empty_line_with_no_close(config_root: Path) -> None:
+    from agnostic_market.agents._copy import all_closes
+
+    graph = _graph(config_root, FakeChatModel(), cart_store=CartStore())
+
+    line = _only_spoken(_typed_read(graph, ViewCart(), turn_id="cart-empty", text="my cart?"))
+
+    assert line == "Your cart's empty at the moment."
+    assert not any(line.endswith(close) for close in all_closes())
+
+
+def test_both_cart_read_paths_speak_the_same_line(config_root: Path) -> None:
+    # The tool-driven render and the typed owner must not drift: one helper authors both.
+    def build(model: FakeChatModel):
+        cart = CartStore()
+        cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+        return _graph(config_root, model, cart_store=cart)
+
+    typed_line = _only_spoken(
+        _typed_read(build(FakeChatModel()), ViewCart(), turn_id="same-typed", text="my cart?")
+    )
+    tool_result = build(FakeChatModel(scripted_calls=[[("view_cart", {})]])).invoke(
+        _admitted_turn("what's in my cart?", turn_id="same-tool")
+    )
+    tool_line = str(
+        [m for m in tool_result["messages"] if isinstance(m, AIMessage) and not m.tool_calls][
+            -1
+        ].content
+    )
+
+    # Both must really be the rendered cart, not an empty line or model prose.
+    assert "waterproof rain jacket" in typed_line and "waterproof rain jacket" in tool_line
+    # Closes rotate, so compare the sentence before the close.
+    assert typed_line.split(" in total.")[0] == tool_line.split(" in total.")[0]
+
+
+def test_each_cart_read_path_takes_exactly_one_close(
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The close is computed ONCE per turn in read_render_node, before its branch. A helper that
+    # called warm_close() itself would advance the module-level rotation twice on a cart read,
+    # which no membership assertion would catch.
+    calls: list[int] = []
+
+    def counting_close() -> str:
+        calls.append(1)
+        return "Anything else I can help with?"
+
+    monkeypatch.setattr(frontline_graph, "warm_close", counting_close)
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+
+    _typed_read(
+        _graph(config_root, FakeChatModel(), cart_store=cart),
+        ViewCart(),
+        turn_id="close-typed",
+        text="my cart?",
+    )
+    assert len(calls) == 1
+
+    calls.clear()
+    _graph(
+        config_root,
+        FakeChatModel(scripted_calls=[[("view_cart", {})]]),
+        cart_store=cart,
+    ).invoke(_admitted_turn("what's in my cart?", turn_id="close-tool"))
+    assert len(calls) == 1
+
+
+def test_identity_status_owner_reports_the_live_binding_only(config_root: Path) -> None:
+    from agnostic_market.agents._copy import (
+        IDENTITY_STATUS_UNVERIFIED,
+        IDENTITY_STATUS_VERIFIED,
+        all_closes,
+    )
+
+    identity = CallerIdentityStore()
+    frontline = FakeChatModel()
+    reasoning = FakeChatModel()
+    graph = _graph(config_root, frontline, identity=identity, reasoning_model=reasoning)
+
+    unbound_result = _typed_read(graph, ViewIdentityStatus(), turn_id="id-1", text="am I verified?")
+    unbound = _only_spoken(unbound_result)
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    bound_result = _typed_read(
+        graph, ViewIdentityStatus(), turn_id="id-2", text="am I verified now?"
+    )
+    bound = _only_spoken(bound_result)
+
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+    assert unbound_result["active_invocation"] is None
+    assert bound_result["active_invocation"] is None
+    # The unverified branch carries its own invitation, so it takes no warm close.
+    assert unbound == IDENTITY_STATUS_UNVERIFIED
+    # A resolved answer closes like every other code-authored line.
+    assert bound.startswith(IDENTITY_STATUS_VERIFIED)
+    assert any(bound.endswith(close) for close in all_closes())
+    # Bound-or-unbound ONLY: never the customer reference, never the contact on file.
+    assert "CUST-001" not in bound and "0119" not in bound
+
+
+def _rows(tmp_path: Path) -> list[dict]:
+    path = tmp_path / "telemetry.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _answered_rows(tmp_path: Path) -> list[dict]:
+    return [row for row in _rows(tmp_path) if row.get("outcome") == "answered"]
+
+
+def _failed_nodes(tmp_path: Path) -> list[str]:
+    return [str(row["node"]) for row in _rows(tmp_path) if row.get("event") == "turn_failed"]
+
+
+def test_every_typed_read_owner_records_an_answered_turn(config_root: Path, tmp_path: Path) -> None:
+    # These nodes END, bypassing finalize_node, so without their own record a typed read would
+    # leave no negative in the classifier dataset. All THREE owners, because the parity is the
+    # point: one missing call is invisible in any test that only asserts a row's absence.
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    graph = _graph(config_root, FakeChatModel(), cart_store=cart)
+
+    _typed_read(graph, ViewCart(), turn_id="tel-cart", text="what's in my cart?")
+    _typed_read(graph, ViewIdentityStatus(), turn_id="tel-id", text="am I verified?")
+    _typed_read(graph, ListOrders(scope="session"), turn_id="tel-list", text="what have I ordered?")
+
+    assert _answered_rows(tmp_path) == [
+        {
+            "utterance": "what's in my cart?",
+            "outcome": "answered",
+            # NOT "code_render": that slug is the tool-driven path's and carries a `tool` key.
+            "outcome_detail": "typed_read",
+            "capability": "view_cart",
+        },
+        {
+            "utterance": "am I verified?",
+            "outcome": "answered",
+            "outcome_detail": "typed_read",
+            "capability": "view_identity_status",
+        },
+        {
+            "utterance": "what have I ordered?",
+            "outcome": "answered",
+            "outcome_detail": "typed_read",
+            "capability": "list_orders",
+        },
+    ]
+    # No tool ran on any path, so claiming one would corrupt any tool-usage analysis.
+    assert all("tool" not in row for row in _answered_rows(tmp_path))
+
+
+def test_rotated_read_continuation_records_no_blank_utterance(
+    config_root: Path, tmp_path: Path
+) -> None:
+    # An ACCOUNT list is the only read `principal_transition_continuation` lets survive rotation
+    # (view_cart, view_identity_status and even a SESSION list are refused), and the engine seeds
+    # that fresh thread with no messages. No in-thread utterance means no label, and an
+    # empty-string row is a mislabelled classifier negative, so none is written.
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    graph = _graph(config_root, FakeChatModel(), identity=identity)
+
+    result = graph.invoke(
+        {
+            "messages": [],
+            "consumed_turn_ids": ("rotated",),
+            "active_invocation": ActiveInvocation(
+                request=ListOrders(scope="account"), opened_turn_id="rotated"
+            ),
+        }
+    )
+
+    # Non-vacuous: the owner really did run and answer, it just recorded nothing.
+    assert "ORD-1001" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
+
+
+def _failing_render(*_args: object, **_kwargs: object) -> NoReturn:
+    raise RuntimeError("render failed")
+
+
+def test_a_failed_cart_render_records_no_answered_turn(
+    config_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The record must FOLLOW the line it reports, as the tool path's does. Written first it
+    # would claim "answered" for a turn whose render blew up and whose caller heard the snag.
+    monkeypatch.setattr(frontline_graph, "render_cart_line", _failing_render)
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    graph = _graph(config_root, FakeChatModel(), cart_store=cart)
+
+    result = _typed_read(graph, ViewCart(), turn_id="cart-fail", text="what's in my cart?")
+
+    # Pinned to the owner: "hit a snag" alone would also pass if some EARLIER node had broken.
+    assert _failed_nodes(tmp_path) == ["cart_view_render"]
+    assert "hit a snag" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
+
+
+def test_a_failed_order_list_render_records_no_answered_turn(
+    config_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(support_flow, "render_order_list_line", _failing_render)
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    graph = _graph(config_root, FakeChatModel(), identity=identity)
+
+    result = _typed_read(
+        graph, ListOrders(scope="account"), turn_id="list-fail", text="what are my orders?"
+    )
+
+    assert _failed_nodes(tmp_path) == ["support_capability_render"]
+    assert "hit a snag" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
 
 
 def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) -> None:
@@ -215,6 +510,8 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "capability_dispatch",
             "support_capability_entry",
             "support_capability_render",
+            "cart_view_render",
+            "identity_status_render",
             "support_clarify",
             "support_guardrail",
             "support_risk_check",
@@ -296,7 +593,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 56
+    assert len(policies) == 58
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -308,7 +605,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 55
+    assert len(graph.recovery_handled_nodes) == 57
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

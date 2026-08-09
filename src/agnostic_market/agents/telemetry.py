@@ -41,3 +41,25 @@ def write_event(record: dict[str, object]) -> None:
             fh.write(json.dumps(record) + "\n")
     except OSError as exc:  # telemetry must never break a live call
         logger.warning("telemetry write failed: %s", exc)
+
+
+def write_typed_read_answered(utterance: str, capability: str) -> None:
+    """The one answered-turn record shared by every capability-dispatched read owner.
+
+    Call it only once the spoken line exists, as the tool path does: a row written ahead of a
+    failing render claims "answered" for a turn the caller never heard. A blank utterance writes
+    NOTHING - an allowlisted read resumed after principal rotation runs in a fresh thread with no
+    messages, and an empty-string row is a mislabelled negative, not a usable one.
+    """
+    if not utterance.strip():
+        return
+    write_event(
+        {
+            "utterance": utterance,
+            "outcome": "answered",
+            # Not the tool path's "code_render": those rows key on `tool`, these on `capability`,
+            # and one slug across both would mix two populations under half-present keys.
+            "outcome_detail": "typed_read",
+            "capability": capability,
+        }
+    )

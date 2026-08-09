@@ -43,3 +43,13 @@ GUEST_LIST_CLOSE = "To pull up any other orders on an account, I can verify you 
 
 def guest_list_close() -> str:
     return GUEST_LIST_CLOSE
+
+
+# The answer to "am I verified?": current state, not the identity flow's transition lines
+# ("You're now verified on the new account."), which announce a change that just happened.
+IDENTITY_STATUS_VERIFIED = "You're verified on this call."
+IDENTITY_STATUS_UNVERIFIED = "You're not verified on this call."
+
+
+def identity_status_line(*, verified: bool) -> str:
+    return IDENTITY_STATUS_VERIFIED if verified else IDENTITY_STATUS_UNVERIFIED
