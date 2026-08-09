@@ -626,18 +626,12 @@ async def test_batch_cancel_idempotent_across_double_resume(config_root: Path) -
     assert store.cancel_count == 2  # exactly N, never N+1
 
 
-async def test_batch_cancel_checkpoints_between_voids_without_serde_warning(
-    config_root: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # The void self-loop serializes PendingCancelBatch + nested CancelTarget/BatchCancelOutcome
-    # BETWEEN each void (replay-safe progress). Those types must be serde-registered — no
-    # langgraph "unregistered type" warning (slated to become a hard block).
+async def test_batch_cancel_checkpoints_between_voids(config_root: Path) -> None:
+    # The void self-loop checkpoints replay-safe progress between targets.
     engine, store = _batch_engine(config_root, ["2", "4"], thread_id="batch-7", place_second=True)
-    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
-        await _events(engine, "cancel both")
-        await _events(engine, "yes")  # drives the void self-loop across both targets
+    await _events(engine, "cancel both")
+    await _events(engine, "yes")  # drives the void self-loop across both targets
     assert store.cancel_count == 2
-    assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
 
 
 async def test_cancel_effect_revalidates_status_changed_after_readback(

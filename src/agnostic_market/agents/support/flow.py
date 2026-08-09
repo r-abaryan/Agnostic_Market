@@ -115,7 +115,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     RefundOrder,
     ReturnOrder,
-    principal_transition_continuation,
+    project_principal_transition,
 )
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
@@ -1061,7 +1061,7 @@ def build_support_nodes(
         identity while filling slots. The rotated context resolves and authorizes live;
         transcript and graph-node-pointer replay are forbidden.
         """
-        principal_transition_continuation(request)
+        project_principal_transition(request)
         write_event({"event": "support_action_needs_identity"})
         next_invocation = (
             open_active_invocation(

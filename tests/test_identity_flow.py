@@ -16,7 +16,12 @@ from turn_helpers import engine_events, next_committed_turn
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
-from agnostic_market.dtos.orchestration import ActiveInvocation, ChangeProfile, ListOrders
+from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
+    ChangeProfile,
+    ListOrders,
+    VerifyIdentity,
+)
 from agnostic_market.dtos.state import PendingIdentity, ReasoningState, open_active_invocation
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
@@ -29,6 +34,11 @@ _CUST1_PHONE = "+1 555 010 0119"  # CUST-001 on file: owns ORD-1001 + ORD-1003
 _CUST2_EMAIL = "casey@example.com"
 _UNKNOWN_CLAIM = "nobody@nowhere.example"
 _ASK_CONTACT_LINE = "What email address or phone number is on the account?"
+_VERIFY_CONTEXT_WARNING = (
+    "Verifying an account will clear this call's cart and recent order context. "
+    "Orders already placed will remain placed, but they won't stay available in this "
+    "conversation. Would you like to continue?"
+)
 # Enumeration has NO gate patterns by design — entry is the MODEL's request_handover.
 _REQUEST = "what orders do I have on my account?"
 
@@ -118,6 +128,21 @@ def _seed_cart(harness: SupportHarness) -> None:
         name="blue wool hat",
         price_usd=29.0,
         quantity=1,
+    )
+
+
+def _seed_typed_verification(harness: SupportHarness, *, turn_id: str) -> None:
+    consumed_turn_ids = (turn_id,)
+    harness.engine._graph.update_state(
+        harness.engine._config,
+        {
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                VerifyIdentity(),
+                consumed_turn_ids=consumed_turn_ids,
+            ),
+        },
+        as_node="__start__",
     )
 
 
@@ -463,6 +488,108 @@ def test_same_principal_apply_preserves_invocation_until_continuation(
     assert after_entry.active_invocation == invocation
     render_update = h.engine._graph.nodes["support_capability_render"].invoke(after_entry)
     assert render_update["active_invocation"] is None
+
+
+async def test_typed_verification_binds_rotates_and_completes_once(config_root: Path) -> None:
+    h = _identity_harness(config_root, thread_id="typed-verify")
+    _seed_typed_verification(h, turn_id="typed-verify-opening")
+    old_thread_id = h.engine.thread_id
+
+    dispatched = await _events(h.engine, "continue")
+    assert [event.prompt for event in dispatched if isinstance(event, InterruptEvent)] == [
+        "For security, please read me the 6-digit code we just sent you."
+    ]
+    assert h.identity.current() is None
+    assert h.otp.dispatch_count == 1
+
+    completed = await _events(h.engine, _VALID_OTP)
+
+    assert [(event.node, event.text) for event in _spoken(completed)] == [
+        ("identity_apply", "You're now verified.")
+    ]
+    assert h.identity.current() == BoundIdentity(
+        customer_ref=_CUST1_REF,
+        masked_contact=_CUST1_MASK,
+    )
+    assert h.engine.thread_id != old_thread_id
+    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    new_state = h.engine._graph.get_state(h.engine._config)
+    assert new_state.next == ()
+    assert new_state.values.get("active_invocation") is None
+    assert new_state.values.get("messages", []) == []
+
+
+async def test_typed_verification_decline_preserves_discardable_context(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        force_tool="propose_identity",
+        canned_args={"propose_identity": {"contact_claim": _CUST1_PHONE}},
+        tool_call_limit=99,
+    )
+    h = _identity_harness(
+        config_root,
+        thread_id="typed-verify-decline",
+        reasoning=reasoning,
+    )
+    _seed_cart(h)
+    _seed_typed_verification(h, turn_id="typed-verify-decline-opening")
+    old_thread_id = h.engine.thread_id
+
+    warning = await _events(h.engine, "continue")
+    assert [event.prompt for event in warning if isinstance(event, InterruptEvent)] == [
+        _VERIFY_CONTEXT_WARNING
+    ]
+    declined = await _events(h.engine, "no")
+
+    assert [(event.node, event.text) for event in _spoken(declined)] == [
+        ("principal_warning", "Okay, I won't start account verification.")
+    ]
+    assert h.engine.thread_id == old_thread_id
+    assert h.identity.current() is None
+    assert not h.caller_context.cart_store.is_empty()
+    assert h.otp.dispatch_count == 0
+    assert reasoning.invoke_count == 0
+    state = ReasoningState.model_validate(h.engine._graph.get_state(h.engine._config).values)
+    assert state.active_invocation is None
+    assert state.active_flow is None
+
+
+async def test_typed_verification_accepts_context_warning_then_rotates(
+    config_root: Path,
+) -> None:
+    h = _identity_harness(config_root, thread_id="typed-verify-accept")
+    _seed_cart(h)
+    _seed_typed_verification(h, turn_id="typed-verify-accept-opening")
+    old_thread_id = h.engine.thread_id
+
+    warning = await _events(h.engine, "continue")
+    assert [event.prompt for event in warning if isinstance(event, InterruptEvent)] == [
+        _VERIFY_CONTEXT_WARNING
+    ]
+    dispatched = await _events(h.engine, "yes")
+    assert [event.prompt for event in dispatched if isinstance(event, InterruptEvent)] == [
+        "For security, please read me the 6-digit code we just sent you."
+    ]
+    assert h.identity.current() is None
+    assert not h.caller_context.cart_store.is_empty()
+
+    completed = await _events(h.engine, _VALID_OTP)
+
+    assert [(event.node, event.text) for event in _spoken(completed)] == [
+        ("identity_apply", "You're now verified.")
+    ]
+    assert h.identity.current() == BoundIdentity(
+        customer_ref=_CUST1_REF,
+        masked_contact=_CUST1_MASK,
+    )
+    assert h.engine.thread_id != old_thread_id
+    assert h.caller_context.cart_store.is_empty()
+    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    new_state = h.engine._graph.get_state(h.engine._config)
+    assert new_state.next == ()
+    assert new_state.values.get("active_invocation") is None
+    assert new_state.values.get("messages", []) == []
 
 
 async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) -> None:

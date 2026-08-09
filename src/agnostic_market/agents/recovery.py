@@ -16,6 +16,7 @@ from langgraph.errors import NodeError
 from langgraph.graph import StateGraph
 from langgraph.types import Command
 
+from agnostic_market.agents._copy import principal_completion_line
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
@@ -658,8 +659,9 @@ def build_recovery_node(
         if inspection.outcome == "coherent" and identity_matches and request_matches:
             write_event(event)
             update = clear_automation_state()
-            if transition.completes_switch:
-                update["messages"] = [AIMessage("You're now verified on the new account.")]
+            completion_line = principal_completion_line(transition.projection.completion_kind)
+            if completion_line is not None:
+                update["messages"] = [AIMessage(completion_line)]
             return update
         invalidate_principal_transition(transition.transition_id)
         event["outcome"] = "inconsistent"

@@ -30,6 +30,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     RefundOrder,
     SwitchAccount,
+    VerifyIdentity,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import PendingIdentity, ReasoningState, open_active_invocation
@@ -392,6 +393,47 @@ async def test_switch_apply_failure_after_coherent_publish_preserves_acknowledge
     assert harness.identity.current() == _CUST2
     assert harness.caller_context.pending_transition() is None
     assert harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values == {}
+
+
+async def test_verify_apply_failure_after_coherent_publish_preserves_acknowledgement(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _identity_harness(config_root, thread_id="verify-after-publish")
+    opening_turn_id = "verify-after-publish-opening"
+    consumed_turn_ids = (opening_turn_id,)
+    harness.engine._graph.update_state(
+        harness.engine._config,
+        {
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                VerifyIdentity(),
+                consumed_turn_ids=consumed_turn_ids,
+            ),
+        },
+        as_node="__start__",
+    )
+    old_thread = harness.engine.thread_id
+    dispatched = await _events(harness, "continue")
+    assert any(isinstance(event, InterruptEvent) for event in dispatched)
+    real_write = identity_flow.write_event
+
+    def fail_after_publication(record: dict[str, object]) -> None:
+        if record.get("event") == "identity_bound":
+            raise RuntimeError("injected verification tail failure")
+        real_write(record)
+
+    monkeypatch.setattr(identity_flow, "write_event", fail_after_publication)
+    recovered = await _events(harness, _OTP)
+
+    assert [event.text for event in _spoken(recovered)] == ["You're now verified."]
+    assert harness.engine.thread_id != old_thread
+    assert harness.identity.current() == _CUST1
+    assert harness.caller_context.pending_transition() is None
+    assert harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values == {}
+    new_state = harness.engine._graph.get_state(harness.engine._config)
+    assert new_state.next == ()
+    assert new_state.values.get("active_invocation") is None
 
 
 @pytest.mark.parametrize("publication", ("none", "coherent", "inconsistent"))

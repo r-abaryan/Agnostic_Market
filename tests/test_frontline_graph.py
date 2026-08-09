@@ -44,6 +44,7 @@ from agnostic_market.dtos.orchestration import (
     IntentRequest,
     ListOrders,
     SwitchAccount,
+    VerifyIdentity,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -171,11 +172,14 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.CHANGE_PROFILE,
         CapabilityId.VIEW_CART,
         CapabilityId.VIEW_IDENTITY_STATUS,
+        CapabilityId.VERIFY_IDENTITY,
+        CapabilityId.SWITCH_ACCOUNT,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
         "cart_view_render",
         "identity_status_render",
+        "identity_capability_entry",
     )
     # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
     # dispatcher must still own no executable outgoing route.
@@ -191,8 +195,6 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.VERIFY_ORDER_STATUS,
         CapabilityId.MODIFY_CART,
         CapabilityId.PLACE_ORDER,
-        CapabilityId.VERIFY_IDENTITY,
-        CapabilityId.SWITCH_ACCOUNT,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.REQUEST_PERSON,
     }
@@ -226,6 +228,70 @@ def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: P
     assert result["active_invocation"] is None
     assert result["active_flow"] is None
     assert "hit a snag" not in _only_spoken(result).lower()
+
+
+def test_identity_capability_entry_is_preparation_only(config_root: Path) -> None:
+    frontline = FakeChatModel()
+    reasoning = FakeChatModel()
+    graph = _graph(config_root, frontline, reasoning_model=reasoning)
+
+    for request in (VerifyIdentity(), SwitchAccount()):
+        state = ReasoningState(
+            consumed_turn_ids=("identity-owner",),
+            active_invocation=ActiveInvocation(
+                request=request,
+                opened_turn_id="identity-owner",
+            ),
+        )
+        update = graph.nodes["identity_capability_entry"].invoke(state)
+
+        assert update == {"active_flow": "identity"}
+
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+
+
+def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    otp = OtpProvider(valid_code=_TEST_OTP)
+    verification = VerificationStore(otp)
+    assert verification.verify_otp(_TEST_OTP)
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    frontline = FakeChatModel()
+    reasoning = FakeChatModel()
+    graph = _graph(
+        config_root,
+        frontline,
+        reasoning_model=reasoning,
+        identity=identity,
+        otp=otp,
+        verification_store=verification,
+        cart_store=cart,
+    )
+
+    result = graph.invoke(
+        _admitted_turn(
+            "verify me",
+            turn_id="bound-verify",
+            active_invocation=ActiveInvocation(
+                request=VerifyIdentity(),
+                opened_turn_id="bound-verify",
+            ),
+        )
+    )
+
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+    assert otp.dispatch_count == 0
+    assert identity.current() == BoundIdentity(
+        customer_ref="CUST-001", masked_contact="number ending 0119"
+    )
+    assert cart.line_count == 1
+    assert result["active_invocation"] is None
+    assert result["active_flow"] is None
+    assert _only_spoken(result) == "You're verified on this call."
 
 
 # --- 3B-b: the two pure code-authored read owners ------------------------------------
@@ -428,7 +494,7 @@ def test_every_typed_read_owner_records_an_answered_turn(config_root: Path, tmp_
 def test_rotated_read_continuation_records_no_blank_utterance(
     config_root: Path, tmp_path: Path
 ) -> None:
-    # An ACCOUNT list is the only read `principal_transition_continuation` lets survive rotation
+    # An ACCOUNT list is the only read `project_principal_transition` lets survive rotation
     # (view_cart, view_identity_status and even a SESSION list are refused), and the engine seeds
     # that fresh thread with no messages. No in-thread utterance means no label, and an
     # empty-string row is a mislabelled classifier negative, so none is written.
@@ -509,6 +575,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "support_assemble",
             "capability_dispatch",
             "support_capability_entry",
+            "identity_capability_entry",
             "support_capability_render",
             "cart_view_render",
             "identity_status_render",
@@ -593,7 +660,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 58
+    assert len(policies) == 59
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -605,7 +672,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 57
+    assert len(graph.recovery_handled_nodes) == 58
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

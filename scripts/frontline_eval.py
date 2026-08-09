@@ -41,12 +41,11 @@ from typing import Literal
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.capabilities import CapabilityRegistry
-from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
+from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech, build_checkpointer
 from agnostic_market.agents.frontline import (
     FRONTLINE_SPEAKABLE_NODES,
     MODEL_SPEECH_NODES,
@@ -351,7 +350,7 @@ def _build_eval_runtime(
         profile_store=profile_store,
         policy=policy,
         lifecycle=caller_context,
-        checkpointer=InMemorySaver(),
+        checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(
         assembly.graph,

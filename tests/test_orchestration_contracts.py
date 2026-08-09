@@ -28,6 +28,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     ModifyCart,
     PrincipalTransition,
+    PrincipalTransitionProjection,
     RefundOrder,
     ReturnOrder,
     RouteDecision,
@@ -40,7 +41,7 @@ from agnostic_market.dtos.orchestration import (
     VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
-    principal_transition_continuation,
+    project_principal_transition,
     validate_route_output,
 )
 from agnostic_market.dtos.state import ReasoningState, open_active_invocation
@@ -176,7 +177,7 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
         ChangeProfile(field="address"),
     )
     with pytest.raises(ValueError, match="initiating request"):
-        principal_transition_continuation(None)  # type: ignore[arg-type]
+        project_principal_transition(None)  # type: ignore[arg-type]
     switch = PrincipalTransition(
         customer_ref="CUST-001",
         masked_contact="number ending 0119",
@@ -184,9 +185,19 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
         initiating_request=SwitchAccount(),
     )
     assert switch.continuation is None
-    assert switch.completes_switch
+    assert switch.completion_kind == "switch_account"
+    verification = PrincipalTransition(
+        customer_ref="CUST-001",
+        masked_contact="number ending 0119",
+        fresh_proof=VerificationProof(),
+        initiating_request=VerifyIdentity(),
+    )
+    assert verification.continuation is None
+    assert verification.completion_kind == "verify_identity"
     for request in allowed:
-        assert principal_transition_continuation(request) == request
+        projection = project_principal_transition(request)
+        assert projection.continuation == request
+        assert projection.completion_kind == "continue_request"
         transition = PrincipalTransition(
             customer_ref="CUST-001",
             masked_contact="number ending 0119",
@@ -195,7 +206,7 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
         )
         assert transition.continuation == request
         assert transition.initiating_request == request
-        assert not transition.completes_switch
+        assert transition.completion_kind == "continue_request"
 
     rejected = (
         ListOrders(scope="session"),
@@ -204,17 +215,33 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
         RefundOrder(target=FocusedOrderTarget()),
         ReturnOrder(target=FocusedOrderTarget()),
         ViewCart(),
-        VerifyIdentity(),
     )
     for request in rejected:
         with pytest.raises(ValueError, match="cannot continue"):
-            principal_transition_continuation(request)
+            project_principal_transition(request)
         with pytest.raises(ValidationError):
             PrincipalTransition(
                 customer_ref="CUST-001",
                 masked_contact="number ending 0119",
                 fresh_proof=VerificationProof(),
                 initiating_request=request,
+            )
+
+    with pytest.raises(ValidationError, match="continue_request"):
+        PrincipalTransitionProjection(
+            continuation=None,
+            completion_kind="continue_request",
+        )
+    with pytest.raises(ValidationError, match="only continue_request"):
+        PrincipalTransitionProjection(
+            continuation=SwitchAccount(),
+            completion_kind="switch_account",
+        )
+    for forbidden in (SwitchAccount(), VerifyIdentity(), ListOrders(scope="session")):
+        with pytest.raises(ValidationError, match="allowlisted continuation"):
+            PrincipalTransitionProjection(
+                continuation=forbidden,
+                completion_kind="continue_request",
             )
 
 

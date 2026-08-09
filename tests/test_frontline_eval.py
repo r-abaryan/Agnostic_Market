@@ -14,6 +14,7 @@ from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.orchestration import ListOrders
 from agnostic_market.dtos.state import open_active_invocation
 from agnostic_market.llm.gateway import load_provider_credentials
+from scripts import frontline_eval
 from scripts.frontline_eval import (
     AudibleObservation,
     CommerceObservation,
@@ -99,6 +100,24 @@ def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Pat
     # registry the dispatcher resolves against, never rebuild its own alongside it.
     assert runtime.capability_registry is runtime.graph.capability_registry
     assert runtime.capability_registry.capability_ids
+
+
+def test_evaluator_runtime_uses_the_production_checkpointer(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = frontline_eval.build_checkpointer()
+    monkeypatch.setattr(frontline_eval, "build_checkpointer", lambda: expected)
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+
+    runtime = _build_eval_runtime(
+        config,
+        FakeChatModel(),
+        FakeChatModel(),
+        thread_id="eval-production-checkpointer",
+    )
+
+    assert runtime.graph.checkpointer is expected
 
 
 @pytest.mark.xfail(strict=True, reason=_XFAIL_ORDER_REFERENCE)

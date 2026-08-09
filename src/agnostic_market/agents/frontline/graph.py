@@ -106,6 +106,7 @@ from agnostic_market.dtos.orchestration import (
     RefundOrder,
     ReturnOrder,
     SwitchAccount,
+    VerifyIdentity,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -126,6 +127,7 @@ _HANDOVER_TOOL_NAME = "request_handover"
 _CAPABILITY_DISPATCH_NODE = "capability_dispatch"
 _SUPPORT_CAPABILITY_ENTRY_NODE = "support_capability_entry"
 _SUPPORT_CAPABILITY_RENDER_NODE = "support_capability_render"
+_IDENTITY_CAPABILITY_ENTRY_NODE = "identity_capability_entry"
 # Pure code-authored read owners: no model, no tools, no flow coupling, so they live here beside
 # the other code-authored reads rather than in the cart/identity packages. An owner that DOES
 # couple to a flow (slot gathering, HITL) belongs in that flow's package, as Support's does.
@@ -901,6 +903,8 @@ def build_frontline_graph(
             return "automation_terminal_response"
         if state.handover is None:
             if state.active_flow == "identity" and state.active_invocation is not None:
+                if isinstance(state.active_invocation.request, SwitchAccount):
+                    return _CAPABILITY_DISPATCH_NODE
                 return (
                     "principal_warning"
                     if lifecycle.has_discardable_state()
@@ -1013,6 +1017,7 @@ def build_frontline_graph(
         display_name=display_name,
     )
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
+    identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
     cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
     identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
     capability_registry = CapabilityRegistry(
@@ -1032,6 +1037,8 @@ def build_frontline_graph(
                 ViewIdentityStatus,
                 identity_status_entry,
             ),
+            CapabilitySpec(CapabilityId.VERIFY_IDENTITY, VerifyIdentity, identity_entry),
+            CapabilitySpec(CapabilityId.SWITCH_ACCOUNT, SwitchAccount, identity_entry),
         )
     )
 
@@ -1047,6 +1054,18 @@ def build_frontline_graph(
         if invocation is None:
             raise TypeError("capability dispatch requires an active invocation")
         return Command(goto=capability_registry.resolve(invocation.request).node_name)
+
+    def route_after_identity_capability_entry(state: ReasoningState) -> str:
+        invocation = state.active_invocation
+        if invocation is None:
+            raise TypeError("identity capability routing requires an active invocation")
+        request = invocation.request
+        if not isinstance(request, VerifyIdentity | SwitchAccount):
+            raise TypeError("identity capability routing requires an identity request")
+        changes_principal = isinstance(request, SwitchAccount) or identity_store.current() is None
+        if changes_principal and lifecycle.has_discardable_state():
+            return "principal_warning"
+        return "identity_assemble"
 
     # --- identity flow routers (the flow owns the store-dependent decisions; the graph
     #     maps them to node names — same stance as the support routers below) ---
@@ -1350,6 +1369,12 @@ def build_frontline_graph(
     node_registry.register(
         _SUPPORT_CAPABILITY_ENTRY_NODE,
         support.capability_entry,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        _IDENTITY_CAPABILITY_ENTRY_NODE,
+        identity.capability_entry,
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.PURE_ABORT,
     )
@@ -1665,6 +1690,7 @@ def build_frontline_graph(
             "support_assemble": "support_assemble",
             "identity_assemble": "identity_assemble",
             "principal_warning": "principal_warning",
+            _CAPABILITY_DISPATCH_NODE: _CAPABILITY_DISPATCH_NODE,
             END: END,
         },
     )
@@ -1731,6 +1757,14 @@ def build_frontline_graph(
             _SUPPORT_CAPABILITY_RENDER_NODE: _SUPPORT_CAPABILITY_RENDER_NODE,
             "handover": "handover",
             END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        _IDENTITY_CAPABILITY_ENTRY_NODE,
+        route_after_identity_capability_entry,
+        {
+            "identity_assemble": "identity_assemble",
+            "principal_warning": "principal_warning",
         },
     )
     graph.add_edge(_SUPPORT_CAPABILITY_RENDER_NODE, END)

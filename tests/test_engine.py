@@ -60,7 +60,10 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     DiscloseAiIdentity,
+    IntentRequest,
     ListOrders,
+    SwitchAccount,
+    VerifyIdentity,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -1428,51 +1431,27 @@ async def test_post_close_turn_stops_before_every_engine_boundary(
     ]
 
 
-# --- checkpoint serde: our DTOs are registered (no 'unregistered type' warning) ----------
-
-
-async def test_checkpointed_dtos_deserialize_without_unregistered_warning(
-    config_root: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # build_checkpointer's serde allowlists PendingPlacement/CartLine/PendingRefund/
-    # HandoffRequest/ReasoningState — a checkpointed interrupt/resume (which deserializes
-    # PendingPlacement + nested CartLine + HandoffRequest live) must NOT emit langgraph's
-    # "Deserializing unregistered type" warning, which is slated to become a hard block.
-    engine, _ = _engine(config_root)
-    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
-        await _pause_at_confirmation(engine)  # writes + reads PendingAction across the interrupt
-        await _events(engine, "yes")  # resume re-reads the checkpoint
-    assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
+# --- checkpoint serde --------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "intent_request",
-    (ViewIdentityStatus(), DiscloseAiIdentity()),
+    (
+        ViewCart(),
+        ViewIdentityStatus(),
+        DiscloseAiIdentity(),
+        VerifyIdentity(),
+        SwitchAccount(),
+    ),
 )
-def test_new_intent_requests_roundtrip_through_production_checkpoint_serde(
-    config_root: Path,
-    caplog: pytest.LogCaptureFixture,
-    intent_request: ViewIdentityStatus | DiscloseAiIdentity,
+def test_intent_requests_roundtrip_through_production_checkpoint_serde(
+    intent_request: IntentRequest,
 ) -> None:
-    consumed_turn_ids = ("serde-turn",)
-    invocation = open_active_invocation(intent_request, consumed_turn_ids=consumed_turn_ids)
-    engine, _ = _engine(
-        config_root,
-        thread_id=f"serde-{intent_request.kind.value}",
-    )
-    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
-        engine._graph.update_state(
-            engine._config,
-            {
-                "consumed_turn_ids": consumed_turn_ids,
-                "active_invocation": invocation,
-            },
-            as_node="__start__",
-        )
-        restored = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    serde = build_checkpointer().serde
+    restored = serde.loads_typed(serde.dumps_typed(intent_request))
 
-    assert restored.active_invocation == invocation
-    assert not any("unregistered" in record.getMessage().lower() for record in caplog.records)
+    assert type(restored) is type(intent_request)
+    assert restored == intent_request
 
 
 def _seed_typed_read(engine: ReasoningEngine, request: ViewCart | ViewIdentityStatus) -> None:
@@ -1630,7 +1609,7 @@ def test_pending_clarification_rejects_cross_flow_detail() -> None:
 
 
 async def test_clarification_state_roundtrips_and_clears_without_an_active_owner(
-    config_root: Path, caplog: pytest.LogCaptureFixture
+    config_root: Path,
 ) -> None:
     engine, _ = _engine(config_root, thread_id="clarification-hygiene")
     engine._graph.update_state(
@@ -1641,17 +1620,15 @@ async def test_clarification_state_roundtrips_and_clears_without_an_active_owner
         },
         as_node="__start__",
     )
-    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
-        seeded = engine._graph.get_state(engine._config)
-        assert seeded.values["pending_clarification"] == SupportClarification(detail="order")
-        assert seeded.values["clarification_progress"] == ClarificationProgress(
-            flow="support", reasks=1
-        )
-        await _events(engine, "hello")
-        finished = engine._graph.get_state(engine._config)
+    seeded = engine._graph.get_state(engine._config)
+    assert seeded.values["pending_clarification"] == SupportClarification(detail="order")
+    assert seeded.values["clarification_progress"] == ClarificationProgress(
+        flow="support", reasks=1
+    )
+    await _events(engine, "hello")
+    finished = engine._graph.get_state(engine._config)
     assert finished.values.get("pending_clarification") is None
     assert finished.values.get("clarification_progress") is None
-    assert not any("unregistered" in r.getMessage().lower() for r in caplog.records)
 
 
 # --- buffer-before-speak (_TurnSpeech, live call #9 P2) ----------------------------------

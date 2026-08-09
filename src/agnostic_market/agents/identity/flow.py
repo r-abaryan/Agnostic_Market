@@ -47,6 +47,7 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, ConfigDict
 
+from agnostic_market.agents._copy import identity_status_line, principal_completion_line
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
 from agnostic_market.agents.clarification import (
     advance_clarification,
@@ -63,6 +64,7 @@ from agnostic_market.dtos.orchestration import (
     PrincipalTransition,
     SwitchAccount,
     VerificationProof,
+    VerifyIdentity,
 )
 from agnostic_market.dtos.state import (
     HandoffRequest,
@@ -98,6 +100,7 @@ class IdentityNodes:
     Wiring is the graph builder's job (frontline/graph.py); this module owns only behavior.
     """
 
+    capability_entry: Callable[[ReasoningState], dict[str, object]]
     assemble: Callable[[ReasoningState], dict[str, object]]
     ask_contact: Callable[[ReasoningState], dict[str, object]]
     reask: Callable[[ReasoningState], dict[str, object]]
@@ -167,6 +170,12 @@ def build_identity_nodes(
     identity_tools = (propose_identity, leave_identity, request_identity_contact)
     bound_tool_names = frozenset(tool.name for tool in identity_tools)
     model = reasoning_model.bind_tools(identity_tools)
+
+    def capability_entry_node(state: ReasoningState) -> dict[str, object]:
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, VerifyIdentity | SwitchAccount):
+            raise TypeError("identity capability entry requires an identity invocation")
+        return {"active_flow": "identity"}
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left identity", tool_call_id=call_id))
@@ -393,7 +402,9 @@ def build_identity_nodes(
                 customer_ref=pending.customer_ref, masked_contact=pending.masked_contact
             )
             transition = transition_principal(new_identity, fresh_proof, request)
-            continuation = transition.continuation
+            projection = transition.projection
+            continuation = projection.continuation
+            completion_line = principal_completion_line(projection.completion_kind)
             write_event(
                 {
                     "event": "identity_bound",
@@ -414,11 +425,7 @@ def build_identity_nodes(
                 "identity_claim_misses": 0,
                 "active_invocation": None,
                 "active_flow": None,
-                "messages": (
-                    [AIMessage("You're now verified on the new account.")]
-                    if transition.completes_switch
-                    else []
-                ),
+                "messages": [AIMessage(completion_line)] if completion_line is not None else [],
             }
         if isinstance(request, SwitchAccount):
             write_event({"event": "principal_transition_skipped", "reason": "same_customer"})
@@ -426,6 +433,20 @@ def build_identity_nodes(
                 {
                     "active_flow": None,
                     "messages": [AIMessage("You're already verified on that account.")],
+                }
+            )
+        if isinstance(request, VerifyIdentity):
+            newly_verified = len(verification_store.grants) > pending.grants_at_mint
+            line = (
+                principal_completion_line("verify_identity")
+                if newly_verified
+                else identity_status_line(verified=True)
+            )
+            assert line is not None
+            return _flow_exit(
+                {
+                    "active_flow": None,
+                    "messages": [AIMessage(line)],
                 }
             )
         write_event({"event": "identity_bound_for_action", "customer_ref": pending.customer_ref})
@@ -504,6 +525,7 @@ def build_identity_nodes(
         return wrapped
 
     return IdentityNodes(
+        capability_entry=capability_entry_node,
         assemble=with_clarification_lifecycle(assemble_node),
         ask_contact=ask_contact_node,
         reask=reask_node,

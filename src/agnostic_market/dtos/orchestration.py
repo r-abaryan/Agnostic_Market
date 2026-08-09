@@ -436,26 +436,63 @@ class VerificationProof(BaseModel):
     raised_to: Literal[2] = 2
 
 
-def principal_transition_continuation(
-    request: IntentRequest,
-) -> IntentRequest | None:
-    """Return the authority-free request that may survive principal rotation."""
+PrincipalCompletionKind = Literal[
+    "continue_request",
+    "switch_account",
+    "verify_identity",
+]
+
+
+def _is_principal_transition_continuation(request: IntentRequest) -> bool:
+    if isinstance(request, ListOrders):
+        return request.scope == "account"
+    if isinstance(request, CancelOrders):
+        return isinstance(request.target, CancellableOrderScope | ExplicitOrderSet)
+    if isinstance(request, RefundOrder | ReturnOrder):
+        return isinstance(request.target, ExplicitOrderTarget)
+    return isinstance(request, ChangeProfile)
+
+
+class PrincipalTransitionProjection(BaseModel):
+    """One total interpretation of an allowlisted principal-transition request."""
+
+    model_config = _FROZEN
+
+    continuation: IntentRequest | None
+    completion_kind: PrincipalCompletionKind
+
+    @model_validator(mode="after")
+    def continuation_matches_completion(self) -> PrincipalTransitionProjection:
+        if self.completion_kind == "continue_request":
+            if self.continuation is None or not _is_principal_transition_continuation(
+                self.continuation
+            ):
+                raise ValueError("continue_request requires an allowlisted continuation")
+        elif self.continuation is not None:
+            raise ValueError("only continue_request may carry a continuation")
+        return self
+
+
+def project_principal_transition(request: IntentRequest) -> PrincipalTransitionProjection:
+    """Project one allowlisted request into its post-rotation continuation and outcome."""
 
     if request is None:
         raise ValueError("principal transition requires an initiating request")
     if isinstance(request, SwitchAccount):
-        return None
-    if isinstance(request, ListOrders):
-        if request.scope == "account":
-            return request
-    elif isinstance(request, CancelOrders):
-        if isinstance(request.target, CancellableOrderScope | ExplicitOrderSet):
-            return request
-    elif isinstance(request, RefundOrder | ReturnOrder):
-        if isinstance(request.target, ExplicitOrderTarget):
-            return request
-    elif isinstance(request, ChangeProfile):
-        return request
+        return PrincipalTransitionProjection(
+            continuation=None,
+            completion_kind="switch_account",
+        )
+    if isinstance(request, VerifyIdentity):
+        return PrincipalTransitionProjection(
+            continuation=None,
+            completion_kind="verify_identity",
+        )
+    if _is_principal_transition_continuation(request):
+        return PrincipalTransitionProjection(
+            continuation=request,
+            completion_kind="continue_request",
+        )
     raise ValueError(f"{request.kind.value} cannot continue across a principal transition")
 
 
@@ -471,16 +508,20 @@ class PrincipalTransition(BaseModel):
     initiating_request: IntentRequest
 
     @property
-    def continuation(self) -> IntentRequest | None:
-        return principal_transition_continuation(self.initiating_request)
+    def projection(self) -> PrincipalTransitionProjection:
+        return project_principal_transition(self.initiating_request)
 
     @property
-    def completes_switch(self) -> bool:
-        return isinstance(self.initiating_request, SwitchAccount)
+    def continuation(self) -> IntentRequest | None:
+        return self.projection.continuation
+
+    @property
+    def completion_kind(self) -> PrincipalCompletionKind:
+        return self.projection.completion_kind
 
     @model_validator(mode="after")
     def initiating_request_is_allowlisted(self) -> PrincipalTransition:
-        principal_transition_continuation(self.initiating_request)
+        project_principal_transition(self.initiating_request)
         return self
 
 

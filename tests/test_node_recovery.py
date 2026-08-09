@@ -265,7 +265,6 @@ def test_invalid_recovery_markers_fail_terminal_without_echoing_marker_data(
 
 def test_pending_recovery_is_strict_and_checkpoint_safe(
     config_root: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     with pytest.raises(ValidationError):
         PendingRecovery.model_validate(
@@ -315,18 +314,15 @@ def test_pending_recovery_is_strict_and_checkpoint_safe(
         ),
     )
 
-    with caplog.at_level("WARNING", logger="langgraph.checkpoint.serde.jsonplus"):
-        for index, marker in enumerate(markers):
-            config = {"configurable": {"thread_id": f"recovery-serde-{index}"}}
-            harness.engine._graph.update_state(
-                config,
-                {"pending_recovery": marker},
-                as_node="__start__",
-            )
-            restored = harness.engine._graph.get_state(config)
-            assert restored.values["pending_recovery"] == marker
-
-    assert not any("unregistered" in record.getMessage().lower() for record in caplog.records)
+    for index, marker in enumerate(markers):
+        config = {"configurable": {"thread_id": f"recovery-serde-{index}"}}
+        harness.engine._graph.update_state(
+            config,
+            {"pending_recovery": marker},
+            as_node="__start__",
+        )
+        restored = harness.engine._graph.get_state(config)
+        assert restored.values["pending_recovery"] == marker
 
 
 async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(

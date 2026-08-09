@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import itertools
 
+from agnostic_market.dtos.orchestration import PrincipalCompletionKind
+
 # A small rotation, not one fixed line — variety across a call without sounding scripted;
 # deterministic order (a cycle, not random) so tests are stable and the wording is reviewable.
 _CLOSES = (
@@ -53,3 +55,16 @@ IDENTITY_STATUS_UNVERIFIED = "You're not verified on this call."
 
 def identity_status_line(*, verified: bool) -> str:
     return IDENTITY_STATUS_VERIFIED if verified else IDENTITY_STATUS_UNVERIFIED
+
+
+_PRINCIPAL_COMPLETION_LINES: dict[PrincipalCompletionKind, str] = {
+    "switch_account": "You're now verified on the new account.",
+    "verify_identity": "You're now verified.",
+}
+
+
+def principal_completion_line(completion_kind: PrincipalCompletionKind) -> str | None:
+    """Render a completed identity outcome; continuations are intentionally silent here."""
+    if completion_kind == "continue_request":
+        return None
+    return _PRINCIPAL_COMPLETION_LINES[completion_kind]
