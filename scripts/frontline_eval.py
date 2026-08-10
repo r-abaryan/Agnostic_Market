@@ -202,6 +202,7 @@ class EvalRuntime:
     capability_registry: CapabilityRegistry
     engine: ReasoningEngine
     store: OrderStore
+    cart_store: CartStore
     profile_store: ProfileStore
     otp: OtpProvider
     verification: VerificationStore
@@ -366,6 +367,7 @@ def _build_eval_runtime(
         capability_registry=assembly.capability_registry,
         engine=engine,
         store=store,
+        cart_store=cart_store,
         profile_store=profile_store,
         otp=otp,
         verification=verification,

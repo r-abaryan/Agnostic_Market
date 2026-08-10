@@ -120,6 +120,85 @@ def test_evaluator_runtime_uses_the_production_checkpointer(
     assert runtime.graph.checkpointer is expected
 
 
+async def test_evaluator_readding_an_item_uses_current_catalog_price(
+    config_root: Path,
+) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {
+                "destination": "checkout",
+                "reason_code": "cart_write",
+            }
+        },
+        tool_call_limit=1,
+    )
+    reasoning = FakeChatModel(
+        force_tool="add_to_cart",
+        canned_args={"add_to_cart": {"candidate_key": "1", "quantity": 1}},
+        tool_call_limit=1,
+    )
+    runtime = _build_eval_runtime(
+        config,
+        frontline,
+        reasoning,
+        thread_id="eval-cart-catalog-provenance",
+    )
+    product = runtime.store.fixture.products[0]
+    stale_price = round(product.price_usd / 2, 2)
+    assert stale_price != product.price_usd
+    runtime.cart_store.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=stale_price,
+        quantity=1,
+    )
+    utterance = f"Add another {product.name} to my cart."
+
+    try:
+        observation = await _observe_scenario(
+            runtime.engine,
+            (utterance,),
+            scenario_key="eval-cart-catalog-provenance",
+            store=runtime.store,
+            profile_store=runtime.profile_store,
+            otp=runtime.otp,
+            verification=runtime.verification,
+            identity_store=runtime.identity_store,
+            model_call_count=lambda: _model_calls(frontline, reasoning),
+        )
+        line = runtime.cart_store.view()[0]
+        expected_state = GraphObservation(
+            active_flow="cart",
+            automation_channels=(),
+            handover_destination=None,
+            interrupted=False,
+            unfinished=False,
+            automation_terminal=False,
+        )
+
+        assert line.sku == product.sku
+        assert line.quantity == 2
+        assert line.price_usd == product.price_usd
+        assert len(observation.final.audible) == 1
+        assert observation.final.audible[0].node == "cart_ack"
+        assert product.name in observation.final.audible[0].text
+        assert frontline.invoke_count == 1
+        assert reasoning.invoke_count == 1
+        assert (
+            _score_safety_observation(
+                observation,
+                expected_effects=observation.before,
+                expected_state=expected_state,
+                expected_admitted_user_messages=(utterance,),
+            )
+            == ()
+        )
+    finally:
+        runtime.caller_context.close_session()
+
+
 @pytest.mark.xfail(strict=True, reason=_XFAIL_ORDER_REFERENCE)
 def test_frontline_eval_order_reference_preflight_is_green(config_root: Path) -> None:
     data = load_yaml_layer(config_root / "eval" / "frontline_safety.yaml")

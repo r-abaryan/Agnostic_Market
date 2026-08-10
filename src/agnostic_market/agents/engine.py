@@ -65,37 +65,13 @@ from agnostic_market.dtos.events import (
 )
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
-    AnswerQuestion,
     CancellableOrderScope,
-    CancelOrders,
     CapabilityId,
-    ChangeProfile,
-    DiscloseAiIdentity,
-    ExplicitOrderSet,
-    ExplicitOrderTarget,
-    FocusedOrderSet,
-    FocusedOrderTarget,
-    ListOrders,
-    ModifyCart,
-    PlaceOrder,
     PrincipalTransition,
-    RecentOrderSet,
-    RefundOrder,
-    RequestPerson,
-    ReturnOrder,
-    SearchCatalog,
-    SwitchAccount,
-    VerifyIdentity,
-    VerifyOrderStatus,
-    ViewCart,
-    ViewIdentityStatus,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
-    BatchCancelOutcome,
-    CancelTarget,
     CartClarification,
-    CartLine,
     ClarificationProgress,
     HandoffRequest,
     IdentityClarification,
@@ -127,67 +103,39 @@ def _write_ingress_rejection(
         logger.critical("ingress-rejection telemetry failed", exc_info=True)
 
 
-# The custom (non-message) types we checkpoint into graph state. langgraph's default
-# msgpack serde is permissive (deserializes anything with a warning), but that path is
-# slated to be BLOCKED — an explicit allowlist registers our DTOs as trusted so the
-# checkpoint roundtrip is future-proof AND stops trusting arbitrary types (the security
-# posture the warning is nudging toward). langchain messages stay covered by the built-in
-# safe types; this ADDS ours. One source of truth — pipeline + tests build via this.
-# PendingPlacement embeds a tuple[CartLine, ...], so CartLine must be registered too (the
-# serde allowlists by MODULE — nested custom types are checked independently).
-_CHECKPOINTED_DTOS = (
+# The custom Pydantic types that can occupy a top-level ReasoningState channel. LangGraph
+# serializes channel values directly, so these are the trust boundary. Nested Pydantic values
+# are reconstructed by their validated outer channel model and do not need an independent serde
+# grant. LangChain messages remain covered by the serializer's built-in safe types.
+_CHECKPOINT_CHANNEL_DTOS = (
     ActiveInvocation,
     PendingPlacement,
-    CartLine,
     PendingRefund,
-    # The cancel lifecycle (F-16.2): the batch + its nested targets/outcomes are each checked
-    # independently by the serde allowlist (like CartLine inside PendingPlacement), and the
-    # pre-auth selector is its own checkpointed type.
     CancellableOrderScope,
-    CapabilityId,
     PendingCancelBatch,
-    CancelTarget,
-    BatchCancelOutcome,
     PendingReturn,
     PendingProfileChange,
     PendingIdentity,
     PendingRecovery,
-    ExceptionAction,
     IdentityClarification,
     SupportClarification,
     CartClarification,
     ClarificationProgress,
     HandoffRequest,
-    ReasoningState,
-    AnswerQuestion,
-    SearchCatalog,
-    VerifyOrderStatus,
-    ExplicitOrderSet,
-    FocusedOrderSet,
-    RecentOrderSet,
-    ListOrders,
-    ViewCart,
-    ModifyCart,
-    PlaceOrder,
-    CancelOrders,
-    ExplicitOrderTarget,
-    FocusedOrderTarget,
-    RefundOrder,
-    ReturnOrder,
-    ChangeProfile,
-    VerifyIdentity,
-    SwitchAccount,
-    ViewIdentityStatus,
-    DiscloseAiIdentity,
-    RequestPerson,
 )
+# Pydantic's Python-mode model_dump flattens nested models but retains custom enum values.
+# LangGraph therefore sees these two constructors independently while decoding otherwise valid
+# channel DTOs. Keep them separate from the schema-derived channel boundary and exact-pinned.
+_CHECKPOINT_NESTED_ENUMS = (CapabilityId, ExceptionAction)
 
 
 def build_checkpointer() -> InMemorySaver:
-    """An InMemorySaver whose serde trusts our checkpointed DTOs (no 'unregistered type'
-    warning, and not silently permissive to arbitrary types). Redis swap at Phase 4 wires
-    the same allowlist into its serde."""
-    return InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=list(_CHECKPOINTED_DTOS)))
+    """Build the strict saver for custom channel DTOs and their serialized enum values."""
+    return InMemorySaver(
+        serde=JsonPlusSerializer(
+            allowed_msgpack_modules=[*_CHECKPOINT_CHANNEL_DTOS, *_CHECKPOINT_NESTED_ENUMS]
+        )
+    )
 
 
 @dataclass

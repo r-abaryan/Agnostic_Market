@@ -30,6 +30,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal, overload
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -48,6 +49,7 @@ from agnostic_market.agents.clarification import (
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
+    Candidate,
     OrderStore,
     PlacedOrder,
     RecentOrderContext,
@@ -142,7 +144,88 @@ class _RequestCartClarification(BaseModel):
 # Reversible cart mutations BATCH within one model response (live call #9 P3: "one from
 # each" emitted N calls and N-1 were silently dropped). Control/terminal tools (review,
 # checkout, buy_now, leave) stay one-per-turn and must LEAD the response to act.
-_MUTATION_TOOLS = frozenset({"add_to_cart", "set_quantity", "remove_from_cart"})
+_MutationOperation = Literal["add", "remove", "set_quantity"]
+_MUTATION_OPERATIONS: dict[str, _MutationOperation] = {
+    "add_to_cart": "add",
+    "remove_from_cart": "remove",
+    "set_quantity": "set_quantity",
+}
+_MUTATION_TOOLS = frozenset(_MUTATION_OPERATIONS)
+
+
+@dataclass(frozen=True)
+class _AddedMutationOutcome:
+    line: CartLine
+
+
+@dataclass(frozen=True)
+class _DescribedMutationOutcome:
+    fragment: str
+
+
+@overload
+def _apply_resolved_mutation(
+    cart_store: CartStore,
+    operation: Literal["add"],
+    item: Candidate,
+    quantity: int,
+) -> _AddedMutationOutcome: ...
+
+
+@overload
+def _apply_resolved_mutation(
+    cart_store: CartStore,
+    operation: Literal["remove", "set_quantity"],
+    item: Candidate | CartLine,
+    quantity: int | None,
+) -> _DescribedMutationOutcome: ...
+
+
+def _apply_resolved_mutation(
+    cart_store: CartStore,
+    operation: _MutationOperation,
+    item: Candidate | CartLine,
+    quantity: int | None,
+) -> _AddedMutationOutcome | _DescribedMutationOutcome:
+    """Apply one already-resolved reversible mutation and record its factual outcome."""
+    if operation == "add":
+        if not isinstance(item, Candidate):
+            raise TypeError("resolved add requires a catalog candidate")
+        if quantity is None or quantity < 1:
+            raise ValueError("resolved add requires a positive quantity")
+        line = cart_store.add_item(
+            sku=item.sku,
+            name=item.name,
+            price_usd=item.price_usd,
+            quantity=quantity,
+        )
+        write_event({"event": "cart_item_added", "sku": item.sku})
+        return _AddedMutationOutcome(line=line)
+    if operation == "remove":
+        if quantity is not None:
+            raise ValueError("resolved remove forbids a quantity")
+        removed = cart_store.remove_item(item.sku)
+        write_event({"event": "cart_item_removed", "sku": item.sku})
+        return _DescribedMutationOutcome(
+            fragment=(
+                f"removed the {item.name} from your cart"
+                if removed
+                else f"the {item.name} wasn't in your cart"
+            )
+        )
+    if operation == "set_quantity":
+        if quantity is None or quantity < 0:
+            raise ValueError("resolved set-quantity requires a non-negative quantity")
+        line = cart_store.set_quantity(item.sku, quantity)
+        write_event({"event": "cart_quantity_set", "sku": item.sku})
+        return _DescribedMutationOutcome(
+            fragment=(
+                f"updated to {speak_lines([line])}"
+                if line
+                else f"removed the {item.name} from your cart"
+            )
+        )
+    raise ValueError(f"unsupported resolved mutation operation: {operation!r}")
 
 
 @dataclass(frozen=True)
@@ -233,11 +316,11 @@ def build_cart_nodes(
     bound_tool_names = frozenset(tool.name for tool in cart_tools)
     model = reasoning_model.bind_tools(cart_tools)
 
-    def _resolve(candidate_key: str, candidates: list) -> object | None:
+    def _resolve(candidate_key: str, candidates: list[Candidate]) -> Candidate | None:
         by_key = {c.key: c for c in candidates}
         return by_key.get(candidate_key)
 
-    def _valid_keys(candidates: list) -> str:
+    def _valid_keys(candidates: list[Candidate]) -> str:
         return ", ".join(sorted(c.key for c in candidates))
 
     def _mint_placement() -> dict[str, object]:
@@ -262,9 +345,9 @@ def build_cart_nodes(
             )
         }
 
-    def _apply_mutation(
+    def _apply_candidate_key_mutation(
         call: dict,
-        candidates: list,
+        candidates: list[Candidate],
         new_messages: list,
         added: list[CartLine],
         fragments: list[str],
@@ -283,14 +366,9 @@ def build_cart_nodes(
                 fb = f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}."
                 new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
                 return False
-            removed = cart_store.remove_item(chosen.sku)
+            outcome = _apply_resolved_mutation(cart_store, "remove", chosen, None)
             new_messages.append(ToolMessage(f"removed {chosen.key}", tool_call_id=call["id"]))
-            write_event({"event": "cart_item_removed", "sku": chosen.sku})
-            fragments.append(
-                f"removed the {chosen.name} from your cart"
-                if removed
-                else f"the {chosen.name} wasn't in your cart"
-            )
+            fragments.append(outcome.fragment)
             return True
         # add_to_cart / set_quantity
         try:
@@ -310,29 +388,18 @@ def build_cart_nodes(
             )
             new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
             return False
-        if name == "add_to_cart":
-            line = cart_store.add_item(
-                sku=chosen.sku,
-                name=chosen.name,
-                price_usd=chosen.price_usd,
-                quantity=proposal.quantity,
-            )
+        operation = _MUTATION_OPERATIONS[name]
+        outcome = _apply_resolved_mutation(cart_store, operation, chosen, proposal.quantity)
+        if operation == "add":
             new_messages.append(
                 ToolMessage(f"added {proposal.quantity} of {chosen.key}", tool_call_id=call["id"])
             )
-            write_event({"event": "cart_item_added", "sku": chosen.sku})
-            added.append(line)
+            added.append(outcome.line)
             return True
-        line = cart_store.set_quantity(chosen.sku, proposal.quantity)
         new_messages.append(
             ToolMessage(f"set {chosen.key} to {proposal.quantity}", tool_call_id=call["id"])
         )
-        write_event({"event": "cart_quantity_set", "sku": chosen.sku})
-        fragments.append(
-            f"updated to {speak_lines([line])}"
-            if line
-            else f"removed the {chosen.name} from your cart"
-        )
+        fragments.append(outcome.fragment)
         return True
 
     def _clarification_result(
@@ -391,7 +458,9 @@ def build_cart_nodes(
                                 tool_call_id=call["id"],
                             )
                         )
-                    elif not _apply_mutation(call, candidates, new_messages, added, fragments):
+                    elif not _apply_candidate_key_mutation(
+                        call, candidates, new_messages, added, fragments
+                    ):
                         invalid += 1
                 if not added and not fragments:  # whole batch invalid -> corrective re-prompt
                     messages = [prompt, *state.messages, *new_messages]

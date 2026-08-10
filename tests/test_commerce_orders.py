@@ -8,11 +8,13 @@ import pytest
 
 from agnostic_market.commerce.orders import (
     CancelError,
+    Candidate,
     OrderStore,
     RecentOrderContext,
     RefundError,
     ReturnError,
     load_orders_fixture,
+    match_named_items,
     resolve_candidates,
 )
 from agnostic_market.dtos.state import CartLine
@@ -93,6 +95,29 @@ def test_placed_order_is_queryable_by_status_read_through(config_root: Path) -> 
 
 
 # --- candidate resolution (the model picks a KEY, never a SKU) --------------------------
+
+
+def _candidate(key: str, name: str) -> Candidate:
+    return Candidate(key=key, sku=f"SKU-{key}", name=name, price_usd=1.0)
+
+
+def test_match_named_items_returns_only_actual_matches() -> None:
+    items = [_candidate("1", "trail running shoes"), _candidate("2", "rain jacket")]
+
+    assert match_named_items(items, "I want the trail running shoes") == [items[0]]
+
+
+@pytest.mark.parametrize("query", ("", "   ", "zzz-nothing"))
+def test_match_named_items_returns_empty_without_an_actual_match(query: str) -> None:
+    items = [_candidate("1", "trail running shoes"), _candidate("2", "rain jacket")]
+
+    assert match_named_items(items, query) == []
+
+
+def test_match_named_items_preserves_ambiguity_for_the_caller_to_narrow() -> None:
+    items = [_candidate("1", "trail running shoes"), _candidate("2", "trail hiking shoes")]
+
+    assert match_named_items(items, "trail") == items
 
 
 def test_resolve_candidates_narrows_on_match(config_root: Path) -> None:

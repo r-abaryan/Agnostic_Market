@@ -10,16 +10,19 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from enum import Enum
 from pathlib import Path
-from typing import Annotated, TypedDict
+from types import UnionType
+from typing import Annotated, TypedDict, Union, get_args, get_origin
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langgraph.checkpoint.serde.event_hooks import register_serde_event_listener
 from langgraph.graph.message import add_messages
 from langgraph.types import PregelTask, StateSnapshot
 from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
 from policy_helpers import make_policy
-from pydantic import PrivateAttr, ValidationError
+from pydantic import BaseModel, PrivateAttr, ValidationError
 from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
     engine_events,
@@ -28,6 +31,8 @@ from turn_helpers import (
 
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
+    _CHECKPOINT_CHANNEL_DTOS,
+    _CHECKPOINT_NESTED_ENUMS,
     ReasoningEngine,
     _classify_cancelled_checkpoint,
     _GraphSpans,
@@ -59,19 +64,26 @@ from agnostic_market.dtos.events import (
 )
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
-    DiscloseAiIdentity,
-    IntentRequest,
+    CancellableOrderScope,
     ListOrders,
-    SwitchAccount,
-    VerifyIdentity,
     ViewCart,
     ViewIdentityStatus,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
+    BatchCancelOutcome,
+    CancelTarget,
     CartClarification,
+    CartLine,
     ClarificationProgress,
+    HandoffRequest,
     IdentityClarification,
+    PendingCancelBatch,
+    PendingIdentity,
+    PendingPlacement,
+    PendingProfileChange,
+    PendingRefund,
+    PendingReturn,
     ReasoningState,
     SupportClarification,
     open_active_invocation,
@@ -1434,24 +1446,191 @@ async def test_post_close_turn_stops_before_every_engine_boundary(
 # --- checkpoint serde --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "intent_request",
-    (
-        ViewCart(),
-        ViewIdentityStatus(),
-        DiscloseAiIdentity(),
-        VerifyIdentity(),
-        SwitchAccount(),
+def _direct_state_model_types(annotation: object) -> set[type[BaseModel]]:
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _direct_state_model_types(get_args(annotation)[0])
+    if origin in (Union, UnionType):
+        return set().union(*(_direct_state_model_types(arg) for arg in get_args(annotation)))
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return {annotation}
+    return set()
+
+
+def test_checkpoint_channel_allowlist_exactly_covers_reasoning_state_models() -> None:
+    required: set[type[BaseModel]] = set()
+    for field in ReasoningState.model_fields.values():
+        required.update(_direct_state_model_types(field.annotation))
+
+    assert set(_CHECKPOINT_CHANNEL_DTOS) == required
+
+
+def _reachable_enum_types(roots: tuple[type[BaseModel], ...]) -> set[type[Enum]]:
+    seen: set[object] = set()
+    enum_types: set[type[Enum]] = set()
+
+    def walk(annotation: object) -> None:
+        if annotation in seen:
+            return
+        seen.add(annotation)
+        if isinstance(annotation, Enum):
+            enum_types.add(type(annotation))
+            return
+        if isinstance(annotation, type):
+            if issubclass(annotation, Enum):
+                enum_types.add(annotation)
+                return
+            if issubclass(annotation, BaseModel):
+                for field in annotation.model_fields.values():
+                    walk(field.annotation)
+                return
+        for argument in get_args(annotation):
+            walk(argument)
+
+    for root in roots:
+        walk(root)
+    return enum_types
+
+
+def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> None:
+    assert set(_CHECKPOINT_NESTED_ENUMS) == _reachable_enum_types(_CHECKPOINT_CHANNEL_DTOS)
+
+
+_CHECKPOINT_CHANNEL_VALUES = (
+    ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1"),
+    PendingPlacement(
+        lines=(CartLine(sku="SKU-1", name="trail shoes", price_usd=79.0, quantity=1),),
+        total_usd=79.0,
+        idempotency_key="placement-1",
+        created_at=1.0,
     ),
+    PendingRefund(
+        order_id="ORD-1",
+        summary="one trail shoe",
+        amount_usd=79.0,
+        destination="original",
+        instrument_ref="card ending 1234",
+        idempotency_key="refund-1",
+        attempt_key="refund-attempt-1",
+        created_at=1.0,
+    ),
+    CancellableOrderScope(scope="all_cancellable"),
+    PendingCancelBatch(
+        targets=(
+            CancelTarget(
+                order_id="ORD-1",
+                summary="one trail shoe",
+                idempotency_key="cancel-1",
+            ),
+        ),
+        ineligible=(
+            BatchCancelOutcome(
+                order_id="ORD-2",
+                summary="one jacket",
+                outcome="not_completed",
+            ),
+        ),
+        created_at=1.0,
+    ),
+    PendingReturn(
+        order_id="ORD-1",
+        summary="one trail shoe",
+        refund_due_usd=79.0,
+        idempotency_key="return-1",
+        created_at=1.0,
+    ),
+    PendingProfileChange(
+        customer_ref="CUST-1",
+        field="address",
+        new_value="1 Example Street",
+        factor_ref="phone ending 1234",
+        idempotency_key="profile-1",
+        attempt_key="profile-attempt-1",
+        created_at=1.0,
+    ),
+    PendingIdentity(
+        customer_ref="CUST-1",
+        masked_contact="phone ending 1234",
+        attempt_key="identity-attempt-1",
+        grants_at_mint=0,
+    ),
+    PendingRecovery(
+        origin_node="cart_assemble",
+        action=ExceptionAction.CART_REVIEW,
+        trigger="node_exception",
+    ),
+    IdentityClarification(),
+    SupportClarification(detail="action"),
+    CartClarification(detail="item"),
+    ClarificationProgress(flow="cart", reasks=1),
+    HandoffRequest(destination="human", reason_code="other", source="gate"),
 )
-def test_intent_requests_roundtrip_through_production_checkpoint_serde(
-    intent_request: IntentRequest,
+
+
+@pytest.mark.parametrize(
+    "channel_value",
+    _CHECKPOINT_CHANNEL_VALUES,
+    ids=lambda value: type(value).__name__,
+)
+def test_direct_state_channel_models_roundtrip_through_production_checkpoint_serde(
+    channel_value: BaseModel,
 ) -> None:
     serde = build_checkpointer().serde
-    restored = serde.loads_typed(serde.dumps_typed(intent_request))
+    restored = serde.loads_typed(serde.dumps_typed(channel_value))
 
-    assert type(restored) is type(intent_request)
-    assert restored == intent_request
+    assert type(restored) is type(channel_value)
+    assert restored == channel_value
+
+
+def test_production_checkpoint_serde_blocks_no_reachable_state_type() -> None:
+    events: list[dict[str, object]] = []
+    unregister = register_serde_event_listener(events.append)
+    try:
+        serde = build_checkpointer().serde
+        for value in _CHECKPOINT_CHANNEL_VALUES:
+            serde.loads_typed(serde.dumps_typed(value))
+    finally:
+        unregister()
+
+    assert {type(value) for value in _CHECKPOINT_CHANNEL_VALUES} == set(_CHECKPOINT_CHANNEL_DTOS)
+    assert [event for event in events if event["kind"] == "msgpack_blocked"] == []
+
+
+def test_outer_channel_models_reconstruct_nested_dtos_without_extra_serde_grants() -> None:
+    serde = build_checkpointer().serde
+    invocation = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
+    placement = PendingPlacement(
+        lines=(CartLine(sku="SKU-1", name="trail shoes", price_usd=79.0, quantity=1),),
+        total_usd=79.0,
+        idempotency_key="placement-1",
+        created_at=1.0,
+    )
+    cancel = PendingCancelBatch(
+        targets=(
+            CancelTarget(
+                order_id="ORD-1",
+                summary="one trail shoe",
+                idempotency_key="cancel-1",
+            ),
+        ),
+        ineligible=(
+            BatchCancelOutcome(
+                order_id="ORD-2",
+                summary="one jacket",
+                outcome="not_completed",
+            ),
+        ),
+        created_at=1.0,
+    )
+
+    restored_invocation = serde.loads_typed(serde.dumps_typed(invocation))
+    restored_placement = serde.loads_typed(serde.dumps_typed(placement))
+    restored_cancel = serde.loads_typed(serde.dumps_typed(cancel))
+
+    assert type(restored_invocation.request) is ViewCart
+    assert type(restored_placement.lines[0]) is CartLine
+    assert type(restored_cancel.targets[0]) is CancelTarget
+    assert type(restored_cancel.ineligible[0]) is BatchCancelOutcome
 
 
 def _seed_typed_read(engine: ReasoningEngine, request: ViewCart | ViewIdentityStatus) -> None:

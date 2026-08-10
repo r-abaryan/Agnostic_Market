@@ -36,6 +36,7 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
+    Candidate,
     OrderStore,
     RecentOrderContext,
     load_orders_fixture,
@@ -469,6 +470,100 @@ async def test_repeat_add_increments(config_root: Path) -> None:
     await graph.ainvoke({"messages": [HumanMessage("one more please")]}, _CFG)
     assert cart.line_count == 1
     assert cart.view()[0].quantity == 2
+
+
+def test_resolved_add_rejects_cart_line_and_uses_current_catalog_price(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = load_orders_fixture(config_root, "acme_store").products[0]
+    stale_price = round(product.price_usd / 2, 2)
+    assert stale_price != product.price_usd
+    cart = CartStore()
+    stale_line = cart.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=stale_price,
+        quantity=1,
+    )
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(cart_flow, "write_event", records.append)
+
+    with pytest.raises(TypeError, match="catalog candidate"):
+        cart_flow._apply_resolved_mutation(cart, "add", stale_line, 1)
+
+    assert cart.view() == (stale_line,)
+    assert records == []
+
+    outcome = cart_flow._apply_resolved_mutation(
+        cart,
+        "add",
+        Candidate(
+            key="1",
+            sku=product.sku,
+            name=product.name,
+            price_usd=product.price_usd,
+        ),
+        1,
+    )
+
+    assert outcome.line.quantity == 2
+    assert outcome.line.price_usd == product.price_usd
+    assert records == [{"event": "cart_item_added", "sku": product.sku}]
+
+
+async def test_set_quantity_zero_removes_the_resolved_cart_line(config_root: Path) -> None:
+    cart = CartStore()
+    cart.add_item(
+        sku="SKU-RED-42",
+        name="trail running shoes",
+        price_usd=89.99,
+        quantity=2,
+    )
+    reasoning = _tool_fake("set_quantity", {"candidate_key": "1", "quantity": 0})
+    graph, _, _ = _build(config_root, reasoning=reasoning, cart=cart)
+
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+
+    assert cart.is_empty()
+    assert any("Removed the trail running shoes from your cart" in text for text in _ai_texts(out))
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "starting_quantity", "event_name"),
+    (
+        ("add_to_cart", {"candidate_key": "1", "quantity": 1}, None, "cart_item_added"),
+        ("remove_from_cart", {"candidate_key": "1"}, 1, "cart_item_removed"),
+        ("set_quantity", {"candidate_key": "1", "quantity": 3}, 1, "cart_quantity_set"),
+    ),
+)
+async def test_each_resolved_mutation_emits_one_matching_audit_event(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    arguments: dict,
+    starting_quantity: int | None,
+    event_name: str,
+) -> None:
+    cart = CartStore()
+    if starting_quantity is not None:
+        cart.add_item(
+            sku="SKU-RED-42",
+            name="trail running shoes",
+            price_usd=89.99,
+            quantity=starting_quantity,
+        )
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(cart_flow, "write_event", records.append)
+    graph, _, _ = _build(
+        config_root,
+        reasoning=_tool_fake(tool_name, arguments),
+        cart=cart,
+    )
+
+    await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+
+    assert records == [{"event": event_name, "sku": "SKU-RED-42"}]
 
 
 async def test_batch_adds_apply_all_with_one_ack(config_root: Path) -> None:

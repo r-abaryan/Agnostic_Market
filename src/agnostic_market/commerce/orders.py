@@ -23,7 +23,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -38,6 +38,10 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 # Stub-store copy for orders this store itself placed (real ETA logic = the Phase-4 SoR).
 _PLACED_STATUS = "processing"
 _PLACED_ETA = "3-5 business days"
+
+
+class _NamedItem(Protocol):
+    name: str
 
 
 def speak_quantity(quantity: int, name: str) -> str:
@@ -553,20 +557,25 @@ def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:
         raise ConfigError(f"orders fixture {path} failed validation:\n{exc}") from exc
 
 
+def match_named_items[T: _NamedItem](items: Sequence[T], query: str) -> list[T]:
+    """Return only deterministic name matches; no fallback or caller-choice policy."""
+    needle = query.strip().lower()
+    return [
+        item
+        for item in items
+        if needle and (needle in item.name.lower() or item.name.lower() in needle)
+    ]
+
+
 def resolve_candidates(fixture: OrdersFixture, query: str) -> list[Candidate]:
-    """Code-side product search for checkout selection — bounded, keyed, deterministic.
+    """Broad product selection for the conversational Cart model.
 
     `query` may be a short phrase ("rain jacket") or a WHOLE utterance ("I'd like the
     waterproof rain jacket"), so containment is checked both ways. Empty/no-match queries
     return the FULL (tiny, fixture-bounded) catalog so the model can steer the caller to
     real items; keys are 1-based list positions as strings.
     """
-    needle = query.strip().lower()
-    matched = [
-        p
-        for p in fixture.products
-        if needle and (needle in p.name.lower() or p.name.lower() in needle)
-    ]
+    matched = match_named_items(fixture.products, query)
     products = matched or fixture.products
     return [
         Candidate(key=str(i), sku=p.sku, name=p.name, price_usd=p.price_usd)
