@@ -12,8 +12,7 @@ import threading
 import time
 from enum import Enum
 from pathlib import Path
-from types import UnionType
-from typing import Annotated, TypedDict, Union, get_args, get_origin
+from typing import Annotated, TypedDict, get_args, get_origin
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -1446,15 +1445,16 @@ async def test_post_close_turn_stops_before_every_engine_boundary(
 # --- checkpoint serde --------------------------------------------------------------------
 
 
+_PROJECT_MODULE_PREFIX = "agnostic_market."
+
+
 def _direct_state_model_types(annotation: object) -> set[type[BaseModel]]:
     origin = get_origin(annotation)
     if origin is Annotated:
         return _direct_state_model_types(get_args(annotation)[0])
-    if origin in (Union, UnionType):
-        return set().union(*(_direct_state_model_types(arg) for arg in get_args(annotation)))
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        return {annotation}
-    return set()
+        return {annotation} if annotation.__module__.startswith(_PROJECT_MODULE_PREFIX) else set()
+    return set().union(*(_direct_state_model_types(arg) for arg in get_args(annotation)))
 
 
 def test_checkpoint_channel_allowlist_exactly_covers_reasoning_state_models() -> None:
@@ -1465,7 +1465,11 @@ def test_checkpoint_channel_allowlist_exactly_covers_reasoning_state_models() ->
     assert set(_CHECKPOINT_CHANNEL_DTOS) == required
 
 
-def _reachable_enum_types(roots: tuple[type[BaseModel], ...]) -> set[type[Enum]]:
+def test_checkpoint_schema_discovery_reaches_models_in_direct_containers() -> None:
+    assert _direct_state_model_types(tuple[CartLine, ...]) == {CartLine}
+
+
+def _reachable_enum_types(roots: tuple[object, ...]) -> set[type[Enum]]:
     seen: set[object] = set()
     enum_types: set[type[Enum]] = set()
 
@@ -1474,13 +1478,18 @@ def _reachable_enum_types(roots: tuple[type[BaseModel], ...]) -> set[type[Enum]]
             return
         seen.add(annotation)
         if isinstance(annotation, Enum):
-            enum_types.add(type(annotation))
+            enum_type = type(annotation)
+            if enum_type.__module__.startswith(_PROJECT_MODULE_PREFIX):
+                enum_types.add(enum_type)
             return
         if isinstance(annotation, type):
             if issubclass(annotation, Enum):
-                enum_types.add(annotation)
+                if annotation.__module__.startswith(_PROJECT_MODULE_PREFIX):
+                    enum_types.add(annotation)
                 return
             if issubclass(annotation, BaseModel):
+                if not annotation.__module__.startswith(_PROJECT_MODULE_PREFIX):
+                    return
                 for field in annotation.model_fields.values():
                     walk(field.annotation)
                 return
@@ -1493,7 +1502,8 @@ def _reachable_enum_types(roots: tuple[type[BaseModel], ...]) -> set[type[Enum]]
 
 
 def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> None:
-    assert set(_CHECKPOINT_NESTED_ENUMS) == _reachable_enum_types(_CHECKPOINT_CHANNEL_DTOS)
+    state_annotations = tuple(field.annotation for field in ReasoningState.model_fields.values())
+    assert set(_CHECKPOINT_NESTED_ENUMS) == _reachable_enum_types(state_annotations)
 
 
 _CHECKPOINT_CHANNEL_VALUES = (

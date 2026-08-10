@@ -530,11 +530,56 @@ async def test_set_quantity_zero_removes_the_resolved_cart_line(config_root: Pat
 
 
 @pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    (
+        ("remove_from_cart", {"candidate_key": "2"}),
+        ("set_quantity", {"candidate_key": "2", "quantity": 5}),
+        ("set_quantity", {"candidate_key": "2", "quantity": 0}),
+    ),
+)
+async def test_absent_item_mutation_is_a_truthful_noop_without_mutation_event(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    arguments: dict,
+) -> None:
+    cart = CartStore()
+    cart.add_item(
+        sku="SKU-RED-42",
+        name="trail running shoes",
+        price_usd=89.99,
+        quantity=2,
+    )
+    before = cart.view()
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(cart_flow, "write_event", records.append)
+    graph, _, _ = _build(
+        config_root,
+        reasoning=_tool_fake(tool_name, arguments),
+        cart=cart,
+    )
+
+    out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
+
+    assert cart.view() == before
+    assert any(
+        "waterproof rain jacket wasn't in your cart" in text.lower() for text in _ai_texts(out)
+    )
+    assert any(
+        "waterproof rain jacket wasn't in your cart" in str(message.content).lower()
+        for message in out["messages"]
+        if isinstance(message, ToolMessage)
+    )
+    assert records == []
+
+
+@pytest.mark.parametrize(
     ("tool_name", "arguments", "starting_quantity", "event_name"),
     (
         ("add_to_cart", {"candidate_key": "1", "quantity": 1}, None, "cart_item_added"),
         ("remove_from_cart", {"candidate_key": "1"}, 1, "cart_item_removed"),
         ("set_quantity", {"candidate_key": "1", "quantity": 3}, 1, "cart_quantity_set"),
+        ("set_quantity", {"candidate_key": "1", "quantity": 0}, 1, "cart_quantity_set"),
     ),
 )
 async def test_each_resolved_mutation_emits_one_matching_audit_event(

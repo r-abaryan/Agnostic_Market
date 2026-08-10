@@ -304,6 +304,18 @@ class OrdersFixture(BaseModel):
     orders: dict[str, _OrderEntry]
     products: list[_ProductEntry] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def _product_skus_are_unique(self) -> OrdersFixture:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for product in self.products:
+            if product.sku in seen:
+                duplicates.add(product.sku)
+            seen.add(product.sku)
+        if duplicates:
+            raise ValueError(f"product SKUs must be unique: {sorted(duplicates)!r}")
+        return self
+
 
 class Candidate(BaseModel):
     """One code-narrowed product option the checkout model may pick (by key, never SKU)."""

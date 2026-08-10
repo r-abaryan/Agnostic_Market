@@ -205,7 +205,8 @@ def _apply_resolved_mutation(
         if quantity is not None:
             raise ValueError("resolved remove forbids a quantity")
         removed = cart_store.remove_item(item.sku)
-        write_event({"event": "cart_item_removed", "sku": item.sku})
+        if removed:
+            write_event({"event": "cart_item_removed", "sku": item.sku})
         return _DescribedMutationOutcome(
             fragment=(
                 f"removed the {item.name} from your cart"
@@ -216,13 +217,25 @@ def _apply_resolved_mutation(
     if operation == "set_quantity":
         if quantity is None or quantity < 0:
             raise ValueError("resolved set-quantity requires a non-negative quantity")
+        if quantity == 0:
+            removed = cart_store.remove_item(item.sku)
+            if removed:
+                write_event({"event": "cart_quantity_set", "sku": item.sku})
+            return _DescribedMutationOutcome(
+                fragment=(
+                    f"removed the {item.name} from your cart"
+                    if removed
+                    else f"the {item.name} wasn't in your cart"
+                )
+            )
         line = cart_store.set_quantity(item.sku, quantity)
-        write_event({"event": "cart_quantity_set", "sku": item.sku})
+        if line is not None:
+            write_event({"event": "cart_quantity_set", "sku": item.sku})
         return _DescribedMutationOutcome(
             fragment=(
                 f"updated to {speak_lines([line])}"
-                if line
-                else f"removed the {item.name} from your cart"
+                if line is not None
+                else f"the {item.name} wasn't in your cart"
             )
         )
     raise ValueError(f"unsupported resolved mutation operation: {operation!r}")
@@ -367,7 +380,7 @@ def build_cart_nodes(
                 new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
                 return False
             outcome = _apply_resolved_mutation(cart_store, "remove", chosen, None)
-            new_messages.append(ToolMessage(f"removed {chosen.key}", tool_call_id=call["id"]))
+            new_messages.append(ToolMessage(outcome.fragment, tool_call_id=call["id"]))
             fragments.append(outcome.fragment)
             return True
         # add_to_cart / set_quantity
@@ -396,9 +409,7 @@ def build_cart_nodes(
             )
             added.append(outcome.line)
             return True
-        new_messages.append(
-            ToolMessage(f"set {chosen.key} to {proposal.quantity}", tool_call_id=call["id"])
-        )
+        new_messages.append(ToolMessage(outcome.fragment, tool_call_id=call["id"]))
         fragments.append(outcome.fragment)
         return True
 

@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from agnostic_market.commerce.orders import (
     CancelError,
     Candidate,
+    OrdersFixture,
     OrderStore,
     RecentOrderContext,
     RefundError,
@@ -118,6 +120,20 @@ def test_match_named_items_preserves_ambiguity_for_the_caller_to_narrow() -> Non
     items = [_candidate("1", "trail running shoes"), _candidate("2", "trail hiking shoes")]
 
     assert match_named_items(items, "trail") == items
+
+
+def test_orders_fixture_requires_unique_skus_but_allows_duplicate_names() -> None:
+    products = [
+        {"sku": "SKU-1", "name": "trail runner", "price_usd": 80.0},
+        {"sku": "SKU-2", "name": "trail runner", "price_usd": 95.0},
+    ]
+
+    fixture = OrdersFixture.model_validate({"orders": {}, "products": products})
+    assert [product.sku for product in fixture.products] == ["SKU-1", "SKU-2"]
+
+    products[1]["sku"] = "SKU-1"
+    with pytest.raises(ValidationError, match="product SKUs must be unique"):
+        OrdersFixture.model_validate({"orders": {}, "products": products})
 
 
 def test_resolve_candidates_narrows_on_match(config_root: Path) -> None:
