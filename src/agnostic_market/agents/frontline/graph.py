@@ -103,6 +103,7 @@ from agnostic_market.dtos.orchestration import (
     CapabilityId,
     ChangeProfile,
     ListOrders,
+    ModifyCart,
     RefundOrder,
     ReturnOrder,
     SwitchAccount,
@@ -128,6 +129,7 @@ _CAPABILITY_DISPATCH_NODE = "capability_dispatch"
 _SUPPORT_CAPABILITY_ENTRY_NODE = "support_capability_entry"
 _SUPPORT_CAPABILITY_RENDER_NODE = "support_capability_render"
 _IDENTITY_CAPABILITY_ENTRY_NODE = "identity_capability_entry"
+_CART_CAPABILITY_ENTRY_NODE = "cart_capability_entry"
 # Pure code-authored read owners: no model, no tools, no flow coupling, so they live here beside
 # the other code-authored reads rather than in the cart/identity packages. An owner that DOES
 # couple to a flow (slot gathering, HITL) belongs in that flow's package, as Support's does.
@@ -154,6 +156,7 @@ class FrontlineGraphAssembly:
 TRANSACTIONAL_MODEL_NODES = frozenset(
     {
         "cart_assemble",
+        _CART_CAPABILITY_ENTRY_NODE,
         "support_assemble",
         _SUPPORT_CAPABILITY_ENTRY_NODE,
         "identity_assemble",
@@ -819,14 +822,31 @@ def build_frontline_graph(
         else:
             assert enumeration_check(text)  # only the two deterministic checks route here
             reason_code, destination = "list_orders", "support"
-        write_event(
-            {
-                "event": "flow_cross_switch",
-                "from": state.active_flow,
-                "destination": destination,
-                "reason_code": reason_code,
-            }
+        same_owner_checkout = bool(
+            state.active_flow == "cart"
+            and state.active_invocation is not None
+            and isinstance(state.active_invocation.request, ModifyCart)
+            and (reason_code, destination) == ("cart_write", "checkout")
         )
+        if same_owner_checkout:
+            write_event(
+                {
+                    "event": "capability_replaced",
+                    "from": CapabilityId.MODIFY_CART.value,
+                    "destination": "checkout",
+                    "reason_code": "cart_write",
+                    "source": "gate",
+                }
+            )
+        else:
+            write_event(
+                {
+                    "event": "flow_cross_switch",
+                    "from": state.active_flow,
+                    "destination": destination,
+                    "reason_code": reason_code,
+                }
+            )
         return {
             **clear_automation_state(),
             "handover": HandoffRequest(
@@ -859,10 +879,18 @@ def build_frontline_graph(
             # Compare by OWNING flow: the gate says "checkout" for a place-order, which this
             # SAME cart flow serves, so that is NOT a cross-switch (O4/D4 — without the map
             # "checkout now" while sticky in cart would spuriously self-cross-switch).
-            if hit is not None and _GATE_OWNER[hit[1]] != "cart":
-                return "cross_switch"
+            if hit is not None:
+                same_owner_checkout = bool(
+                    state.active_invocation is not None
+                    and isinstance(state.active_invocation.request, ModifyCart)
+                    and hit == ("cart_write", "checkout")
+                )
+                if same_owner_checkout or _GATE_OWNER[hit[1]] != "cart":
+                    return "cross_switch"
             if enumeration_check(text):
                 return "cross_switch"
+            if state.active_invocation is not None:
+                return _CAPABILITY_DISPATCH_NODE
             return "cart_assemble"
         if state.active_flow == "support":
             if wants_human(text):
@@ -1018,6 +1046,7 @@ def build_frontline_graph(
     )
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
     identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
+    cart_entry = CapabilityEntry(_CART_CAPABILITY_ENTRY_NODE)
     cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
     identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
     capability_registry = CapabilityRegistry(
@@ -1039,6 +1068,7 @@ def build_frontline_graph(
             ),
             CapabilitySpec(CapabilityId.VERIFY_IDENTITY, VerifyIdentity, identity_entry),
             CapabilitySpec(CapabilityId.SWITCH_ACCOUNT, SwitchAccount, identity_entry),
+            CapabilitySpec(CapabilityId.MODIFY_CART, ModifyCart, cart_entry),
         )
     )
 
@@ -1317,6 +1347,12 @@ def build_frontline_graph(
     node_registry.register(
         "cart_assemble",
         cart.assemble,
+        ExceptionAction.CART_REVIEW,
+        AbandonmentKind.CART_REVIEW,
+    )
+    node_registry.register(
+        _CART_CAPABILITY_ENTRY_NODE,
+        cart.capability_entry,
         ExceptionAction.CART_REVIEW,
         AbandonmentKind.CART_REVIEW,
     )
@@ -1699,15 +1735,21 @@ def build_frontline_graph(
         route_after_principal_warning,
         {"identity_assemble": "identity_assemble", "handover": "handover", END: END},
     )
+    cart_outcome_routes = {
+        "gate": "gate",
+        "cart_ack": "cart_ack",
+        "cart_clarify": "cart_clarify",
+        "cart_guardrail": "cart_guardrail",
+    }
     graph.add_conditional_edges(
         "cart_assemble",
         route_after_cart_assemble,
-        {
-            "gate": "gate",
-            "cart_ack": "cart_ack",
-            "cart_clarify": "cart_clarify",
-            "cart_guardrail": "cart_guardrail",
-        },
+        cart_outcome_routes,
+    )
+    graph.add_conditional_edges(
+        _CART_CAPABILITY_ENTRY_NODE,
+        route_after_cart_assemble,
+        cart_outcome_routes,
     )
     graph.add_edge("cart_ack", END)
     graph.add_edge("cart_clarify", END)

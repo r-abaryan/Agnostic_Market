@@ -44,6 +44,11 @@ class _NamedItem(Protocol):
     name: str
 
 
+class _CandidateItem(_NamedItem, Protocol):
+    sku: str
+    price_usd: float
+
+
 def speak_quantity(quantity: int, name: str) -> str:
     """'one waterproof rain jacket' / 'two waterproof rain jackets' — not '1 x name'
     (TTS reads the 'x' separator literally as 'ex'). Lives in commerce (next to the order
@@ -318,7 +323,7 @@ class OrdersFixture(BaseModel):
 
 
 class Candidate(BaseModel):
-    """One code-narrowed product option the checkout model may pick (by key, never SKU)."""
+    """One transient code-numbered catalog/cart option a model may pick (by key, never SKU)."""
 
     model_config = _FROZEN
 
@@ -579,6 +584,14 @@ def match_named_items[T: _NamedItem](items: Sequence[T], query: str) -> list[T]:
     ]
 
 
+def number_candidates(items: Sequence[_CandidateItem]) -> list[Candidate]:
+    """Render live catalog/cart items as local model-facing keys; no fallback or persistence."""
+    return [
+        Candidate(key=str(index), sku=item.sku, name=item.name, price_usd=item.price_usd)
+        for index, item in enumerate(items, start=1)
+    ]
+
+
 def resolve_candidates(fixture: OrdersFixture, query: str) -> list[Candidate]:
     """Broad product selection for the conversational Cart model.
 
@@ -589,10 +602,7 @@ def resolve_candidates(fixture: OrdersFixture, query: str) -> list[Candidate]:
     """
     matched = match_named_items(fixture.products, query)
     products = matched or fixture.products
-    return [
-        Candidate(key=str(i), sku=p.sku, name=p.name, price_usd=p.price_usd)
-        for i, p in enumerate(products, start=1)
-    ]
+    return number_candidates(products)
 
 
 class OrderStore:

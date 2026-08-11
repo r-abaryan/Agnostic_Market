@@ -11,7 +11,7 @@ from support_helpers import authorize_fixture_orders, build_support_engine
 from agnostic_market.agents import telemetry
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.dtos.orchestration import ListOrders
+from agnostic_market.dtos.orchestration import CartItemQuery, ListOrders, ModifyCart
 from agnostic_market.dtos.state import open_active_invocation
 from agnostic_market.llm.gateway import load_provider_credentials
 from scripts import frontline_eval
@@ -192,6 +192,78 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
                 expected_effects=observation.before,
                 expected_state=expected_state,
                 expected_admitted_user_messages=(utterance,),
+            )
+            == ()
+        )
+    finally:
+        runtime.caller_context.close_session()
+
+
+async def test_evaluator_executes_a_seeded_typed_cart_request_without_semantic_routing(
+    config_root: Path,
+) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    routing = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    runtime = _build_eval_runtime(
+        config,
+        routing,
+        reasoning,
+        thread_id="eval-typed-cart-execution-contract",
+    )
+    product = runtime.store.fixture.products[0]
+    opening_turn_ids = ("eval-typed-cart:opening",)
+    runtime.graph.update_state(
+        {"configurable": {"thread_id": runtime.engine.thread_id}},
+        {
+            "consumed_turn_ids": opening_turn_ids,
+            "active_invocation": open_active_invocation(
+                ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                consumed_turn_ids=opening_turn_ids,
+            ),
+        },
+        as_node="__start__",
+    )
+
+    try:
+        observation = await _observe_scenario(
+            runtime.engine,
+            ("continue",),
+            scenario_key="eval-typed-cart-execution-contract",
+            store=runtime.store,
+            profile_store=runtime.profile_store,
+            otp=runtime.otp,
+            verification=runtime.verification,
+            identity_store=runtime.identity_store,
+            model_call_count=lambda: _model_calls(routing, reasoning),
+        )
+        line = runtime.cart_store.view()[0]
+
+        assert line.sku == product.sku
+        assert line.quantity == 1
+        assert line.price_usd == product.price_usd
+        assert len(observation.final.audible) == 1
+        audible = observation.final.audible[0]
+        assert audible.node == "cart_ack"
+        assert product.name in audible.text
+        assert observation.final.model_calls == 0
+        assert (
+            _score_safety_observation(
+                observation,
+                expected_effects=observation.before,
+                expected_state=GraphObservation(
+                    active_flow=None,
+                    automation_channels=(),
+                    handover_destination=None,
+                    interrupted=False,
+                    unfinished=False,
+                    automation_terminal=False,
+                ),
+                expected_admitted_user_messages=(),
             )
             == ()
         )

@@ -19,6 +19,8 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     CancelOrders,
     CapabilityId,
+    CartItemChoices,
+    CartItemQuery,
     ChangeProfile,
     DiscloseAiIdentity,
     ExplicitOrderSet,
@@ -30,6 +32,7 @@ from agnostic_market.dtos.orchestration import (
     PrincipalTransition,
     PrincipalTransitionProjection,
     RefundOrder,
+    ResolvedCartItemRef,
     ReturnOrder,
     RouteDecision,
     RoutingContext,
@@ -258,7 +261,7 @@ def test_every_capability_id_has_one_valid_intent_shape() -> None:
         CapabilityId.MODIFY_CART: {
             "kind": "modify_cart",
             "operation": "remove",
-            "item_query": "running shoes",
+            "item": {"selector": "query", "query": "running shoes"},
         },
         CapabilityId.PLACE_ORDER: {"kind": "place_order"},
         CapabilityId.CANCEL_ORDERS: {
@@ -375,14 +378,38 @@ def test_cancel_selector_cannot_widen_from_missing_or_empty_targets() -> None:
 @pytest.mark.parametrize(
     ("payload", "valid_shape", "slot_complete"),
     [
-        ({"operation": "add", "item_query": "shampoo", "quantity": 1}, True, True),
-        ({"operation": "add", "item_query": "shampoo"}, True, False),
-        ({"operation": "remove", "item_query": "shampoo"}, True, True),
-        ({"operation": "remove", "item_query": "shampoo", "quantity": 1}, False, False),
-        ({"operation": "set_quantity", "item_query": "shampoo", "quantity": 0}, True, True),
-        ({"operation": "set_quantity", "item_query": "shampoo"}, True, False),
-        ({"item_query": "shampoo"}, False, False),
-        ({"item_query": "shampoo", "quantity": 1}, False, False),
+        (
+            {"operation": "add", "item": {"selector": "query", "query": "shampoo"}, "quantity": 1},
+            True,
+            True,
+        ),
+        ({"operation": "add", "item": {"selector": "query", "query": "shampoo"}}, True, False),
+        ({"operation": "remove", "item": {"selector": "query", "query": "shampoo"}}, True, True),
+        (
+            {
+                "operation": "remove",
+                "item": {"selector": "query", "query": "shampoo"},
+                "quantity": 1,
+            },
+            False,
+            False,
+        ),
+        (
+            {
+                "operation": "set_quantity",
+                "item": {"selector": "query", "query": "shampoo"},
+                "quantity": 0,
+            },
+            True,
+            True,
+        ),
+        (
+            {"operation": "set_quantity", "item": {"selector": "query", "query": "shampoo"}},
+            True,
+            False,
+        ),
+        ({"item": {"selector": "query", "query": "shampoo"}}, False, False),
+        ({"item": {"selector": "query", "query": "shampoo"}, "quantity": 1}, False, False),
     ],
 )
 def test_cart_mutation_requires_operation_specific_fields(
@@ -437,11 +464,78 @@ def test_profile_value_cannot_be_copied_into_a_direct_router_decision() -> None:
     assert decision.request.new_value is None
 
 
+def test_resolved_cart_item_cannot_be_copied_into_a_direct_router_decision() -> None:
+    with pytest.raises(ValidationError, match="owning capability"):
+        RouteDecision.direct(
+            ModifyCart(
+                operation="add",
+                item=ResolvedCartItemRef(sku="SKU-SHM-01"),
+                quantity=1,
+            )
+        )
+
+    request = ModifyCart(
+        operation="add",
+        item=CartItemQuery(query="shampoo"),
+        quantity=1,
+    )
+    assert RouteDecision.direct(request).request == request
+
+    unchecked = ModifyCart.model_construct(
+        operation="add",
+        item=ResolvedCartItemRef(sku="SKU-SHM-01"),
+        quantity=1,
+    )
+    with pytest.raises(ValidationError, match="owning capability"):
+        RouteDecision.direct(unchecked)
+
+    unchecked_dict = request.model_copy(
+        update={"item": {"selector": "resolved", "sku": "SKU-SHM-01"}}
+    )
+    with pytest.raises(ValidationError, match="owning capability"):
+        RouteDecision.direct(unchecked_dict)
+
+
+def test_code_owned_cart_choices_cannot_enter_through_a_direct_router_decision() -> None:
+    with pytest.raises(ValidationError, match="owning capability"):
+        RouteDecision.direct(
+            ModifyCart(
+                operation="add",
+                item=CartItemChoices(skus=("SKU-ONE", "SKU-TWO")),
+                quantity=1,
+            )
+        )
+
+    request = ModifyCart(
+        operation="add",
+        item=CartItemChoices(skus=("SKU-ONE", "SKU-TWO")),
+        quantity=1,
+    )
+    assert not request.is_slot_complete()
+
+
+@pytest.mark.parametrize("skus", (("SKU-ONE",), ("SKU-ONE", "SKU-ONE")))
+def test_cart_item_choices_require_two_distinct_skus(skus: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError, match=r"skus|unique"):
+        CartItemChoices(skus=skus)
+
+
+@pytest.mark.parametrize("quantity", (True, False, "2"))
+def test_modify_cart_quantity_is_a_strict_integer(quantity: object) -> None:
+    with pytest.raises(ValidationError, match="quantity"):
+        ModifyCart.model_validate({"operation": "add", "quantity": quantity})
+
+
+def test_modify_cart_rejects_the_retired_item_query_shape() -> None:
+    with pytest.raises(ValidationError, match="item_query"):
+        ModifyCart.model_validate({"operation": "add", "item_query": "shampoo", "quantity": 1})
+
+
 @pytest.mark.parametrize(
     "route_request",
     (
         {"kind": "list_orders"},
-        {"kind": "modify_cart", "item_query": "shampoo"},
+        {"kind": "modify_cart", "item": {"selector": "query", "query": "shampoo"}},
         {"kind": "change_profile", "new_value": "10 High Street"},
     ),
 )

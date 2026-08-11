@@ -17,6 +17,7 @@ from agnostic_market.commerce.orders import (
     ReturnError,
     load_orders_fixture,
     match_named_items,
+    number_candidates,
     resolve_candidates,
 )
 from agnostic_market.dtos.state import CartLine
@@ -120,6 +121,18 @@ def test_match_named_items_preserves_ambiguity_for_the_caller_to_narrow() -> Non
     items = [_candidate("1", "trail running shoes"), _candidate("2", "trail hiking shoes")]
 
     assert match_named_items(items, "trail") == items
+
+
+def test_number_candidates_is_shared_by_catalog_and_live_cart_items() -> None:
+    lines = (
+        _line("SKU-1", "trail shoes", 79.0, 2),
+        _line("SKU-2", "rain jacket", 129.0, 1),
+    )
+
+    assert number_candidates(lines) == [
+        Candidate(key="1", sku="SKU-1", name="trail shoes", price_usd=79.0),
+        Candidate(key="2", sku="SKU-2", name="rain jacket", price_usd=129.0),
+    ]
 
 
 def test_orders_fixture_requires_unique_skus_but_allows_duplicate_names() -> None:

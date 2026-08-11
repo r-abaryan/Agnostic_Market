@@ -391,16 +391,33 @@ def test_cart_proposal_models_reject_undeclared_fields(
         proposal_model.model_validate(arguments)
 
 
-@pytest.mark.parametrize("tool_name", ("add_to_cart", "buy_now"))
-async def test_malformed_item_proposal_cannot_reach_cart_or_placement(
-    config_root: Path, tool_name: str
+@pytest.mark.parametrize("proposal_model", (cart_flow._ProposeItem, cart_flow._ProposeQuantity))
+@pytest.mark.parametrize("quantity", (True, False, "2"))
+def test_cart_proposal_quantities_are_strict_integers(
+    proposal_model: type,
+    quantity: object,
 ) -> None:
-    malformed = [
-        (
-            tool_name,
-            {"candidate_key": "1", "quantity": 1, "unexpected": "not allowed"},
-        )
-    ]
+    payload = {"quantity": quantity}
+    if proposal_model is cart_flow._ProposeItem:
+        payload["candidate_key"] = "1"
+    with pytest.raises(ValidationError, match="quantity"):
+        proposal_model.model_validate(payload)
+
+
+@pytest.mark.parametrize("tool_name", ("add_to_cart", "buy_now"))
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        {"candidate_key": "1", "quantity": 1, "unexpected": "not allowed"},
+        {"candidate_key": "1", "quantity": True},
+    ),
+)
+async def test_malformed_item_proposal_cannot_reach_cart_or_placement(
+    config_root: Path,
+    tool_name: str,
+    arguments: dict[str, object],
+) -> None:
+    malformed = [(tool_name, arguments)]
     reasoning = FakeChatModel(scripted_calls=[malformed, malformed])
     graph, store, cart = _build(config_root, reasoning=reasoning)
     events = await _events(_reasoning_engine(graph), "checkout now please")
@@ -924,6 +941,7 @@ async def test_speakable_nodes_and_read_only_tools(config_root: Path) -> None:
         "catalog_search",
         "view_cart",
     }
+    assert "cart_capability_entry" not in graph.speakable_nodes
 
 
 @pytest.mark.parametrize(

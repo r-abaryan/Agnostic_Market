@@ -718,7 +718,7 @@ def build_recovery_node(
             cart_line = (
                 render_cart_line(lines, cart_store.cart_total()) if lines else "Your cart is empty."
             )
-            line = f"{cart_line} Please review your cart before trying checkout again."
+            line = f"{cart_line} Please review your cart before trying again."
         else:
             line = _ACTION_LINES.get(marker.action)
             if line is None:

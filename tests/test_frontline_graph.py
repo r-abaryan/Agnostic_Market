@@ -14,6 +14,7 @@ from langgraph.graph import END
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
+from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
@@ -30,7 +31,12 @@ from agnostic_market.commerce.identity import (
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.orders import (
+    OrdersFixture,
+    OrderStore,
+    RecentOrderContext,
+    load_orders_fixture,
+)
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentDirectory,
     load_payment_instruments_fixture,
@@ -41,8 +47,12 @@ from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancelOrders,
     CapabilityId,
+    CartItemChoices,
+    CartItemQuery,
     IntentRequest,
     ListOrders,
+    ModifyCart,
+    ResolvedCartItemRef,
     SwitchAccount,
     VerifyIdentity,
     ViewCart,
@@ -50,6 +60,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
+    ClarificationProgress,
     HandoffDestination,
     HandoffReasonCode,
     HandoffRequest,
@@ -174,12 +185,14 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.VIEW_IDENTITY_STATUS,
         CapabilityId.VERIFY_IDENTITY,
         CapabilityId.SWITCH_ACCOUNT,
+        CapabilityId.MODIFY_CART,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
         "cart_view_render",
         "identity_status_render",
         "identity_capability_entry",
+        "cart_capability_entry",
     )
     # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
     # dispatcher must still own no executable outgoing route.
@@ -193,11 +206,767 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.ANSWER_QUESTION,
         CapabilityId.SEARCH_CATALOG,
         CapabilityId.VERIFY_ORDER_STATUS,
-        CapabilityId.MODIFY_CART,
         CapabilityId.PLACE_ORDER,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.REQUEST_PERSON,
     }
+
+
+def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    cart = CartStore()
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(cart_flow, "write_event", records.append)
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-add"
+
+    result = graph.invoke(
+        _admitted_turn(
+            f"add one {product.name}",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert reasoning.invoke_count == 0
+    assert cart.view()[0].sku == product.sku
+    assert cart.view()[0].price_usd == product.price_usd
+    assert result["active_invocation"] is None
+    assert result["active_flow"] is None
+    assert product.name in _only_spoken(result)
+    assert records == [{"event": "cart_item_added", "sku": product.sku}]
+
+
+def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
+    config_root: Path,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    cart = CartStore()
+    graph = _graph(config_root, FakeChatModel(), store=store, cart_store=cart)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-resolved"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "add it",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=ResolvedCartItemRef(sku=product.sku),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert cart.view()[0].sku == product.sku
+    assert result["active_invocation"] is None
+
+
+def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    cart = CartStore()
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_item", {"candidate_key": "1"})],
+            [("provide_cart_quantity", {"quantity": 2})],
+        ]
+    )
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    invocation = ActiveInvocation(
+        request=ModifyCart(operation="add"),
+        opened_turn_id="typed-cart-item",
+    )
+    first_state = ReasoningState(
+        messages=[HumanMessage("add one of those", id="typed-cart-item")],
+        consumed_turn_ids=("typed-cart-item",),
+        active_invocation=invocation,
+    )
+
+    first = graph.nodes["cart_capability_entry"].invoke(first_state)
+
+    retained = first["active_invocation"]
+    assert isinstance(retained, ActiveInvocation)
+    assert isinstance(retained.request, ModifyCart)
+    assert isinstance(retained.request.item, ResolvedCartItemRef)
+    assert retained.request.quantity is None
+    assert first["pending_clarification"].detail == "quantity"
+    assert cart.is_empty()
+    assert reasoning.invoke_count == 1
+
+    second_state = ReasoningState(
+        messages=[
+            *first_state.messages,
+            *first["messages"],
+            HumanMessage("make it two", id="typed-cart-quantity"),
+        ],
+        consumed_turn_ids=("typed-cart-item", "typed-cart-quantity"),
+        active_invocation=retained,
+        active_flow="cart",
+        clarification_progress=first["clarification_progress"],
+    )
+    second = graph.nodes["cart_capability_entry"].invoke(second_state)
+
+    assert second["active_invocation"] is None
+    assert second["active_flow"] is None
+    assert second["pending_ack"]
+    assert cart.view()[0].quantity == 2
+    assert reasoning.invoke_count == 2
+
+
+@pytest.mark.parametrize(
+    ("operation", "quantity", "expected_quantity", "expected_event"),
+    (
+        ("set_quantity", 3, 3, "cart_quantity_set"),
+        ("set_quantity", 0, None, "cart_quantity_set"),
+        ("remove", None, None, "cart_item_removed"),
+    ),
+)
+def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    quantity: int | None,
+    expected_quantity: int | None,
+    expected_event: str,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    product = store.fixture.products[0]
+    cart = CartStore()
+    cart.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(cart_flow, "write_event", records.append)
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    turn_id = f"typed-cart-{operation}-{quantity}"
+    request = ModifyCart(
+        operation=operation,
+        item=CartItemQuery(query=product.name),
+        quantity=quantity,
+    )
+
+    result = graph.invoke(
+        _admitted_turn(
+            f"{operation} {product.name}",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(request=request, opened_turn_id=turn_id),
+        )
+    )
+
+    assert reasoning.invoke_count == 0
+    assert result["active_invocation"] is None
+    lines = cart.view()
+    if expected_quantity is None:
+        assert lines == ()
+    else:
+        assert lines[0].quantity == expected_quantity
+    assert records == [{"event": expected_event, "sku": product.sku}]
+
+
+def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+    turn_id = "typed-cart-no-match"
+    request = ModifyCart(
+        operation="add",
+        item=CartItemQuery(query="product that does not exist"),
+        quantity=2,
+    )
+
+    result = graph.invoke(
+        _admitted_turn(
+            "add two unavailable things",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(request=request, opened_turn_id=turn_id),
+        )
+    )
+
+    retained = result["active_invocation"]
+    assert isinstance(retained, ActiveInvocation)
+    assert retained.request == ModifyCart(operation="add", quantity=2)
+    assert result["active_flow"] == "cart"
+    assert _only_spoken(result) == "Which item would you like?"
+    assert reasoning.invoke_count == 0
+
+
+def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
+    config_root: Path,
+) -> None:
+    fixture = load_orders_fixture(config_root, "acme_store")
+    payload = fixture.model_dump()
+    duplicate = {
+        **payload["products"][0],
+        "sku": "SKU-DUPLICATE",
+        "price_usd": payload["products"][0]["price_usd"] + 10,
+    }
+    payload["products"].append(duplicate)
+    store = OrderStore(OrdersFixture.model_validate(payload))
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_item", {"candidate_key": "2"})],
+            [("provide_cart_quantity", {"quantity": 2})],
+        ],
+        record_prompts=True,
+    )
+    cart = CartStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    name = store.fixture.products[0].name
+    invocation = ActiveInvocation(
+        request=ModifyCart(
+            operation="add",
+            item=CartItemQuery(query=name),
+        ),
+        opened_turn_id="typed-cart-duplicate",
+    )
+    first = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage(f"add the {name}", id="typed-cart-duplicate")],
+            consumed_turn_ids=("typed-cart-duplicate",),
+            active_invocation=invocation,
+        )
+    )
+
+    retained = first["active_invocation"]
+    assert isinstance(retained, ActiveInvocation)
+    assert retained.request == ModifyCart(
+        operation="add",
+        item=CartItemChoices(skus=(store.fixture.products[0].sku, "SKU-DUPLICATE")),
+    )
+    assert first["pending_clarification"].detail == "item"
+    assert reasoning.invoke_count == 0
+
+    clarification = graph.nodes["cart_clarify"].invoke(
+        ReasoningState(
+            active_invocation=retained,
+            consumed_turn_ids=("typed-cart-duplicate",),
+            pending_clarification=first["pending_clarification"],
+        )
+    )
+    spoken_choices = str(clarification["messages"][0].content)
+    assert "option 1" in spoken_choices and "option 2" in spoken_choices
+    assert name in spoken_choices
+    assert "waterproof rain jacket" not in spoken_choices
+
+    second = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("the second option", id="typed-cart-selection")],
+            consumed_turn_ids=("typed-cart-duplicate", "typed-cart-selection"),
+            active_invocation=retained,
+            active_flow="cart",
+            clarification_progress=first["clarification_progress"],
+        )
+    )
+
+    selected = second["active_invocation"]
+    assert isinstance(selected, ActiveInvocation)
+    assert selected.request == ModifyCart(
+        operation="add",
+        item=ResolvedCartItemRef(sku="SKU-DUPLICATE"),
+    )
+    assert second["pending_clarification"].detail == "quantity"
+    assert cart.is_empty()
+    assert reasoning.invoke_count == 1
+    assert "waterproof rain jacket" not in reasoning._seen_prompts[-1]
+
+    third = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("make it two", id="typed-cart-quantity")],
+            consumed_turn_ids=(
+                "typed-cart-duplicate",
+                "typed-cart-selection",
+                "typed-cart-quantity",
+            ),
+            active_invocation=selected,
+            active_flow="cart",
+            clarification_progress=second["clarification_progress"],
+        )
+    )
+
+    assert third["active_invocation"] is None
+    assert cart.view()[0].sku == "SKU-DUPLICATE"
+    assert cart.view()[0].quantity == 2
+    assert reasoning.invoke_count == 2
+
+
+def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[[("provide_cart_item", {"candidate_key": "1"})]],
+        record_prompts=True,
+    )
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+
+    update = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[
+                HumanMessage("add the jacket", id="prior-turn"),
+                AIMessage("Which item would you like?"),
+                HumanMessage("the first option", id="current-turn"),
+            ],
+            consumed_turn_ids=("prior-turn", "current-turn"),
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(operation="add"),
+                opened_turn_id="prior-turn",
+            ),
+        )
+    )
+
+    assert update["active_invocation"] is not None
+    assert "the first option" in reasoning._seen_prompts[-1]
+    assert "add the jacket" not in reasoning._seen_prompts[-1]
+
+
+def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_quantity", {"quantity": True})],
+            [("provide_cart_quantity", {"quantity": True})],
+        ]
+    )
+    cart = CartStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    product = load_orders_fixture(config_root, "acme_store").products[0]
+
+    update = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("add it", id="typed-cart-boolean")],
+            consumed_turn_ids=("typed-cart-boolean",),
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=ResolvedCartItemRef(sku=product.sku),
+                ),
+                opened_turn_id="typed-cart-boolean",
+            ),
+        )
+    )
+
+    assert cart.is_empty()
+    assert update["pending_clarification"].detail == "quantity"
+    assert reasoning.invoke_count == 2
+
+
+def test_stale_resolved_cart_sku_performs_no_effect_and_returns_to_selection(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+    invocation = ActiveInvocation(
+        request=ModifyCart(
+            operation="add",
+            item=ResolvedCartItemRef(sku="SKU-NOT-LIVE"),
+            quantity=1,
+        ),
+        opened_turn_id="typed-cart-stale",
+    )
+
+    update = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("add it")],
+            consumed_turn_ids=("typed-cart-stale",),
+            active_invocation=invocation,
+        )
+    )
+
+    retained = update["active_invocation"]
+    assert isinstance(retained, ActiveInvocation)
+    assert retained.request == ModifyCart(operation="add", quantity=1)
+    assert update["pending_clarification"].detail == "item"
+    assert reasoning.invoke_count == 0
+
+
+def test_two_invalid_typed_cart_item_keys_enter_bounded_clarification(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_item", {"candidate_key": "999"})],
+            [("provide_cart_item", {"candidate_key": "still-not-valid"})],
+        ]
+    )
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+    invocation = ActiveInvocation(
+        request=ModifyCart(operation="add", quantity=1),
+        opened_turn_id="typed-cart-invalid",
+    )
+
+    update = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("add something", id="typed-cart-invalid")],
+            consumed_turn_ids=("typed-cart-invalid",),
+            active_invocation=invocation,
+        )
+    )
+
+    assert update["active_invocation"] == invocation
+    assert update["pending_clarification"].detail == "item"
+    assert reasoning.invoke_count == 2
+    tool_uses = {
+        call["id"]
+        for message in update["messages"]
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    }
+    tool_results = {
+        message.tool_call_id for message in update["messages"] if isinstance(message, ToolMessage)
+    }
+    assert tool_uses == tool_results
+
+
+def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing_slot(
+    config_root: Path,
+) -> None:
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_quantity", {"quantity": 99})],
+            [("provide_cart_item", {"candidate_key": "1"})],
+        ]
+    )
+    cart = CartStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    invocation = ActiveInvocation(
+        request=ModifyCart(operation="add", quantity=2),
+        opened_turn_id="typed-cart-fixed-slot",
+    )
+
+    update = graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("add the first one", id="typed-cart-fixed-slot")],
+            consumed_turn_ids=("typed-cart-fixed-slot",),
+            active_invocation=invocation,
+        )
+    )
+
+    assert update["active_invocation"] is None
+    assert cart.view()[0].quantity == 2
+    assert reasoning.invoke_count == 2
+    assert any(
+        isinstance(message, ToolMessage) and "Unavailable action" in str(message.content)
+        for message in update["messages"]
+    )
+
+
+def test_typed_cart_model_prose_is_replaced_by_code_clarification(config_root: Path) -> None:
+    fabricated = "I added it to your cart."
+    reasoning = FakeChatModel(emit_tool_calls=False, text_response=fabricated)
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+    turn_id = "typed-cart-prose"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "add something",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(operation="add", quantity=1),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert _only_spoken(result) == "Which item would you like?"
+    assert fabricated not in _only_spoken(result)
+
+
+def test_typed_cart_empty_remove_uses_review_ack_and_clears(config_root: Path) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
+    turn_id = "typed-cart-empty-remove"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "remove the shoes",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(
+                    operation="remove",
+                    item=CartItemQuery(query="shoes"),
+                ),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert result["active_invocation"] is None
+    assert result["active_flow"] is None
+    assert _only_spoken(result) == "Your cart's empty right now - what would you like to add?"
+    assert reasoning.invoke_count == 0
+
+
+def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> None:
+    request = ModifyCart(operation="add")
+    invocation = ActiveInvocation(request=request, opened_turn_id="typed-cart-exit")
+
+    leave_graph = _graph(
+        config_root,
+        FakeChatModel(),
+        reasoning_model=FakeChatModel(scripted_calls=[[("leave_cart", {})]]),
+    )
+    leave = leave_graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("never mind", id="typed-cart-exit")],
+            consumed_turn_ids=("typed-cart-exit",),
+            active_invocation=invocation,
+        )
+    )
+    assert leave["active_invocation"] is None
+
+    exhausted_graph = _graph(
+        config_root,
+        FakeChatModel(),
+        reasoning_model=FakeChatModel(emit_tool_calls=False),
+    )
+    exhausted = exhausted_graph.nodes["cart_capability_entry"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("I still don't know", id="typed-cart-exit")],
+            consumed_turn_ids=("typed-cart-exit",),
+            active_invocation=invocation,
+            active_flow="cart",
+            clarification_progress=ClarificationProgress(flow="cart", reasks=2),
+        )
+    )
+    assert exhausted["active_invocation"] is None
+    assert exhausted["active_flow"] == "left_cart"
+
+    for node_name in ("cart_abort", "cart_escape_human"):
+        graph = _graph(config_root, FakeChatModel())
+        update = graph.nodes[node_name].invoke(
+            ReasoningState(
+                consumed_turn_ids=("typed-cart-exit",),
+                active_invocation=invocation,
+                active_flow="cart",
+            )
+        )
+        assert update["active_invocation"] is None
+
+
+@pytest.mark.parametrize("exit_kind", ("leave", "exhaustion", "abort", "human"))
+def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
+    config_root: Path,
+    exit_kind: str,
+) -> None:
+    reasoning = (
+        FakeChatModel(scripted_calls=[[("leave_cart", {})]])
+        if exit_kind == "leave"
+        else FakeChatModel(emit_tool_calls=False)
+    )
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False),
+        reasoning_model=reasoning,
+    )
+    text = {
+        "leave": "let's discuss something unrelated",
+        "exhaustion": "I still cannot choose",
+        "abort": "never mind",
+        "human": "get me a person",
+    }[exit_kind]
+    state: dict[str, object] = {
+        "active_flow": "cart",
+        "active_invocation": ActiveInvocation(
+            request=ModifyCart(operation="add"),
+            opened_turn_id=f"typed-cart-{exit_kind}",
+        ),
+    }
+    if exit_kind == "exhaustion":
+        state["clarification_progress"] = ClarificationProgress(flow="cart", reasks=2)
+
+    result = graph.invoke(_admitted_turn(text, turn_id=f"typed-cart-{exit_kind}", **state))
+
+    assert result["active_invocation"] is None
+    if exit_kind == "human":
+        assert result["automation_terminal"] is True
+
+
+def test_cross_flow_switch_clears_a_typed_cart_invocation(config_root: Path) -> None:
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    cart = CartStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False),
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    turn_id = "typed-cart-cross-flow"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "actually I want a refund",
+            turn_id=turn_id,
+            active_flow="cart",
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(operation="add"),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert result["active_invocation"] is None
+    assert result["active_flow"] == "support"
+    assert cart.is_empty()
+
+
+def test_mid_slot_checkout_replaces_typed_cart_once(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    product = store.fixture.products[0]
+    cart = CartStore()
+    cart.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+    reasoning = FakeChatModel(
+        force_tool="go_to_checkout",
+        canned_args={"go_to_checkout": {}},
+        tool_call_limit=1,
+    )
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(frontline_graph, "write_event", records.append)
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    turn_id = "typed-cart-to-checkout"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "just check out",
+            turn_id=turn_id,
+            active_flow="cart",
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(operation="add"),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert result["active_invocation"] is None
+    assert result["pending_placement"] is not None
+    assert len(result["__interrupt__"]) == 1
+    assert cart.line_count == 1
+    assert reasoning.invoke_count == 1
+    assert [record for record in records if record.get("event") == "capability_replaced"] == [
+        {
+            "event": "capability_replaced",
+            "from": "modify_cart",
+            "destination": "checkout",
+            "reason_code": "cart_write",
+            "source": "gate",
+        }
+    ]
+    assert not any(record.get("event") == "flow_cross_switch" for record in records)
+
+
+@pytest.mark.parametrize("fails_after_mutation", (False, True))
+def test_typed_cart_recovery_reads_live_cart_without_replaying_mutation(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fails_after_mutation: bool,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    cart = CartStore()
+    graph = _graph(config_root, FakeChatModel(), store=store, cart_store=cart)
+    product = store.fixture.products[0]
+    if fails_after_mutation:
+        real_write = cart_flow.write_event
+
+        def fail_after_write(record: dict[str, object]) -> None:
+            if record.get("event") == "cart_item_added":
+                raise RuntimeError("injected post-mutation telemetry failure")
+            real_write(record)
+
+        monkeypatch.setattr(cart_flow, "write_event", fail_after_write)
+    else:
+
+        def fail_before_mutation(*_args, **_kwargs):
+            raise RuntimeError("injected pre-mutation failure")
+
+        monkeypatch.setattr(cart_flow, "_apply_resolved_mutation", fail_before_mutation)
+    turn_id = f"typed-cart-recovery-{fails_after_mutation}"
+
+    result = graph.invoke(
+        _admitted_turn(
+            f"add one {product.name}",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert cart.line_count == int(fails_after_mutation)
+    assert result["active_invocation"] is None
+    line = _only_spoken(result)
+    assert "Please review your cart before trying again." in line
+    if fails_after_mutation:
+        assert product.name in line
+    else:
+        assert "Your cart is empty." in line
 
 
 def _only_spoken(result: dict[str, object]) -> str:
@@ -595,7 +1364,11 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "identity_risk_check",
             "identity_abort",
         },
-        AbandonmentKind.CART_REVIEW: {"cart_assemble", "cart_ack"},
+        AbandonmentKind.CART_REVIEW: {
+            "cart_assemble",
+            "cart_capability_entry",
+            "cart_ack",
+        },
         AbandonmentKind.AUTHORITATIVE_RECONCILE: {
             "cart_place",
             "support_place",
@@ -632,7 +1405,11 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             *expected_abandonment[AbandonmentKind.PURE_ABORT],
             "tools",
         },
-        ExceptionAction.CART_REVIEW: {"cart_assemble", "cart_ack"},
+        ExceptionAction.CART_REVIEW: {
+            "cart_assemble",
+            "cart_capability_entry",
+            "cart_ack",
+        },
         ExceptionAction.RECONCILE_PLACEMENT: {"cart_place"},
         ExceptionAction.RECONCILE_REFUND: {"support_place"},
         ExceptionAction.RECONCILE_CANCEL: {"support_cancel_void"},
@@ -660,7 +1437,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 59
+    assert len(policies) == 60
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -672,7 +1449,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 58
+    assert len(graph.recovery_handled_nodes) == 59
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}
@@ -814,6 +1591,16 @@ async def test_gate_trip_skips_model_and_hands_over(config_root: Path) -> None:
     out = await graph.ainvoke({"messages": [HumanMessage("cancel my order please")]})
     assert out["active_flow"] == "support"  # entered by the gate, pre-generation
     assert fake._tool_calls_made == 0  # the frontline model never ran
+
+
+def test_ambiguous_pronoun_cancel_does_not_force_an_order_handover(config_root: Path) -> None:
+    graph = _graph(config_root, FakeChatModel())
+
+    update = graph.nodes["gate"].invoke(
+        ReasoningState(messages=[HumanMessage("Actually, you know what? Let's cancel it.")])
+    )
+
+    assert update == {}
 
 
 async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:

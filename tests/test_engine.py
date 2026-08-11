@@ -64,7 +64,11 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
+    CartItemChoices,
+    CartItemQuery,
     ListOrders,
+    ModifyCart,
+    ResolvedCartItemRef,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -1590,6 +1594,36 @@ def test_direct_state_channel_models_roundtrip_through_production_checkpoint_ser
 
     assert type(restored) is type(channel_value)
     assert restored == channel_value
+
+
+@pytest.mark.parametrize(
+    "cart_request",
+    (
+        ModifyCart(operation="add"),
+        ModifyCart(operation="add", item=CartItemQuery(query="trail shoes"), quantity=1),
+        ModifyCart(
+            operation="add",
+            item=CartItemChoices(skus=("SKU-SHO-01", "SKU-SHO-02")),
+            quantity=1,
+        ),
+        ModifyCart(
+            operation="set_quantity",
+            item=ResolvedCartItemRef(sku="SKU-SHO-01"),
+            quantity=0,
+        ),
+    ),
+)
+def test_modify_cart_invocation_roundtrips_without_nested_serde_grants(
+    cart_request: ModifyCart,
+) -> None:
+    serde = build_checkpointer().serde
+    invocation = ActiveInvocation(request=cart_request, opened_turn_id="cart-origin")
+
+    restored = serde.loads_typed(serde.dumps_typed(invocation))
+
+    assert type(restored) is ActiveInvocation
+    assert type(restored.request) is ModifyCart
+    assert restored == invocation
 
 
 def test_production_checkpoint_serde_blocks_no_reachable_state_type() -> None:

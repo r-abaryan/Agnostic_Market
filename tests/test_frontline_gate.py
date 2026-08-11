@@ -47,6 +47,9 @@ _MODEL_OWNS = [
     "cancel both of my orders",
     "cancel all my orders",
     "cancel them",
+    "cancel it",
+    "cancel this",
+    "Actually, you know what? Let's cancel it.",
 ]
 
 # Reads / questions / policy asks — MUST NOT false-trip (the gate's precision guarantee).

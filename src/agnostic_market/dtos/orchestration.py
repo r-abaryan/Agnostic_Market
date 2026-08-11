@@ -166,13 +166,48 @@ class ViewCart(_CompleteIntentRequest):
     kind: Literal[CapabilityId.VIEW_CART] = CapabilityId.VIEW_CART
 
 
+class CartItemQuery(BaseModel):
+    model_config = _FROZEN
+
+    selector: Literal["query"] = "query"
+    query: NonEmptyText
+
+
+class CartItemChoices(BaseModel):
+    """Code-owned ambiguous SKU set retained until the caller selects one live option."""
+
+    model_config = _FROZEN
+
+    selector: Literal["choices"] = "choices"
+    skus: tuple[NonEmptyText, ...] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def skus_are_unique(self) -> CartItemChoices:
+        if len(set(self.skus)) != len(self.skus):
+            raise ValueError("cart item choices must be unique")
+        return self
+
+
+class ResolvedCartItemRef(BaseModel):
+    model_config = _FROZEN
+
+    selector: Literal["resolved"] = "resolved"
+    sku: NonEmptyText
+
+
+CartItemSelector = Annotated[
+    CartItemQuery | CartItemChoices | ResolvedCartItemRef,
+    Field(discriminator="selector"),
+]
+
+
 class ModifyCart(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.MODIFY_CART] = CapabilityId.MODIFY_CART
     operation: Literal["add", "remove", "set_quantity"]
-    item_query: NonEmptyText | None = None
-    quantity: int | None = Field(default=None, ge=0)
+    item: CartItemSelector | None = None
+    quantity: int | None = Field(default=None, strict=True, ge=0)
 
     @model_validator(mode="after")
     def quantity_matches_operation(self) -> ModifyCart:
@@ -183,7 +218,7 @@ class ModifyCart(IntentRequestModel):
         return self
 
     def is_slot_complete(self) -> bool:
-        if self.item_query is None:
+        if self.item is None or isinstance(self.item, CartItemChoices):
             return False
         return self.operation == "remove" or self.quantity is not None
 
@@ -291,6 +326,12 @@ IntentRequest = Annotated[
 _INTENT_REQUEST_ADAPTER = TypeAdapter(IntentRequest)
 
 
+def _revalidate_intent_request(value: object) -> IntentRequest:
+    if isinstance(value, IntentRequestModel):
+        value = value.model_dump(warnings=False)
+    return _INTENT_REQUEST_ADAPTER.validate_python(value)
+
+
 class ActiveInvocation(BaseModel):
     """One code-opened capability request retained across deterministic continuation."""
 
@@ -305,11 +346,7 @@ class ActiveInvocation(BaseModel):
     def request_is_fully_validated(cls, value: object) -> IntentRequest:
         # A model instance may have been built past validation (`model_construct`, an
         # unchecked copy), so re-validate the payload rather than trusting the instance.
-        if isinstance(value, IntentRequestModel):
-            payload: object = value.model_dump(warnings=False)
-        else:
-            payload = value
-        return _INTENT_REQUEST_ADAPTER.validate_python(payload)
+        return _revalidate_intent_request(value)
 
     @property
     def capability(self) -> CapabilityId:
@@ -348,6 +385,13 @@ class RouteDecision(BaseModel):
     request: IntentRequest | None = None
     clarification_reason: ClarificationReason | None = None
 
+    @field_validator("request", mode="before")
+    @classmethod
+    def request_is_fully_validated(cls, value: object) -> IntentRequest | None:
+        if value is None:
+            return None
+        return _revalidate_intent_request(value)
+
     @model_validator(mode="after")
     def payload_matches_decision(self) -> RouteDecision:
         if self.decision == "clarify":
@@ -358,6 +402,10 @@ class RouteDecision(BaseModel):
                 raise ValueError("direct requires only one request")
             if isinstance(self.request, ChangeProfile) and self.request.new_value is not None:
                 raise ValueError("profile values are gathered by the owning capability")
+            if isinstance(self.request, ModifyCart) and isinstance(
+                self.request.item, (CartItemChoices, ResolvedCartItemRef)
+            ):
+                raise ValueError("code-owned cart selectors are minted by the owning capability")
         elif self.request is not None or self.clarification_reason is not None:
             raise ValueError("continue carries no payload")
         return self

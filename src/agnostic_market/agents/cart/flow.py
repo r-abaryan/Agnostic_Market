@@ -15,9 +15,10 @@ snapshot) BEFORE the interrupt (A10a rule 2); `confirm` holds the interrupt(s) a
 effects; the §4a barged-readback re-confirm; the Clock-A TTL checked first; `place` is the
 sole post-interrupt effect, idempotent by the OrderStore key dedup.
 
-`cart_assemble` never speaks. Dynamic mutation/review/empty-cart results travel through the
-turn-scoped `pending_ack` channel to `cart_ack`; closed clarification selectors travel through
-`pending_clarification` to `cart_clarify`. Each code-owned node speaks and clears its own channel.
+`cart_assemble` and `cart_capability_entry` never speak. Dynamic mutation/review/empty-cart results
+travel through the turn-scoped `pending_ack` channel to `cart_ack`; closed clarification selectors
+travel through `pending_clarification` to `cart_clarify`. Each code-owned node speaks and clears its
+own channel.
 
 SKU discipline (unchanged from checkout): the model NEVER emits a SKU — it picks a candidate
 KEY; code resolves key → sku → name → price and does all arithmetic.
@@ -36,12 +37,12 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from agnostic_market.agents._consent import classify_consent
 from agnostic_market.agents._copy import warm_close
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
-from agnostic_market.agents.cart.prompt import compose_cart_prompt
+from agnostic_market.agents.cart.prompt import compose_cart_capability_prompt, compose_cart_prompt
 from agnostic_market.agents.clarification import (
     advance_clarification,
     with_clarification_lifecycle,
@@ -53,12 +54,20 @@ from agnostic_market.commerce.orders import (
     OrderStore,
     PlacedOrder,
     RecentOrderContext,
+    match_named_items,
+    number_candidates,
     resolve_candidates,
     speak_lines,
 )
 from agnostic_market.dtos.confirmation import (
     ToolConfirmationPolicy,
     validate_confirmation_rendering,
+)
+from agnostic_market.dtos.orchestration import (
+    CartItemChoices,
+    CartItemQuery,
+    ModifyCart,
+    ResolvedCartItemRef,
 )
 from agnostic_market.dtos.state import (
     CartClarification,
@@ -89,6 +98,7 @@ _CART_CLARIFICATION_LINES: dict[CartClarificationDetail, str] = {
     "item": "Which item would you like?",
     "quantity": "How many would you like?",
 }
+_EMPTY_CART_REVIEW_LINE = "Your cart's empty right now - what would you like to add?"
 
 
 def _last_user_text(state: ReasoningState) -> str:
@@ -96,6 +106,20 @@ def _last_user_text(state: ReasoningState) -> str:
         if isinstance(msg, HumanMessage):
             return str(msg.content)
     return ""
+
+
+def _current_committed_user_message(state: ReasoningState) -> HumanMessage | None:
+    if not state.consumed_turn_ids:
+        return None
+    turn_id = state.consumed_turn_ids[-1]
+    return next(
+        (
+            message
+            for message in reversed(state.messages)
+            if isinstance(message, HumanMessage) and message.id == turn_id
+        ),
+        None,
+    )
 
 
 def _placement_confirmation_phrase(
@@ -126,13 +150,19 @@ class _ProposeItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     candidate_key: str
-    quantity: int
+    quantity: int = Field(strict=True)
 
 
 class _ProposeKey(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     candidate_key: str
+
+
+class _ProposeQuantity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    quantity: int = Field(strict=True, ge=0)
 
 
 class _RequestCartClarification(BaseModel):
@@ -251,6 +281,7 @@ class CartNodes:
     """
 
     assemble: Callable[[ReasoningState], dict[str, object]]
+    capability_entry: Callable[[ReasoningState], dict[str, object]]
     ack: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
@@ -316,6 +347,16 @@ def build_cart_nodes(
         """Leave the cart flow (caller changed their mind or asked something else)."""
         raise NotImplementedError("intercepted by the assemble node; never executed")
 
+    @tool
+    def provide_cart_item(candidate_key: str) -> str:
+        """Supply only the missing item using its current code-bounded option number."""
+        raise NotImplementedError("intercepted by the capability entry; never executed")
+
+    @tool
+    def provide_cart_quantity(quantity: int) -> str:
+        """Supply only the missing whole-number quantity for the active cart request."""
+        raise NotImplementedError("intercepted by the capability entry; never executed")
+
     cart_tools = (
         add_to_cart,
         remove_from_cart,
@@ -335,6 +376,16 @@ def build_cart_nodes(
 
     def _valid_keys(candidates: list[Candidate]) -> str:
         return ", ".join(sorted(c.key for c in candidates))
+
+    def _mutation_ack(added: list[CartLine], fragments: list[str], *, invalid: int = 0) -> str:
+        parts = [f"added {speak_lines(added)} to your cart"] if added else []
+        parts.extend(fragments)
+        ack = ", ".join(parts)
+        ack = ack[0].upper() + ack[1:]
+        if invalid:
+            what = "one of those" if invalid == 1 else "some of those"
+            return f"{ack} - {what} didn't go through, could you say it again?"
+        return f"{ack}. {warm_close()}"
 
     def _mint_placement() -> dict[str, object]:
         """Freeze the current cart into a PendingPlacement (A10a rule 2: key exists in state
@@ -427,6 +478,7 @@ def build_cart_nodes(
             return {
                 "messages": new_messages,
                 "active_flow": "left_cart",
+                "active_invocation": None,
                 "pending_clarification": None,
             }
         return {
@@ -434,6 +486,232 @@ def build_cart_nodes(
             "active_flow": "cart",
             "pending_clarification": CartClarification(detail=detail),
             "clarification_progress": step.progress,
+        }
+
+    def _leave_result(new_messages: list, call_id: str) -> dict[str, object]:
+        new_messages.append(ToolMessage("left cart", tool_call_id=call_id))
+        write_event({"event": "cart_left", "reason": "left_flow"})
+        return {
+            "messages": new_messages,
+            "active_flow": "left_cart",
+            "active_invocation": None,
+            "pending_placement": None,
+            "pending_clarification": None,
+        }
+
+    def capability_entry_node(state: ReasoningState) -> dict[str, object]:
+        """Prepare one typed reversible mutation; code owns target resolution and effect."""
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, ModifyCart):
+            raise TypeError("cart capability entry requires a modify-cart invocation")
+        request = invocation.request
+        new_messages: list = []
+
+        def domain():
+            items = (
+                list(order_store.fixture.products)
+                if request.operation == "add"
+                else list(cart_store.view())
+            )
+            candidates = number_candidates(items)
+            return (
+                items,
+                candidates,
+                {candidate.key: item for candidate, item in zip(candidates, items, strict=True)},
+            )
+
+        def retain(updated: ModifyCart) -> None:
+            nonlocal invocation, request
+            invocation = invocation.with_request(updated)
+            request = updated
+
+        def clarify(detail: CartClarificationDetail) -> dict[str, object]:
+            result = _clarification_result(state, new_messages, detail)
+            if result.get("active_flow") == "cart":
+                result["active_invocation"] = invocation
+            return result
+
+        def empty_cart() -> dict[str, object]:
+            return {
+                "messages": new_messages,
+                "active_invocation": None,
+                "active_flow": None,
+                "pending_ack": _EMPTY_CART_REVIEW_LINE,
+            }
+
+        items, candidates, by_key = domain()
+        if request.operation != "add" and not items:
+            return empty_cart()
+
+        if isinstance(request.item, CartItemQuery):
+            matches = match_named_items(items, request.item.query)
+            if not matches:
+                retain(
+                    ModifyCart(
+                        operation=request.operation,
+                        quantity=request.quantity,
+                    )
+                )
+                return clarify("item")
+            if len(matches) > 1:
+                retain(
+                    ModifyCart(
+                        operation=request.operation,
+                        item=CartItemChoices(skus=tuple(item.sku for item in matches)),
+                        quantity=request.quantity,
+                    )
+                )
+                return clarify("item")
+            retain(
+                ModifyCart(
+                    operation=request.operation,
+                    item=ResolvedCartItemRef(sku=matches[0].sku),
+                    quantity=request.quantity,
+                )
+            )
+
+        selecting_item = request.item is None or isinstance(request.item, CartItemChoices)
+        if isinstance(request.item, CartItemChoices):
+            item_by_sku = {item.sku: item for item in items}
+            choice_items = [item_by_sku.get(sku) for sku in request.item.skus]
+            if any(item is None for item in choice_items):
+                retain(ModifyCart(operation=request.operation, quantity=request.quantity))
+                return clarify("item")
+            narrowed_items = [item for item in choice_items if item is not None]
+            candidates = number_candidates(narrowed_items)
+            by_key = {
+                candidate.key: item
+                for candidate, item in zip(candidates, narrowed_items, strict=True)
+            }
+
+        if isinstance(request.item, ResolvedCartItemRef):
+            live_item = next((item for item in items if item.sku == request.item.sku), None)
+            if live_item is None:
+                retain(
+                    ModifyCart(
+                        operation=request.operation,
+                        quantity=request.quantity,
+                    )
+                )
+                return clarify("item")
+        else:
+            live_item = None
+
+        if selecting_item or not request.is_slot_complete():
+            proposal_tool = provide_cart_item if selecting_item else provide_cart_quantity
+            prompt_candidates = candidates if selecting_item else number_candidates([live_item])
+            capability_model = reasoning_model.bind_tools(
+                (proposal_tool, request_cart_clarification, leave_cart)
+            )
+            prompt = SystemMessage(
+                compose_cart_capability_prompt(
+                    display_name,
+                    prompt_candidates,
+                    policy,
+                    request,
+                    proposal_tool.name,
+                )
+            )
+            current_user_message = _current_committed_user_message(state)
+            if current_user_message is None:
+                return clarify("item" if selecting_item else "quantity")
+            messages: list = [prompt, current_user_message]
+            expected_tool = proposal_tool.name
+            for _attempt in range(2):
+                response = capability_model.invoke(messages)
+                if not response.tool_calls:
+                    return clarify("item" if selecting_item else "quantity")
+                new_messages.append(response)
+                ack_extra_tool_calls(response, new_messages)
+                call = response.tool_calls[0]
+                if call["name"] == leave_cart.name:
+                    return _leave_result(new_messages, call["id"])
+                if call["name"] == request_cart_clarification.name:
+                    new_messages.append(
+                        ToolMessage("cart clarification requested", tool_call_id=call["id"])
+                    )
+                    return clarify("item" if selecting_item else "quantity")
+                if call["name"] == expected_tool:
+                    try:
+                        if selecting_item:
+                            proposal = _ProposeKey.model_validate(call["args"])
+                            chosen = by_key.get(proposal.candidate_key)
+                            if chosen is None:
+                                raise ValueError("unknown candidate key")
+                            updated = ModifyCart(
+                                operation=request.operation,
+                                item=ResolvedCartItemRef(sku=chosen.sku),
+                                quantity=request.quantity,
+                            )
+                        else:
+                            proposal = _ProposeQuantity.model_validate(call["args"])
+                            if request.operation == "add" and proposal.quantity < 1:
+                                raise ValueError("add quantity must be positive")
+                            updated = ModifyCart(
+                                operation=request.operation,
+                                item=request.item,
+                                quantity=proposal.quantity,
+                            )
+                    except (TypeError, ValueError):
+                        new_messages.append(
+                            ToolMessage(
+                                "The proposal was invalid. Fill only the missing field.",
+                                tool_call_id=call["id"],
+                            )
+                        )
+                        messages = [prompt, current_user_message, *new_messages]
+                        continue
+                    new_messages.append(
+                        ToolMessage("cart request updated", tool_call_id=call["id"])
+                    )
+                    retain(updated)
+                    if not request.is_slot_complete():
+                        return clarify("quantity")
+                    break
+                if call["name"] not in {
+                    expected_tool,
+                    request_cart_clarification.name,
+                    leave_cart.name,
+                }:
+                    new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_cart.name))
+                    messages = [prompt, current_user_message, *new_messages]
+                    continue
+                raise ValueError(
+                    f"cart capability entry: bound tool has no handler: {call['name']!r}"
+                )
+            else:
+                return clarify("item" if selecting_item else "quantity")
+
+        if not isinstance(request.item, ResolvedCartItemRef):
+            raise TypeError("complete cart mutation requires a resolved item")
+        items, _candidates, _by_key = domain()
+        live_item = next((item for item in items if item.sku == request.item.sku), None)
+        if live_item is None:
+            if request.operation != "add" and not items:
+                return empty_cart()
+            retain(ModifyCart(operation=request.operation, quantity=request.quantity))
+            return clarify("item")
+        if request.operation == "add":
+            outcome = _apply_resolved_mutation(
+                cart_store,
+                "add",
+                number_candidates([live_item])[0],
+                request.quantity,
+            )
+            ack = _mutation_ack([outcome.line], [])
+        else:
+            outcome = _apply_resolved_mutation(
+                cart_store,
+                request.operation,
+                live_item,
+                request.quantity,
+            )
+            ack = _mutation_ack([], [outcome.fragment])
+        return {
+            "messages": new_messages,
+            "active_invocation": None,
+            "active_flow": None,
+            "pending_ack": ack,
         }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
@@ -476,16 +754,10 @@ def build_cart_nodes(
                 if not added and not fragments:  # whole batch invalid -> corrective re-prompt
                     messages = [prompt, *state.messages, *new_messages]
                     continue
-                parts = [f"added {speak_lines(added)} to your cart"] if added else []
-                parts.extend(fragments)
-                ack = ", ".join(parts)
-                ack = ack[0].upper() + ack[1:]
-                if invalid:
-                    what = "one of those" if invalid == 1 else "some of those"
-                    ack += f" - {what} didn't go through, could you say it again?"
-                else:
-                    ack += f". {warm_close()}"  # its own sentence (proper case), factual
-                return {"messages": new_messages, "pending_ack": ack}
+                return {
+                    "messages": new_messages,
+                    "pending_ack": _mutation_ack(added, fragments, invalid=invalid),
+                }
 
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
@@ -508,19 +780,12 @@ def build_cart_nodes(
                 return _clarification_result(state, new_messages, clarification.detail)
 
             if name == "leave_cart":
-                new_messages.append(ToolMessage("left cart", tool_call_id=call["id"]))
-                write_event({"event": "cart_left", "reason": "left_flow"})
-                return {
-                    "messages": new_messages,
-                    "active_flow": "left_cart",
-                    "pending_placement": None,
-                    "pending_clarification": None,
-                }
+                return _leave_result(new_messages, call["id"])
 
             if name == "review_cart":
                 new_messages.append(ToolMessage("reviewed cart", tool_call_id=call["id"]))
                 if cart_store.is_empty():
-                    ack = "Your cart's empty right now - what would you like to add?"
+                    ack = _EMPTY_CART_REVIEW_LINE
                 else:
                     ack = (
                         f"You've got {speak_lines(cart_store.view())} - "
@@ -579,8 +844,9 @@ def build_cart_nodes(
 
     def ack_node(state: ReasoningState) -> dict[str, object]:
         """Speak the code-authored in-flow line (mutation ack / review listing / empty-cart)
-        and clear it. The flow stays sticky (`active_flow` unchanged). Clear-before-speak:
-        `pending_ack` goes None in the same update as the spoken message."""
+        and clear it. This node preserves `active_flow`: broad Cart stays sticky, while a completed
+        typed mutation has already cleared it. Clear-before-speak: `pending_ack` goes None in the
+        same update as the spoken message."""
         ack = state.pending_ack or warm_close()
         return {"pending_ack": None, "messages": [AIMessage(ack)]}
 
@@ -588,10 +854,31 @@ def build_cart_nodes(
         clarification = state.pending_clarification
         if not isinstance(clarification, CartClarification):
             raise TypeError("cart clarify node requires CartClarification")
+        line = _CART_CLARIFICATION_LINES[clarification.detail]
+        invocation = state.active_invocation
+        if (
+            clarification.detail == "item"
+            and invocation is not None
+            and isinstance(invocation.request, ModifyCart)
+            and isinstance(invocation.request.item, CartItemChoices)
+        ):
+            request = invocation.request
+            items = (
+                order_store.fixture.products if request.operation == "add" else cart_store.view()
+            )
+            item_by_sku = {item.sku: item for item in items}
+            choices = [item_by_sku.get(sku) for sku in request.item.skus]
+            if all(item is not None for item in choices):
+                rendered = "; ".join(
+                    f"option {index}, {item.name} at ${item.price_usd:.2f}"
+                    for index, item in enumerate(choices, start=1)
+                    if item is not None
+                )
+                line = f"I found multiple matches: {rendered}. Which item would you like?"
         return {
             "pending_clarification": None,
             "active_flow": "cart",
-            "messages": [AIMessage(_CART_CLARIFICATION_LINES[clarification.detail])],
+            "messages": [AIMessage(line)],
         }
 
     def guardrail_node(state: ReasoningState) -> dict[str, object]:
@@ -712,6 +999,7 @@ def build_cart_nodes(
             "pending_placement": None,
             "pending_clarification": None,
             "clarification_progress": None,
+            "active_invocation": None,
             "active_flow": None,
             "messages": [AIMessage(f"No problem - I've dropped that.{kept}")],
         }
@@ -723,6 +1011,7 @@ def build_cart_nodes(
             "pending_placement": None,
             "pending_clarification": None,
             "clarification_progress": None,
+            "active_invocation": None,
             "active_flow": None,
             "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
         }
@@ -742,6 +1031,7 @@ def build_cart_nodes(
 
     return CartNodes(
         assemble=with_clarification_lifecycle(assemble_node),
+        capability_entry=with_clarification_lifecycle(capability_entry_node),
         ack=ack_node,
         clarify=clarify_node,
         guardrail=guardrail_node,

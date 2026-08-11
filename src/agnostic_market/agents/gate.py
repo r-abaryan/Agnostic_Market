@@ -30,6 +30,8 @@ from agnostic_market.dtos.state import HandoffDestination, HandoffReasonCode
 # irreversible thing, guarded against the read/question phrasings that would collide.
 _RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, HandoffDestination], ...] = (
     # cancel an order (NOT "why was my order cancelled" — a read about a past cancel).
+    # Bare "cancel it/this" is also excluded: the pronoun may refer to Cart work rather than an
+    # order, so forcing Support would violate this gate's precision contract.
     # Deliberately SINGULAR/high-certainty only: plural and collective phrasings ("cancel both
     # my orders", "cancel them") were tried here and REVERTED — weak objects like them/both/all
     # false-trip non-imperatives the guard can't catch ("did you cancel both?", "I did not
@@ -39,7 +41,7 @@ _RULES: tuple[tuple[re.Pattern[str], HandoffReasonCode, HandoffDestination], ...
     # own with confidence (F-16.2 decision: do not grow the regex gate toward paraphrases).
     (
         re.compile(
-            r"\bcancel\b(?:(?!\b(?:why|was|been|already)\b).)*\b(?:order|purchase|it|this)\b",
+            r"\bcancel\b(?:(?!\b(?:why|was|been|already)\b).)*\b(?:order|purchase)\b",
             re.IGNORECASE,
         ),
         "cancel_order",

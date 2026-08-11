@@ -180,7 +180,7 @@ def test_every_ordinary_recovery_action_has_one_closed_result(
         )
         expected_line = (
             f"{render_cart_line(cart.view(), cart.cart_total())} "
-            "Please review your cart before trying checkout again."
+            "Please review your cart before trying again."
         )
     before_counts = _commerce_counts(harness)
     before_cart = cart.view()
