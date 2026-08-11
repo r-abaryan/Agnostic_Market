@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import Literal, overload
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field
@@ -101,27 +101,6 @@ _CART_CLARIFICATION_LINES: dict[CartClarificationDetail, str] = {
 }
 _EMPTY_CART_CHECKOUT_LINE = "Your cart's empty - what would you like to add?"
 _EMPTY_CART_REVIEW_LINE = "Your cart's empty right now - what would you like to add?"
-
-
-def _last_user_text(state: ReasoningState) -> str:
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            return str(msg.content)
-    return ""
-
-
-def _current_committed_user_message(state: ReasoningState) -> HumanMessage | None:
-    if not state.consumed_turn_ids:
-        return None
-    turn_id = state.consumed_turn_ids[-1]
-    return next(
-        (
-            message
-            for message in reversed(state.messages)
-            if isinstance(message, HumanMessage) and message.id == turn_id
-        ),
-        None,
-    )
 
 
 def _placement_confirmation_phrase(
@@ -626,7 +605,7 @@ def build_cart_nodes(
                     proposal_tool.name,
                 )
             )
-            current_user_message = _current_committed_user_message(state)
+            current_user_message = state.current_committed_user_message()
             if current_user_message is None:
                 return clarify("item" if selecting_item else "quantity")
             messages: list = [prompt, current_user_message]
@@ -738,7 +717,7 @@ def build_cart_nodes(
         call in it applies in order under ONE combined ack; control calls mixed in behind
         mutations are answered but not acted on (control intent must lead its own turn).
         Control/terminal tools stay one-per-turn as before."""
-        candidates = resolve_candidates(order_store.fixture, _last_user_text(state))
+        candidates = resolve_candidates(order_store.fixture, state.last_user_text())
         prompt = SystemMessage(compose_cart_prompt(display_name, candidates, cart_store, policy))
         messages: list = [prompt, *state.messages]
         new_messages: list = []

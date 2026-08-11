@@ -2072,8 +2072,7 @@ def test_graph_declares_disjoint_code_and_model_speech_sources(config_root: Path
     engine, _ = _engine(config_root)
     graph = engine._graph
     assert graph.model_speech_nodes == MODEL_SPEECH_NODES
-    assert graph.model_speech_nodes == frozenset({"model"})
-    assert frozenset(graph.nodes) >= MODEL_SPEECH_NODES
+    assert frozenset(graph.nodes) >= graph.model_speech_nodes
     assert "cart_clarify" in graph.speakable_nodes
     assert "identity_ask_contact" in graph.speakable_nodes
     assert graph.speakable_nodes.isdisjoint(graph.model_speech_nodes)

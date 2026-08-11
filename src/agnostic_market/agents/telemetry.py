@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 from agnostic_market.commerce.spoken import redact_contact
 
@@ -43,8 +44,16 @@ def write_event(record: dict[str, object]) -> None:
         logger.warning("telemetry write failed: %s", exc)
 
 
-def write_typed_read_answered(utterance: str, capability: str) -> None:
-    """The one answered-turn record shared by every capability-dispatched read owner.
+CapabilityAnswerSource = Literal["code_authored_read", "grounded_model_response"]
+
+
+def write_capability_answered(
+    utterance: str,
+    capability: str,
+    *,
+    answer_source: CapabilityAnswerSource,
+) -> None:
+    """The one answered-turn record shared by every capability-dispatched answer owner.
 
     Call it only once the spoken line exists, as the tool path does: a row written ahead of a
     failing render claims "answered" for a turn the caller never heard. A blank utterance writes
@@ -57,9 +66,8 @@ def write_typed_read_answered(utterance: str, capability: str) -> None:
         {
             "utterance": utterance,
             "outcome": "answered",
-            # Not the tool path's "code_render": those rows key on `tool`, these on `capability`,
-            # and one slug across both would mix two populations under half-present keys.
-            "outcome_detail": "typed_read",
+            "outcome_detail": "capability_answer",
             "capability": capability,
+            "answer_source": answer_source,
         }
     )

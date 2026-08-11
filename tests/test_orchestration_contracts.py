@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, ValidationError
 
 from agnostic_market.agents.capabilities import (
@@ -168,6 +169,28 @@ def test_invocation_opening_uses_only_the_admitted_ledger_tail() -> None:
             consumed_turn_ids=("turn-1",),
             active_invocation=invocation,
         )
+
+
+def test_reasoning_state_distinguishes_latest_history_from_the_current_admitted_turn() -> None:
+    current = HumanMessage("current question", id="turn-2")
+    state = ReasoningState(
+        messages=[
+            HumanMessage("older question", id="turn-1"),
+            AIMessage("older answer"),
+            current,
+        ],
+        consumed_turn_ids=("turn-1", "turn-2"),
+    )
+
+    assert state.last_user_text() == "current question"
+    assert state.current_committed_user_message() is current
+
+    missing = ReasoningState(
+        messages=[HumanMessage("older question", id="turn-1")],
+        consumed_turn_ids=("turn-1", "turn-2"),
+    )
+    assert missing.last_user_text() == "older question"
+    assert missing.current_committed_user_message() is None
 
 
 def test_principal_transition_projection_is_closed_and_context_free() -> None:

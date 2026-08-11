@@ -31,6 +31,7 @@ from agnostic_market.commerce.identity import (
 from agnostic_market.commerce.orders import (
     OrderStore,
     RecentOrderContext,
+    lookup_catalog,
     render_order_list_line,
     speak_lines,
 )
@@ -133,16 +134,12 @@ def build_voice_tools(
     @tool
     def catalog_search(query: str) -> str:
         """Search the product catalog for items matching a text query."""
-        needle = query.strip().lower()
-        matches = [
-            f"{p.name} (sku {p.sku}, ${p.price_usd:.2f})"
-            for p in store.fixture.products
-            if needle and needle in p.name.lower()
-        ]
+        result = lookup_catalog(store.fixture, query)
+        matches = [f"{p.name} (sku {p.sku}, ${p.price_usd:.2f})" for p in result.matches]
         if not matches:
             # Tiny fixture catalog: list what DOES exist so the model steers the caller
             # to real items instead of inventing categories (observed live 2026-07-06).
-            available = "; ".join(p.name for p in store.fixture.products)
+            available = "; ".join(p.name for p in result.available)
             return f"No catalog items match {query!r}. The catalog carries: {available}."
         return "Matching items: " + "; ".join(matches)
 
