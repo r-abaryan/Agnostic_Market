@@ -68,6 +68,7 @@ from agnostic_market.dtos.orchestration import (
     CartItemQuery,
     ListOrders,
     ModifyCart,
+    PlaceOrder,
     ResolvedCartItemRef,
     ViewCart,
     ViewIdentityStatus,
@@ -199,6 +200,18 @@ def _engine(
     )
     caller_context.attach_engine(engine)
     return engine, store
+
+
+def _cart_with_fixture_product(config_root: Path, *, quantity: int = 1) -> CartStore:
+    product = load_orders_fixture(config_root, "acme_store").products[0]
+    cart = CartStore()
+    cart.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=quantity,
+    )
+    return cart
 
 
 async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS) -> list:
@@ -521,6 +534,189 @@ async def test_duplicate_consent_turn_id_cannot_be_reused_as_a_fresh_turn(
 
     assert store.placed_count == 1
     assert frontline.invoke_count == 0
+
+
+def _seed_typed_place_order(engine: ReasoningEngine, *, origin_id: str) -> None:
+    consumed_turn_ids = (origin_id,)
+    engine._graph.update_state(
+        engine._config,
+        {
+            "consumed_turn_ids": consumed_turn_ids,
+            "active_invocation": open_active_invocation(
+                PlaceOrder(),
+                consumed_turn_ids=consumed_turn_ids,
+            ),
+        },
+        as_node="__start__",
+    )
+
+
+async def test_duplicate_typed_place_dispatch_cannot_resume_or_replace_placement(
+    config_root: Path,
+) -> None:
+    cart = _cart_with_fixture_product(config_root)
+    frontline = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="duplicate-typed-place-dispatch",
+    )
+    _seed_typed_place_order(engine, origin_id="typed-place-origin")
+    adapter = GraphVoiceAdapter(engine)
+    dispatch_id = "typed-place-dispatch"
+
+    await _adapter_turn(adapter, "place my cart", dispatch_id)
+    first = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    pending = first.pending_placement
+    assert pending is not None
+    assert first.active_invocation is None
+    assert engine.pending_interrupt()
+
+    duplicate_output = await _adapter_turn(adapter, "place my cart", dispatch_id)
+    duplicate = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert duplicate_output == []
+    assert duplicate.pending_placement == pending
+    assert engine.pending_interrupt()
+    assert store.placed_count == 0
+    assert frontline.invoke_count == 0
+    assert reasoning.invoke_count == 0
+
+    await _adapter_turn(adapter, "yes", "typed-place-consent")
+
+    assert store.placed_count == 1
+    assert not engine.pending_interrupt()
+    assert (
+        store.placement_receipt(
+            pending.idempotency_key,
+            lines=pending.lines,
+            total_usd=pending.total_usd,
+        ).kind
+        == "committed"
+    )
+
+
+async def test_typed_place_order_barged_readback_requires_fresh_consent(
+    config_root: Path,
+) -> None:
+    cart = _cart_with_fixture_product(config_root)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=FakeChatModel(emit_tool_calls=False),
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="typed-place-barged-readback",
+    )
+    _seed_typed_place_order(engine, origin_id="typed-place-barge-origin")
+
+    await _events(engine, "place my cart")
+    reconfirm = await _events(engine, "yes", TurnFacts(readback_interrupted=True))
+
+    assert store.placed_count == 0
+    assert engine.pending_interrupt()
+    assert [event for event in reconfirm if isinstance(event, InterruptEvent)]
+    assert reasoning.invoke_count == 0
+
+    await _events(engine, "yes")
+
+    assert store.placed_count == 1
+    assert not engine.pending_interrupt()
+
+
+async def test_typed_place_order_decline_keeps_cart_and_clears_automation(
+    config_root: Path,
+) -> None:
+    cart = _cart_with_fixture_product(config_root)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=FakeChatModel(emit_tool_calls=False),
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="typed-place-decline",
+    )
+    _seed_typed_place_order(engine, origin_id="typed-place-decline-origin")
+
+    await _events(engine, "place my cart")
+    events = await _events(engine, "no")
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert store.placed_count == 0
+    assert cart.line_count == 1
+    assert state.active_invocation is None
+    assert state.pending_placement is None
+    assert state.active_flow is None
+    assert not engine.pending_interrupt()
+    assert any(
+        isinstance(event, SpokenMessageEvent) and "won't place it" in event.text.lower()
+        for event in events
+    )
+    assert reasoning.invoke_count == 0
+
+
+async def test_typed_place_order_value_cap_denies_before_consent(
+    config_root: Path,
+) -> None:
+    cart = _cart_with_fixture_product(config_root, quantity=100)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=FakeChatModel(emit_tool_calls=False),
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="typed-place-value-cap",
+    )
+    _seed_typed_place_order(engine, origin_id="typed-place-cap-origin")
+
+    events = await _events(engine, "place my cart")
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert store.placed_count == 0
+    assert cart.line_count == 1
+    assert not engine.pending_interrupt()
+    assert state.active_invocation is None
+    assert state.pending_placement is None
+    assert state.active_flow is None
+    assert any(
+        isinstance(event, SpokenMessageEvent)
+        and "more than i'm able to place" in event.text.lower()
+        for event in events
+    )
+    assert reasoning.invoke_count == 0
+
+
+async def test_typed_place_order_duplicate_readback_names_a_second_order(
+    config_root: Path,
+) -> None:
+    cart = _cart_with_fixture_product(config_root)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, store = _engine(
+        config_root,
+        frontline=FakeChatModel(emit_tool_calls=False),
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="typed-place-duplicate",
+    )
+    existing = store.place_cart(
+        "typed-place-existing",
+        lines=cart.snapshot(),
+        total_usd=cart.cart_total(),
+    )
+    _seed_typed_place_order(engine, origin_id="typed-place-duplicate-origin")
+
+    events = await _events(engine, "place my cart")
+    interrupts = [event for event in events if isinstance(event, InterruptEvent)]
+
+    assert len(interrupts) == 1
+    assert "SECOND order" in interrupts[0].prompt
+    assert existing.order_id in interrupts[0].prompt
+    assert store.placed_count == 1
+    assert cart.line_count == 1
+    assert reasoning.invoke_count == 0
 
 
 async def test_placed_order_is_queryable_same_session(config_root: Path) -> None:
@@ -1611,10 +1807,11 @@ def test_direct_state_channel_models_roundtrip_through_production_checkpoint_ser
             item=ResolvedCartItemRef(sku="SKU-SHO-01"),
             quantity=0,
         ),
+        PlaceOrder(),
     ),
 )
-def test_modify_cart_invocation_roundtrips_without_nested_serde_grants(
-    cart_request: ModifyCart,
+def test_cart_invocation_roundtrips_without_nested_serde_grants(
+    cart_request: ModifyCart | PlaceOrder,
 ) -> None:
     serde = build_checkpointer().serde
     invocation = ActiveInvocation(request=cart_request, opened_turn_id="cart-origin")
@@ -1622,7 +1819,7 @@ def test_modify_cart_invocation_roundtrips_without_nested_serde_grants(
     restored = serde.loads_typed(serde.dumps_typed(invocation))
 
     assert type(restored) is ActiveInvocation
-    assert type(restored.request) is ModifyCart
+    assert type(restored.request) is type(cart_request)
     assert restored == invocation
 
 

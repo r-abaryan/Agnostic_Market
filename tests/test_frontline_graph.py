@@ -52,6 +52,7 @@ from agnostic_market.dtos.orchestration import (
     IntentRequest,
     ListOrders,
     ModifyCart,
+    PlaceOrder,
     ResolvedCartItemRef,
     SwitchAccount,
     VerifyIdentity,
@@ -186,6 +187,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.VERIFY_IDENTITY,
         CapabilityId.SWITCH_ACCOUNT,
         CapabilityId.MODIFY_CART,
+        CapabilityId.PLACE_ORDER,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
@@ -206,7 +208,6 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.ANSWER_QUESTION,
         CapabilityId.SEARCH_CATALOG,
         CapabilityId.VERIFY_ORDER_STATUS,
-        CapabilityId.PLACE_ORDER,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.REQUEST_PERSON,
     }
@@ -859,7 +860,7 @@ def test_cross_flow_switch_clears_a_typed_cart_invocation(config_root: Path) -> 
     assert cart.is_empty()
 
 
-def test_mid_slot_checkout_replaces_typed_cart_once(
+def test_mid_slot_checkout_replaces_typed_cart_without_a_model_call(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -872,11 +873,7 @@ def test_mid_slot_checkout_replaces_typed_cart_once(
         price_usd=product.price_usd,
         quantity=1,
     )
-    reasoning = FakeChatModel(
-        force_tool="go_to_checkout",
-        canned_args={"go_to_checkout": {}},
-        tool_call_limit=1,
-    )
+    reasoning = FakeChatModel(emit_tool_calls=False)
     records: list[dict[str, object]] = []
     monkeypatch.setattr(frontline_graph, "write_event", records.append)
     graph = _graph(
@@ -904,7 +901,7 @@ def test_mid_slot_checkout_replaces_typed_cart_once(
     assert result["pending_placement"] is not None
     assert len(result["__interrupt__"]) == 1
     assert cart.line_count == 1
-    assert reasoning.invoke_count == 1
+    assert reasoning.invoke_count == 0
     assert [record for record in records if record.get("event") == "capability_replaced"] == [
         {
             "event": "capability_replaced",
@@ -915,6 +912,133 @@ def test_mid_slot_checkout_replaces_typed_cart_once(
         }
     ]
     assert not any(record.get("event") == "flow_cross_switch" for record in records)
+
+
+def test_mid_slot_checkout_opens_a_fresh_place_order_invocation(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(frontline_graph, "write_event", records.append)
+    graph = _graph(config_root, FakeChatModel())
+    turn_id = "typed-cart-replacement"
+    original = ActiveInvocation(
+        request=ModifyCart(operation="add"),
+        opened_turn_id=turn_id,
+    )
+
+    update = graph.nodes["cross_switch"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("just check out", id=turn_id)],
+            consumed_turn_ids=(turn_id,),
+            active_flow="cart",
+            active_invocation=original,
+        )
+    )
+
+    replacement = update["active_invocation"]
+    assert isinstance(replacement, ActiveInvocation)
+    assert type(replacement.request) is PlaceOrder
+    assert replacement.invocation_id != original.invocation_id
+    assert replacement.opened_turn_id == turn_id
+    assert update["handover"] == HandoffRequest(
+        destination="checkout",
+        reason_code="cart_write",
+        source="gate",
+    )
+    assert records == [
+        {
+            "event": "capability_replaced",
+            "from": "modify_cart",
+            "destination": "checkout",
+            "reason_code": "cart_write",
+            "source": "gate",
+        }
+    ]
+
+
+def test_mid_slot_checkout_with_an_empty_cart_uses_the_checkout_line_without_a_model(
+    config_root: Path,
+) -> None:
+    cart = CartStore()
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+    turn_id = "typed-empty-cart-to-checkout"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "just check out",
+            turn_id=turn_id,
+            active_flow="cart",
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(operation="add"),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert _only_spoken(result) == "Your cart's empty - what would you like to add?"
+    assert reasoning.invoke_count == 0
+    assert result["active_invocation"] is None
+    assert result["active_flow"] is None
+    assert result["pending_placement"] is None
+    assert result["pending_clarification"] is None
+    assert "__interrupt__" not in result
+
+
+def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    product = store.fixture.products[0]
+    cart = CartStore()
+    cart.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        reasoning_model=reasoning,
+    )
+
+    def fail_snapshot() -> NoReturn:
+        raise RuntimeError("injected typed placement snapshot failure")
+
+    monkeypatch.setattr(cart, "snapshot", fail_snapshot)
+    turn_id = "typed-place-recovery"
+    result = graph.invoke(
+        _admitted_turn(
+            "place my cart",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=PlaceOrder(),
+                opened_turn_id=turn_id,
+            ),
+        )
+    )
+
+    assert _failed_nodes(tmp_path) == ["cart_capability_entry"]
+    assert _only_spoken(result).endswith("Please review your cart before trying again.")
+    assert cart.line_count == 1
+    assert store.placed_count == 0
+    assert reasoning.invoke_count == 0
+    assert result["active_invocation"] is None
+    assert result["pending_placement"] is None
+    assert result.get("pending_recovery") is None
+    assert "__interrupt__" not in result
 
 
 @pytest.mark.parametrize("fails_after_mutation", (False, True))

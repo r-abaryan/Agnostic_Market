@@ -104,6 +104,7 @@ from agnostic_market.dtos.orchestration import (
     ChangeProfile,
     ListOrders,
     ModifyCart,
+    PlaceOrder,
     RefundOrder,
     ReturnOrder,
     SwitchAccount,
@@ -847,12 +848,18 @@ def build_frontline_graph(
                     "reason_code": reason_code,
                 }
             )
-        return {
+        update: dict[str, object] = {
             **clear_automation_state(),
             "handover": HandoffRequest(
                 destination=destination, reason_code=reason_code, source="gate"
             ),
         }
+        if same_owner_checkout:
+            update["active_invocation"] = open_active_invocation(
+                PlaceOrder(),
+                consumed_turn_ids=state.consumed_turn_ids,
+            )
+        return update
 
     def route_after_entry(state: ReasoningState) -> str:
         # Escape checks BEFORE the sticky flow re-engages (decision: no caller is ever
@@ -939,6 +946,10 @@ def build_frontline_graph(
                     else "identity_assemble"
                 )
             if state.active_flow == "cart":
+                if state.active_invocation is not None:
+                    if isinstance(state.active_invocation.request, PlaceOrder):
+                        return _CAPABILITY_DISPATCH_NODE
+                    raise TypeError("checkout handover retained an incompatible Cart invocation")
                 return "cart_assemble"
             if state.active_flow == "support":
                 return "support_assemble"
@@ -1069,6 +1080,7 @@ def build_frontline_graph(
             CapabilitySpec(CapabilityId.VERIFY_IDENTITY, VerifyIdentity, identity_entry),
             CapabilitySpec(CapabilityId.SWITCH_ACCOUNT, SwitchAccount, identity_entry),
             CapabilitySpec(CapabilityId.MODIFY_CART, ModifyCart, cart_entry),
+            CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
         )
     )
 

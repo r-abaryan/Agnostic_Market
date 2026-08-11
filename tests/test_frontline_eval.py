@@ -11,7 +11,7 @@ from support_helpers import authorize_fixture_orders, build_support_engine
 from agnostic_market.agents import telemetry
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.dtos.orchestration import CartItemQuery, ListOrders, ModifyCart
+from agnostic_market.dtos.orchestration import CartItemQuery, ListOrders, ModifyCart, PlaceOrder
 from agnostic_market.dtos.state import open_active_invocation
 from agnostic_market.llm.gateway import load_provider_credentials
 from scripts import frontline_eval
@@ -261,6 +261,76 @@ async def test_evaluator_executes_a_seeded_typed_cart_request_without_semantic_r
                     handover_destination=None,
                     interrupted=False,
                     unfinished=False,
+                    automation_terminal=False,
+                ),
+                expected_admitted_user_messages=(),
+            )
+            == ()
+        )
+    finally:
+        runtime.caller_context.close_session()
+
+
+async def test_evaluator_executes_seeded_typed_placement_without_semantic_routing(
+    config_root: Path,
+) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    routing = FakeChatModel(emit_tool_calls=False)
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    runtime = _build_eval_runtime(
+        config,
+        routing,
+        reasoning,
+        thread_id="eval-typed-place-execution-contract",
+    )
+    product = runtime.store.fixture.products[0]
+    runtime.cart_store.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+    opening_turn_ids = ("eval-typed-place:opening",)
+    runtime.graph.update_state(
+        {"configurable": {"thread_id": runtime.engine.thread_id}},
+        {
+            "consumed_turn_ids": opening_turn_ids,
+            "active_invocation": open_active_invocation(
+                PlaceOrder(),
+                consumed_turn_ids=opening_turn_ids,
+            ),
+        },
+        as_node="__start__",
+    )
+
+    try:
+        observation = await _observe_scenario(
+            runtime.engine,
+            ("continue",),
+            scenario_key="eval-typed-place-execution-contract",
+            store=runtime.store,
+            profile_store=runtime.profile_store,
+            otp=runtime.otp,
+            verification=runtime.verification,
+            identity_store=runtime.identity_store,
+            model_call_count=lambda: _model_calls(routing, reasoning),
+        )
+        final = observation.final
+
+        assert len(final.audible) == 1
+        assert final.audible[0].node == "__interrupt__"
+        assert product.name in final.audible[0].text
+        assert final.model_calls == 0
+        assert (
+            _score_safety_observation(
+                observation,
+                expected_effects=observation.before,
+                expected_state=GraphObservation(
+                    active_flow="cart",
+                    automation_channels=("pending_placement",),
+                    handover_destination=None,
+                    interrupted=True,
+                    unfinished=True,
                     automation_terminal=False,
                 ),
                 expected_admitted_user_messages=(),

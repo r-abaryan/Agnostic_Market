@@ -725,7 +725,7 @@ async def test_empty_cart_checkout_stays_and_asks(config_root: Path) -> None:
     out = await graph.ainvoke({"messages": [HumanMessage("checkout now please")]}, _CFG)
     assert store.placed_count == 0
     assert _flow(graph) == "cart"  # stayed, no placement
-    assert any("empty" in t.lower() for t in _ai_texts(out))
+    assert "Your cart's empty - what would you like to add?" in _ai_texts(out)
 
 
 async def test_review_cart_lists_contents(config_root: Path) -> None:

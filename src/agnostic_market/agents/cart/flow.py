@@ -67,6 +67,7 @@ from agnostic_market.dtos.orchestration import (
     CartItemChoices,
     CartItemQuery,
     ModifyCart,
+    PlaceOrder,
     ResolvedCartItemRef,
 )
 from agnostic_market.dtos.state import (
@@ -98,6 +99,7 @@ _CART_CLARIFICATION_LINES: dict[CartClarificationDetail, str] = {
     "item": "Which item would you like?",
     "quantity": "How many would you like?",
 }
+_EMPTY_CART_CHECKOUT_LINE = "Your cart's empty - what would you like to add?"
 _EMPTY_CART_REVIEW_LINE = "Your cart's empty right now - what would you like to add?"
 
 
@@ -500,10 +502,22 @@ def build_cart_nodes(
         }
 
     def capability_entry_node(state: ReasoningState) -> dict[str, object]:
-        """Prepare one typed reversible mutation; code owns target resolution and effect."""
+        """Prepare one typed Cart request; code owns live state and every effect boundary."""
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, ModifyCart):
-            raise TypeError("cart capability entry requires a modify-cart invocation")
+        if invocation is None or not isinstance(invocation.request, ModifyCart | PlaceOrder):
+            raise TypeError("cart capability entry requires a typed Cart invocation")
+        if isinstance(invocation.request, PlaceOrder):
+            if cart_store.is_empty():
+                return {
+                    "active_invocation": None,
+                    "active_flow": None,
+                    "pending_ack": _EMPTY_CART_CHECKOUT_LINE,
+                }
+            return {
+                "active_invocation": None,
+                "active_flow": "cart",
+                **_mint_placement(),
+            }
         request = invocation.request
         new_messages: list = []
 
@@ -798,7 +812,7 @@ def build_cart_nodes(
                 if cart_store.is_empty():
                     return {
                         "messages": new_messages,
-                        "pending_ack": "Your cart's empty - what would you like to add?",
+                        "pending_ack": _EMPTY_CART_CHECKOUT_LINE,
                     }
                 return {"messages": new_messages, **_mint_placement()}
 
