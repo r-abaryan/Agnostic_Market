@@ -64,6 +64,14 @@ from agnostic_market.agents.capabilities import (
 )
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
+from agnostic_market.agents.frontline.read_flow import (
+    CATALOG_ENTRY_NODE,
+    CATALOG_QUERY_CLARIFY_NODE,
+    CATALOG_QUERY_REJECT_NODE,
+    CATALOG_RESPONSE_NODE,
+    READ_FLOW_MODEL_SPEECH_NODES,
+    build_read_flow_nodes,
+)
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
@@ -81,7 +89,7 @@ from agnostic_market.agents.recovery import (
     validate_automation_state_clear,
 )
 from agnostic_market.agents.support import build_support_nodes
-from agnostic_market.agents.telemetry import write_event, write_typed_read_answered
+from agnostic_market.agents.telemetry import write_capability_answered, write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -107,6 +115,7 @@ from agnostic_market.dtos.orchestration import (
     PlaceOrder,
     RefundOrder,
     ReturnOrder,
+    SearchCatalog,
     SwitchAccount,
     VerifyIdentity,
     ViewCart,
@@ -152,8 +161,8 @@ class FrontlineGraphAssembly:
 
 # Graph topology is the source of truth for model-authored speech provenance. Identity,
 # Support, and Cart retain transactional execution/audit identity after their code-authored
-# clarification migrations, but only the frontline model may author model prose. Every node
-# named here invokes a model, so none may be caller-speakable (asserted at compile).
+# clarification migrations, but none may author model prose. Every node named here invokes a
+# model, so none may be caller-speakable (asserted at compile).
 TRANSACTIONAL_MODEL_NODES = frozenset(
     {
         "cart_assemble",
@@ -163,7 +172,10 @@ TRANSACTIONAL_MODEL_NODES = frozenset(
         "identity_assemble",
     }
 )
-MODEL_SPEECH_NODES = frozenset({"model"})
+_FRONTLINE_MODEL_SPEECH_NODES = frozenset({"model"})
+MODEL_SPEECH_NODES = _FRONTLINE_MODEL_SPEECH_NODES | READ_FLOW_MODEL_SPEECH_NODES
+# Frontline-owned code-speech subset, not the compiled production set. Cart, Support,
+# Identity, and read-flow bundles retain ownership of their names and graph assembly unions them.
 FRONTLINE_SPEAKABLE_NODES = frozenset(
     {
         "handover",
@@ -343,12 +355,6 @@ def build_frontline_graph(
     system_prompt = compose_system_prompt(display_name, policy)
     read_only_names = {t.name for t in read_only_tools}
 
-    def _last_user_text(state: ReasoningState) -> str:
-        for msg in reversed(state.messages):
-            if isinstance(msg, HumanMessage):
-                return str(msg.content)
-        return ""
-
     def gate_node(state: ReasoningState) -> dict[str, object]:
         """Deterministic pre-generation check. Trip -> set handover, skip the model.
 
@@ -359,7 +365,7 @@ def build_frontline_graph(
         about a purchase that was already done). The frontline model answers instead —
         safe by construction, it holds no write tools.
         """
-        hit = gate_check(_last_user_text(state))
+        hit = gate_check(state.last_user_text())
         if hit is None:
             return {}
         reason_code, destination = hit
@@ -376,13 +382,13 @@ def build_frontline_graph(
     def route_after_gate(state: ReasoningState) -> str:
         if state.handover is not None:
             return "handover"
-        scope = status_check(_last_user_text(state))
+        scope = status_check(state.last_user_text())
         if scope is not None:
             if _status_order_ids(state, scope):
                 return "forced_status"
             if scope == "list" and state.active_flow != "left_identity":
                 return "enumeration_gate"
-        if enumeration_check(_last_user_text(state)) and state.active_flow != "left_identity":
+        if enumeration_check(state.last_user_text()) and state.active_flow != "left_identity":
             return "enumeration_gate"
         return "model"
 
@@ -456,7 +462,7 @@ def build_frontline_graph(
                 return [focused]
             return []
 
-        current = _last_user_text(state)
+        current = state.last_user_text()
         bound = identity_store.current()
         if bound is not None and re.search(r"\b(?:all|orders|purchases)\b", current, re.I):
             return [candidate.order_id for candidate in store.owned_orders(bound.customer_ref)]
@@ -471,7 +477,7 @@ def build_frontline_graph(
 
     def forced_status_node(state: ReasoningState) -> dict[str, object]:
         """Answer a state-verification follow-up from live authorized store reads."""
-        scope = status_check(_last_user_text(state))
+        scope = status_check(state.last_user_text())
         assert scope is not None
         order_ids = _status_order_ids(state, scope)
         assert order_ids
@@ -479,7 +485,7 @@ def build_frontline_graph(
         line += f" {warm_close()}"
         write_event(
             {
-                "utterance": _last_user_text(state),
+                "utterance": state.last_user_text(),
                 "outcome": "answered",
                 "outcome_detail": "forced_status_read",
                 "order_count": len(order_ids),
@@ -490,7 +496,7 @@ def build_frontline_graph(
     def finalize_node(state: ReasoningState) -> dict[str, object]:
         """Telemetry sink for ANSWERED turns — the classifier dataset needs negatives
         (turns that did NOT escalate) just as much as the handover positives."""
-        write_event({"utterance": _last_user_text(state), "outcome": "answered"})
+        write_event({"utterance": state.last_user_text(), "outcome": "answered"})
         return {}
 
     def _render_ready(state: ReasoningState) -> tuple[str, dict] | None:
@@ -597,7 +603,7 @@ def build_frontline_graph(
         # tagged so the code-render count is measurable against the model-narration path.
         write_event(
             {
-                "utterance": _last_user_text(state),
+                "utterance": state.last_user_text(),
                 "outcome": "answered",
                 "outcome_detail": "code_render",
                 "tool": name,
@@ -616,7 +622,11 @@ def build_frontline_graph(
         ):
             raise TypeError("cart view render requires a view-cart invocation")
         line = _cart_view_line(f" {warm_close()}")
-        write_typed_read_answered(_last_user_text(state), CapabilityId.VIEW_CART.value)
+        write_capability_answered(
+            state.last_user_text(),
+            CapabilityId.VIEW_CART.value,
+            answer_source="code_authored_read",
+        )
         return {"active_invocation": None, "messages": [AIMessage(line)]}
 
     def identity_status_render_node(state: ReasoningState) -> dict[str, object]:
@@ -634,7 +644,11 @@ def build_frontline_graph(
         line = identity_status_line(verified=verified)
         if verified:
             line = f"{line} {warm_close()}"
-        write_typed_read_answered(_last_user_text(state), CapabilityId.VIEW_IDENTITY_STATUS.value)
+        write_capability_answered(
+            state.last_user_text(),
+            CapabilityId.VIEW_IDENTITY_STATUS.value,
+            answer_source="code_authored_read",
+        )
         return {"active_invocation": None, "messages": [AIMessage(line)]}
 
     def handover_node(state: ReasoningState) -> dict[str, object]:
@@ -662,7 +676,7 @@ def build_frontline_graph(
             if candidates is not None:
                 write_event(
                     {
-                        "utterance": _last_user_text(state),
+                        "utterance": state.last_user_text(),
                         "outcome": "answered",
                         "outcome_detail": "code_render",
                         "tool": "list_orders",
@@ -684,7 +698,7 @@ def build_frontline_graph(
             # Unbound with nothing placed this call: nothing to read -> verify (fall through).
         write_event(
             {
-                "utterance": _last_user_text(state),
+                "utterance": state.last_user_text(),
                 "outcome": "handover",
                 "gate_or_model": handover.source,
                 "destination": handover.destination,
@@ -816,7 +830,7 @@ def build_frontline_graph(
         (2026-07-09: a refund request while sticky in checkout was refused once and
         narrated-over once). Abandons the in-flight flow and hands the turn over; NOTHING
         is spoken here — the receiving flow owns the voice."""
-        text = _last_user_text(state)
+        text = state.last_user_text()
         hit = gate_check(text)
         if hit is not None:
             reason_code, destination = hit
@@ -876,7 +890,7 @@ def build_frontline_graph(
             return RECOVERY_NODE_NAME
         if state.active_invocation is not None and state.active_flow is None:
             return _CAPABILITY_DISPATCH_NODE
-        text = _last_user_text(state)
+        text = state.last_user_text()
         if state.active_flow == "cart":
             if wants_human(text):
                 return "cart_escape_human"
@@ -1055,11 +1069,18 @@ def build_frontline_graph(
         lifecycle.transition_principal,
         display_name=display_name,
     )
+    reads = build_read_flow_nodes(
+        chat_model,
+        store,
+        policy,
+        display_name=display_name,
+    )
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
     identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
     cart_entry = CapabilityEntry(_CART_CAPABILITY_ENTRY_NODE)
     cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
     identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
+    catalog_entry = CapabilityEntry(CATALOG_ENTRY_NODE)
     capability_registry = CapabilityRegistry(
         (
             CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
@@ -1081,6 +1102,7 @@ def build_frontline_graph(
             CapabilitySpec(CapabilityId.SWITCH_ACCOUNT, SwitchAccount, identity_entry),
             CapabilitySpec(CapabilityId.MODIFY_CART, ModifyCart, cart_entry),
             CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
+            CapabilitySpec(CapabilityId.SEARCH_CATALOG, SearchCatalog, catalog_entry),
         )
     )
 
@@ -1443,6 +1465,36 @@ def build_frontline_graph(
         identity_status_render_node,
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        CATALOG_ENTRY_NODE,
+        reads.catalog_entry,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(
+            CATALOG_RESPONSE_NODE,
+            CATALOG_QUERY_CLARIFY_NODE,
+            CATALOG_QUERY_REJECT_NODE,
+        ),
+    )
+    node_registry.register(
+        CATALOG_QUERY_CLARIFY_NODE,
+        reads.catalog_query_clarify,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        CATALOG_QUERY_REJECT_NODE,
+        reads.catalog_query_reject,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        CATALOG_RESPONSE_NODE,
+        reads.catalog_response,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(END,),
     )
     node_registry.register(
         "support_clarify",
@@ -1824,6 +1876,8 @@ def build_frontline_graph(
     graph.add_edge(_SUPPORT_CAPABILITY_RENDER_NODE, END)
     graph.add_edge(_CART_VIEW_RENDER_NODE, END)  # code-authored typed read ENDs, no model pass
     graph.add_edge(_IDENTITY_STATUS_RENDER_NODE, END)
+    graph.add_edge(CATALOG_QUERY_CLARIFY_NODE, END)
+    graph.add_edge(CATALOG_QUERY_REJECT_NODE, END)
     graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",
@@ -2013,8 +2067,11 @@ def build_frontline_graph(
         | cart.speakable_nodes
         | support.speakable_nodes
         | identity.speakable_nodes
+        | reads.speakable_nodes
     )
-    compiled.model_speech_nodes = MODEL_SPEECH_NODES  # type: ignore[attr-defined]
+    compiled.model_speech_nodes = (  # type: ignore[attr-defined]
+        _FRONTLINE_MODEL_SPEECH_NODES | reads.model_speech_nodes
+    )
     compiled.capability_registry = capability_registry  # type: ignore[attr-defined]
     compiled.node_recovery_policies = node_recovery_policies  # type: ignore[attr-defined]
     compiled.recovery_infrastructure_nodes = infrastructure_nodes  # type: ignore[attr-defined]

@@ -170,11 +170,20 @@ def test_summaries_never_carry_customer_linkage(config_root: Path) -> None:
 
 def test_catalog_search_matches_and_misses(config_root: Path) -> None:
     h = Harness(config_root)
-    assert "SKU-RED-42" in h.tools["catalog_search"].invoke({"query": "running"})
+    assert h.tools["catalog_search"].invoke({"query": "running"}) == (
+        "Matching items: trail running shoes (sku SKU-RED-42, $89.99)"
+    )
     miss = h.tools["catalog_search"].invoke({"query": "zzz-nothing"})
-    assert "No catalog items" in miss
+    assert miss == (
+        "No catalog items match 'zzz-nothing'. The catalog carries: "
+        "trail running shoes; waterproof rain jacket; merino hiking socks."
+    )
     # A miss steers the model to REAL items instead of invented categories.
     assert "rain jacket" in miss
+    assert h.tools["catalog_search"].invoke({"query": "   "}) == (
+        "No catalog items match '   '. The catalog carries: "
+        "trail running shoes; waterproof rain jacket; merino hiking socks."
+    )
 
 
 def test_view_cart_reads_the_session_cart(config_root: Path) -> None:

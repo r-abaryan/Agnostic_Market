@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -62,7 +62,7 @@ from agnostic_market.agents.support.prompt import (
     compose_support_capability_prompt,
     compose_support_prompt,
 )
-from agnostic_market.agents.telemetry import write_event, write_typed_read_answered
+from agnostic_market.agents.telemetry import write_capability_answered, write_event
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     order_mutation_allowed,
@@ -168,13 +168,6 @@ _PROFILE_VALUE_REQUIRED_ACK = "caller-stated profile value required"
 # bounded key, never the caller's free text (an attacker probing random ids must not grow
 # an unbounded dict of their own strings).
 _UNRESOLVED_ORDER = "<unresolved>"
-
-
-def _last_user_text(state: ReasoningState) -> str:
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            return str(msg.content)
-    return ""
 
 
 def _caller_stated_profile_value(utterance: str, field: ProfileField, value: str) -> bool:
@@ -624,7 +617,9 @@ def build_support_nodes(
         line = f"{render_order_list_line(orders, scope=request.scope)} {close}"
         # This node ENDs, bypassing the frontline's finalize sink, so the answered-turn record
         # is written here rather than there.
-        write_typed_read_answered(_last_user_text(state), request.kind.value)
+        write_capability_answered(
+            state.last_user_text(), request.kind.value, answer_source="code_authored_read"
+        )
         return {
             "active_invocation": None,
             "active_flow": None,
@@ -750,7 +745,7 @@ def build_support_nodes(
                 if was_focused:
                     return clarify("order")
                 stated_ref = caller_stated_order_id(
-                    _last_user_text(state), current.target.order_ref
+                    state.last_user_text(), current.target.order_ref
                 )
                 if stated_ref is None:
                     return clarify("order")
@@ -811,7 +806,7 @@ def build_support_nodes(
                     if current.amount_usd is None:
                         proposal = _ProvideRefundAmount.model_validate(call["args"])
                         amount_usd = _caller_stated_refund_amount(
-                            _last_user_text(state), proposal.amount_usd
+                            state.last_user_text(), proposal.amount_usd
                         )
                         if amount_usd is None:
                             return None
@@ -822,7 +817,7 @@ def build_support_nodes(
                         )
                     proposal = _ProvideRefundDestination.model_validate(call["args"])
                     destination = _caller_stated_refund_destination(
-                        _last_user_text(state), proposal.destination
+                        state.last_user_text(), proposal.destination
                     )
                     if destination is None:
                         return None
@@ -833,7 +828,7 @@ def build_support_nodes(
                     )
                 proposal = _ProposeProfileChange.model_validate(call["args"])
                 if proposal.field != current.field or not _caller_stated_profile_value(
-                    _last_user_text(state), proposal.field, proposal.new_value
+                    state.last_user_text(), proposal.field, proposal.new_value
                 ):
                     return None
                 return ChangeProfile(
@@ -938,7 +933,7 @@ def build_support_nodes(
                         if was_focused:
                             return clarify("order")
                         stated = tuple(
-                            caller_stated_order_id(_last_user_text(state), order_ref)
+                            caller_stated_order_id(state.last_user_text(), order_ref)
                             for order_ref in request.target.order_refs
                         )
                         if any(order_ref is None for order_ref in stated):
@@ -973,7 +968,7 @@ def build_support_nodes(
                 if was_focused:
                     return clarify("order")
                 stated_ref = caller_stated_order_id(
-                    _last_user_text(state), request.target.order_ref
+                    state.last_user_text(), request.target.order_ref
                 )
                 if stated_ref is None:
                     return clarify("order")
@@ -1018,7 +1013,7 @@ def build_support_nodes(
                 if was_focused:
                     return clarify("order")
                 stated_ref = caller_stated_order_id(
-                    _last_user_text(state), request.target.order_ref
+                    state.last_user_text(), request.target.order_ref
                 )
                 if stated_ref is None:
                     return clarify("order")
@@ -1390,7 +1385,7 @@ def build_support_nodes(
                 if verdict == _NEEDS_IDENTITY:
                     # Unbound caller: bind first, then resume this cancel (no pending minted).
                     stated_refs = tuple(
-                        caller_stated_order_id(_last_user_text(state), ref) for ref, _hit in unique
+                        caller_stated_order_id(state.last_user_text(), ref) for ref, _hit in unique
                     )
                     if any(ref is None for ref in stated_refs):
                         new_messages.append(
@@ -1439,7 +1434,7 @@ def build_support_nodes(
                 )
                 if verdict == _NEEDS_IDENTITY:
                     stated_ref = caller_stated_order_id(
-                        _last_user_text(state),
+                        state.last_user_text(),
                         chosen.order_id if chosen is not None else proposed.order_key,
                     )
                     if stated_ref is None:
@@ -1480,7 +1475,7 @@ def build_support_nodes(
                     messages = [prompt, *state.messages, *new_messages]
                     continue
                 if not _caller_stated_profile_value(
-                    _last_user_text(state), change.field, change.new_value
+                    state.last_user_text(), change.field, change.new_value
                 ):
                     new_messages.append(
                         ToolMessage(
@@ -1542,7 +1537,7 @@ def build_support_nodes(
                 )
                 if verdict == _NEEDS_IDENTITY:
                     stated_ref = caller_stated_order_id(
-                        _last_user_text(state),
+                        state.last_user_text(),
                         chosen.order_id if chosen is not None else proposal.order_key,
                     )
                     if stated_ref is None:
@@ -1560,10 +1555,10 @@ def build_support_nodes(
                         RefundOrder(
                             target=ExplicitOrderTarget(order_ref=stated_ref),
                             amount_usd=_caller_stated_refund_amount(
-                                _last_user_text(state), proposal.amount_usd
+                                state.last_user_text(), proposal.amount_usd
                             ),
                             destination=_caller_stated_refund_destination(
-                                _last_user_text(state), proposal.destination
+                                state.last_user_text(), proposal.destination
                             ),
                         ),
                     )

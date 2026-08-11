@@ -16,6 +16,7 @@ from agnostic_market.commerce.orders import (
     RefundError,
     ReturnError,
     load_orders_fixture,
+    lookup_catalog,
     match_named_items,
     number_candidates,
     resolve_candidates,
@@ -121,6 +122,30 @@ def test_match_named_items_preserves_ambiguity_for_the_caller_to_narrow() -> Non
     items = [_candidate("1", "trail running shoes"), _candidate("2", "trail hiking shoes")]
 
     assert match_named_items(items, "trail") == items
+
+
+@pytest.mark.parametrize(
+    ("query", "matched_names"),
+    (
+        ("running", ("trail running shoes",)),
+        ("  RUNNING  ", ("trail running shoes",)),
+        ("I want the trail running shoes", ()),
+        ("", ()),
+        ("   ", ()),
+        ("zzz-nothing", ()),
+    ),
+)
+def test_catalog_lookup_preserves_the_legacy_one_way_match_contract(
+    config_root: Path,
+    query: str,
+    matched_names: tuple[str, ...],
+) -> None:
+    fixture = load_orders_fixture(config_root, "acme_store")
+
+    result = lookup_catalog(fixture, query)
+
+    assert tuple(product.name for product in result.matches) == matched_names
+    assert result.available == tuple(fixture.products)
 
 
 def test_number_candidates_is_shared_by_catalog_and_live_cart_items() -> None:

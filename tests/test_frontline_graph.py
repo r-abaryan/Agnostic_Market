@@ -15,7 +15,7 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 
 from agnostic_market.agents.cart import flow as cart_flow
-from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.frontline import build_frontline_graph, read_flow
 from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
     RECOVERY_NODE_NAME,
@@ -32,6 +32,7 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
+    CatalogLookup,
     OrdersFixture,
     OrderStore,
     RecentOrderContext,
@@ -54,6 +55,7 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     PlaceOrder,
     ResolvedCartItemRef,
+    SearchCatalog,
     SwitchAccount,
     VerifyIdentity,
     ViewCart,
@@ -188,6 +190,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.SWITCH_ACCOUNT,
         CapabilityId.MODIFY_CART,
         CapabilityId.PLACE_ORDER,
+        CapabilityId.SEARCH_CATALOG,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
@@ -195,6 +198,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "identity_status_render",
         "identity_capability_entry",
         "cart_capability_entry",
+        "catalog_entry",
     )
     # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
     # dispatcher must still own no executable outgoing route.
@@ -206,11 +210,20 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     # while another is added, and it names nothing when it breaks.
     assert set(CapabilityId) - set(registry.capability_ids) == {
         CapabilityId.ANSWER_QUESTION,
-        CapabilityId.SEARCH_CATALOG,
         CapabilityId.VERIFY_ORDER_STATUS,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.REQUEST_PERSON,
     }
+    assert registry.resolve(SearchCatalog(query="shoes")).node_name == "catalog_entry"
+    assert graph.builder.nodes["catalog_entry"].ends == (
+        "catalog_response",
+        "catalog_query_clarify",
+        "catalog_query_reject",
+    )
+    assert graph.builder.nodes["catalog_response"].ends == (END,)
+    for command_node in ("catalog_entry", "catalog_response"):
+        assert not any(source == command_node for source, _target in graph.builder.edges)
+        assert command_node not in graph.builder.branches
 
 
 def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
@@ -1187,7 +1200,7 @@ def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
     assert _only_spoken(result) == "You're verified on this call."
 
 
-# --- 3B-b: the two pure code-authored read owners ------------------------------------
+# --- capability-dispatched answer owners ---------------------------------------------
 
 
 def _typed_read(graph, request: IntentRequest, *, turn_id: str, text: str) -> dict[str, object]:
@@ -1197,6 +1210,262 @@ def _typed_read(graph, request: IntentRequest, *, turn_id: str, text: str) -> di
             turn_id=turn_id,
             active_invocation=ActiveInvocation(request=request, opened_turn_id=turn_id),
         )
+    )
+
+
+def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_call(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lookup_queries: list[str] = []
+    real_lookup = read_flow.lookup_catalog
+
+    def observed_lookup(fixture: OrdersFixture, query: str) -> CatalogLookup:
+        lookup_queries.append(query)
+        return real_lookup(fixture, query)
+
+    monkeypatch.setattr(read_flow, "lookup_catalog", observed_lookup)
+    response_model = FakeChatModel(
+        emit_tool_calls=False,
+        text_response="We carry trail running shoes for $89.99.",
+        record_prompts=True,
+    )
+    graph = _graph(config_root, response_model)
+
+    result = _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="catalog-complete",
+        text="Tell me about running shoes.",
+    )
+
+    assert response_model.invoke_count == 1
+    assert lookup_queries == ["running"]
+    assert response_model.emitted_messages[-1].tool_calls == []
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "We carry trail running shoes for $89.99."
+    prompt = response_model._seen_prompts[-1]
+    assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
+    assert "waterproof rain jacket" not in prompt
+
+
+def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
+    config_root: Path,
+) -> None:
+    response_model = FakeChatModel(
+        emit_tool_calls=False,
+        text_response="No catalog name matched. The catalog contains trail running shoes.",
+        record_prompts=True,
+    )
+    graph = _graph(config_root, response_model)
+
+    result = _typed_read(
+        graph,
+        SearchCatalog(query="walking shoes"),
+        turn_id="catalog-no-match",
+        text="Do you have walking shoes?",
+    )
+
+    assert _only_spoken(result) == (
+        "No catalog name matched. The catalog contains trail running shoes."
+    )
+    prompt = response_model._seen_prompts[-1]
+    assert "do not claim they match the request" in prompt
+    assert "or are relevant alternatives" in prompt
+    assert "trail running shoes" in prompt
+    assert "waterproof rain jacket" in prompt
+
+
+def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False, text_response="We carry trail running shoes."),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage("Tell me about running shoes.", id="catalog-current"),
+                HumanMessage("unadmitted later history", id="catalog-later"),
+            ],
+            "consumed_turn_ids": ("catalog-current",),
+            "active_invocation": ActiveInvocation(
+                request=SearchCatalog(query="running"),
+                opened_turn_id="catalog-current",
+            ),
+        }
+    )
+
+    assert _only_spoken(result) == "We carry trail running shoes."
+    assert _answered_rows(tmp_path) == [
+        {
+            "utterance": "Tell me about running shoes.",
+            "outcome": "answered",
+            "outcome_detail": "capability_answer",
+            "capability": "search_catalog",
+            "answer_source": "grounded_model_response",
+        }
+    ]
+
+
+def test_catalog_owner_asks_once_then_fills_only_the_query_from_the_next_committed_turn(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    response_model = FakeChatModel(emit_tool_calls=False, text_response="We carry everyday socks.")
+    graph = _graph(config_root, response_model)
+    opening = _typed_read(
+        graph,
+        SearchCatalog(),
+        turn_id="catalog-opening",
+        text="What do you sell?",
+    )
+
+    assert _only_spoken(opening) == "What product would you like me to look for?"
+    assert _answered_rows(tmp_path) == []
+    retained = opening["active_invocation"]
+    assert retained is not None and retained.request == SearchCatalog()
+    continuation = graph.invoke(
+        _admitted_turn(
+            "everyday socks",
+            turn_id="catalog-followup",
+            active_invocation=retained,
+            consumed_turn_ids=("catalog-opening", "catalog-followup"),
+        )
+    )
+
+    assert response_model.invoke_count == 1
+    assert continuation["active_invocation"] is None
+    assert _only_spoken(continuation) == "We carry everyday socks."
+    assert _answered_rows(tmp_path) == [
+        {
+            "utterance": "everyday socks",
+            "outcome": "answered",
+            "outcome_detail": "capability_answer",
+            "capability": "search_catalog",
+            "answer_source": "grounded_model_response",
+        }
+    ]
+
+
+def test_catalog_owner_rejects_a_blank_followup_without_a_model_call(config_root: Path) -> None:
+    response_model = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, response_model)
+    invocation = ActiveInvocation(
+        request=SearchCatalog(),
+        opened_turn_id="catalog-opening",
+    )
+
+    result = graph.invoke(
+        _admitted_turn(
+            "   ",
+            turn_id="catalog-blank",
+            consumed_turn_ids=("catalog-opening", "catalog-blank"),
+            active_invocation=invocation,
+        )
+    )
+
+    assert response_model.invoke_count == 0
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "I didn't get a product to look for. What else can I help with?"
+
+
+@pytest.mark.parametrize("text_response", ("", "   "))
+def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_response(
+    config_root: Path,
+    tmp_path: Path,
+    text_response: str,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False, text_response=text_response),
+    )
+
+    result = _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="catalog-blank-model",
+        text="Tell me about running shoes.",
+    )
+
+    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert "hit a snag" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
+
+
+class _UnexpectedCatalogToolCall(FakeChatModel):
+    def _respond(self, messages: list, **kwargs: object) -> AIMessage:
+        self._invoke_count += 1
+        response = AIMessage(
+            content="I changed something.",
+            tool_calls=[
+                {
+                    "name": "invented_effect",
+                    "args": {},
+                    "id": "unexpected-call",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        self._emitted_messages.append(response)
+        return response
+
+
+def test_catalog_owner_rejects_an_unexpected_tool_call_before_speech_or_telemetry(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    graph = _graph(config_root, _UnexpectedCatalogToolCall())
+
+    result = _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="catalog-tool-call",
+        text="Tell me about running shoes.",
+    )
+
+    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert _only_spoken(result) != "I changed something."
+    assert _answered_rows(tmp_path) == []
+
+
+def test_catalog_owner_fails_closed_when_the_admitted_turn_has_no_matching_message(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    response_model = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, response_model)
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage("an older question", id="older")],
+            "consumed_turn_ids": ("older", "missing-current"),
+            "active_invocation": ActiveInvocation(
+                request=SearchCatalog(query="running"),
+                opened_turn_id="older",
+            ),
+        }
+    )
+
+    assert response_model.invoke_count == 0
+    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert "hit a snag" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
+
+
+def test_catalog_speech_authority_is_owned_by_the_response_and_code_question_nodes(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+
+    assert {"catalog_query_clarify", "catalog_query_reject"} <= graph.speakable_nodes
+    assert "catalog_response" in graph.model_speech_nodes
+    assert "catalog_response" not in graph.speakable_nodes
+    assert {"catalog_entry", "catalog_response"}.isdisjoint(
+        frontline_graph.TRANSACTIONAL_MODEL_NODES
     )
 
 
@@ -1347,7 +1616,9 @@ def _failed_nodes(tmp_path: Path) -> list[str]:
     return [str(row["node"]) for row in _rows(tmp_path) if row.get("event") == "turn_failed"]
 
 
-def test_every_typed_read_owner_records_an_answered_turn(config_root: Path, tmp_path: Path) -> None:
+def test_every_capability_answer_owner_records_one_answered_turn(
+    config_root: Path, tmp_path: Path
+) -> None:
     # These nodes END, bypassing finalize_node, so without their own record a typed read would
     # leave no negative in the classifier dataset. All THREE owners, because the parity is the
     # point: one missing call is invisible in any test that only asserts a row's absence.
@@ -1358,26 +1629,42 @@ def test_every_typed_read_owner_records_an_answered_turn(config_root: Path, tmp_
     _typed_read(graph, ViewCart(), turn_id="tel-cart", text="what's in my cart?")
     _typed_read(graph, ViewIdentityStatus(), turn_id="tel-id", text="am I verified?")
     _typed_read(graph, ListOrders(scope="session"), turn_id="tel-list", text="what have I ordered?")
+    _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="tel-catalog",
+        text="what running shoes do you have?",
+    )
 
     assert _answered_rows(tmp_path) == [
         {
             "utterance": "what's in my cart?",
             "outcome": "answered",
             # NOT "code_render": that slug is the tool-driven path's and carries a `tool` key.
-            "outcome_detail": "typed_read",
+            "outcome_detail": "capability_answer",
             "capability": "view_cart",
+            "answer_source": "code_authored_read",
         },
         {
             "utterance": "am I verified?",
             "outcome": "answered",
-            "outcome_detail": "typed_read",
+            "outcome_detail": "capability_answer",
             "capability": "view_identity_status",
+            "answer_source": "code_authored_read",
         },
         {
             "utterance": "what have I ordered?",
             "outcome": "answered",
-            "outcome_detail": "typed_read",
+            "outcome_detail": "capability_answer",
             "capability": "list_orders",
+            "answer_source": "code_authored_read",
+        },
+        {
+            "utterance": "what running shoes do you have?",
+            "outcome": "answered",
+            "outcome_detail": "capability_answer",
+            "capability": "search_catalog",
+            "answer_source": "grounded_model_response",
         },
     ]
     # No tool ran on any path, so claiming one would corrupt any tool-usage analysis.
@@ -1472,6 +1759,10 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "support_capability_render",
             "cart_view_render",
             "identity_status_render",
+            "catalog_entry",
+            "catalog_query_clarify",
+            "catalog_query_reject",
+            "catalog_response",
             "support_clarify",
             "support_guardrail",
             "support_risk_check",
@@ -1561,7 +1852,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 60
+    assert len(policies) == 64
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -1573,7 +1864,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 59
+    assert len(graph.recovery_handled_nodes) == 63
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

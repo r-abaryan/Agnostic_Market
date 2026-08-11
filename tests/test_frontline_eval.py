@@ -11,7 +11,13 @@ from support_helpers import authorize_fixture_orders, build_support_engine
 from agnostic_market.agents import telemetry
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.dtos.orchestration import CartItemQuery, ListOrders, ModifyCart, PlaceOrder
+from agnostic_market.dtos.orchestration import (
+    CartItemQuery,
+    ListOrders,
+    ModifyCart,
+    PlaceOrder,
+    SearchCatalog,
+)
 from agnostic_market.dtos.state import open_active_invocation
 from agnostic_market.llm.gateway import load_provider_credentials
 from scripts import frontline_eval
@@ -271,6 +277,71 @@ async def test_evaluator_executes_a_seeded_typed_cart_request_without_semantic_r
         runtime.caller_context.close_session()
 
 
+async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_speech(
+    config_root: Path,
+) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    routing = FakeChatModel(
+        emit_tool_calls=False,
+        text_response="We carry trail running shoes for $89.99.",
+    )
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    runtime = _build_eval_runtime(
+        config,
+        routing,
+        reasoning,
+        thread_id="eval-typed-catalog-execution-contract",
+    )
+    opening_turn_ids = ("eval-typed-catalog:opening",)
+    runtime.graph.update_state(
+        {"configurable": {"thread_id": runtime.engine.thread_id}},
+        {
+            "consumed_turn_ids": opening_turn_ids,
+            "active_invocation": open_active_invocation(
+                SearchCatalog(query="running"),
+                consumed_turn_ids=opening_turn_ids,
+            ),
+        },
+        as_node=runtime.graph.principal_seed_complete_node,
+    )
+
+    try:
+        observation = await _observe_scenario(
+            runtime.engine,
+            ("Tell me about running shoes.",),
+            scenario_key="eval-typed-catalog-execution-contract",
+            store=runtime.store,
+            profile_store=runtime.profile_store,
+            otp=runtime.otp,
+            verification=runtime.verification,
+            identity_store=runtime.identity_store,
+            model_call_count=lambda: _model_calls(routing, reasoning),
+        )
+
+        assert observation.final.audible == (
+            AudibleObservation(
+                kind="token",
+                text="We carry trail running shoes for $89.99.",
+                # TokenEvent does not carry graph-node provenance; the transport-failure
+                # scenario pins catalog_response attribution from turn_failed telemetry.
+                node=None,
+            ),
+        )
+        assert observation.final.admitted_user_messages == ("Tell me about running shoes.",)
+        assert observation.final.model_calls == 1
+        assert observation.final.effects == observation.before
+        assert observation.final.state == GraphObservation(
+            active_flow=None,
+            automation_channels=(),
+            handover_destination=None,
+            interrupted=False,
+            unfinished=False,
+            automation_terminal=False,
+        )
+    finally:
+        runtime.caller_context.close_session()
+
+
 async def test_evaluator_executes_seeded_typed_placement_without_semantic_routing(
     config_root: Path,
 ) -> None:
@@ -369,7 +440,12 @@ def test_transport_case_matrix_covers_every_owner_provider_and_fault_class() -> 
     providers = ("anthropic", "openai")
     offline = _transport_case_matrix(tier="offline", providers=providers)
     live = _transport_case_matrix(tier="live", providers=providers)
+    scenario_ids = tuple(
+        scenario.scenario_id for scenario in frontline_eval._TRANSPORT_OWNER_SCENARIOS
+    )
 
+    assert all(scenario_id.strip() for scenario_id in scenario_ids)
+    assert len(scenario_ids) == len(set(scenario_ids))
     assert {scenario.owner for scenario, _provider, _kind in offline} == {
         "frontline",
         "cart",
@@ -381,10 +457,28 @@ def test_transport_case_matrix_covers_every_owner_provider_and_fault_class() -> 
         FaultKind.PRE_RESPONSE_DISCONNECT,
         FaultKind.INTERRUPTED_BODY,
     }
-    assert [(scenario.owner, provider, kind) for scenario, provider, kind in live] == [
-        ("frontline", "anthropic", FaultKind.PRE_RESPONSE_DISCONNECT),
-        ("frontline", "openai", FaultKind.PRE_RESPONSE_DISCONNECT),
+    assert {(provider, kind) for _scenario, provider, kind in offline} == {
+        (provider, kind)
+        for provider in providers
+        for kind in (FaultKind.PRE_RESPONSE_DISCONNECT, FaultKind.INTERRUPTED_BODY)
+    }
+    assert {
+        (scenario.scenario_id, scenario.origin_node, kind) for scenario, _provider, kind in offline
+    } >= {
+        ("frontline_browse", "model", FaultKind.PRE_RESPONSE_DISCONNECT),
+        ("cart_checkout", "cart_assemble", FaultKind.INTERRUPTED_BODY),
+        ("catalog_grounded_response", "catalog_response", FaultKind.PRE_RESPONSE_DISCONNECT),
+    }
+    assert [(scenario.scenario_id, provider, kind) for scenario, provider, kind in live] == [
+        ("frontline_browse", "anthropic", FaultKind.PRE_RESPONSE_DISCONNECT),
+        ("frontline_browse", "openai", FaultKind.PRE_RESPONSE_DISCONNECT),
     ]
+    catalog = next(
+        scenario
+        for scenario, _provider, _kind in offline
+        if scenario.scenario_id == "catalog_grounded_response"
+    )
+    assert catalog.initial_request == SearchCatalog(query="trail shoes")
 
 
 async def test_offline_transport_cases_reach_and_recover_every_real_model_owner(
@@ -437,6 +531,7 @@ def test_live_transport_scorer_requires_a_successful_upstream_retry(
     expected_failures: tuple[str, ...],
 ) -> None:
     scenario = TransportOwnerScenario(
+        scenario_id="frontline_browse",
         owner="frontline",
         origin_node="model",
         utterance="Tell me about trail shoes.",

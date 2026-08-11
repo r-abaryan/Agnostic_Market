@@ -9,6 +9,7 @@ to read and iterate as it grows. STRICTLY DISJOINT from the T1 eval set (leakage
 from __future__ import annotations
 
 from agnostic_market.agents._shared_prompt import compose_shared_context
+from agnostic_market.commerce.orders import CatalogLookup
 from agnostic_market.dtos.state import PolicyContext
 
 _INSTRUCTIONS = (
@@ -160,3 +161,38 @@ def compose_system_prompt(display_name: str, policy: PolicyContext) -> str:
     for utterance, decision in _FEW_SHOT:
         lines.append(f'- Caller: "{utterance}" -> {decision}')
     return "\n".join(lines)
+
+
+def compose_catalog_response_prompt(
+    display_name: str,
+    policy: PolicyContext,
+    result: CatalogLookup,
+) -> str:
+    """Bound a product answer to one current catalog lookup and the shared merchant context."""
+
+    if result.matches:
+        catalog_facts = "\n".join(
+            f"- {product.name}; SKU {product.sku}; price ${product.price_usd:.2f}"
+            for product in result.matches
+        )
+        lookup_instruction = "Answer using only the matching catalog facts below."
+    else:
+        catalog_facts = "\n".join(f"- {product.name}" for product in result.available)
+        lookup_instruction = (
+            "Say that no catalog name matched the request. You may mention names from the bounded "
+            "catalog list below, but do not claim they match the request, share requested "
+            "attributes, or are relevant alternatives."
+        )
+    return "\n".join(
+        (
+            compose_shared_context(display_name, policy),
+            "",
+            "You are the product-catalog response owner. This is a read-only answer.",
+            lookup_instruction,
+            "Do not invent products, prices, SKUs, stock, shipping, or availability.",
+            "Keep the spoken answer to one or two short sentences.",
+            "",
+            "Live catalog result:",
+            catalog_facts,
+        )
+    )

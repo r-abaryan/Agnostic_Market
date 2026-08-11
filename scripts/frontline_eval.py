@@ -52,6 +52,7 @@ from agnostic_market.agents.frontline import (
     TRANSACTIONAL_MODEL_NODES,
     build_frontline_graph,
 )
+from agnostic_market.agents.frontline.read_flow import CATALOG_RESPONSE_NODE
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
@@ -90,6 +91,8 @@ from agnostic_market.dtos.events import (
     TurnFacts,
 )
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
+from agnostic_market.dtos.orchestration import IntentRequest, SearchCatalog
+from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.llm.providers import load_conformance_targets
 from agnostic_market.secrets.base import SecretResolver
@@ -212,9 +215,13 @@ class EvalRuntime:
 
 @dataclass(frozen=True)
 class TransportOwnerScenario:
+    scenario_id: str
     owner: Literal["frontline", "cart", "identity", "support"]
     origin_node: str
     utterance: str
+    initial_request: IntentRequest | None = None
+    offline_faults: tuple[FaultKind, ...] = (FaultKind.PRE_RESPONSE_DISCONNECT,)
+    live_faults: tuple[FaultKind, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -489,17 +496,26 @@ def _speech_authority_failures() -> tuple[str, ...]:
         if list(orphan_speech.flush()):
             failures.append(f"orphaned transactional model text reached caller speech: {node!r}")
 
-    # Positive controls keep the gate honest: an approved frontline model answer and a
-    # code-owned line must remain audible while unknown and missing provenance fail closed.
-    model_control = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
-    if not isinstance(
-        model_control.feed(
-            AIMessage(content="approved model control", id="eval-model"),
-            {"langgraph_node": "model"},
-        ),
-        TokenEvent,
-    ):
-        failures.append("approved frontline model text was not caller-speakable")
+    # Positive controls keep the gate honest: every approved model source and one code-owned
+    # line remain audible while unknown and missing provenance fail closed.
+    for node in sorted(MODEL_SPEECH_NODES):
+        model_control = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
+        if not isinstance(
+            model_control.feed(
+                AIMessage(content="approved model control", id=f"eval-approved-{node}"),
+                {"langgraph_node": node},
+            ),
+            TokenEvent,
+        ):
+            failures.append(f"approved model text was not caller-speakable: {node!r}")
+
+        orphan_control = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
+        orphan_control.feed(
+            AIMessageChunk(content="approved orphan control", id=f"orphan-approved-{node}"),
+            {"langgraph_node": node},
+        )
+        if len(list(orphan_control.flush())) != 1:
+            failures.append(f"approved orphaned model text was not caller-speakable: {node!r}")
 
     code_node = "read_render"
     code_control = _TurnSpeech(FRONTLINE_SPEAKABLE_NODES, MODEL_SPEECH_NODES)
@@ -544,24 +560,38 @@ def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
 
 _TRANSPORT_OWNER_SCENARIOS = (
     TransportOwnerScenario(
+        scenario_id="frontline_browse",
         owner="frontline",
         origin_node="model",
         utterance="Tell me about trail shoes.",
+        offline_faults=(FaultKind.PRE_RESPONSE_DISCONNECT, FaultKind.INTERRUPTED_BODY),
+        live_faults=(FaultKind.PRE_RESPONSE_DISCONNECT,),
     ),
     TransportOwnerScenario(
+        scenario_id="cart_checkout",
         owner="cart",
         origin_node="cart_assemble",
         utterance="Checkout now please.",
+        offline_faults=(FaultKind.PRE_RESPONSE_DISCONNECT, FaultKind.INTERRUPTED_BODY),
     ),
     TransportOwnerScenario(
+        scenario_id="identity_account_orders",
         owner="identity",
         origin_node="identity_assemble",
         utterance="What orders are on my account?",
     ),
     TransportOwnerScenario(
+        scenario_id="support_cancel",
         owner="support",
         origin_node="support_assemble",
         utterance="Cancel order ORD-1002.",
+    ),
+    TransportOwnerScenario(
+        scenario_id="catalog_grounded_response",
+        owner="frontline",
+        origin_node=CATALOG_RESPONSE_NODE,
+        utterance="Tell me about trail shoes.",
+        initial_request=SearchCatalog(query="trail shoes"),
     ),
 )
 _EMPTY_RECOVERY_STATE = GraphObservation(
@@ -599,25 +629,55 @@ def _transport_case_matrix(
 ) -> tuple[tuple[TransportOwnerScenario, str, FaultKind], ...]:
     if not providers:
         raise RuntimeError("transport certification has no configured providers")
-    if tier == "live":
-        frontline = _TRANSPORT_OWNER_SCENARIOS[0]
-        return tuple(
-            (frontline, provider, FaultKind.PRE_RESPONSE_DISCONNECT) for provider in providers
-        )
-
-    cases = [
-        (scenario, providers[index % len(providers)], FaultKind.PRE_RESPONSE_DISCONNECT)
-        for index, scenario in enumerate(_TRANSPORT_OWNER_SCENARIOS)
-    ]
-    cases.extend(
-        (
-            _TRANSPORT_OWNER_SCENARIOS[index],
-            providers[index % len(providers)],
-            FaultKind.INTERRUPTED_BODY,
-        )
-        for index in (0, 1)
-    )
+    cases: list[tuple[TransportOwnerScenario, str, FaultKind]] = []
+    provider_offsets: dict[FaultKind, int] = {}
+    for scenario in _TRANSPORT_OWNER_SCENARIOS:
+        fault_kinds = scenario.live_faults if tier == "live" else scenario.offline_faults
+        if tier == "live":
+            cases.extend(
+                (scenario, provider, fault_kind)
+                for fault_kind in fault_kinds
+                for provider in providers
+            )
+            continue
+        for fault_kind in fault_kinds:
+            provider_offset = provider_offsets.get(fault_kind, 0)
+            provider = providers[provider_offset % len(providers)]
+            provider_offsets[fault_kind] = provider_offset + 1
+            cases.append((scenario, provider, fault_kind))
     return tuple(cases)
+
+
+def _seed_transport_request(runtime: EvalRuntime, scenario: TransportOwnerScenario) -> None:
+    if scenario.initial_request is None:
+        return
+    opening_turn_ids = (f"transport:{scenario.scenario_id}:opening",)
+    config = {"configurable": {"thread_id": runtime.engine.thread_id}}
+    runtime.graph.update_state(
+        config,
+        {
+            "consumed_turn_ids": opening_turn_ids,
+            "active_invocation": open_active_invocation(
+                scenario.initial_request,
+                consumed_turn_ids=opening_turn_ids,
+            ),
+        },
+        # Seed as a completed bootstrap node so the observed utterance enters as a real fresh
+        # HumanMessage. START seeding creates a principal-continuation task that intentionally
+        # consumes the next message id without appending caller text.
+        as_node=runtime.graph.principal_seed_complete_node,
+    )
+    snapshot = runtime.graph.get_state(config)
+    state = ReasoningState.model_validate(snapshot.values)
+    if (
+        snapshot.next
+        or snapshot.interrupts
+        or state.messages
+        or state.consumed_turn_ids != opening_turn_ids
+        or state.active_invocation is None
+        or state.active_invocation.request != scenario.initial_request
+    ):
+        raise RuntimeError("transport initial request did not seed as a completed checkpoint")
 
 
 def _read_telemetry(path: Path) -> tuple[dict[str, object], ...]:
@@ -715,7 +775,7 @@ def _failed_transport_case(
         record for record in _read_telemetry(telemetry_path) if record.get("event") == "turn_failed"
     )
     return TransportCaseResult(
-        case_id=f"{tier}:{provider}:{scenario.owner}:{fault_kind}",
+        case_id=f"{tier}:{provider}:{scenario.scenario_id}:{fault_kind}",
         tier=tier,
         provider=provider,
         model=target.model,
@@ -776,11 +836,12 @@ async def _run_transport_case(
                     model,
                     thread_id=f"transport-{uuid.uuid4().hex}",
                 )
+                _seed_transport_request(runtime, scenario)
                 observation = await asyncio.wait_for(
                     _observe_scenario(
                         runtime.engine,
                         (scenario.utterance,),
-                        scenario_key=f"transport-{tier}-{provider}-{scenario.owner}",
+                        scenario_key=f"transport-{tier}-{provider}-{scenario.scenario_id}",
                         store=runtime.store,
                         profile_store=runtime.profile_store,
                         otp=runtime.otp,
@@ -815,7 +876,7 @@ async def _run_transport_case(
             )
             final = observation.final
             return TransportCaseResult(
-                case_id=f"{tier}:{provider}:{scenario.owner}:{fault_kind}",
+                case_id=f"{tier}:{provider}:{scenario.scenario_id}:{fault_kind}",
                 tier=tier,
                 provider=provider,
                 model=target.model,

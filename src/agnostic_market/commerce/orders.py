@@ -293,7 +293,7 @@ class _OrderEntry(BaseModel):
         return self
 
 
-class _ProductEntry(BaseModel):
+class CatalogProduct(BaseModel):
     model_config = _STRICT
 
     sku: str = Field(min_length=1)
@@ -307,7 +307,7 @@ class OrdersFixture(BaseModel):
     model_config = _STRICT
 
     orders: dict[str, _OrderEntry]
-    products: list[_ProductEntry] = Field(min_length=1)
+    products: list[CatalogProduct] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _product_skus_are_unique(self) -> OrdersFixture:
@@ -582,6 +582,23 @@ def match_named_items[T: _NamedItem](items: Sequence[T], query: str) -> list[T]:
         for item in items
         if needle and (needle in item.name.lower() or item.name.lower() in needle)
     ]
+
+
+@dataclass(frozen=True)
+class CatalogLookup:
+    """One bounded catalog read: exact matches plus the fallback products callers may mention."""
+
+    matches: tuple[CatalogProduct, ...]
+    available: tuple[CatalogProduct, ...]
+
+
+def lookup_catalog(fixture: OrdersFixture, query: str) -> CatalogLookup:
+    """Preserve the legacy read tool's one-way, case-insensitive name containment."""
+
+    needle = query.strip().lower()
+    products = tuple(fixture.products)
+    matches = tuple(product for product in products if needle and needle in product.name.lower())
+    return CatalogLookup(matches=matches, available=products)
 
 
 def number_candidates(items: Sequence[_CandidateItem]) -> list[Candidate]:

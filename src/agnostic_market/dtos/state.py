@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, HumanMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -484,6 +484,29 @@ class ReasoningState(BaseModel):
     # Engagement-scoped liveness tracker. Entry preserves it while the same sticky flow
     # continues; real progress and every lifecycle exit clear it.
     clarification_progress: ClarificationProgress | None = None
+
+    def last_user_text(self) -> str:
+        """Return the latest stored caller text, preserving the legacy flow lookup contract."""
+
+        for message in reversed(self.messages):
+            if isinstance(message, HumanMessage):
+                return str(message.content)
+        return ""
+
+    def current_committed_user_message(self) -> HumanMessage | None:
+        """Return only the HumanMessage admitted as the current engine turn."""
+
+        if not self.consumed_turn_ids:
+            return None
+        turn_id = self.consumed_turn_ids[-1]
+        return next(
+            (
+                message
+                for message in reversed(self.messages)
+                if isinstance(message, HumanMessage) and message.id == turn_id
+            ),
+            None,
+        )
 
     @field_validator("consumed_turn_ids")
     @classmethod
