@@ -2,6 +2,7 @@
 
 Run: uv run python scripts/frontline_eval.py
 Structural gate only: uv run python scripts/frontline_eval.py --preflight-only
+Order-target semantic corpus: uv run python scripts/frontline_eval.py --order-target-eval
 Offline 6E gate: uv run python scripts/frontline_eval.py --recovery-certification offline
 Live retry gate: uv run python scripts/frontline_eval.py --recovery-certification live
 The routing eval needs the merchant model credentials; the live recovery tier needs every
@@ -39,10 +40,17 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph.state import CompiledStateGraph
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.capabilities import CapabilityRegistry
@@ -97,7 +105,12 @@ from agnostic_market.dtos.events import (
     TurnFacts,
 )
 from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutputMethod
-from agnostic_market.dtos.orchestration import AnswerQuestion, IntentRequest, SearchCatalog
+from agnostic_market.dtos.orchestration import (
+    AnswerQuestion,
+    IntentRequest,
+    OrderTargetProposal,
+    SearchCatalog,
+)
 from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.llm.providers import load_conformance_targets
@@ -130,6 +143,8 @@ _EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_t1.yaml"
 _SAFETY_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_safety.yaml"
 _READ_OWNER_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_read_owners.yaml"
 _READ_OWNER_EVAL_SCHEMA_VERSION = "1"
+_ORDER_TARGET_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_order_targets.yaml"
+_ORDER_TARGET_EVAL_SCHEMA_VERSION = "1"
 _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
 _TRANSPORT_REPORT_PATHS = {
@@ -196,6 +211,49 @@ class ReadOwnerEvalCorpus(BaseModel):
         if not ids or len(ids) != len(set(ids)):
             raise ValueError("read-owner eval requires non-empty unique case ids")
         return self
+
+
+class OrderTargetEvalCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: str
+    utterance: str
+    expected_relationship: Literal["single", "plural", "alternative", "ambiguous"]
+    expected_order_refs: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _expected_proposal_is_valid(self) -> OrderTargetEvalCase:
+        if not self.case_id.strip() or not self.utterance.strip():
+            raise ValueError("order-target eval text fields must be non-empty")
+        OrderTargetProposal(
+            relationship=self.expected_relationship,
+            order_refs=self.expected_order_refs,
+        )
+        return self
+
+
+class OrderTargetEvalCorpus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str
+    cases: tuple[OrderTargetEvalCase, ...]
+
+    @model_validator(mode="after")
+    def _case_ids_are_unique(self) -> OrderTargetEvalCorpus:
+        if self.schema_version != _ORDER_TARGET_EVAL_SCHEMA_VERSION:
+            raise ValueError("unsupported order-target eval schema version")
+        ids = [case.case_id for case in self.cases]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("order-target eval requires non-empty unique case ids")
+        return self
+
+
+@dataclass(frozen=True)
+class _RoutingEvalSelection:
+    config: MerchantConfig
+    gateway: LLMGateway
+    chat_model: BaseChatModel
+    structured_output_method: StructuredOutputMethod
 
 
 @dataclass(frozen=True)
@@ -614,6 +672,109 @@ def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
 
 def _load_read_owner_corpus(path: Path = _READ_OWNER_EVAL_PATH) -> ReadOwnerEvalCorpus:
     return ReadOwnerEvalCorpus.model_validate(load_yaml_layer(path))
+
+
+def _load_order_target_corpus(path: Path = _ORDER_TARGET_EVAL_PATH) -> OrderTargetEvalCorpus:
+    return OrderTargetEvalCorpus.model_validate(load_yaml_layer(path))
+
+
+def _load_routing_eval_selection() -> _RoutingEvalSelection:
+    load_dotenv()
+    credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
+    config = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID).config
+    gateway = LLMGateway(credentials, EnvSecretResolver())
+    return _RoutingEvalSelection(
+        config=config,
+        gateway=gateway,
+        chat_model=gateway.chat_model(config.llm.routing),
+        structured_output_method=gateway.structured_output_method(config.llm.routing),
+    )
+
+
+_ORDER_TARGET_EVAL_PROMPT = """Classify only the order references stated in the caller's message.
+Return single for one intended order, plural for multiple intended orders, alternative when the
+caller presents choices, and ambiguous when a reference is merely quoted or disclaimed, or when
+fragmentary, conflicting, or unresolved wording does not establish an executable target. A clear
+correction keeps only the corrected-to reference. Preserve every observed order reference on
+non-single arms; do not select
+one alternative or infer an order from conversational context. Normalize a clear labelled numeric
+reference to ORD-<digits>."""
+
+
+def _score_order_target_output(
+    case: OrderTargetEvalCase,
+    proposal: OrderTargetProposal,
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    if proposal.relationship != case.expected_relationship:
+        failures.append(f"expected {case.expected_relationship}, got {proposal.relationship}")
+    expected_refs = tuple(ref.casefold() for ref in case.expected_order_refs)
+    actual_refs = tuple(ref.casefold() for ref in proposal.order_refs)
+    if actual_refs != expected_refs:
+        failures.append(f"expected refs {expected_refs!r}, got {actual_refs!r}")
+    return tuple(failures)
+
+
+async def _run_order_target_cases(
+    chat_model: BaseChatModel,
+    structured_output_method: StructuredOutputMethod,
+    corpus: OrderTargetEvalCorpus,
+) -> dict[str, tuple[str, ...]]:
+    structured = chat_model.with_structured_output(
+        OrderTargetProposal,
+        method=structured_output_method,
+    )
+    failures: dict[str, tuple[str, ...]] = {}
+    for case in corpus.cases:
+        try:
+            result = await structured.ainvoke(
+                [SystemMessage(_ORDER_TARGET_EVAL_PROMPT), HumanMessage(case.utterance)]
+            )
+        except (OutputParserException, ValidationError) as exc:
+            failures[case.case_id] = (f"output failed schema ({type(exc).__name__})",)
+            continue
+        if not isinstance(result, OrderTargetProposal):
+            failures[case.case_id] = (f"expected OrderTargetProposal, got {type(result).__name__}",)
+            continue
+        case_failures = _score_order_target_output(case, result)
+        if case_failures:
+            failures[case.case_id] = case_failures
+    return failures
+
+
+async def _evaluate_order_targets(
+    chat_model: BaseChatModel,
+    structured_output_method: StructuredOutputMethod,
+) -> dict[str, tuple[str, ...]]:
+    corpus = _load_order_target_corpus()
+    failures = await _run_order_target_cases(
+        chat_model,
+        structured_output_method,
+        corpus,
+    )
+    print(
+        f"[order_targets] semantic cases: {len(corpus.cases) - len(failures)}/{len(corpus.cases)}"
+    )
+    for case_id, case_failures in failures.items():
+        for failure in case_failures:
+            print(f"    {case_id}: {failure}")
+    return failures
+
+
+async def _run_order_target_eval() -> int:
+    selection = _load_routing_eval_selection()
+    failures = await _evaluate_order_targets(
+        selection.chat_model,
+        selection.structured_output_method,
+    )
+    if failures:
+        print("\nFRONTLINE ORDER-TARGET EVAL FAILED. [FAIL]")
+        return 1
+    print("\nFRONTLINE ORDER-TARGET EVAL PASSED. [SEMANTIC-QUALITY PASS]")
+    print(
+        "Coverage limit: text-only structured extraction; no graph, authorization, effect, or STT."
+    )
+    return 0
 
 
 def _score_read_owner_output(
@@ -1179,22 +1340,18 @@ async def _run(*, preflight_only: bool = False) -> int:
     if preflight_only:
         return 0
 
-    load_dotenv()
     # Eval runs must not pollute the LIVE telemetry dataset (classifier data): redirect
     # this process's sink to a sibling eval file (same local-only, gitignored dir).
     telemetry._TELEMETRY_PATH = telemetry._TELEMETRY_PATH.with_name("frontline_eval.jsonl")
-    secrets = EnvSecretResolver()
-    credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
-    resolved = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID)
-    gateway = LLMGateway(credentials, secrets)
-    chat_model = gateway.chat_model(resolved.config.llm.routing)
-    config = resolved.config
+    selection = _load_routing_eval_selection()
+    config = selection.config
+    chat_model = selection.chat_model
     runtime = _build_eval_runtime(
         config,
         chat_model,
-        gateway.chat_model(config.llm.reasoning),
+        selection.gateway.chat_model(config.llm.reasoning),
         thread_id=f"frontline-eval-{uuid.uuid4().hex}",
-        structured_output_method=gateway.structured_output_method(config.llm.routing),
+        structured_output_method=selection.structured_output_method,
     )
     graph = runtime.graph
     data = load_yaml_layer(_EVAL_PATH)
@@ -1245,6 +1402,11 @@ async def _run(*, preflight_only: bool = False) -> int:
         for failure in failures:
             print(f"    {case_id}: {failure}")
 
+    order_target_failures = await _evaluate_order_targets(
+        chat_model,
+        selection.structured_output_method,
+    )
+
     if recall < _RECALL_BAR:
         print(
             f"\nT1 ROUTING EVAL FAILED - escalation recall {recall:.0%} < {_RECALL_BAR:.0%}. [FAIL]"
@@ -1252,6 +1414,9 @@ async def _run(*, preflight_only: bool = False) -> int:
         return 1
     if read_owner_failures:
         print("\nFRONTLINE READ-OWNER EVAL FAILED. [FAIL]")
+        return 1
+    if order_target_failures:
+        print("\nFRONTLINE ORDER-TARGET EVAL FAILED. [FAIL]")
         return 1
     print(
         f"\nT1 ROUTING eval passed: escalation recall {recall:.0%} "
@@ -1264,10 +1429,16 @@ async def _run(*, preflight_only: bool = False) -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--preflight-only", action="store_true")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--preflight-only", action="store_true")
+    mode.add_argument(
+        "--order-target-eval",
+        action="store_true",
+        help="run the text-only credentialed order-target semantic corpus",
+    )
+    mode.add_argument(
         "--recovery-certification",
         choices=("offline", "live"),
         help=(
@@ -1300,13 +1471,20 @@ if __name__ == "__main__":
         type=float,
         default=_TRANSPORT_SCENARIO_TIMEOUT_SECONDS,
     )
-    args = parser.parse_args()
-    if args.preflight_only and args.recovery_certification is not None:
-        parser.error("--preflight-only cannot be combined with --recovery-certification")
-    if args.recovery_certification is None:
-        exit_code = asyncio.run(_run(preflight_only=args.preflight_only))
-    else:
-        exit_code = asyncio.run(
+    args = parser.parse_args(argv)
+    custom_transport_options = (
+        args.transport_report is not None
+        or args.transport_request_ceiling != _TRANSPORT_REQUEST_CEILING
+        or args.transport_fault_window_seconds != _TRANSPORT_FAULT_WINDOW_SECONDS
+        or args.transport_upstream_timeout_seconds != _TRANSPORT_UPSTREAM_TIMEOUT_SECONDS
+        or args.transport_scenario_timeout_seconds != _TRANSPORT_SCENARIO_TIMEOUT_SECONDS
+    )
+    if args.recovery_certification is None and custom_transport_options:
+        parser.error("transport options require --recovery-certification")
+    if args.order_target_eval:
+        return asyncio.run(_run_order_target_eval())
+    if args.recovery_certification is not None:
+        return asyncio.run(
             _run_transport_certification(
                 tier=args.recovery_certification,
                 report_path=(
@@ -1318,4 +1496,8 @@ if __name__ == "__main__":
                 scenario_timeout_seconds=args.transport_scenario_timeout_seconds,
             )
         )
-    sys.exit(exit_code)
+    return asyncio.run(_run(preflight_only=args.preflight_only))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

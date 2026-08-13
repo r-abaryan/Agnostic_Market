@@ -1,0 +1,61 @@
+schema_version: "1"
+cases:
+  - case_id: numeric_label
+    utterance: "Order 1002."
+    expected_relationship: single
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: letter_spelled_label
+    utterance: "O R D one zero zero two."
+    expected_relationship: single
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: fused_label
+    utterance: "ord1002"
+    expected_relationship: single
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: cardinal_number
+    utterance: "Order one thousand two."
+    expected_relationship: single
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: plural_set
+    utterance: "ORD-1001 and ORD-1002."
+    expected_relationship: plural
+    expected_order_refs: ["ORD-1001", "ORD-1002"]
+
+  - case_id: quoted_example
+    utterance: "They mentioned ORD-1002 as an example, not as my order."
+    expected_relationship: ambiguous
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: quoted_intended_reference
+    utterance: "My order number is 'ORD-1002'."
+    expected_relationship: single
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: corrected_reference
+    utterance: "ORD-1001, sorry, I mean ORD-1002."
+    expected_relationship: single
+    expected_order_refs: ["ORD-1002"]
+
+  - case_id: alternative_set
+    utterance: "Either ORD-1001 or ORD-1002."
+    expected_relationship: alternative
+    expected_order_refs: ["ORD-1001", "ORD-1002"]
+
+  - case_id: conflicting_unresolved
+    utterance: "It might be ORD-1001; no, maybe ORD-1002. I am not sure."
+    expected_relationship: ambiguous
+    expected_order_refs: ["ORD-1001", "ORD-1002"]
+
+  - case_id: false_eou_fragment
+    utterance: "02"
+    expected_relationship: ambiguous
+    expected_order_refs: ["02"]
+
+  - case_id: contextual_only
+    utterance: "That one."
+    expected_relationship: ambiguous
+    expected_order_refs: []

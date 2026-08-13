@@ -22,6 +22,7 @@ routing will consume.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -47,10 +48,13 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     CancelOrders,
     CapabilityId,
+    OrderTargetProposal,
     RouteDecision,
 )
 
-# Bump when checks are added/changed — outstanding reports then fail closed (re-certify).
+# After the first report for this suite version is accepted, bump when checks or
+# transmitted schemas change so accepted reports fail closed. Before that, the version
+# is unreleased and its checks may still be completed without a meaningless bump.
 SUITE_VERSION = "3"
 
 # Prompts name the required tool explicitly: the check verifies protocol conformance
@@ -103,6 +107,24 @@ def _accepts_answer(decision: str) -> Callable[[BaseModel], bool]:
     )
 
 
+def _accepts_order_target(expected: OrderTargetProposal) -> Callable[[BaseModel], bool]:
+    return lambda result: (
+        isinstance(result, OrderTargetProposal)
+        and result.relationship == expected.relationship
+        and Counter(result.order_refs) == Counter(expected.order_refs)
+    )
+
+
+def _order_target_case(expected: OrderTargetProposal) -> _StructuredOutputCase:
+    return _StructuredOutputCase(
+        f"order_target_{expected.relationship}",
+        OrderTargetProposal,
+        "Return this structured target proposal; order_refs array order is insignificant: "
+        f"{expected.model_dump_json()}.",
+        _accepts_order_target(expected),
+    )
+
+
 _STRUCTURED_OUTPUT_CASES = (
     _StructuredOutputCase("route_direct", RouteDecision, _STRUCTURED_PROMPT, _accepts_route),
     _StructuredOutputCase(
@@ -122,6 +144,24 @@ _STRUCTURED_OUTPUT_CASES = (
         AnswerResponse,
         "Return decision=unsupported with no answer.",
         _accepts_answer("unsupported"),
+    ),
+    _order_target_case(
+        OrderTargetProposal(relationship="single", order_refs=("ORD-1002",)),
+    ),
+    _order_target_case(
+        OrderTargetProposal(
+            relationship="plural",
+            order_refs=("ORD-1001", "ORD-1002"),
+        ),
+    ),
+    _order_target_case(
+        OrderTargetProposal(
+            relationship="alternative",
+            order_refs=("ORD-1001", "ORD-1002"),
+        ),
+    ),
+    _order_target_case(
+        OrderTargetProposal(relationship="ambiguous", order_refs=()),
     ),
 )
 

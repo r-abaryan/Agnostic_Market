@@ -6,7 +6,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from llm_fakes import BROKEN_ROUTE_ARGS, TEST_STRUCTURED_OUTPUT_METHOD, FakeChatModel
+from llm_fakes import (
+    BROKEN_ROUTE_ARGS,
+    CONFORMANT_STRUCTURED_ARGS,
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    FakeChatModel,
+)
 from pydantic import ValidationError
 
 from agnostic_market.config.loader import ConfigError
@@ -43,7 +48,7 @@ async def test_conformant_model_is_commerce_ready() -> None:
     assert report.verdict == "commerce-ready", _failed_checks(report)
     assert report.suite_version == SUITE_VERSION
     assert [c.name for c in report.checks] == ["tool_call", "structured_output", "streaming"]
-    assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,) * 4
+    assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,) * 8
 
 
 async def test_no_tool_calls_flagged_chat_only() -> None:
@@ -101,6 +106,77 @@ async def test_invalid_answer_response_case_names_the_failed_internal_case() -> 
     detail = _failed_checks(report)["structured_output"]
     assert report.verdict == "chat-only"
     assert "unsupported" in detail
+
+
+async def test_invalid_order_target_case_names_the_failed_internal_case() -> None:
+    report = await run_conformance(
+        FakeChatModel(
+            structured_args={
+                "AnswerResponse": (
+                    {"decision": "answer", "answer": "A bounded answer."},
+                    {"decision": "clarify", "answer": None},
+                    {"decision": "unsupported", "answer": None},
+                ),
+                "OrderTargetProposal": (
+                    {"relationship": "single", "order_refs": ["ORD-1002"]},
+                    {"relationship": "plural", "order_refs": ["ORD-1001", "ORD-1002"]},
+                    {"relationship": "alternative", "order_refs": ["ORD-1001"]},
+                ),
+            }
+        ),
+        provider="fake",
+        model="bad-order-target-schema",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    detail = _failed_checks(report)["structured_output"]
+    assert report.verdict == "chat-only"
+    assert "order_target_alternative" in detail
+
+
+async def test_order_target_transport_acceptance_ignores_order_but_preserves_multiplicity() -> None:
+    reversed_report = await run_conformance(
+        FakeChatModel(
+            structured_args={
+                **CONFORMANT_STRUCTURED_ARGS,
+                "OrderTargetProposal": (
+                    {"relationship": "single", "order_refs": ["ORD-1002"]},
+                    {"relationship": "plural", "order_refs": ["ORD-1002", "ORD-1001"]},
+                    {
+                        "relationship": "alternative",
+                        "order_refs": ["ORD-1002", "ORD-1001"],
+                    },
+                    {"relationship": "ambiguous", "order_refs": []},
+                ),
+            }
+        ),
+        provider="fake",
+        model="reversed-order-targets",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+    assert reversed_report.verdict == "commerce-ready", _failed_checks(reversed_report)
+
+    duplicate_report = await run_conformance(
+        FakeChatModel(
+            structured_args={
+                **CONFORMANT_STRUCTURED_ARGS,
+                "OrderTargetProposal": (
+                    {"relationship": "single", "order_refs": ["ORD-1002"]},
+                    {"relationship": "plural", "order_refs": ["ORD-1001", "ORD-1002"]},
+                    {
+                        "relationship": "alternative",
+                        "order_refs": ["ORD-1001", "ORD-1001"],
+                    },
+                ),
+            }
+        ),
+        provider="fake",
+        model="duplicate-order-target",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+    detail = _failed_checks(duplicate_report)["structured_output"]
+    assert duplicate_report.verdict == "chat-only"
+    assert "order_target_alternative" in detail
 
 
 async def test_non_streaming_flagged_chat_only() -> None:

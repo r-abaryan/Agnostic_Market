@@ -104,13 +104,32 @@ class RecentOrderSet(BaseModel):
     model_config = _FROZEN
 
     selector: Literal["recent"] = "recent"
-    cardinality: Literal["one", "all"]
 
 
 OrderStatusSelector = Annotated[
     ExplicitOrderSet | FocusedOrderSet | RecentOrderSet,
     Field(discriminator="selector"),
 ]
+
+
+class OrderTargetProposal(BaseModel):
+    """Ephemeral model proposal; shape validation is not target resolution or authority."""
+
+    model_config = _FROZEN
+
+    relationship: Literal["single", "plural", "alternative", "ambiguous"]
+    order_refs: tuple[NonEmptyText, ...] = ()
+
+    @model_validator(mode="after")
+    def _reference_count_matches_relationship(self) -> OrderTargetProposal:
+        count = len(self.order_refs)
+        if self.relationship == "single" and count != 1:
+            raise ValueError("a single target proposal requires exactly one reference")
+        if self.relationship in {"plural", "alternative"} and count < 2:
+            raise ValueError(
+                f"an {self.relationship} target proposal requires at least two references"
+            )
+        return self
 
 
 class CancellableOrderScope(BaseModel):

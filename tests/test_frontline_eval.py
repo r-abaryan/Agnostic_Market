@@ -1,6 +1,7 @@
 """The sole frontline evaluator's zero-network readiness and scenario contracts."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -21,6 +22,7 @@ from agnostic_market.dtos.orchestration import (
     CartItemQuery,
     ListOrders,
     ModifyCart,
+    OrderTargetProposal,
     PlaceOrder,
     SearchCatalog,
 )
@@ -35,13 +37,16 @@ from scripts.frontline_eval import (
     TransportOwnerScenario,
     TurnObservation,
     _build_eval_runtime,
+    _load_order_target_corpus,
     _load_read_owner_corpus,
     _observe_scenario,
     _OfflineSecretResolver,
     _order_reference_failures,
     _outcome,
+    _run_order_target_cases,
     _run_read_owner_cases,
     _run_transport_case,
+    _score_order_target_output,
     _score_read_owner_output,
     _score_safety_observation,
     _score_transport_recovery,
@@ -65,6 +70,20 @@ _TERMINAL_LINE = (
 
 def _model_calls(*models: FakeChatModel) -> int:
     return sum(model.invoke_count for model in models)
+
+
+def _order_target_fake(corpus: frontline_eval.OrderTargetEvalCorpus) -> FakeChatModel:
+    return FakeChatModel(
+        structured_args={
+            "OrderTargetProposal": tuple(
+                {
+                    "relationship": case.expected_relationship,
+                    "order_refs": list(case.expected_order_refs),
+                }
+                for case in corpus.cases
+            )
+        }
+    )
 
 
 def _effects(*, otp_dispatches: int = 0, verification_level: int = 0) -> CommerceObservation:
@@ -506,6 +525,107 @@ def test_read_owner_corpus_retains_each_answer_boundary_case(config_root: Path) 
         "answer_policy_unknown_detail",
         "answer_elliptical_live_state_is_unsupported",
     } <= {case.case_id for case in corpus.cases}
+
+
+async def test_order_target_corpus_runs_through_the_shared_structured_fake(
+    config_root: Path,
+) -> None:
+    corpus = _load_order_target_corpus(config_root / "eval" / "frontline_order_targets.yaml")
+    model = _order_target_fake(corpus)
+
+    assert await _run_order_target_cases(model, TEST_STRUCTURED_OUTPUT_METHOD, corpus) == {}
+    assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,)
+
+
+async def test_order_target_only_eval_bypasses_unrelated_red_preflight_and_graph(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _load_order_target_corpus(config_root / "eval" / "frontline_order_targets.yaml")
+    model = _order_target_fake(corpus)
+    selection = SimpleNamespace(
+        chat_model=model,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+    monkeypatch.setattr(frontline_eval, "_load_order_target_corpus", lambda: corpus)
+    monkeypatch.setattr(frontline_eval, "_load_routing_eval_selection", lambda: selection)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("order-target-only mode crossed an unrelated evaluator boundary")
+
+    monkeypatch.setattr(frontline_eval, "_speech_authority_failures", forbidden)
+    monkeypatch.setattr(frontline_eval, "_order_reference_failures", forbidden)
+    monkeypatch.setattr(frontline_eval, "_build_eval_runtime", forbidden)
+
+    assert await frontline_eval._run_order_target_eval() == 0
+    assert model.invoke_count == len(corpus.cases)
+
+
+def test_cli_dispatches_order_target_only_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    async def run() -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    monkeypatch.setattr(frontline_eval, "_run_order_target_eval", run)
+
+    assert frontline_eval.main(["--order-target-eval"]) == 0
+    assert calls == 1
+
+
+def test_order_target_corpus_covers_each_spoken_and_conflict_class(config_root: Path) -> None:
+    corpus = _load_order_target_corpus(config_root / "eval" / "frontline_order_targets.yaml")
+
+    assert {
+        "numeric_label",
+        "letter_spelled_label",
+        "fused_label",
+        "cardinal_number",
+        "plural_set",
+        "quoted_example",
+        "quoted_intended_reference",
+        "corrected_reference",
+        "alternative_set",
+        "conflicting_unresolved",
+        "false_eou_fragment",
+        "contextual_only",
+    } == {case.case_id for case in corpus.cases}
+
+
+def test_order_target_scorer_detects_relationship_and_reference_drift(
+    config_root: Path,
+) -> None:
+    corpus = _load_order_target_corpus(config_root / "eval" / "frontline_order_targets.yaml")
+    case = next(item for item in corpus.cases if item.case_id == "alternative_set")
+
+    failures = _score_order_target_output(
+        case,
+        OrderTargetProposal(relationship="single", order_refs=("ORD-1001",)),
+    )
+
+    assert "expected alternative, got single" in failures
+    assert any(failure.startswith("expected refs") for failure in failures)
+
+
+async def test_order_target_eval_records_schema_failure_without_running_a_graph(
+    config_root: Path,
+) -> None:
+    corpus = _load_order_target_corpus(config_root / "eval" / "frontline_order_targets.yaml")
+    case = next(item for item in corpus.cases if item.case_id == "numeric_label")
+    one_case = corpus.model_copy(update={"cases": (case,)})
+    model = FakeChatModel(
+        structured_args={"OrderTargetProposal": ({"relationship": "single", "order_refs": []},)}
+    )
+
+    failures = await _run_order_target_cases(
+        model,
+        TEST_STRUCTURED_OUTPUT_METHOD,
+        one_case,
+    )
+
+    assert failures == {"numeric_label": ("output failed schema (ValidationError)",)}
 
 
 def test_read_owner_scorer_detects_wrong_disposition_and_forbidden_claims(

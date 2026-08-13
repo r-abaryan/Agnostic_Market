@@ -60,7 +60,13 @@ CONFORMANT_STRUCTURED_ARGS: dict[str, tuple[dict[str, Any], ...]] = {
         {"decision": "answer", "answer": "Returns are accepted within 30 days."},
         {"decision": "clarify", "answer": None},
         {"decision": "unsupported", "answer": None},
-    )
+    ),
+    "OrderTargetProposal": (
+        {"relationship": "single", "order_refs": ["ORD-1002"]},
+        {"relationship": "plural", "order_refs": ["ORD-1001", "ORD-1002"]},
+        {"relationship": "alternative", "order_refs": ["ORD-1001", "ORD-1002"]},
+        {"relationship": "ambiguous", "order_refs": []},
+    ),
 }
 
 _TEXT_RESPONSE = "A light, cushioned running shoe. It grips well on wet roads."

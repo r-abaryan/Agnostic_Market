@@ -7,7 +7,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from agnostic_market.agents.capabilities import (
     CapabilityEntry,
@@ -27,12 +27,16 @@ from agnostic_market.dtos.orchestration import (
     DiscloseAiIdentity,
     ExplicitOrderSet,
     ExplicitOrderTarget,
+    FocusedOrderSet,
     FocusedOrderTarget,
     IntentRequestModel,
     ListOrders,
     ModifyCart,
+    OrderStatusSelector,
+    OrderTargetProposal,
     PrincipalTransition,
     PrincipalTransitionProjection,
+    RecentOrderSet,
     RefundOrder,
     ResolvedCartItemRef,
     ReturnOrder,
@@ -80,6 +84,57 @@ def test_answer_response_is_a_closed_three_arm_contract() -> None:
     for payload in malformed:
         with pytest.raises(ValidationError):
             AnswerResponse.model_validate(payload)
+
+
+def test_recent_order_set_is_plural_context_while_focus_remains_a_distinct_selector() -> None:
+    recent = RecentOrderSet()
+    assert recent.model_dump() == {"selector": "recent"}
+    with pytest.raises(ValidationError):
+        RecentOrderSet.model_validate({"selector": "recent", "cardinality": "one"})
+
+    focused = FocusedOrderSet()
+    assert VerifyOrderStatus(target=focused).target == focused
+    assert CancelOrders(target=focused).target == focused
+
+    schema = TypeAdapter(OrderStatusSelector).json_schema()
+    recent_schema = schema["$defs"]["RecentOrderSet"]
+    assert "cardinality" not in recent_schema["properties"]
+
+
+@pytest.mark.parametrize(
+    ("relationship", "order_refs"),
+    [
+        ("single", ("ORD-1002",)),
+        ("plural", ("ORD-1001", "ORD-1002")),
+        ("alternative", ("ORD-1001", "ORD-1002")),
+        ("ambiguous", ()),
+        ("ambiguous", ("ORD-1002",)),
+    ],
+)
+def test_order_target_proposal_accepts_only_closed_shape_valid_arms(
+    relationship: str,
+    order_refs: tuple[str, ...],
+) -> None:
+    proposal = OrderTargetProposal.model_validate(
+        {"relationship": relationship, "order_refs": order_refs}
+    )
+    assert proposal.order_refs == order_refs
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"relationship": "single", "order_refs": []},
+        {"relationship": "single", "order_refs": ["ORD-1001", "ORD-1002"]},
+        {"relationship": "plural", "order_refs": ["ORD-1001"]},
+        {"relationship": "alternative", "order_refs": ["ORD-1001"]},
+        {"relationship": "plural", "order_refs": [" ", "ORD-1002"]},
+        {"relationship": "ambiguous", "order_refs": [], "unexpected": True},
+    ],
+)
+def test_order_target_proposal_rejects_malformed_relationship_counts(payload: dict) -> None:
+    with pytest.raises(ValidationError):
+        OrderTargetProposal.model_validate(payload)
 
 
 def test_active_invocation_is_minimal_derived_and_freshly_identified() -> None:
