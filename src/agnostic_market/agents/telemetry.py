@@ -44,7 +44,11 @@ def write_event(record: dict[str, object]) -> None:
         logger.warning("telemetry write failed: %s", exc)
 
 
-CapabilityAnswerSource = Literal["code_authored_read", "grounded_model_response"]
+CapabilityAnswerSource = Literal[
+    "code_authored_read",
+    "grounded_model_response",
+    "general_model_response",
+]
 
 
 def write_capability_answered(

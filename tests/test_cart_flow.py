@@ -15,7 +15,11 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
-from llm_fakes import FakeChatModel
+from llm_fakes import (
+    TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    FakeChatModel,
+)
 from policy_helpers import make_policy
 from pydantic import ValidationError
 from turn_helpers import (
@@ -123,6 +127,8 @@ def _build(
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=_POLICY,
         lifecycle=caller_context,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         checkpointer=build_checkpointer(),
     )
     return assembly.graph, store, cart

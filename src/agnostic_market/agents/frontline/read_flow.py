@@ -10,21 +10,46 @@ from langchain_core.messages import AIMessage, SystemMessage
 from langgraph.graph import END
 from langgraph.types import Command
 
-from agnostic_market.agents.frontline.prompt import compose_catalog_response_prompt
+from agnostic_market.agents.frontline.prompt import (
+    compose_answer_response_prompt,
+    compose_catalog_response_prompt,
+)
+from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.telemetry import write_capability_answered
 from agnostic_market.commerce.orders import OrderStore, lookup_catalog
-from agnostic_market.dtos.orchestration import CapabilityId, SearchCatalog
+from agnostic_market.dtos.llm import StructuredOutputMethod
+from agnostic_market.dtos.orchestration import (
+    AnswerQuestion,
+    AnswerResponse,
+    CapabilityId,
+    SearchCatalog,
+)
 from agnostic_market.dtos.state import PolicyContext, ReasoningState
 
 CATALOG_ENTRY_NODE = "catalog_entry"
 CATALOG_QUERY_CLARIFY_NODE = "catalog_query_clarify"
 CATALOG_QUERY_REJECT_NODE = "catalog_query_reject"
 CATALOG_RESPONSE_NODE = "catalog_response"
-READ_FLOW_SPEAKABLE_NODES = frozenset({CATALOG_QUERY_CLARIFY_NODE, CATALOG_QUERY_REJECT_NODE})
-READ_FLOW_MODEL_SPEECH_NODES = frozenset({CATALOG_RESPONSE_NODE})
+ANSWER_RESPONSE_NODE = "answer_response"
+ANSWER_CLARIFY_NODE = "answer_clarify"
+ANSWER_UNSUPPORTED_NODE = "answer_unsupported"
+READ_FLOW_SPEAKABLE_NODES = frozenset(
+    {
+        CATALOG_QUERY_CLARIFY_NODE,
+        CATALOG_QUERY_REJECT_NODE,
+        ANSWER_CLARIFY_NODE,
+        ANSWER_UNSUPPORTED_NODE,
+    }
+)
+READ_FLOW_MODEL_SPEECH_NODES = frozenset({CATALOG_RESPONSE_NODE, ANSWER_RESPONSE_NODE})
 
 _CATALOG_QUERY_QUESTION = "What product would you like me to look for?"
 _CATALOG_QUERY_REJECTED = "I didn't get a product to look for. What else can I help with?"
+_ANSWER_CONTEXT_QUESTION = "What would you like me to explain?"
+_ANSWER_UNSUPPORTED_RETRY = (
+    "Please restate that as a specific store request, including the order, product, account, "
+    "or cart detail I should use."
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +58,9 @@ class ReadFlowNodes:
     catalog_query_clarify: Callable[[ReasoningState], dict[str, object]]
     catalog_query_reject: Callable[[ReasoningState], dict[str, object]]
     catalog_response: Callable[[ReasoningState], Command]
+    answer_response: Callable[[ReasoningState], Command]
+    answer_clarify: Callable[[ReasoningState], dict[str, object]]
+    answer_unsupported: Callable[[ReasoningState], dict[str, object]]
     speakable_nodes: frozenset[str]
     model_speech_nodes: frozenset[str]
 
@@ -43,8 +71,15 @@ def build_read_flow_nodes(
     policy: PolicyContext,
     *,
     display_name: str,
+    structured_output_method: StructuredOutputMethod,
+    model_text_policy: CallerAudibleModelTextPolicy,
 ) -> ReadFlowNodes:
     """Build the typed catalog owner over session-bound dependencies."""
+
+    answer_model = response_model.with_structured_output(
+        AnswerResponse,
+        method=structured_output_method,
+    )
 
     def catalog_entry_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
@@ -115,8 +150,7 @@ def build_read_flow_nodes(
             raise TypeError("catalog response model returned an incompatible message")
         if response.tool_calls:
             raise ValueError("catalog response model returned an unexpected tool call")
-        if not response.text.strip():
-            raise ValueError("catalog response model returned blank text")
+        model_text_policy.validate(response.text)
 
         write_capability_answered(
             current.content,
@@ -128,11 +162,71 @@ def build_read_flow_nodes(
             update={"active_invocation": None, "messages": [response]},
         )
 
+    def answer_response_node(state: ReasoningState) -> Command:
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, AnswerQuestion):
+            raise TypeError("answer response requires an answer-question invocation")
+        current = state.current_committed_user_message()
+        if current is None:
+            raise ValueError("answer response requires the current committed caller message")
+        if not isinstance(current.content, str):
+            raise TypeError("answer response requires plain committed caller text")
+
+        result = answer_model.invoke(
+            [
+                SystemMessage(
+                    compose_answer_response_prompt(
+                        display_name,
+                        policy,
+                        invocation.request,
+                    )
+                ),
+                current,
+            ]
+        )
+        if not isinstance(result, AnswerResponse):
+            raise TypeError("answer response model returned an incompatible result")
+        if result.decision == "clarify":
+            return Command(goto=ANSWER_CLARIFY_NODE, update={"active_invocation": None})
+        if result.decision == "unsupported":
+            return Command(goto=ANSWER_UNSUPPORTED_NODE, update={"active_invocation": None})
+
+        answer = result.answer
+        if answer is None:
+            raise RuntimeError("validated answer response omitted its answer")
+        model_text_policy.validate(answer)
+        write_capability_answered(
+            current.content,
+            CapabilityId.ANSWER_QUESTION.value,
+            answer_source=(
+                "grounded_model_response"
+                if invocation.request.topic == "policy"
+                else "general_model_response"
+            ),
+        )
+        return Command(
+            goto=END,
+            update={"active_invocation": None, "messages": [AIMessage(answer)]},
+        )
+
+    def answer_clarify_node(state: ReasoningState) -> dict[str, object]:
+        if state.active_invocation is not None:
+            raise TypeError("answer clarification requires the invocation to be cleared")
+        return {"messages": [AIMessage(_ANSWER_CONTEXT_QUESTION)]}
+
+    def answer_unsupported_node(state: ReasoningState) -> dict[str, object]:
+        if state.active_invocation is not None:
+            raise TypeError("unsupported answer requires the invocation to be cleared")
+        return {"messages": [AIMessage(_ANSWER_UNSUPPORTED_RETRY)]}
+
     return ReadFlowNodes(
         catalog_entry=catalog_entry_node,
         catalog_query_clarify=catalog_query_clarify_node,
         catalog_query_reject=catalog_query_reject_node,
         catalog_response=catalog_response_node,
+        answer_response=answer_response_node,
+        answer_clarify=answer_clarify_node,
+        answer_unsupported=answer_unsupported_node,
         speakable_nodes=READ_FLOW_SPEAKABLE_NODES,
         model_speech_nodes=READ_FLOW_MODEL_SPEECH_NODES,
     )

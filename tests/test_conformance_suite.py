@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from llm_fakes import BROKEN_ROUTE_ARGS, FakeChatModel
+from llm_fakes import BROKEN_ROUTE_ARGS, TEST_STRUCTURED_OUTPUT_METHOD, FakeChatModel
 from pydantic import ValidationError
 
 from agnostic_market.config.loader import ConfigError
@@ -23,7 +23,6 @@ from agnostic_market.llm.providers import (
 )
 
 _MAX_AGE_DAYS = 30
-_STRUCTURED_OUTPUT_METHOD = "function_calling"
 
 
 def _failed_checks(report: ConformanceReport) -> dict[str, str]:
@@ -34,15 +33,17 @@ def _failed_checks(report: ConformanceReport) -> dict[str, str]:
 
 
 async def test_conformant_model_is_commerce_ready() -> None:
+    model = FakeChatModel()
     report = await run_conformance(
-        FakeChatModel(),
+        model,
         provider="fake",
         model="good",
-        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     assert report.verdict == "commerce-ready", _failed_checks(report)
     assert report.suite_version == SUITE_VERSION
     assert [c.name for c in report.checks] == ["tool_call", "structured_output", "streaming"]
+    assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,) * 4
 
 
 async def test_no_tool_calls_flagged_chat_only() -> None:
@@ -50,7 +51,7 @@ async def test_no_tool_calls_flagged_chat_only() -> None:
         FakeChatModel(emit_tool_calls=False),
         provider="fake",
         model="no-tools",
-        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     assert report.verdict == "chat-only"
     assert "no tool_calls" in _failed_checks(report)["tool_call"]
@@ -61,7 +62,7 @@ async def test_wrong_tool_selection_flagged_chat_only() -> None:
         FakeChatModel(pick_wrong_tool=True),
         provider="fake",
         model="wrong-tool",
-        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
@@ -73,7 +74,7 @@ async def test_invalid_structured_output_flagged_chat_only() -> None:
         FakeChatModel(canned_args=BROKEN_ROUTE_ARGS),
         provider="fake",
         model="bad-schema",
-        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
@@ -81,12 +82,33 @@ async def test_invalid_structured_output_flagged_chat_only() -> None:
     assert "structured_output" in failed
 
 
+async def test_invalid_answer_response_case_names_the_failed_internal_case() -> None:
+    report = await run_conformance(
+        FakeChatModel(
+            structured_args={
+                "AnswerResponse": (
+                    {"decision": "answer", "answer": "A bounded answer."},
+                    {"decision": "clarify", "answer": None},
+                    {"decision": "unsupported", "answer": "contradictory prose"},
+                )
+            }
+        ),
+        provider="fake",
+        model="bad-answer-schema",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    detail = _failed_checks(report)["structured_output"]
+    assert report.verdict == "chat-only"
+    assert "unsupported" in detail
+
+
 async def test_non_streaming_flagged_chat_only() -> None:
     report = await run_conformance(
         FakeChatModel(stream_chunks=1),
         provider="fake",
         model="no-stream",
-        structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     failed = _failed_checks(report)
     assert report.verdict == "chat-only"
@@ -99,7 +121,7 @@ async def test_transport_error_yields_no_verdict() -> None:
             FakeChatModel(raise_transport=True),
             provider="fake",
             model="flaky",
-            structured_output_method=_STRUCTURED_OUTPUT_METHOD,
+            structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         )
 
 
@@ -223,7 +245,10 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
                 "catalog": {"source": "ingested", "freshness_sla_min": 15},
             },
             "isolation": {"tier": "shared"},
-            "runtime": {"cancellation_quiescence_timeout_seconds": 2.0},
+            "runtime": {
+                "cancellation_quiescence_timeout_seconds": 2.0,
+                "caller_audible_model_text_max_chars": 500,
+            },
             "vector_namespace": "m1",
             "secrets_ref": "vault://m1",
         }

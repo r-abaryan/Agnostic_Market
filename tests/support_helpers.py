@@ -6,7 +6,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import NamedTuple
 
-from llm_fakes import FakeChatModel
+from llm_fakes import (
+    TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    FakeChatModel,
+)
 from turn_helpers import TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS
 
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
@@ -125,6 +129,8 @@ def build_support_engine(
         customers=customers,
         payment_instruments=payment_instruments,
         lifecycle=caller_context,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(

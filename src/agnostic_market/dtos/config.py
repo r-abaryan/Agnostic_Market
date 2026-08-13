@@ -288,6 +288,7 @@ class RuntimeConfig(BaseModel):
     model_config = _STRICT
 
     cancellation_quiescence_timeout_seconds: float = Field(gt=0)
+    caller_audible_model_text_max_chars: int = Field(gt=0)
 
 
 class MerchantConfig(BaseModel):

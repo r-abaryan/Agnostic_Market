@@ -42,6 +42,7 @@ from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.capabilities import CapabilityRegistry
@@ -52,7 +53,12 @@ from agnostic_market.agents.frontline import (
     TRANSACTIONAL_MODEL_NODES,
     build_frontline_graph,
 )
-from agnostic_market.agents.frontline.read_flow import CATALOG_RESPONSE_NODE
+from agnostic_market.agents.frontline.read_flow import (
+    ANSWER_CLARIFY_NODE,
+    ANSWER_RESPONSE_NODE,
+    ANSWER_UNSUPPORTED_NODE,
+    CATALOG_RESPONSE_NODE,
+)
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
@@ -90,8 +96,8 @@ from agnostic_market.dtos.events import (
     TurnEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.llm import ProviderCredentialsConfig
-from agnostic_market.dtos.orchestration import IntentRequest, SearchCatalog
+from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutputMethod
+from agnostic_market.dtos.orchestration import AnswerQuestion, IntentRequest, SearchCatalog
 from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.llm.providers import load_conformance_targets
@@ -122,6 +128,8 @@ else:
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 _EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_t1.yaml"
 _SAFETY_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_safety.yaml"
+_READ_OWNER_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_read_owners.yaml"
+_READ_OWNER_EVAL_SCHEMA_VERSION = "1"
 _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
 _TRANSPORT_REPORT_PATHS = {
@@ -145,6 +153,49 @@ _AUTOMATION_CHANNELS = (
     "pending_clarification",
     "clarification_progress",
 )
+
+
+class ReadOwnerEvalCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: str
+    owner: Literal["catalog", "answer"]
+    utterance: str
+    expected_disposition: Literal["answer", "clarify", "unsupported"]
+    query: str | None = None
+    topic: Literal["policy", "general"] | None = None
+    required_facts: tuple[str, ...] = ()
+    forbidden_facts: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _owner_matches_request(self) -> ReadOwnerEvalCase:
+        text_fields = (self.case_id, self.utterance, *self.required_facts, *self.forbidden_facts)
+        if any(not value.strip() for value in text_fields):
+            raise ValueError("read-owner eval text fields must be non-empty")
+        if self.owner == "catalog":
+            if self.query is None or not self.query.strip() or self.topic is not None:
+                raise ValueError("catalog cases require only a non-empty query")
+            if self.expected_disposition != "answer":
+                raise ValueError("catalog query clarification is a structural, not semantic, case")
+        elif self.topic is None or self.query is not None:
+            raise ValueError("answer cases require only a closed topic")
+        return self
+
+
+class ReadOwnerEvalCorpus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str
+    cases: tuple[ReadOwnerEvalCase, ...]
+
+    @model_validator(mode="after")
+    def _case_ids_are_unique(self) -> ReadOwnerEvalCorpus:
+        if self.schema_version != _READ_OWNER_EVAL_SCHEMA_VERSION:
+            raise ValueError("unsupported read-owner eval schema version")
+        ids = [case.case_id for case in self.cases]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("read-owner eval requires non-empty unique case ids")
+        return self
 
 
 @dataclass(frozen=True)
@@ -306,6 +357,7 @@ def _build_eval_runtime(
     reasoning_model: BaseChatModel,
     *,
     thread_id: str,
+    structured_output_method: StructuredOutputMethod,
 ) -> EvalRuntime:
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, config.merchant_id))
     cart_store = CartStore()
@@ -358,6 +410,8 @@ def _build_eval_runtime(
         profile_store=profile_store,
         policy=policy,
         lifecycle=caller_context,
+        structured_output_method=structured_output_method,
+        caller_audible_model_text_max_chars=(config.runtime.caller_audible_model_text_max_chars),
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(
@@ -558,6 +612,108 @@ def _structural_preflight_failures(data: dict) -> tuple[str, ...]:
     return _speech_authority_failures() + _order_reference_failures(data)
 
 
+def _load_read_owner_corpus(path: Path = _READ_OWNER_EVAL_PATH) -> ReadOwnerEvalCorpus:
+    return ReadOwnerEvalCorpus.model_validate(load_yaml_layer(path))
+
+
+def _score_read_owner_output(
+    case: ReadOwnerEvalCase,
+    *,
+    actual_disposition: Literal["answer", "clarify", "unsupported"],
+    spoken_text: str,
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    normalized = spoken_text.casefold()
+    if actual_disposition != case.expected_disposition:
+        failures.append(f"expected {case.expected_disposition}, got {actual_disposition}")
+    for fact in case.required_facts:
+        if fact.casefold() not in normalized:
+            failures.append(f"missing required fact {fact!r}")
+    for fact in case.forbidden_facts:
+        if fact.casefold() in normalized:
+            failures.append(f"included forbidden fact {fact!r}")
+    return tuple(failures)
+
+
+def _read_owner_disposition(
+    case: ReadOwnerEvalCase,
+    response_nodes: Sequence[str],
+) -> Literal["answer", "clarify", "unsupported"] | None:
+    node_dispositions: dict[str, Literal["answer", "clarify", "unsupported"]]
+    if case.owner == "catalog":
+        node_dispositions = {CATALOG_RESPONSE_NODE: "answer"}
+    else:
+        node_dispositions = {
+            ANSWER_RESPONSE_NODE: "answer",
+            ANSWER_CLARIFY_NODE: "clarify",
+            ANSWER_UNSUPPORTED_NODE: "unsupported",
+        }
+    if len(response_nodes) != 1:
+        return None
+    return node_dispositions.get(response_nodes[0])
+
+
+async def _run_read_owner_cases(
+    graph: CompiledStateGraph,
+    corpus: ReadOwnerEvalCorpus,
+) -> dict[str, tuple[str, ...]]:
+    failures: dict[str, tuple[str, ...]] = {}
+    for case in corpus.cases:
+        request: IntentRequest
+        if case.owner == "catalog":
+            request = SearchCatalog(query=case.query)
+        else:
+            request = AnswerQuestion(topic=case.topic)
+        turn_id = f"read-owner:{case.case_id}:{uuid.uuid4().hex}"
+        spoken: list[str] = []
+        response_nodes: list[str] = []
+        async for update in graph.astream(
+            {
+                "messages": [HumanMessage(content=case.utterance, id=turn_id)],
+                "consumed_turn_ids": (turn_id,),
+                "active_invocation": open_active_invocation(
+                    request,
+                    consumed_turn_ids=(turn_id,),
+                ),
+            },
+            {"configurable": {"thread_id": turn_id}},
+            stream_mode="updates",
+        ):
+            for node, delta in update.items():
+                if not isinstance(delta, dict):
+                    continue
+                messages = delta.get("messages")
+                if not isinstance(messages, (list, tuple)):
+                    continue
+                audible = [
+                    message.text
+                    for message in messages
+                    if isinstance(message, AIMessage) and message.text.strip()
+                ]
+                if audible:
+                    response_nodes.append(node)
+                    spoken.extend(audible)
+        if not spoken:
+            failures[case.case_id] = ("owner produced no caller-audible text",)
+            continue
+        line = spoken[-1]
+        disposition = _read_owner_disposition(case, response_nodes)
+        if disposition is None:
+            failures[case.case_id] = (
+                "owner did not execute exactly one expected terminal response node; "
+                f"got {tuple(response_nodes)!r}",
+            )
+            continue
+        case_failures = _score_read_owner_output(
+            case,
+            actual_disposition=disposition,
+            spoken_text=line,
+        )
+        if case_failures:
+            failures[case.case_id] = case_failures
+    return failures
+
+
 _TRANSPORT_OWNER_SCENARIOS = (
     TransportOwnerScenario(
         scenario_id="frontline_browse",
@@ -592,6 +748,13 @@ _TRANSPORT_OWNER_SCENARIOS = (
         origin_node=CATALOG_RESPONSE_NODE,
         utterance="Tell me about trail shoes.",
         initial_request=SearchCatalog(query="trail shoes"),
+    ),
+    TransportOwnerScenario(
+        scenario_id="answer_bounded_response",
+        owner="frontline",
+        origin_node=ANSWER_RESPONSE_NODE,
+        utterance="What is your return policy?",
+        initial_request=AnswerQuestion(topic="policy"),
     ),
 )
 _EMPTY_RECOVERY_STATE = GraphObservation(
@@ -824,7 +987,8 @@ async def _run_transport_case(
         )
         try:
             with proxy:
-                model = LLMGateway(credentials, secrets).chat_model(
+                gateway = LLMGateway(credentials, secrets)
+                model = gateway.chat_model(
                     target,
                     base_url=proxy.model_base_url,
                     max_retries=max_retries,
@@ -835,6 +999,7 @@ async def _run_transport_case(
                     model,
                     model,
                     thread_id=f"transport-{uuid.uuid4().hex}",
+                    structured_output_method=gateway.structured_output_method(target),
                 )
                 _seed_transport_request(runtime, scenario)
                 observation = await asyncio.wait_for(
@@ -1021,13 +1186,15 @@ async def _run(*, preflight_only: bool = False) -> int:
     secrets = EnvSecretResolver()
     credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
     resolved = ConfigRegistry(_CONFIG_ROOT).load().get(_MERCHANT_ID)
-    chat_model = LLMGateway(credentials, secrets).chat_model(resolved.config.llm.routing)
+    gateway = LLMGateway(credentials, secrets)
+    chat_model = gateway.chat_model(resolved.config.llm.routing)
     config = resolved.config
     runtime = _build_eval_runtime(
         config,
         chat_model,
-        LLMGateway(credentials, secrets).chat_model(config.llm.reasoning),
+        gateway.chat_model(config.llm.reasoning),
         thread_id=f"frontline-eval-{uuid.uuid4().hex}",
+        structured_output_method=gateway.structured_output_method(config.llm.routing),
     )
     graph = runtime.graph
     data = load_yaml_layer(_EVAL_PATH)
@@ -1067,10 +1234,24 @@ async def _run(*, preflight_only: bool = False) -> int:
     for o in over:
         print(f"    OVER-ESCALATED: {o}")
 
+    read_owner_corpus = _load_read_owner_corpus()
+    read_owner_failures = await _run_read_owner_cases(graph, read_owner_corpus)
+    print(
+        f"[read_owners] semantic cases: "
+        f"{len(read_owner_corpus.cases) - len(read_owner_failures)}/"
+        f"{len(read_owner_corpus.cases)}"
+    )
+    for case_id, failures in read_owner_failures.items():
+        for failure in failures:
+            print(f"    {case_id}: {failure}")
+
     if recall < _RECALL_BAR:
         print(
             f"\nT1 ROUTING EVAL FAILED - escalation recall {recall:.0%} < {_RECALL_BAR:.0%}. [FAIL]"
         )
+        return 1
+    if read_owner_failures:
+        print("\nFRONTLINE READ-OWNER EVAL FAILED. [FAIL]")
         return 1
     print(
         f"\nT1 ROUTING eval passed: escalation recall {recall:.0%} "

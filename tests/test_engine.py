@@ -19,7 +19,12 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 from langgraph.checkpoint.serde.event_hooks import register_serde_event_listener
 from langgraph.graph.message import add_messages
 from langgraph.types import PregelTask, StateSnapshot
-from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
+from llm_fakes import (
+    TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    ExplodingOnceFakeChatModel,
+    FakeChatModel,
+)
 from policy_helpers import make_policy
 from pydantic import BaseModel, PrivateAttr, ValidationError
 from turn_helpers import (
@@ -190,6 +195,8 @@ def _engine(
         profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
         policy=policy,
         lifecycle=caller_context,
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(

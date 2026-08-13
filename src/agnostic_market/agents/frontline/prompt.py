@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from agnostic_market.agents._shared_prompt import compose_shared_context
 from agnostic_market.commerce.orders import CatalogLookup
+from agnostic_market.dtos.orchestration import AnswerQuestion
 from agnostic_market.dtos.state import PolicyContext
 
 _INSTRUCTIONS = (
@@ -194,5 +195,45 @@ def compose_catalog_response_prompt(
             "",
             "Live catalog result:",
             catalog_facts,
+        )
+    )
+
+
+def compose_answer_response_prompt(
+    display_name: str,
+    policy: PolicyContext,
+    request: AnswerQuestion,
+) -> str:
+    """Compose one closed instruction branch for the bounded question owner."""
+
+    if request.topic == "policy":
+        topic_instruction = (
+            "For a self-contained policy question, answer only from the approved merchant policy "
+            "facts above. If those facts do not cover the detail, say that the detail is not "
+            "available. Do not use general model knowledge to fill a merchant-policy gap."
+        )
+    else:
+        topic_instruction = (
+            "For a self-contained general question, you may give a low-risk explanation from "
+            "general knowledge, but do not make claims about this merchant, an account, an order, "
+            "inventory, a transfer, or whether any commerce effect happened."
+        )
+    return "\n".join(
+        (
+            compose_shared_context(display_name, policy),
+            "",
+            "You are the terminal, tool-incapable bounded-question response owner.",
+            topic_instruction,
+            "If a question is both context-dependent and requires a live merchant, account, "
+            "order, inventory, transfer, or commerce-effect owner, unsupported takes precedence "
+            "over clarify.",
+            "Return decision=clarify for an incomplete or context-dependent question.",
+            "Return decision=unsupported for any merchant-specific, account, order, inventory, "
+            "transfer, or commerce-effect question that needs a live owner.",
+            "The shared guidance about work being handled elsewhere does not apply here: "
+            "never promise to check, handle, transfer, or follow up. Unsupported output "
+            "carries no prose.",
+            "Return decision=answer only when the answer is within the selected topic boundary.",
+            "Keep an answer to one or two short sentences.",
         )
     )

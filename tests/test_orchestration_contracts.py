@@ -17,6 +17,7 @@ from agnostic_market.agents.capabilities import (
 )
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
+    AnswerResponse,
     CancellableOrderScope,
     CancelOrders,
     CapabilityId,
@@ -60,6 +61,25 @@ class _RogueRequest(BaseModel):
 
 def _cancel_request() -> CancelOrders:
     return CancelOrders(target=CancellableOrderScope(scope="all_cancellable"))
+
+
+def test_answer_response_is_a_closed_three_arm_contract() -> None:
+    assert AnswerResponse(decision="answer", answer="A bounded answer.").answer == (
+        "A bounded answer."
+    )
+    assert AnswerResponse(decision="clarify").answer is None
+    assert AnswerResponse(decision="unsupported").answer is None
+
+    malformed = (
+        {"decision": "answer"},
+        {"decision": "answer", "answer": "   "},
+        {"decision": "clarify", "answer": "model prose"},
+        {"decision": "unsupported", "answer": "model prose"},
+        {"decision": "clarify", "extra": True},
+    )
+    for payload in malformed:
+        with pytest.raises(ValidationError):
+            AnswerResponse.model_validate(payload)
 
 
 def test_active_invocation_is_minimal_derived_and_freshly_identified() -> None:

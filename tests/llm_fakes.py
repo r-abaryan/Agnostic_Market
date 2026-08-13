@@ -19,6 +19,11 @@ from langchain_core.runnables import Runnable
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import PrivateAttr
 
+from agnostic_market.dtos.llm import StructuredOutputMethod
+
+TEST_STRUCTURED_OUTPUT_METHOD: StructuredOutputMethod = "function_calling"
+TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS = 500
+
 
 class RecordingResolver:
     """SecretResolver test double — records refs, returns a dummy key."""
@@ -50,6 +55,14 @@ BROKEN_ROUTE_ARGS: dict[str, dict[str, Any]] = {
     "RouteDecision": {"decision": "direct", "request": None},
 }
 
+CONFORMANT_STRUCTURED_ARGS: dict[str, tuple[dict[str, Any], ...]] = {
+    "AnswerResponse": (
+        {"decision": "answer", "answer": "Returns are accepted within 30 days."},
+        {"decision": "clarify", "answer": None},
+        {"decision": "unsupported", "answer": None},
+    )
+}
+
 _TEXT_RESPONSE = "A light, cushioned running shoe. It grips well on wet roads."
 
 
@@ -59,6 +72,7 @@ class FakeChatModel(BaseChatModel):
     emit_tool_calls: bool = True
     pick_wrong_tool: bool = False
     canned_args: dict[str, dict[str, Any]] = CONFORMANT_ARGS
+    structured_args: dict[str, tuple[dict[str, Any], ...]] | None = CONFORMANT_STRUCTURED_ARGS
     stream_chunks: int = 3
     raise_transport: bool = False
     # None = tool-call on every tools-bound invoke (conformance-suite behavior). An int
@@ -85,6 +99,8 @@ class FakeChatModel(BaseChatModel):
     _seen_prompts: list[str] = PrivateAttr(default_factory=list)
     _emitted_messages: list[AIMessage] = PrivateAttr(default_factory=list)
     _bound_tools: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
+    _structured_indexes: dict[str, int] = PrivateAttr(default_factory=dict)
+    _structured_methods: list[object] = PrivateAttr(default_factory=list)
 
     @property
     def invoke_count(self) -> int:
@@ -99,6 +115,10 @@ class FakeChatModel(BaseChatModel):
         return dict(self._bound_tools)
 
     @property
+    def structured_methods(self) -> tuple[object, ...]:
+        return tuple(self._structured_methods)
+
+    @property
     def _llm_type(self) -> str:
         return "fake-conformance"
 
@@ -106,6 +126,16 @@ class FakeChatModel(BaseChatModel):
         converted = [convert_to_openai_tool(tool) for tool in tools]
         self._bound_tools.update({schema["function"]["name"]: schema for schema in converted})
         return self.bind(tools=converted, **kwargs)
+
+    def with_structured_output(
+        self,
+        schema: dict[str, Any] | type,
+        *,
+        include_raw: bool = False,
+        **kwargs: Any,
+    ) -> Runnable:
+        self._structured_methods.append(kwargs.get("method"))
+        return super().with_structured_output(schema, include_raw=include_raw, **kwargs)
 
     def _pick_tool(self, tools: list[dict[str, Any]], messages: list[BaseMessage]) -> str:
         names = [t["function"]["name"] for t in tools]
@@ -141,10 +171,18 @@ class FakeChatModel(BaseChatModel):
         if tools and self.emit_tool_calls and budget_left:
             self._tool_calls_made += 1
             name = self.force_tool or self._pick_tool(tools, messages)
+            args = self.canned_args.get(name, {})
+            if self.structured_args is not None and name in self.structured_args:
+                payloads = self.structured_args[name]
+                index = self._structured_indexes.get(name, 0)
+                if index >= len(payloads):
+                    raise RuntimeError(f"no structured payload remains for {name}")
+                args = payloads[index]
+                self._structured_indexes[name] = index + 1
             calls = [
                 {
                     "name": name,
-                    "args": self.canned_args.get(name, {}),
+                    "args": args,
                     "id": "call_1",
                     "type": "tool_call",
                 }
