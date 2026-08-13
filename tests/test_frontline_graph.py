@@ -10,8 +10,13 @@ from typing import NoReturn
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableLambda
 from langgraph.graph import END
-from llm_fakes import FakeChatModel
+from llm_fakes import (
+    TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    FakeChatModel,
+)
 from policy_helpers import make_policy
 
 from agnostic_market.agents.cart import flow as cart_flow
@@ -44,8 +49,10 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
+    AnswerQuestion,
     CancelOrders,
     CapabilityId,
     CartItemChoices,
@@ -145,6 +152,13 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         store=store,
         policy=policy,
         lifecycle=caller_context,
+        structured_output_method=kwargs.pop(
+            "structured_output_method", TEST_STRUCTURED_OUTPUT_METHOD
+        ),
+        caller_audible_model_text_max_chars=kwargs.pop(
+            "caller_audible_model_text_max_chars",
+            TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+        ),
         **kwargs,
     ).graph
 
@@ -172,6 +186,33 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("model_text", "max_chars"),
+    (
+        ("\u200b", TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS),
+        ("x" * 41, 40),
+    ),
+)
+def test_ordinary_frontline_model_rejects_invalid_caller_audible_text(
+    config_root: Path,
+    tmp_path: Path,
+    model_text: str,
+    max_chars: int,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False, text_response=model_text),
+        caller_audible_model_text_max_chars=max_chars,
+    )
+
+    result = graph.invoke(_admitted_turn("Tell me a joke about shoes.", turn_id="bounded-model"))
+
+    assert _failed_nodes(tmp_path) == ["model"]
+    assert "hit a snag" in _only_spoken(result)
+    assert model_text not in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
+
+
 def test_support_capability_registry_and_dispatch_topology_are_closed(
     config_root: Path,
 ) -> None:
@@ -191,6 +232,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.MODIFY_CART,
         CapabilityId.PLACE_ORDER,
         CapabilityId.SEARCH_CATALOG,
+        CapabilityId.ANSWER_QUESTION,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
@@ -199,6 +241,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "identity_capability_entry",
         "cart_capability_entry",
         "catalog_entry",
+        "answer_response",
     )
     # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
     # dispatcher must still own no executable outgoing route.
@@ -209,7 +252,6 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     # The unmigrated set is named, not counted: a count stays green if one id gains an owner
     # while another is added, and it names nothing when it breaks.
     assert set(CapabilityId) - set(registry.capability_ids) == {
-        CapabilityId.ANSWER_QUESTION,
         CapabilityId.VERIFY_ORDER_STATUS,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.REQUEST_PERSON,
@@ -221,9 +263,17 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "catalog_query_reject",
     )
     assert graph.builder.nodes["catalog_response"].ends == (END,)
+    assert registry.resolve(AnswerQuestion(topic="policy")).node_name == "answer_response"
+    assert graph.builder.nodes["answer_response"].ends == (
+        "answer_clarify",
+        "answer_unsupported",
+        END,
+    )
     for command_node in ("catalog_entry", "catalog_response"):
         assert not any(source == command_node for source, _target in graph.builder.edges)
         assert command_node not in graph.builder.branches
+    assert not any(source == "answer_response" for source, _target in graph.builder.edges)
+    assert "answer_response" not in graph.builder.branches
 
 
 def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
@@ -1396,6 +1446,29 @@ def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_respon
     assert _answered_rows(tmp_path) == []
 
 
+def test_catalog_owner_rejects_model_text_over_the_platform_limit(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    limit = 40
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False, text_response="x" * (limit + 1)),
+        caller_audible_model_text_max_chars=limit,
+    )
+
+    result = _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="catalog-over-limit",
+        text="Tell me about running shoes.",
+    )
+
+    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert "hit a snag" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == []
+
+
 class _UnexpectedCatalogToolCall(FakeChatModel):
     def _respond(self, messages: list, **kwargs: object) -> AIMessage:
         self._invoke_count += 1
@@ -1467,6 +1540,242 @@ def test_catalog_speech_authority_is_owned_by_the_response_and_code_question_nod
     assert {"catalog_entry", "catalog_response"}.isdisjoint(
         frontline_graph.TRANSACTIONAL_MODEL_NODES
     )
+
+
+@pytest.mark.parametrize(
+    ("topic", "answer_source", "answer"),
+    (
+        ("policy", "grounded_model_response", "Returns are accepted within 30 days."),
+        ("general", "general_model_response", "A shoe midsole cushions each step."),
+    ),
+)
+def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_provenance(
+    config_root: Path,
+    tmp_path: Path,
+    topic: str,
+    answer_source: str,
+    answer: str,
+) -> None:
+    response_model = FakeChatModel(
+        structured_args={"AnswerResponse": ({"decision": "answer", "answer": answer},)},
+        record_prompts=True,
+    )
+    graph = _graph(config_root, response_model)
+    utterance = "What is your return policy?" if topic == "policy" else "What is a shoe midsole?"
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic=topic),  # type: ignore[arg-type]
+        turn_id=f"answer-{topic}",
+        text=utterance,
+    )
+
+    assert response_model.invoke_count == 1
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == answer
+    prompt = response_model._seen_prompts[-1]
+    assert utterance in prompt
+    if topic == "policy":
+        assert "answer only from the approved merchant policy facts" in prompt
+        assert "may give a low-risk explanation" not in prompt
+    else:
+        assert "may give a low-risk explanation" in prompt
+        assert "answer only from the approved merchant policy facts" not in prompt
+        assert "unsupported takes precedence over clarify" in prompt
+    assert _answered_rows(tmp_path) == [
+        {
+            "utterance": utterance,
+            "outcome": "answered",
+            "outcome_detail": "capability_answer",
+            "capability": "answer_question",
+            "answer_source": answer_source,
+        }
+    ]
+
+
+def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    line = "That policy detail is not available."
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args={"AnswerResponse": ({"decision": "answer", "answer": line},)}
+        ),
+    )
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="policy"),
+        turn_id="answer-unknown-policy",
+        text="Does the return policy cover monogrammed products?",
+    )
+
+    assert _only_spoken(result) == line
+    assert _failed_nodes(tmp_path) == []
+    assert _answered_rows(tmp_path)[0]["answer_source"] == "grounded_model_response"
+
+
+@pytest.mark.parametrize(
+    ("decision", "line", "node"),
+    (
+        ("clarify", "What would you like me to explain?", "answer_clarify"),
+        (
+            "unsupported",
+            "Please restate that as a specific store request, including the order, product, "
+            "account, or cart detail I should use.",
+            "answer_unsupported",
+        ),
+    ),
+)
+def test_answer_no_answer_decisions_use_only_their_code_authored_destination(
+    config_root: Path,
+    tmp_path: Path,
+    decision: str,
+    line: str,
+    node: str,
+) -> None:
+    response_model = FakeChatModel(
+        structured_args={"AnswerResponse": ({"decision": decision, "answer": None},)}
+    )
+    graph = _graph(config_root, response_model)
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="general"),
+        turn_id=f"answer-{decision}",
+        text="What does that mean?",
+    )
+
+    assert response_model.invoke_count == 1
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == line
+    assert _answered_rows(tmp_path) == []
+    assert _failed_nodes(tmp_path) == []
+    assert node in graph.speakable_nodes
+
+
+def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel(raise_transport=True))
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="general"),
+        turn_id="answer-transport-failure",
+        text="What is a shoe midsole?",
+    )
+
+    spoken = _only_spoken(result)
+    assert "hit a snag" in spoken
+    assert "specific store request" not in spoken
+    assert result["active_invocation"] is None
+    assert _failed_nodes(tmp_path) == ["answer_response"]
+    assert _answered_rows(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    (
+        "\u200b",
+        ". . .",
+    ),
+)
+def test_answer_owner_rejects_model_text_without_lexical_content(
+    config_root: Path,
+    tmp_path: Path,
+    answer: str,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args={"AnswerResponse": ({"decision": "answer", "answer": answer},)}
+        ),
+    )
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="general"),
+        turn_id="answer-non-lexical",
+        text="What is a shoe midsole?",
+    )
+
+    assert "hit a snag" in _only_spoken(result)
+    assert _failed_nodes(tmp_path) == ["answer_response"]
+    assert _answered_rows(tmp_path) == []
+
+
+def test_answer_owner_rejects_model_text_over_the_platform_limit(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    limit = 40
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args={
+                "AnswerResponse": ({"decision": "answer", "answer": "x" * (limit + 1)},)
+            }
+        ),
+        caller_audible_model_text_max_chars=limit,
+    )
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="general"),
+        turn_id="answer-over-limit",
+        text="What is a shoe midsole?",
+    )
+
+    assert "hit a snag" in _only_spoken(result)
+    assert _failed_nodes(tmp_path) == ["answer_response"]
+    assert _answered_rows(tmp_path) == []
+
+
+class _RawAnswerMappingModel(FakeChatModel):
+    def with_structured_output(self, schema, *, include_raw=False, **kwargs):
+        return RunnableLambda(lambda _messages: {"decision": "answer", "answer": "unvalidated"})
+
+
+def test_answer_owner_rejects_a_raw_mapping_from_the_structured_wrapper(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    graph = _graph(config_root, _RawAnswerMappingModel())
+
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="general"),
+        turn_id="answer-raw-mapping",
+        text="What is a shoe midsole?",
+    )
+
+    assert "hit a snag" in _only_spoken(result)
+    assert _failed_nodes(tmp_path) == ["answer_response"]
+    assert _answered_rows(tmp_path) == []
+
+
+def test_answer_speech_authority_is_split_between_model_and_code_nodes(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+
+    assert {"answer_clarify", "answer_unsupported"} <= graph.speakable_nodes
+    assert "answer_response" in graph.model_speech_nodes
+    assert "answer_response" not in graph.speakable_nodes
+    assert "answer_response" not in frontline_graph.TRANSACTIONAL_MODEL_NODES
+
+
+def test_answer_owner_uses_the_required_configured_structured_transport(config_root: Path) -> None:
+    response_model = FakeChatModel()
+    configured_method: StructuredOutputMethod = "json_schema"
+
+    _graph(config_root, response_model, structured_output_method=configured_method)
+
+    assert response_model.structured_methods == (configured_method,)
 
 
 def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(config_root: Path) -> None:
@@ -1763,6 +2072,9 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "catalog_query_clarify",
             "catalog_query_reject",
             "catalog_response",
+            "answer_response",
+            "answer_clarify",
+            "answer_unsupported",
             "support_clarify",
             "support_guardrail",
             "support_risk_check",
@@ -1852,7 +2164,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 64
+    assert len(policies) == 67
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -1864,7 +2176,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 63
+    assert len(graph.recovery_handled_nodes) == 66
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

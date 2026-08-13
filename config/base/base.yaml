@@ -12,6 +12,7 @@ _safety_locked:
   - schema_version       # structural — merchant may not fork the schema version
   - policies.cancel_batch_max   # safety bound (fits the LangGraph step budget), not a merchant knob
   - runtime.cancellation_quiescence_timeout_seconds
+  - runtime.caller_audible_model_text_max_chars
 
 _platform:
   # Guardrails / verification / PCI / egress — enforced in code; declared here as the locked
@@ -59,10 +60,13 @@ _platform:
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"
 
-# Runtime containment, present in the effective MerchantConfig. Unlike `_platform`, this value
-# survives resolution because the engine consumes it; the safety lock prevents tenant tuning.
+# Runtime containment, present in the effective MerchantConfig. Unlike `_platform`, these values
+# survive resolution because runtime owners consume them; the safety lock prevents tenant tuning.
 runtime:
   cancellation_quiescence_timeout_seconds: 2.0
+  # Hard containment for completed model prose sent to TTS. Prompts remain shorter by design;
+  # this ceiling rejects runaway output rather than truncating a caller-facing claim.
+  caller_audible_model_text_max_chars: 500
 
 # Platform-owned structural policy values. This partial block deep-merges with the category
 # template and merchant override; the safety lock above prevents either later layer changing it.

@@ -42,7 +42,10 @@ def _valid_merchant_dict() -> dict:
             "catalog": {"source": "ingested", "freshness_sla_min": 10},
         },
         "isolation": {"tier": "shared"},
-        "runtime": {"cancellation_quiescence_timeout_seconds": 2.0},
+        "runtime": {
+            "cancellation_quiescence_timeout_seconds": 2.0,
+            "caller_audible_model_text_max_chars": 500,
+        },
         "vector_namespace": "m1",
         "secrets_ref": "vault://m1",
     }
@@ -53,6 +56,7 @@ def test_valid_config_validates() -> None:
     assert config.merchant_id == "m1"
     assert config.isolation.tier == "shared"
     assert config.runtime.cancellation_quiescence_timeout_seconds == 2.0
+    assert config.runtime.caller_audible_model_text_max_chars == 500
 
 
 def test_runtime_quiescence_timeout_is_required_and_positive() -> None:
@@ -64,6 +68,11 @@ def test_runtime_quiescence_timeout_is_required_and_positive() -> None:
     invalid = _valid_merchant_dict()
     invalid["runtime"]["cancellation_quiescence_timeout_seconds"] = 0
     with pytest.raises(ValidationError, match="cancellation_quiescence_timeout_seconds"):
+        MerchantConfig.model_validate(invalid)
+
+    invalid = _valid_merchant_dict()
+    invalid["runtime"]["caller_audible_model_text_max_chars"] = 0
+    with pytest.raises(ValidationError, match="caller_audible_model_text_max_chars"):
         MerchantConfig.model_validate(invalid)
 
 

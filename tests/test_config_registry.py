@@ -30,8 +30,10 @@ secrets_ref: "vault://m1"
 
 _BASE_BODY = (
     "_safety_locked: [policies.cancel_batch_max, "
-    'runtime.cancellation_quiescence_timeout_seconds]\nschema_version: "0.2"\n'
-    "runtime: { cancellation_quiescence_timeout_seconds: 2.0 }\n"
+    "runtime.cancellation_quiescence_timeout_seconds, "
+    'runtime.caller_audible_model_text_max_chars]\nschema_version: "0.2"\n'
+    "runtime: { cancellation_quiescence_timeout_seconds: 2.0, "
+    "caller_audible_model_text_max_chars: 500 }\n"
     'compliance: { call_start_disclosure: "Hi, this is an AI assistant." }\n'
     "policies:\n"
     "  cancel_batch_max: 10\n"

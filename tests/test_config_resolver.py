@@ -18,6 +18,7 @@ def _base() -> dict:
             "schema_version",
             "policies.cancel_batch_max",
             "runtime.cancellation_quiescence_timeout_seconds",
+            "runtime.caller_audible_model_text_max_chars",
         ],
         "_platform": {
             "payment": {"out_of_band_only": True},
@@ -38,7 +39,10 @@ def _base() -> dict:
             },
         },
         "schema_version": "0.2",
-        "runtime": {"cancellation_quiescence_timeout_seconds": 2.0},
+        "runtime": {
+            "cancellation_quiescence_timeout_seconds": 2.0,
+            "caller_audible_model_text_max_chars": 500,
+        },
         "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
         "policies": {
             "cancel_batch_max": 10,
@@ -156,6 +160,19 @@ def test_runtime_quiescence_timeout_comes_from_locked_base() -> None:
     with pytest.raises(
         SafetyLockViolationError,
         match="cancellation_quiescence_timeout_seconds",
+    ):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_caller_audible_model_text_limit_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.caller_audible_model_text_max_chars == 500
+
+    bad = _override()
+    bad["runtime"] = {"caller_audible_model_text_max_chars": 50_000}
+    with pytest.raises(
+        SafetyLockViolationError,
+        match="caller_audible_model_text_max_chars",
     ):
         resolve_merchant_config(_base(), _template(), bad)
 

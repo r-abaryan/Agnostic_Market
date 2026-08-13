@@ -22,6 +22,8 @@ routing will consume.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -29,7 +31,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessageChunk
 from langchain_core.tools import tool
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.config import LLMConfig, MerchantConfig, ProviderModel
@@ -41,6 +43,7 @@ from agnostic_market.dtos.llm import (
     StructuredOutputMethod,
 )
 from agnostic_market.dtos.orchestration import (
+    AnswerResponse,
     CancellableOrderScope,
     CancelOrders,
     CapabilityId,
@@ -69,6 +72,58 @@ class ConformanceRunError(RuntimeError):
 
 class ChatOnlyModelError(RuntimeError):
     """A commerce turn was about to be routed to a non-certified model (gate refusal)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredOutputCase:
+    name: str
+    schema: type[BaseModel]
+    prompt: str
+    accepts: Callable[[BaseModel], bool]
+
+
+def _accepts_route(result: BaseModel) -> bool:
+    if not isinstance(result, RouteDecision):
+        return False
+    request = result.request
+    return (
+        result.decision == "direct"
+        and isinstance(request, CancelOrders)
+        and request.kind == CapabilityId.CANCEL_ORDERS
+        and isinstance(request.target, CancellableOrderScope)
+        and request.target.scope == "all_cancellable"
+    )
+
+
+def _accepts_answer(decision: str) -> Callable[[BaseModel], bool]:
+    return lambda result: (
+        isinstance(result, AnswerResponse)
+        and result.decision == decision
+        and ((decision == "answer") == (result.answer is not None))
+    )
+
+
+_STRUCTURED_OUTPUT_CASES = (
+    _StructuredOutputCase("route_direct", RouteDecision, _STRUCTURED_PROMPT, _accepts_route),
+    _StructuredOutputCase(
+        "answer",
+        AnswerResponse,
+        "Return decision=answer with a short non-empty answer.",
+        _accepts_answer("answer"),
+    ),
+    _StructuredOutputCase(
+        "clarify",
+        AnswerResponse,
+        "Return decision=clarify with no answer.",
+        _accepts_answer("clarify"),
+    ),
+    _StructuredOutputCase(
+        "unsupported",
+        AnswerResponse,
+        "Return decision=unsupported with no answer.",
+        _accepts_answer("unsupported"),
+    ),
+)
 
 
 @tool
@@ -111,29 +166,24 @@ async def _check_tool_call(chat_model: BaseChatModel) -> ConformanceCheck:
 async def _check_structured_output(
     chat_model: BaseChatModel, *, method: StructuredOutputMethod
 ) -> ConformanceCheck:
-    """`with_structured_output` must return the real validated route contract."""
+    """The configured transport must validate every structured schema used in production."""
     name = "structured_output"
-    structured = chat_model.with_structured_output(RouteDecision, method=method)
-    try:
-        result = await structured.ainvoke(_STRUCTURED_PROMPT)
-    except (OutputParserException, ValidationError) as exc:
-        # The model RESPONDED but its output failed the schema — a capability failure.
-        return ConformanceCheck(
-            name=name, passed=False, detail=f"output failed schema ({type(exc).__name__})"
-        )
-    if not isinstance(result, RouteDecision):
-        return ConformanceCheck(
-            name=name, passed=False, detail=f"no RouteDecision (got {type(result).__name__})"
-        )
-    request = result.request
-    if (
-        result.decision != "direct"
-        or not isinstance(request, CancelOrders)
-        or request.kind != CapabilityId.CANCEL_ORDERS
-        or not isinstance(request.target, CancellableOrderScope)
-        or request.target.scope != "all_cancellable"
-    ):
-        return ConformanceCheck(name=name, passed=False, detail="route has the wrong typed request")
+    for case in _STRUCTURED_OUTPUT_CASES:
+        structured = chat_model.with_structured_output(case.schema, method=method)
+        try:
+            result = await structured.ainvoke(case.prompt)
+        except (OutputParserException, ValidationError) as exc:
+            return ConformanceCheck(
+                name=name,
+                passed=False,
+                detail=_clip(f"{case.name}: output failed schema ({type(exc).__name__})"),
+            )
+        if not isinstance(result, BaseModel) or not case.accepts(result):
+            return ConformanceCheck(
+                name=name,
+                passed=False,
+                detail=_clip(f"{case.name}: wrong validated result ({type(result).__name__})"),
+            )
     return ConformanceCheck(name=name, passed=True, detail="")
 
 

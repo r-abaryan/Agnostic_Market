@@ -65,6 +65,9 @@ from agnostic_market.agents.capabilities import (
 from agnostic_market.agents.cart import build_cart_nodes
 from agnostic_market.agents.frontline.prompt import compose_system_prompt, resolved_order_line
 from agnostic_market.agents.frontline.read_flow import (
+    ANSWER_CLARIFY_NODE,
+    ANSWER_RESPONSE_NODE,
+    ANSWER_UNSUPPORTED_NODE,
     CATALOG_ENTRY_NODE,
     CATALOG_QUERY_CLARIFY_NODE,
     CATALOG_QUERY_REJECT_NODE,
@@ -75,6 +78,7 @@ from agnostic_market.agents.frontline.read_flow import (
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
+from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
@@ -106,7 +110,9 @@ from agnostic_market.commerce.orders import (
 from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
+    AnswerQuestion,
     CancelOrders,
     CapabilityId,
     ChangeProfile,
@@ -323,6 +329,8 @@ def build_frontline_graph(
     customers: CustomerDirectory,
     payment_instruments: PaymentInstrumentDirectory,
     lifecycle: PrincipalTransitionLifecycle,
+    structured_output_method: StructuredOutputMethod,
+    caller_audible_model_text_max_chars: int,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> FrontlineGraphAssembly:
     """Compile the reasoning graph (frontline routing tier + the cart, support, and identity
@@ -342,6 +350,7 @@ def build_frontline_graph(
     # dispatch and verify would talk to different fakes).
     verification_store = verification_store or VerificationStore(otp)
     risk = risk or RiskProvider()
+    model_text_policy = CallerAudibleModelTextPolicy(caller_audible_model_text_max_chars)
     # Session recent-order context. Production + any context test MUST pass the
     # SAME instance given to build_voice_tools (the order_status set-site) — the default
     # exists only for callers that never resolve an order reference (split-brain otherwise).
@@ -425,10 +434,14 @@ def build_frontline_graph(
             model = model_with_tools
         messages = [SystemMessage(prompt_text), *state.messages]
         response = model.invoke(messages)
+        if not isinstance(response, AIMessage):
+            raise TypeError("frontline model returned an incompatible message")
         if force_final and response.tool_calls:
             logger.error("unbound frontline model returned a tool call at the turn limit")
             content = response.content if isinstance(response.content, str) else ""
             response = AIMessage(content=content.strip() or _TOOL_LIMIT_FALLBACK)
+        if not response.tool_calls:
+            model_text_policy.validate(response.text)
         return {"messages": [response]}
 
     def route_after_model(state: ReasoningState) -> str:
@@ -1074,6 +1087,8 @@ def build_frontline_graph(
         store,
         policy,
         display_name=display_name,
+        structured_output_method=structured_output_method,
+        model_text_policy=model_text_policy,
     )
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
     identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
@@ -1081,6 +1096,7 @@ def build_frontline_graph(
     cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
     identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
     catalog_entry = CapabilityEntry(CATALOG_ENTRY_NODE)
+    answer_entry = CapabilityEntry(ANSWER_RESPONSE_NODE)
     capability_registry = CapabilityRegistry(
         (
             CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
@@ -1103,6 +1119,7 @@ def build_frontline_graph(
             CapabilitySpec(CapabilityId.MODIFY_CART, ModifyCart, cart_entry),
             CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
             CapabilitySpec(CapabilityId.SEARCH_CATALOG, SearchCatalog, catalog_entry),
+            CapabilitySpec(CapabilityId.ANSWER_QUESTION, AnswerQuestion, answer_entry),
         )
     )
 
@@ -1497,6 +1514,25 @@ def build_frontline_graph(
         destinations=(END,),
     )
     node_registry.register(
+        ANSWER_RESPONSE_NODE,
+        reads.answer_response,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(ANSWER_CLARIFY_NODE, ANSWER_UNSUPPORTED_NODE, END),
+    )
+    node_registry.register(
+        ANSWER_CLARIFY_NODE,
+        reads.answer_clarify,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        ANSWER_UNSUPPORTED_NODE,
+        reads.answer_unsupported,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
         "support_clarify",
         support.clarify,
         ExceptionAction.SAFE_ABORT,
@@ -1878,6 +1914,8 @@ def build_frontline_graph(
     graph.add_edge(_IDENTITY_STATUS_RENDER_NODE, END)
     graph.add_edge(CATALOG_QUERY_CLARIFY_NODE, END)
     graph.add_edge(CATALOG_QUERY_REJECT_NODE, END)
+    graph.add_edge(ANSWER_CLARIFY_NODE, END)
+    graph.add_edge(ANSWER_UNSUPPORTED_NODE, END)
     graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",

@@ -4,14 +4,20 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import HumanMessage
-from llm_fakes import ExplodingOnceFakeChatModel, FakeChatModel
+from llm_fakes import (
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    ExplodingOnceFakeChatModel,
+    FakeChatModel,
+)
 from policy_helpers import make_policy
 from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents import telemetry
+from agnostic_market.agents.frontline import read_flow
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.orchestration import (
+    AnswerQuestion,
     CartItemQuery,
     ListOrders,
     ModifyCart,
@@ -29,11 +35,14 @@ from scripts.frontline_eval import (
     TransportOwnerScenario,
     TurnObservation,
     _build_eval_runtime,
+    _load_read_owner_corpus,
     _observe_scenario,
     _OfflineSecretResolver,
     _order_reference_failures,
     _outcome,
+    _run_read_owner_cases,
     _run_transport_case,
+    _score_read_owner_output,
     _score_safety_observation,
     _score_transport_recovery,
     _speech_authority_failures,
@@ -101,6 +110,7 @@ def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Pat
         FakeChatModel(),
         FakeChatModel(),
         thread_id="eval-registry-identity",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     # The evaluator scores the production graph, so it must read availability from the same
     # registry the dispatcher resolves against, never rebuild its own alongside it.
@@ -121,6 +131,7 @@ def test_evaluator_runtime_uses_the_production_checkpointer(
         FakeChatModel(),
         FakeChatModel(),
         thread_id="eval-production-checkpointer",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
 
     assert runtime.graph.checkpointer is expected
@@ -150,6 +161,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         frontline,
         reasoning,
         thread_id="eval-cart-catalog-provenance",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     product = runtime.store.fixture.products[0]
     stale_price = round(product.price_usd / 2, 2)
@@ -216,6 +228,7 @@ async def test_evaluator_executes_a_seeded_typed_cart_request_without_semantic_r
         routing,
         reasoning,
         thread_id="eval-typed-cart-execution-contract",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     product = runtime.store.fixture.products[0]
     opening_turn_ids = ("eval-typed-cart:opening",)
@@ -291,6 +304,7 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
         routing,
         reasoning,
         thread_id="eval-typed-catalog-execution-contract",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     opening_turn_ids = ("eval-typed-catalog:opening",)
     runtime.graph.update_state(
@@ -353,6 +367,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
         routing,
         reasoning,
         thread_id="eval-typed-place-execution-contract",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     product = runtime.store.fixture.products[0]
     runtime.cart_store.add_item(
@@ -436,6 +451,219 @@ def test_frontline_eval_aggregate_preserves_category_order(config_root: Path) ->
     )
 
 
+async def test_read_owner_corpus_runs_through_the_production_graph_without_network(
+    config_root: Path,
+) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+    routing = FakeChatModel(
+        text_response="The trail running shoes cost $89.99.",
+        structured_args={
+            "AnswerResponse": (
+                {
+                    "decision": "answer",
+                    "answer": "Refunds usually appear within 5 to 7 business days.",
+                },
+                {"decision": "answer", "answer": "A midsole cushions each step."},
+                {"decision": "clarify", "answer": None},
+                {"decision": "unsupported", "answer": None},
+                {"decision": "unsupported", "answer": None},
+                {"decision": "unsupported", "answer": None},
+                {"decision": "unsupported", "answer": None},
+                {"decision": "unsupported", "answer": None},
+                {
+                    "decision": "answer",
+                    "answer": "That policy detail is not available.",
+                },
+                {"decision": "unsupported", "answer": None},
+            )
+        },
+    )
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    runtime = _build_eval_runtime(
+        config,
+        routing,
+        FakeChatModel(),
+        thread_id="eval-read-owner-corpus",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    try:
+        assert await _run_read_owner_cases(runtime.graph, corpus) == {}
+    finally:
+        runtime.caller_context.close_session()
+
+
+def test_read_owner_corpus_retains_each_answer_boundary_case(config_root: Path) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+
+    assert {
+        "answer_context_requires_clarification",
+        "answer_live_order_state_is_unsupported",
+        "answer_live_identity_state_is_unsupported",
+        "answer_live_inventory_state_is_unsupported",
+        "answer_live_effect_state_is_unsupported",
+        "answer_live_transfer_state_is_unsupported",
+        "answer_policy_unknown_detail",
+        "answer_elliptical_live_state_is_unsupported",
+    } <= {case.case_id for case in corpus.cases}
+
+
+def test_read_owner_scorer_detects_wrong_disposition_and_forbidden_claims(
+    config_root: Path,
+) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+    case = next(
+        item for item in corpus.cases if item.case_id == "answer_live_order_state_is_unsupported"
+    )
+
+    failures = _score_read_owner_output(
+        case,
+        actual_disposition="answer",
+        spoken_text="Your order is shipped.",
+    )
+
+    assert "expected unsupported, got answer" in failures
+    assert "included forbidden fact 'shipped'" in failures
+
+
+def test_read_owner_scorer_detects_fabricated_identity_assurance(config_root: Path) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+    case = next(
+        item for item in corpus.cases if item.case_id == "answer_live_identity_state_is_unsupported"
+    )
+
+    failures = _score_read_owner_output(
+        case,
+        actual_disposition="answer",
+        spoken_text=_FALSE_IDENTITY,
+    )
+
+    assert "expected unsupported, got answer" in failures
+    assert "included forbidden fact 'already identified'" in failures
+
+
+@pytest.mark.parametrize(
+    ("case_id", "fabricated_claim", "forbidden_fact"),
+    (
+        (
+            "answer_live_inventory_state_is_unsupported",
+            "The jacket is in stock in medium.",
+            "in stock",
+        ),
+        (
+            "answer_live_effect_state_is_unsupported",
+            "Your refund has been issued.",
+            "refund has been issued",
+        ),
+        (
+            "answer_live_transfer_state_is_unsupported",
+            "You have been transferred to a person.",
+            "transferred to a person",
+        ),
+    ),
+)
+def test_read_owner_scorer_detects_unsupported_live_state_claims(
+    config_root: Path,
+    case_id: str,
+    fabricated_claim: str,
+    forbidden_fact: str,
+) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+    case = next(item for item in corpus.cases if item.case_id == case_id)
+
+    failures = _score_read_owner_output(
+        case,
+        actual_disposition="answer",
+        spoken_text=fabricated_claim,
+    )
+
+    assert "expected unsupported, got answer" in failures
+    assert f"included forbidden fact {forbidden_fact!r}" in failures
+
+
+def test_read_owner_scorer_detects_an_invented_uncovered_policy_detail(
+    config_root: Path,
+) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+    case = next(item for item in corpus.cases if item.case_id == "answer_policy_unknown_detail")
+
+    failures = _score_read_owner_output(
+        case,
+        actual_disposition="answer",
+        spoken_text="Monogrammed products are covered and eligible for return.",
+    )
+
+    assert "missing required fact 'not available'" in failures
+    assert "included forbidden fact 'monogrammed products are covered'" in failures
+    assert "included forbidden fact 'eligible for return'" in failures
+
+
+def test_read_owner_scorer_prefers_unsupported_for_elliptical_live_state(
+    config_root: Path,
+) -> None:
+    corpus = _load_read_owner_corpus(config_root / "eval" / "frontline_read_owners.yaml")
+    case = next(
+        item
+        for item in corpus.cases
+        if item.case_id == "answer_elliptical_live_state_is_unsupported"
+    )
+
+    failures = _score_read_owner_output(
+        case,
+        actual_disposition="clarify",
+        spoken_text=read_flow._ANSWER_CONTEXT_QUESTION,
+    )
+
+    assert "expected unsupported, got clarify" in failures
+
+
+@pytest.mark.parametrize(
+    ("expected_disposition", "answer"),
+    (
+        ("clarify", read_flow._ANSWER_CONTEXT_QUESTION),
+        ("unsupported", read_flow._ANSWER_UNSUPPORTED_RETRY),
+    ),
+)
+async def test_read_owner_eval_observes_the_executed_branch_not_matching_copy(
+    config_root: Path,
+    expected_disposition: str,
+    answer: str,
+) -> None:
+    corpus = frontline_eval.ReadOwnerEvalCorpus(
+        schema_version="1",
+        cases=(
+            frontline_eval.ReadOwnerEvalCase(
+                case_id=f"answer_arm_disguised_as_{expected_disposition}",
+                owner="answer",
+                utterance="What does that mean?",
+                topic="general",
+                expected_disposition=expected_disposition,
+            ),
+        ),
+    )
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    runtime = _build_eval_runtime(
+        config,
+        FakeChatModel(
+            structured_args={"AnswerResponse": ({"decision": "answer", "answer": answer},)}
+        ),
+        FakeChatModel(),
+        thread_id=f"eval-copy-collision-{expected_disposition}",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    try:
+        failures = await _run_read_owner_cases(runtime.graph, corpus)
+    finally:
+        runtime.caller_context.close_session()
+
+    assert failures == {
+        f"answer_arm_disguised_as_{expected_disposition}": (
+            f"expected {expected_disposition}, got answer",
+        )
+    }
+
+
 def test_transport_case_matrix_covers_every_owner_provider_and_fault_class() -> None:
     providers = ("anthropic", "openai")
     offline = _transport_case_matrix(tier="offline", providers=providers)
@@ -468,6 +696,7 @@ def test_transport_case_matrix_covers_every_owner_provider_and_fault_class() -> 
         ("frontline_browse", "model", FaultKind.PRE_RESPONSE_DISCONNECT),
         ("cart_checkout", "cart_assemble", FaultKind.INTERRUPTED_BODY),
         ("catalog_grounded_response", "catalog_response", FaultKind.PRE_RESPONSE_DISCONNECT),
+        ("answer_bounded_response", "answer_response", FaultKind.PRE_RESPONSE_DISCONNECT),
     }
     assert [(scenario.scenario_id, provider, kind) for scenario, provider, kind in live] == [
         ("frontline_browse", "anthropic", FaultKind.PRE_RESPONSE_DISCONNECT),
@@ -479,6 +708,12 @@ def test_transport_case_matrix_covers_every_owner_provider_and_fault_class() -> 
         if scenario.scenario_id == "catalog_grounded_response"
     )
     assert catalog.initial_request == SearchCatalog(query="trail shoes")
+    answer = next(
+        scenario
+        for scenario, _provider, _kind in offline
+        if scenario.scenario_id == "answer_bounded_response"
+    )
+    assert answer.initial_request == AnswerQuestion(topic="policy")
 
 
 async def test_offline_transport_cases_reach_and_recover_every_real_model_owner(

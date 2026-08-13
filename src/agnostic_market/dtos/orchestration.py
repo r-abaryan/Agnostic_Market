@@ -133,6 +133,21 @@ class AnswerQuestion(_CompleteIntentRequest):
     topic: Literal["policy", "general"]
 
 
+class AnswerResponse(BaseModel):
+    """Tool-incapable answer-owner output; no-answer decisions carry no model prose."""
+
+    model_config = _FROZEN
+
+    decision: Literal["answer", "clarify", "unsupported"]
+    answer: NonEmptyText | None = None
+
+    @model_validator(mode="after")
+    def _answer_matches_decision(self) -> AnswerResponse:
+        if (self.decision == "answer") != (self.answer is not None):
+            raise ValueError("only the answer decision may carry a non-empty answer")
+        return self
+
+
 class SearchCatalog(IntentRequestModel):
     model_config = _FROZEN
 

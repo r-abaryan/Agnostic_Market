@@ -206,6 +206,8 @@ def build_voice_loop(
         customers=customers,
         payment_instruments=payment_instruments,
         lifecycle=caller_context,
+        structured_output_method=gateway.structured_output_method(config.llm.routing),
+        caller_audible_model_text_max_chars=(config.runtime.caller_audible_model_text_max_chars),
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
