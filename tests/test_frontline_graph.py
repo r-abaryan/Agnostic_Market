@@ -11,7 +11,9 @@ from typing import NoReturn
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableLambda
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END
+from langgraph.types import Command
 from llm_fakes import (
     TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
     TEST_STRUCTURED_OUTPUT_METHOD,
@@ -57,14 +59,20 @@ from agnostic_market.dtos.orchestration import (
     CapabilityId,
     CartItemChoices,
     CartItemQuery,
+    ExplicitOrderSet,
+    ExplicitOrderTarget,
+    FocusedOrderSet,
     IntentRequest,
     ListOrders,
     ModifyCart,
     PlaceOrder,
+    RecentOrderSet,
+    RefundOrder,
     ResolvedCartItemRef,
     SearchCatalog,
     SwitchAccount,
     VerifyIdentity,
+    VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -232,6 +240,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.PLACE_ORDER,
         CapabilityId.SEARCH_CATALOG,
         CapabilityId.ANSWER_QUESTION,
+        CapabilityId.VERIFY_ORDER_STATUS,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
@@ -241,6 +250,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "cart_capability_entry",
         "catalog_entry",
         "answer_response",
+        "order_status_entry",
     )
     # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
     # dispatcher must still own no executable outgoing route.
@@ -251,7 +261,6 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     # The unmigrated set is named, not counted: a count stays green if one id gains an owner
     # while another is added, and it names nothing when it breaks.
     assert set(CapabilityId) - set(registry.capability_ids) == {
-        CapabilityId.VERIFY_ORDER_STATUS,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.REQUEST_PERSON,
     }
@@ -273,6 +282,36 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         assert command_node not in graph.builder.branches
     assert not any(source == "answer_response" for source, _target in graph.builder.edges)
     assert "answer_response" not in graph.builder.branches
+    assert registry.resolve(VerifyOrderStatus()).node_name == "order_status_entry"
+    assert graph.builder.nodes["order_status_entry"].ends == (
+        "order_status_target_ask",
+        "order_status_target_propose",
+        "order_status_fulfill",
+    )
+    assert graph.builder.nodes["order_status_target_propose"].ends == (
+        "order_status_target_reject",
+        "order_status_fulfill",
+    )
+    assert graph.builder.nodes["order_status_target_confirm"].ends == (
+        "order_status_target_reject",
+        "order_status_fulfill",
+        "handover",
+    )
+    assert graph.builder.nodes["order_status_fulfill"].ends == (
+        "order_status_target_ask",
+        "order_status_target_confirm",
+        "order_status_target_reject",
+        "order_status_fulfill",
+        END,
+    )
+    for command_node in (
+        "order_status_entry",
+        "order_status_target_propose",
+        "order_status_target_confirm",
+        "order_status_fulfill",
+    ):
+        assert not any(source == command_node for source, _target in graph.builder.edges)
+        assert command_node not in graph.builder.branches
 
 
 def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
@@ -1537,7 +1576,7 @@ def test_catalog_speech_authority_is_owned_by_the_response_and_code_question_nod
     assert "catalog_response" in graph.model_speech_nodes
     assert "catalog_response" not in graph.speakable_nodes
     assert {"catalog_entry", "catalog_response"}.isdisjoint(
-        frontline_graph.TRANSACTIONAL_MODEL_NODES
+        frontline_graph.NON_SPEAKING_MODEL_NODES
     )
 
 
@@ -1765,7 +1804,7 @@ def test_answer_speech_authority_is_split_between_model_and_code_nodes(
     assert {"answer_clarify", "answer_unsupported"} <= graph.speakable_nodes
     assert "answer_response" in graph.model_speech_nodes
     assert "answer_response" not in graph.speakable_nodes
-    assert "answer_response" not in frontline_graph.TRANSACTIONAL_MODEL_NODES
+    assert "answer_response" not in frontline_graph.NON_SPEAKING_MODEL_NODES
 
 
 def test_answer_owner_uses_the_required_configured_structured_transport(config_root: Path) -> None:
@@ -1774,7 +1813,497 @@ def test_answer_owner_uses_the_required_configured_structured_transport(config_r
 
     _graph(config_root, response_model, structured_output_method=configured_method)
 
-    assert response_model.structured_methods == (configured_method,)
+    assert response_model.structured_methods == (configured_method, configured_method)
+
+
+def test_order_status_owner_grants_and_renders_one_explicit_order_without_model_speech(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    model = FakeChatModel()
+    graph = _graph(config_root, model)
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1001",))),
+        turn_id="status-explicit",
+        text="ORD-1001, my phone is 555 010 0119",
+    )
+
+    assert model.invoke_count == 0
+    assert result["active_invocation"] is None
+    assert "Your order ORD-1001" in _only_spoken(result)
+    assert _answered_rows(tmp_path) == [
+        {
+            "utterance": "ORD-1001, my phone is [phone]",
+            "outcome": "answered",
+            "outcome_detail": "capability_answer",
+            "capability": "verify_order_status",
+            "answer_source": "code_authored_read",
+        }
+    ]
+
+
+def test_order_status_spoken_email_after_contact_phrase_matches_end_to_end(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    graph = _graph(config_root, FakeChatModel(), identity=identity)
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
+        turn_id="status-spoken-email",
+        text="ORD-1002, contact me at casey at example dot com",
+    )
+
+    assert identity.order_granted("ORD-1002")
+    assert "Your order ORD-1002" in _only_spoken(result)
+
+
+def _pause_unwitnessed_order_status_target(config_root: Path, *, thread_id: str):
+    identity = CallerIdentityStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        identity=identity,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": thread_id}}
+    paused = graph.invoke(
+        _admitted_turn(
+            "I do not know the order number. My email is casey@example.com.",
+            turn_id=thread_id,
+            active_invocation=ActiveInvocation(
+                request=VerifyOrderStatus(
+                    target=ExplicitOrderSet(order_refs=("ORD-1002",)),
+                ),
+                opened_turn_id=thread_id,
+            ),
+        ),
+        config,
+    )
+    return graph, identity, config, paused
+
+
+def test_unwitnessed_router_target_requires_caller_confirmation_before_guest_grant(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    graph, identity, config, paused = _pause_unwitnessed_order_status_target(
+        config_root,
+        thread_id="status-router-confirm",
+    )
+
+    assert "I heard ORD-1002" in str(paused["__interrupt__"][0].value)
+    assert paused["active_invocation"].request.explicit_target_turn_id == "status-router-confirm"
+    assert not identity.order_granted("ORD-1002")
+    assert _answered_rows(tmp_path) == []
+
+    result = graph.invoke(
+        Command(
+            resume={"text": "yes"},
+            update={"consumed_turn_ids": ("status-router-confirm-answer",)},
+        ),
+        config,
+    )
+
+    assert identity.order_granted("ORD-1002")
+    assert result["active_invocation"] is None
+    assert "Your order ORD-1002" in _only_spoken(result)
+
+
+def test_model_only_order_status_target_cannot_grant_before_confirmation(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    model = FakeChatModel(
+        structured_args={
+            "OrderTargetProposal": ({"relationship": "single", "order_refs": ["ORD-1002"]},)
+        }
+    )
+    graph = _graph(
+        config_root,
+        model,
+        identity=identity,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "status-model-confirm"}}
+    invocation = ActiveInvocation(
+        request=VerifyOrderStatus(),
+        opened_turn_id="status-opening",
+    )
+
+    paused = graph.invoke(
+        _admitted_turn(
+            "I do not know the order number. My email is casey@example.com.",
+            turn_id="status-followup",
+            consumed_turn_ids=("status-opening", "status-followup"),
+            active_invocation=invocation,
+        ),
+        config,
+    )
+
+    assert model.invoke_count == 1
+    assert "I heard ORD-1002" in str(paused["__interrupt__"][0].value)
+    assert paused["active_invocation"].request.explicit_target_turn_id == "status-followup"
+    assert not identity.order_granted("ORD-1002")
+    assert _answered_rows(tmp_path) == []
+
+
+def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        identity=identity,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "status-confirm-then-contact"}}
+    paused = graph.invoke(
+        _admitted_turn(
+            "I do not know the order number.",
+            turn_id="status-target-source",
+            active_invocation=ActiveInvocation(
+                request=VerifyOrderStatus(
+                    target=ExplicitOrderSet(order_refs=("ORD-1002",)),
+                ),
+                opened_turn_id="status-target-source",
+            ),
+        ),
+        config,
+    )
+    assert "I heard ORD-1002" in str(paused["__interrupt__"][0].value)
+
+    contact_question = graph.invoke(
+        Command(
+            resume={"text": "yes"},
+            update={"consumed_turn_ids": ("status-target-confirmation",)},
+        ),
+        config,
+    )
+
+    assert _only_spoken(contact_question) == "What email address or phone number is on the account?"
+    assert contact_question["active_invocation"].request.explicit_target_confirmed
+    assert not identity.order_granted("ORD-1002")
+    prior_message_count = len(contact_question["messages"])
+
+    result = graph.invoke(
+        _admitted_turn(
+            "casey@example.com",
+            turn_id="status-contact-followup",
+        ),
+        config,
+    )
+
+    assert identity.order_granted("ORD-1002")
+    new_spoken = [
+        message
+        for message in result["messages"][prior_message_count:]
+        if isinstance(message, AIMessage)
+    ]
+    assert len(new_spoken) == 1
+    assert "Your order ORD-1002" in str(new_spoken[0].content)
+
+
+def test_declined_order_status_target_confirmation_grants_nothing(
+    config_root: Path,
+) -> None:
+    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+        config_root,
+        thread_id="status-confirm-no",
+    )
+
+    result = graph.invoke(
+        Command(
+            resume={"text": "no"},
+            update={"consumed_turn_ids": ("status-confirm-no-answer",)},
+        ),
+        config,
+    )
+
+    assert not identity.order_granted("ORD-1002")
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
+
+
+def test_unclear_order_status_target_confirmation_is_bounded(
+    config_root: Path,
+) -> None:
+    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+        config_root,
+        thread_id="status-confirm-unclear",
+    )
+
+    retry = graph.invoke(
+        Command(
+            resume={"text": "maybe"},
+            update={"consumed_turn_ids": ("status-confirm-unclear-1",)},
+        ),
+        config,
+    )
+
+    assert "Please say yes or no" in str(retry["__interrupt__"][0].value)
+    assert not identity.order_granted("ORD-1002")
+
+    result = graph.invoke(
+        Command(
+            resume={"text": "I am not sure"},
+            update={"consumed_turn_ids": ("status-confirm-unclear-2",)},
+        ),
+        config,
+    )
+
+    assert not identity.order_granted("ORD-1002")
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
+
+
+def test_interrupted_order_status_target_readback_reconfirms_before_grant(
+    config_root: Path,
+) -> None:
+    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+        config_root,
+        thread_id="status-confirm-interrupted",
+    )
+
+    retry = graph.invoke(
+        Command(
+            resume={"text": "yes", "readback_interrupted": True},
+            update={"consumed_turn_ids": ("status-confirm-interrupted-1",)},
+        ),
+        config,
+    )
+
+    assert "Please say yes or no" in str(retry["__interrupt__"][0].value)
+    assert not identity.order_granted("ORD-1002")
+
+    result = graph.invoke(
+        Command(
+            resume={"text": "yes"},
+            update={"consumed_turn_ids": ("status-confirm-interrupted-2",)},
+        ),
+        config,
+    )
+
+    assert identity.order_granted("ORD-1002")
+    assert "Your order ORD-1002" in _only_spoken(result)
+
+
+def test_order_status_target_confirmation_human_escape_uses_terminal_handover(
+    config_root: Path,
+) -> None:
+    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+        config_root,
+        thread_id="status-confirm-human",
+    )
+
+    result = graph.invoke(
+        Command(
+            resume={"text": "I want a person"},
+            update={"consumed_turn_ids": ("status-confirm-human-answer",)},
+        ),
+        config,
+    )
+
+    assert not identity.order_granted("ORD-1002")
+    assert result["active_invocation"] is None
+    assert result["automation_terminal"] is True
+
+
+def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+        config_root,
+        thread_id="status-confirm-failure",
+    )
+
+    def _fail_consent(_text: str) -> NoReturn:
+        raise RuntimeError("injected confirmation failure")
+
+    monkeypatch.setattr(read_flow, "classify_consent", _fail_consent)
+    result = graph.invoke(
+        Command(
+            resume={"text": "yes"},
+            update={"consumed_turn_ids": ("status-confirm-failure-answer",)},
+        ),
+        config,
+    )
+
+    assert not identity.order_granted("ORD-1002")
+    assert result["active_invocation"] is None
+    assert "hit a snag" in _only_spoken(result)
+    assert _failed_nodes(tmp_path) == ["order_status_target_confirm"]
+
+
+def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
+    config_root: Path,
+) -> None:
+    model = FakeChatModel(
+        structured_args={
+            "OrderTargetProposal": ({"relationship": "single", "order_refs": ["ORD-1002"]},)
+        }
+    )
+    graph = _graph(config_root, model)
+    opening = _typed_read(
+        graph,
+        VerifyOrderStatus(),
+        turn_id="status-opening",
+        text="Where is my order?",
+    )
+    assert _only_spoken(opening) == "What is the order number, for example ORD-1234?"
+    retained = opening["active_invocation"]
+    assert retained is not None
+
+    result = graph.invoke(
+        _admitted_turn(
+            "ORD-1002, casey@example.com",
+            turn_id="status-followup",
+            consumed_turn_ids=("status-opening", "status-followup"),
+            active_invocation=retained,
+        )
+    )
+
+    assert model.invoke_count == 1
+    assert result["active_invocation"] is None
+    assert "Your order ORD-1002" in _only_spoken(result)
+    assert "order_status_target_propose" in frontline_graph.NON_SPEAKING_MODEL_NODES
+    assert "order_status_target_propose" not in graph.speakable_nodes
+
+
+def test_order_status_focused_selector_fails_closed_without_live_focus(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=FocusedOrderSet()),
+        turn_id="status-no-focus",
+        text="Where is that order?",
+    )
+
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
+
+
+def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    recent = RecentOrderContext(max_refs=3)
+    identity = CallerIdentityStore()
+    graph = _graph(config_root, FakeChatModel(), recent_orders=recent, identity=identity)
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1001", "ORD-1003"))),
+        turn_id="status-plural",
+        text="ORD-1001 and ORD-1003, phone 555 010 0119",
+    )
+
+    line = _only_spoken(result)
+    assert "Your order ORD-1001" in line and "Your order ORD-1003" in line
+    assert identity.order_granted("ORD-1001") and identity.order_granted("ORD-1003")
+    assert recent.snapshot().order_refs == ("ORD-1001", "ORD-1003")
+    assert recent.snapshot().focused_order_ref is None
+    assert len(_answered_rows(tmp_path)) == 1
+
+
+def test_order_status_bound_principal_cannot_widen_with_a_foreign_contact(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    graph = _graph(config_root, FakeChatModel(), identity=identity)
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
+        turn_id="status-bound-foreign",
+        text="ORD-1002, casey@example.com",
+    )
+
+    assert "couldn't retrieve" in _only_spoken(result)
+    assert not identity.order_granted("ORD-1002")
+    assert identity.current() is not None
+
+
+def test_order_status_recent_selector_uses_the_complete_bounded_set(
+    config_root: Path,
+) -> None:
+    recent = RecentOrderContext(max_refs=3)
+    recent.record(("ORD-1001", "ORD-1003"), operation="list")
+    graph = _graph(config_root, FakeChatModel(), recent_orders=recent)
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=RecentOrderSet()),
+        turn_id="status-recent",
+        text="check those orders, phone 555 010 0119",
+    )
+
+    line = _only_spoken(result)
+    assert "Your order ORD-1001" in line and "Your order ORD-1003" in line
+
+
+def test_order_status_rejects_alternatives_without_read_or_grant(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    model = FakeChatModel(
+        structured_args={
+            "OrderTargetProposal": (
+                {
+                    "relationship": "alternative",
+                    "order_refs": ["ORD-1001", "ORD-1002"],
+                },
+            )
+        }
+    )
+    graph = _graph(config_root, model, identity=identity)
+    invocation = ActiveInvocation(
+        request=VerifyOrderStatus(),
+        opened_turn_id="status-opening",
+    )
+
+    result = graph.invoke(
+        _admitted_turn(
+            "Either ORD-1001 or ORD-1002",
+            turn_id="status-alternative",
+            consumed_turn_ids=("status-opening", "status-alternative"),
+            active_invocation=invocation,
+        )
+    )
+
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
+    assert not identity.order_granted("ORD-1001")
+    assert not identity.order_granted("ORD-1002")
+
+
+def test_order_status_multiple_contact_claims_clarify_without_matching(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    graph = _graph(config_root, FakeChatModel(), identity=identity)
+
+    result = _typed_read(
+        graph,
+        VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1001",))),
+        turn_id="status-multiple-contact",
+        text="ORD-1001, casey@example.com or phone 555 010 0119",
+    )
+
+    assert _only_spoken(result) == "What email address or phone number is on the account?"
+    assert result["active_invocation"] is not None
+    assert not identity.order_granted("ORD-1001")
 
 
 def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(config_root: Path) -> None:
@@ -2074,6 +2603,11 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "answer_response",
             "answer_clarify",
             "answer_unsupported",
+            "order_status_entry",
+            "order_status_target_ask",
+            "order_status_target_propose",
+            "order_status_target_reject",
+            "order_status_fulfill",
             "support_clarify",
             "support_guardrail",
             "support_risk_check",
@@ -2105,6 +2639,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         AbandonmentKind.LIFECYCLE_SPECIAL: {
             "tools",
             "principal_warning",
+            "order_status_target_confirm",
             "cart_confirm",
             "support_dispatch",
             "support_collect",
@@ -2129,6 +2664,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     expected_exception = {
         ExceptionAction.SAFE_ABORT: {
             *expected_abandonment[AbandonmentKind.PURE_ABORT],
+            "order_status_target_confirm",
             "tools",
         },
         ExceptionAction.CART_REVIEW: {
@@ -2163,7 +2699,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 67
+    assert len(policies) == 73
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -2175,7 +2711,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 66
+    assert len(graph.recovery_handled_nodes) == 72
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}
@@ -2591,6 +3127,68 @@ async def test_plural_state_followup_corrects_a_memory_claim_from_live_store(
     assert "ORD-1001" in line and "ORD-1002" in line
     assert "ORD-1001" in line and "was expected" in line
     assert "ORD-1002" in line and "cancelled" in line
+
+
+@pytest.mark.parametrize(
+    ("recorded_refs", "has_focus"),
+    (
+        (("ORD-1001",), True),
+        (("ORD-1001", "ORD-1003"), False),
+    ),
+)
+def test_recent_order_focus_is_consistent_across_frontline_and_support_prompts(
+    config_root: Path,
+    recorded_refs: tuple[str, ...],
+    has_focus: bool,
+) -> None:
+    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
+    recent_orders.record(recorded_refs, operation="read")
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    frontline = FakeChatModel(emit_tool_calls=False, record_prompts=True)
+    reasoning = FakeChatModel(emit_tool_calls=False, record_prompts=True)
+    graph = _graph(
+        config_root,
+        frontline,
+        recent_orders=recent_orders,
+        identity=identity,
+        reasoning_model=reasoning,
+    )
+    state = ReasoningState(
+        messages=[HumanMessage("Please continue.", id="focus-prompt")],
+        consumed_turn_ids=("focus-prompt",),
+    )
+
+    graph.nodes["model"].invoke(state)
+    frontline_prompt = frontline._seen_prompts[-1]
+    graph.nodes["support_assemble"].invoke(
+        ReasoningState(
+            messages=state.messages,
+            consumed_turn_ids=state.consumed_turn_ids,
+            active_flow="support",
+        )
+    )
+    broad_support_prompt = reasoning._seen_prompts[-1]
+    typed_state = ReasoningState(
+        messages=state.messages,
+        consumed_turn_ids=state.consumed_turn_ids,
+        active_flow="support",
+        active_invocation=ActiveInvocation(
+            request=RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1001"),
+                destination="original",
+            ),
+            opened_turn_id="focus-prompt",
+        ),
+    )
+    graph.nodes["support_capability_entry"].invoke(typed_state)
+    typed_support_prompt = reasoning._seen_prompts[-1]
+
+    assert ("The order most recently discussed on this call is ORD-1001" in frontline_prompt) is (
+        has_focus
+    )
+    for prompt in (broad_support_prompt, typed_support_prompt):
+        assert ("the order most recently discussed" in prompt) is has_focus
 
 
 async def test_unverified_all_orders_state_check_enters_identity_flow(

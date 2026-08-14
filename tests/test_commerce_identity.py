@@ -14,6 +14,7 @@ from agnostic_market.commerce.identity import (
     CustomerEntry,
     CustomersFixture,
     assert_orders_have_customers,
+    classify_contact_claims,
     load_customers_fixture,
     order_mutation_allowed,
     order_read_allowed,
@@ -22,6 +23,25 @@ from agnostic_market.commerce.identity import (
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "+1 555 010 0119 or 555 010 0119",
+        "casey@example.com, again casey at example dot com",
+    ),
+)
+def test_contact_claim_classification_deduplicates_by_directory_match_key(
+    utterance: str,
+) -> None:
+    assert classify_contact_claims(utterance).disposition == "single"
+
+
+def test_contact_claim_classification_rejects_two_distinct_claims() -> None:
+    selection = classify_contact_claims("casey@example.com or 555 010 0119")
+    assert selection.disposition == "multiple"
+    assert selection.claim is None
 
 
 def _directory(config_root: Path) -> CustomerDirectory:

@@ -14,6 +14,7 @@ from agnostic_market.commerce.spoken import (
     caller_stated_order_id,
     caller_stated_phone,
     redact_contact,
+    scan_contact_candidates,
 )
 
 _XFAIL_STRONG_STT = "strong-labelled fused or letter-spelled order IDs are not normalized"
@@ -100,6 +101,33 @@ def test_order_ids_and_small_numbers_survive() -> None:
 def test_plain_utterances_pass_through() -> None:
     assert redact_contact("hi there") == "hi there"
     assert redact_contact("cancel my rain jacket order") == "cancel my rain jacket order"
+
+
+@pytest.mark.parametrize(
+    ("utterance", "kind", "claim"),
+    (
+        ("casey@example.com", "email", "casey@example.com"),
+        ("my email is casey at example dot com", "email", "casey@example.com"),
+        ("contact me at casey at example dot com", "email", "casey@example.com"),
+        ("order ORD-1002 and casey at example dot com", "email", "casey@example.com"),
+        ("my number is five five five zero one zero zero one one nine", "phone", "5550100119"),
+    ),
+)
+def test_contact_scanner_extracts_one_bounded_syntax_candidate(
+    utterance: str, kind: str, claim: str
+) -> None:
+    observed = tuple(
+        (candidate.kind, candidate.claim) for candidate in scan_contact_candidates(utterance)
+    )
+    assert observed == ((kind, claim),)
+
+
+def test_contact_scanner_does_not_turn_an_order_reference_into_a_phone() -> None:
+    assert scan_contact_candidates("check order ORD-10020001") == ()
+    assert tuple(
+        (candidate.kind, candidate.claim)
+        for candidate in scan_contact_candidates("order 10020001, phone 555 010 0119")
+    ) == (("phone", "5550100119"),)
 
 
 def test_write_event_redacts_the_utterance_field(tmp_path: Path) -> None:

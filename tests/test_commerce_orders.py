@@ -47,8 +47,17 @@ def test_recent_order_context_marks_a_bounded_set_incomplete() -> None:
     context.record(["ORD-1001", "ORD-1002", "ORD-1003"], operation="list")
     snapshot = context.snapshot()
     assert snapshot.order_refs == ("ORD-1002", "ORD-1003")
-    assert snapshot.focused_order_ref == "ORD-1003"
+    assert snapshot.focused_order_ref is None
     assert snapshot.complete is False
+
+
+def test_recent_order_context_focuses_only_one_implicit_reference() -> None:
+    context = RecentOrderContext(max_refs=3)
+    context.record(["ORD-1001"], operation="read")
+    assert context.snapshot().focused_order_ref == "ORD-1001"
+
+    context.record(["ORD-1001", "ORD-1002"], operation="read")
+    assert context.snapshot().focused_order_ref is None
 
 
 # --- the idempotency arbiter (A10 rule 5: replay/retry can never double-order) ---------

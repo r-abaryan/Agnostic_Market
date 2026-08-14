@@ -58,14 +58,16 @@ from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech, build_ch
 from agnostic_market.agents.frontline import (
     FRONTLINE_SPEAKABLE_NODES,
     MODEL_SPEECH_NODES,
-    TRANSACTIONAL_MODEL_NODES,
+    NON_SPEAKING_MODEL_NODES,
     build_frontline_graph,
 )
+from agnostic_market.agents.frontline.prompt import ORDER_TARGET_PROPOSAL_PROMPT
 from agnostic_market.agents.frontline.read_flow import (
     ANSWER_CLARIFY_NODE,
     ANSWER_RESPONSE_NODE,
     ANSWER_UNSUPPORTED_NODE,
     CATALOG_RESPONSE_NODE,
+    ORDER_STATUS_TARGET_PROPOSE_NODE,
 )
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.tooling import wrap_readonly_tool
@@ -110,6 +112,7 @@ from agnostic_market.dtos.orchestration import (
     IntentRequest,
     OrderTargetProposal,
     SearchCatalog,
+    VerifyOrderStatus,
 )
 from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
@@ -590,7 +593,7 @@ def _speech_authority_failures() -> tuple[str, ...]:
     """Exercise production speech-source policy against every transactional model node."""
     failures: list[str] = []
 
-    for node in sorted(TRANSACTIONAL_MODEL_NODES):
+    for node in sorted(NON_SPEAKING_MODEL_NODES):
         meta = {"langgraph_node": node}
         completed_speech = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
         event = completed_speech.feed(
@@ -691,16 +694,6 @@ def _load_routing_eval_selection() -> _RoutingEvalSelection:
     )
 
 
-_ORDER_TARGET_EVAL_PROMPT = """Classify only the order references stated in the caller's message.
-Return single for one intended order, plural for multiple intended orders, alternative when the
-caller presents choices, and ambiguous when a reference is merely quoted or disclaimed, or when
-fragmentary, conflicting, or unresolved wording does not establish an executable target. A clear
-correction keeps only the corrected-to reference. Preserve every observed order reference on
-non-single arms; do not select
-one alternative or infer an order from conversational context. Normalize a clear labelled numeric
-reference to ORD-<digits>."""
-
-
 def _score_order_target_output(
     case: OrderTargetEvalCase,
     proposal: OrderTargetProposal,
@@ -728,7 +721,7 @@ async def _run_order_target_cases(
     for case in corpus.cases:
         try:
             result = await structured.ainvoke(
-                [SystemMessage(_ORDER_TARGET_EVAL_PROMPT), HumanMessage(case.utterance)]
+                [SystemMessage(ORDER_TARGET_PROPOSAL_PROMPT), HumanMessage(case.utterance)]
             )
         except (OutputParserException, ValidationError) as exc:
             failures[case.case_id] = (f"output failed schema ({type(exc).__name__})",)
@@ -916,6 +909,13 @@ _TRANSPORT_OWNER_SCENARIOS = (
         origin_node=ANSWER_RESPONSE_NODE,
         utterance="What is your return policy?",
         initial_request=AnswerQuestion(topic="policy"),
+    ),
+    TransportOwnerScenario(
+        scenario_id="order_status_target_proposal",
+        owner="frontline",
+        origin_node=ORDER_STATUS_TARGET_PROPOSE_NODE,
+        utterance="Order 1002.",
+        initial_request=VerifyOrderStatus(),
     ),
 )
 _EMPTY_RECOVERY_STATE = GraphObservation(

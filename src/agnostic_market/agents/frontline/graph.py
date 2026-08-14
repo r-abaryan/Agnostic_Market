@@ -72,6 +72,12 @@ from agnostic_market.agents.frontline.read_flow import (
     CATALOG_QUERY_CLARIFY_NODE,
     CATALOG_QUERY_REJECT_NODE,
     CATALOG_RESPONSE_NODE,
+    ORDER_STATUS_ENTRY_NODE,
+    ORDER_STATUS_FULFILL_NODE,
+    ORDER_STATUS_TARGET_ASK_NODE,
+    ORDER_STATUS_TARGET_CONFIRM_NODE,
+    ORDER_STATUS_TARGET_PROPOSE_NODE,
+    ORDER_STATUS_TARGET_REJECT_NODE,
     READ_FLOW_MODEL_SPEECH_NODES,
     build_read_flow_nodes,
 )
@@ -124,6 +130,7 @@ from agnostic_market.dtos.orchestration import (
     SearchCatalog,
     SwitchAccount,
     VerifyIdentity,
+    VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -165,17 +172,17 @@ class FrontlineGraphAssembly:
     capability_registry: CapabilityRegistry
 
 
-# Graph topology is the source of truth for model-authored speech provenance. Identity,
-# Support, and Cart retain transactional execution/audit identity after their code-authored
-# clarification migrations, but none may author model prose. Every node named here invokes a
-# model, so none may be caller-speakable (asserted at compile).
-TRANSACTIONAL_MODEL_NODES = frozenset(
+# Graph topology is the source of truth for model-authored speech provenance. These nodes invoke
+# a model for typed proposals or transactional decisions but never own caller prose, so none may
+# be caller-speakable (asserted at compile).
+NON_SPEAKING_MODEL_NODES = frozenset(
     {
         "cart_assemble",
         _CART_CAPABILITY_ENTRY_NODE,
         "support_assemble",
         _SUPPORT_CAPABILITY_ENTRY_NODE,
         "identity_assemble",
+        ORDER_STATUS_TARGET_PROPOSE_NODE,
     }
 )
 _FRONTLINE_MODEL_SPEECH_NODES = frozenset({"model"})
@@ -1089,6 +1096,9 @@ def build_frontline_graph(
         display_name=display_name,
         structured_output_method=structured_output_method,
         model_text_policy=model_text_policy,
+        recent_orders=recent_orders,
+        identity_store=identity_store,
+        customers=customers,
     )
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
     identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
@@ -1097,6 +1107,7 @@ def build_frontline_graph(
     identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
     catalog_entry = CapabilityEntry(CATALOG_ENTRY_NODE)
     answer_entry = CapabilityEntry(ANSWER_RESPONSE_NODE)
+    order_status_entry = CapabilityEntry(ORDER_STATUS_ENTRY_NODE)
     capability_registry = CapabilityRegistry(
         (
             CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
@@ -1120,6 +1131,11 @@ def build_frontline_graph(
             CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
             CapabilitySpec(CapabilityId.SEARCH_CATALOG, SearchCatalog, catalog_entry),
             CapabilitySpec(CapabilityId.ANSWER_QUESTION, AnswerQuestion, answer_entry),
+            CapabilitySpec(
+                CapabilityId.VERIFY_ORDER_STATUS,
+                VerifyOrderStatus,
+                order_status_entry,
+            ),
         )
     )
 
@@ -1533,6 +1549,59 @@ def build_frontline_graph(
         AbandonmentKind.PURE_ABORT,
     )
     node_registry.register(
+        ORDER_STATUS_ENTRY_NODE,
+        reads.order_status_entry,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(
+            ORDER_STATUS_TARGET_ASK_NODE,
+            ORDER_STATUS_TARGET_PROPOSE_NODE,
+            ORDER_STATUS_FULFILL_NODE,
+        ),
+    )
+    node_registry.register(
+        ORDER_STATUS_TARGET_ASK_NODE,
+        reads.order_status_target_ask,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        ORDER_STATUS_TARGET_PROPOSE_NODE,
+        reads.order_status_target_propose,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(
+            ORDER_STATUS_TARGET_REJECT_NODE,
+            ORDER_STATUS_FULFILL_NODE,
+        ),
+    )
+    node_registry.register(
+        ORDER_STATUS_TARGET_CONFIRM_NODE,
+        reads.order_status_target_confirm,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+        destinations=(ORDER_STATUS_TARGET_REJECT_NODE, ORDER_STATUS_FULFILL_NODE, "handover"),
+    )
+    node_registry.register(
+        ORDER_STATUS_TARGET_REJECT_NODE,
+        reads.order_status_target_reject,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        ORDER_STATUS_FULFILL_NODE,
+        reads.order_status_fulfill,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(
+            ORDER_STATUS_TARGET_ASK_NODE,
+            ORDER_STATUS_TARGET_CONFIRM_NODE,
+            ORDER_STATUS_TARGET_REJECT_NODE,
+            ORDER_STATUS_FULFILL_NODE,
+            END,
+        ),
+    )
+    node_registry.register(
         "support_clarify",
         support.clarify,
         ExceptionAction.SAFE_ABORT,
@@ -1916,6 +1985,8 @@ def build_frontline_graph(
     graph.add_edge(CATALOG_QUERY_REJECT_NODE, END)
     graph.add_edge(ANSWER_CLARIFY_NODE, END)
     graph.add_edge(ANSWER_UNSUPPORTED_NODE, END)
+    graph.add_edge(ORDER_STATUS_TARGET_ASK_NODE, END)
+    graph.add_edge(ORDER_STATUS_TARGET_REJECT_NODE, END)
     graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",
@@ -2126,12 +2197,11 @@ def build_frontline_graph(
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")
     # A model-invoking node that is ALSO speakable could put model prose in front of the
     # caller without passing the code-authored path: the structural half of one-author.
-    transactional_overlap = (  # type: ignore[attr-defined]
-        compiled.speakable_nodes & TRANSACTIONAL_MODEL_NODES
+    non_speaking_overlap = (  # type: ignore[attr-defined]
+        compiled.speakable_nodes & NON_SPEAKING_MODEL_NODES
     )
-    if transactional_overlap:
+    if non_speaking_overlap:
         raise RuntimeError(
-            "transactional model nodes cannot be caller-speakable: "
-            f"{sorted(transactional_overlap)!r}"
+            f"non-speaking model nodes cannot be caller-speakable: {sorted(non_speaking_overlap)!r}"
         )
     return FrontlineGraphAssembly(graph=compiled, capability_registry=capability_registry)

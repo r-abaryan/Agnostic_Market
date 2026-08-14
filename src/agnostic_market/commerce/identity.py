@@ -40,13 +40,14 @@ constraint that makes neutral "dispatch anyway" flows unsafe today.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.commerce.orders import OrdersFixture, OrderStore
-from agnostic_market.commerce.spoken import spoken_digits, spoken_email
+from agnostic_market.commerce.spoken import scan_contact_candidates, spoken_digits, spoken_email
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 
 _STRICT = ConfigDict(extra="forbid")
@@ -65,6 +66,33 @@ def _match_key(contact: str) -> str:
         return "".join(contact.lower().split())
     digits = _digits(contact)
     return digits[-10:] if len(digits) >= 10 else digits
+
+
+@dataclass(frozen=True, slots=True)
+class ContactClaimSelection:
+    """Closed, ephemeral classification of contact spans in one committed utterance."""
+
+    disposition: Literal["none", "single", "multiple"]
+    claim: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.disposition == "single") != (self.claim is not None):
+            raise ValueError("only a single contact selection may retain a claim")
+
+
+def classify_contact_claims(utterance: str) -> ContactClaimSelection:
+    """Collapse syntax candidates by the directory's exact contact-equivalence key."""
+
+    by_key: dict[tuple[str, str], str] = {}
+    for candidate in scan_contact_candidates(utterance):
+        key = (candidate.kind, _match_key(candidate.claim))
+        if key[1]:
+            by_key.setdefault(key, candidate.claim)
+        if len(by_key) > 1:
+            return ContactClaimSelection(disposition="multiple")
+    if not by_key:
+        return ContactClaimSelection(disposition="none")
+    return ContactClaimSelection(disposition="single", claim=next(iter(by_key.values())))
 
 
 class CustomerEntry(BaseModel):

@@ -22,6 +22,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 
@@ -182,6 +183,42 @@ class VerifyOrderStatus(IntentRequestModel):
 
     kind: Literal[CapabilityId.VERIFY_ORDER_STATUS] = CapabilityId.VERIFY_ORDER_STATUS
     target: OrderStatusSelector | None = None
+    explicit_target_turn_id: SkipJsonSchema[NonEmptyText | None] = None
+    explicit_target_confirmed: SkipJsonSchema[StrictBool] = False
+
+    @model_validator(mode="after")
+    def code_owned_target_evidence_is_coherent(self) -> VerifyOrderStatus:
+        if (
+            self.explicit_target_turn_id is not None or self.explicit_target_confirmed
+        ) and not isinstance(self.target, ExplicitOrderSet):
+            raise ValueError("only an explicit order-status target can carry caller evidence")
+        if self.explicit_target_confirmed and self.explicit_target_turn_id is None:
+            raise ValueError("order-status confirmation requires its admitted source turn")
+        return self
+
+    def with_explicit_target_turn(self, turn_id: str) -> VerifyOrderStatus:
+        if not isinstance(self.target, ExplicitOrderSet):
+            raise ValueError("order-status target evidence requires an explicit target")
+        normalized_turn_id = turn_id.strip()
+        if (
+            self.explicit_target_turn_id is not None
+            and self.explicit_target_turn_id != normalized_turn_id
+        ):
+            raise ValueError("order-status target evidence turn cannot be replaced")
+        return VerifyOrderStatus(
+            target=self.target,
+            explicit_target_turn_id=normalized_turn_id,
+            explicit_target_confirmed=self.explicit_target_confirmed,
+        )
+
+    def with_confirmed_explicit_target(self) -> VerifyOrderStatus:
+        if not isinstance(self.target, ExplicitOrderSet) or self.explicit_target_turn_id is None:
+            raise ValueError("order-status confirmation requires explicit target evidence")
+        return VerifyOrderStatus(
+            target=self.target,
+            explicit_target_turn_id=self.explicit_target_turn_id,
+            explicit_target_confirmed=True,
+        )
 
     def is_slot_complete(self) -> bool:
         return self.target is not None
@@ -440,6 +477,11 @@ class RouteDecision(BaseModel):
                 self.request.item, (CartItemChoices, ResolvedCartItemRef)
             ):
                 raise ValueError("code-owned cart selectors are minted by the owning capability")
+            if isinstance(self.request, VerifyOrderStatus) and (
+                self.request.explicit_target_turn_id is not None
+                or self.request.explicit_target_confirmed
+            ):
+                raise ValueError("order-status target evidence is minted by its owning flow")
         elif self.request is not None or self.clarification_reason is not None:
             raise ValueError("continue carries no payload")
         return self

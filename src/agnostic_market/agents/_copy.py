@@ -45,6 +45,7 @@ GUEST_LIST_CLOSE = "To pull up any other orders on an account, I can verify you 
 # Shared factual question for flows that need the account contact. Authorization-specific
 # instructions and decline copy stay with their owning flows.
 ACCOUNT_CONTACT_QUESTION = "What email address or phone number is on the account?"
+ORDER_NUMBER_QUESTION = "What is the order number, for example ORD-1234?"
 
 
 def guest_list_close() -> str:

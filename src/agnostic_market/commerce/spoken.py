@@ -13,6 +13,8 @@ normalizes deterministically).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import Literal
 
 # Digit words as STT emits them. "oh" is the common spoken zero in phone numbers/codes
 # ("five five five oh one oh"); as a standalone token in a NUMBER context it is
@@ -131,6 +133,97 @@ _TYPED_EMAIL = re.compile(r"\S+@\S+")
 _SPOKEN_EMAIL = re.compile(
     r"(?:[\w.'-]+\s+){0,3}[\w.'-]+\s+at\s+[\w-]+(?:\s+dot\s+[\w-]+)+", re.IGNORECASE
 )
+_SPOKEN_EMAIL_PREFIX_FILLERS = frozenset(
+    {"address", "again", "contact", "email", "is", "its", "my", "the"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ContactCandidate:
+    """One ephemeral contact-shaped span; syntax only, never directory authority."""
+
+    kind: Literal["email", "phone"]
+    claim: str
+
+
+def _spoken_email_candidate(span: str) -> str | None:
+    separators = tuple(re.finditer(r"\s+at\s+", span, re.IGNORECASE))
+    if not separators:
+        return None
+    separator = separators[-1]
+    local, domain = span[: separator.start()], span[separator.end() :]
+    local_tokens = local.split()
+    while len(local_tokens) > 1 and local_tokens[0].casefold().strip(".,:;'") in (
+        _SPOKEN_EMAIL_PREFIX_FILLERS
+    ):
+        local_tokens.pop(0)
+    if not local_tokens:
+        return None
+    # The redaction grammar intentionally captures context before the address. Authorization
+    # takes only the final lexical token, plus a contiguous run of single-character tokens
+    # for STT forms such as "k c at example dot com".
+    bounded_local = [local_tokens[-1]]
+    for token in reversed(local_tokens[:-1]):
+        bare = re.sub(r"[^a-z0-9]", "", token.casefold())
+        if len(bare) != 1:
+            break
+        bounded_local.append(token)
+    bounded_local.reverse()
+    return spoken_email(f"{' '.join(bounded_local)} at {domain}")
+
+
+def scan_contact_candidates(text: str) -> tuple[ContactCandidate, ...]:
+    """Return bounded contact spans without consulting a customer directory.
+
+    The scanner shares the redaction grammars below but is precision-biased for
+    authorization: an order-labelled numeric run is excluded instead of being guessed as a
+    phone number. Directory-equivalent deduplication remains the Identity layer's job.
+    """
+
+    candidates: list[ContactCandidate] = []
+    for match in _TYPED_EMAIL.finditer(text):
+        claim = spoken_email(match.group(0).strip(".,;:!?()[]{}"))
+        if claim is not None:
+            candidates.append(ContactCandidate(kind="email", claim=claim))
+    for match in _SPOKEN_EMAIL.finditer(text):
+        claim = _spoken_email_candidate(match.group(0))
+        if claim is not None:
+            candidates.append(ContactCandidate(kind="email", claim=claim))
+
+    # Remove email spans before numeric scanning so digits inside an address cannot become
+    # a second phone candidate. Preserve whitespace to keep surrounding numeric runs apart.
+    numeric_text = _TYPED_EMAIL.sub(" ", text)
+    numeric_text = _SPOKEN_EMAIL.sub(" ", numeric_text)
+    run: list[str] = []
+    run_digits = 0
+    order_tainted = False
+    preceding_order_label = False
+
+    def flush() -> None:
+        nonlocal run, run_digits, order_tainted
+        if run_digits >= _MIN_PHONE_DIGITS and not order_tainted:
+            candidates.append(ContactCandidate(kind="phone", claim="".join(run)))
+        run = []
+        run_digits = 0
+        order_tainted = False
+
+    for token in numeric_text.split():
+        bare = re.sub(r"[^a-z0-9]", "", token.casefold())
+        value = spoken_digits(token)
+        is_numeric = bool(value) and (bare in _DIGIT_WORDS or any(ch.isdigit() for ch in bare))
+        if is_numeric:
+            if not run:
+                order_tainted = preceding_order_label or bare.startswith("ord")
+            else:
+                order_tainted = order_tainted or bare.startswith("ord")
+            run.append(value)
+            run_digits += len(value)
+            preceding_order_label = False
+            continue
+        flush()
+        preceding_order_label = bare in _ORDER_VALUE_PREFIXES
+    flush()
+    return tuple(candidates)
 
 
 def redact_contact(text: str) -> str:

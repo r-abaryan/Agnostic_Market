@@ -71,10 +71,12 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     CartItemChoices,
     CartItemQuery,
+    ExplicitOrderSet,
     ListOrders,
     ModifyCart,
     PlaceOrder,
     ResolvedCartItemRef,
+    VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
 )
@@ -1881,7 +1883,10 @@ def test_outer_channel_models_reconstruct_nested_dtos_without_extra_serde_grants
     assert type(restored_cancel.ineligible[0]) is BatchCancelOutcome
 
 
-def _seed_typed_read(engine: ReasoningEngine, request: ViewCart | ViewIdentityStatus) -> None:
+def _seed_typed_read(
+    engine: ReasoningEngine,
+    request: ViewCart | ViewIdentityStatus | VerifyOrderStatus,
+) -> None:
     consumed_turn_ids = (f"{request.kind.value}-origin",)
     engine._graph.update_state(
         engine._config,
@@ -1892,8 +1897,11 @@ def _seed_typed_read(engine: ReasoningEngine, request: ViewCart | ViewIdentitySt
                 consumed_turn_ids=consumed_turn_ids,
             ),
         },
-        as_node="__start__",
+        as_node=engine._graph.principal_seed_complete_node,
     )
+    snapshot = engine._graph.get_state(engine._config)
+    assert snapshot.next == ()
+    assert snapshot.interrupts == ()
 
 
 async def test_cart_view_owner_is_audible_once_through_the_engine(config_root: Path) -> None:
@@ -1961,6 +1969,43 @@ async def test_identity_status_owner_is_audible_once_through_the_engine(
         is None
     )
     assert identity.current() is None
+
+
+async def test_order_status_confirmation_resume_uses_its_admitted_source_turn(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    engine, _ = _engine(
+        config_root,
+        frontline=FakeChatModel(emit_tool_calls=False),
+        reasoning=FakeChatModel(emit_tool_calls=False),
+        identity=identity,
+        thread_id="typed-status-confirmation",
+    )
+    _seed_typed_read(
+        engine,
+        VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
+    )
+
+    first = await _events(engine, "My email is casey@example.com.")
+
+    assert [event for event in first if isinstance(event, InterruptEvent)]
+    assert not identity.order_granted("ORD-1002")
+    paused = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    assert paused.active_invocation is not None
+    assert paused.active_invocation.request.explicit_target_turn_id == "test-turn-1"
+    assert not paused.active_invocation.request.explicit_target_confirmed
+
+    second = await _events(engine, "yes")
+
+    spoken = [event for event in second if isinstance(event, SpokenMessageEvent)]
+    assert len(spoken) == 1
+    assert spoken[0].node == "order_status_fulfill"
+    assert "Your order ORD-1002" in spoken[0].text
+    assert identity.order_granted("ORD-1002")
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    assert state.active_invocation is None
+    assert state.current_committed_user_message() is None
 
 
 async def test_incoherent_persisted_invocation_terminalizes_before_any_execution(

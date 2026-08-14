@@ -549,10 +549,16 @@ class RecentOrderContext:
             raise ValueError("recent order context requires at least one order reference")
         complete = len(refs) <= self._max_refs
         bounded_refs = refs[-self._max_refs :]
-        focused = focused_order_ref.strip().upper() if focused_order_ref else bounded_refs[-1]
-        if focused not in refs:
+        focused = (
+            focused_order_ref.strip().upper()
+            if focused_order_ref
+            else bounded_refs[0]
+            if len(bounded_refs) == 1
+            else None
+        )
+        if focused is not None and focused not in refs:
             raise ValueError("focused order must be included in order_refs")
-        if focused not in bounded_refs:
+        if focused is not None and focused not in bounded_refs:
             bounded_refs = (*bounded_refs[1:], focused)
         normalized_outcomes = tuple((ref.strip().upper(), code) for ref, code in outcomes)
         if any(ref not in refs for ref, _code in normalized_outcomes):

@@ -51,7 +51,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from agnostic_market.agents._consent import classify_cancel_consent, classify_consent
-from agnostic_market.agents._copy import guest_list_close, warm_close
+from agnostic_market.agents._copy import ORDER_NUMBER_QUESTION, guest_list_close, warm_close
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
 from agnostic_market.agents.clarification import (
     advance_clarification,
@@ -153,7 +153,7 @@ _SUPPORT_NOT_FOUND_OFFER_HUMAN = (
 )
 _SUPPORT_CLARIFICATION_LINES: dict[SupportQuestionDetail | SupportAuthorizationDetail, str] = {
     "action": "What would you like help with: a cancellation, return, refund, or profile update?",
-    "order": "What is the order number, for example ORD-1234?",
+    "order": ORDER_NUMBER_QUESTION,
     "amount": "What amount would you like refunded?",
     "refund_destination": "Should the refund go back to the original payment method?",
     "profile_field": "Would you like to update your delivery address or contact number?",
