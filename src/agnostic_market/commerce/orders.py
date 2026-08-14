@@ -133,6 +133,18 @@ def _is_past_date_eta(eta: str | None, today: date) -> bool:
         return False
 
 
+# Security-sensitive order-read copy is code-authored and shared by every caller-facing
+# adapter. Model instructions may wrap these lines but must not independently paraphrase them.
+ORDER_CONTACT_NOT_FOUND_LINE = (
+    "I couldn't find an order matching those details - could you double-check the order "
+    "number and the email or phone on the account?"
+)
+BOUND_ORDER_READ_UNAVAILABLE_LINE = (
+    "I couldn't retrieve an order with that number on this call. Please double-check the "
+    "order number, or ask to switch accounts if you meant a different account."
+)
+
+
 def render_order_status_line(
     *, order_id: str, status: str, items: str, eta: str | None, today: date
 ) -> str:

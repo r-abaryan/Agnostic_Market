@@ -203,8 +203,12 @@ class CallerIdentityStore:
     def current(self) -> BoundIdentity | None:
         return self._bound
 
-    def grant_order(self, order_id: str) -> None:
-        self._granted_orders.add(order_id.strip().upper())
+    def grant_orders(self, *order_ids: str) -> None:
+        """Grant a validated order set atomically; never leave a partial grant."""
+        normalized = tuple(order_id.strip().upper() for order_id in order_ids)
+        if not normalized or any(not order_id for order_id in normalized):
+            raise ValueError("order grants require one or more non-blank order ids")
+        self._granted_orders.update(normalized)
 
     def order_granted(self, order_id: str) -> bool:
         return order_id.strip().upper() in self._granted_orders
@@ -234,23 +238,22 @@ class CallerIdentityStore:
 
 def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIdentityStore) -> bool:
     """May this session read that order? The ONE order-read authorization check — the
-    order_status tool, the L3 render-divert router, and the render node all call THIS (the
-    shared-predicate stance: two independent computations would drift, and a drifted render
-    path would leak around the tool's gate).
+    Voice tool, Frontline render/forced-status paths, and Support candidate filters all call
+    THIS (the shared-predicate stance: two independent computations would drift, and a drifted
+    render or prompt path would leak around the tool's gate).
 
     True when the order was PLACED this session (the caller placed it moments ago), the
-    session already holds a rung-1 grant for it, or the bound identity owns it. PURE read —
-    the contact-match GRANT mutation stays in the tool body (explicit, single writer).
+    bound identity owns it, or an UNBOUND session holds a rung-1 grant for it. Once a
+    principal is bound, that principal is authoritative and residual guest grants cannot
+    widen it. PURE read — the contact-match GRANT mutation stays in the tool body.
     """
     if store.is_session_placed(order_id):
-        return True
-    if identity.order_granted(order_id):
         return True
     bound = identity.current()
     if bound is not None:
         owner = store.order_owner(order_id)
         return owner is not None and owner == bound.customer_ref
-    return False
+    return identity.order_granted(order_id)
 
 
 def order_mutation_allowed(
@@ -258,7 +261,7 @@ def order_mutation_allowed(
 ) -> bool:
     """May this session ACT irreversibly on that order (cancel/refund/return)? The rung-2
     authorization check — deliberately STRICTER than `order_read_allowed`: a rung-1
-    contact-match grant (`identity.order_granted`, earned via `try_grant_by_contact`)
+    contact-match grant (`identity.order_granted`, earned via `try_grant_orders_by_contact`)
     authorizes a READ but NOT a mutation. The account contact is guessable/leaked, so
     contact-matching one order must never let one caller cancel another's; a mutation requires
     that the caller either placed the order THIS session (per-session store — no cross-caller
@@ -278,30 +281,26 @@ def order_mutation_allowed(
     return owner is not None and owner == bound.customer_ref
 
 
-def try_grant_by_contact(
-    order_id: str,
+def try_grant_orders_by_contact(
     claim: str,
-    *,
+    *order_ids: str,
     store: OrderStore,
     customers: CustomerDirectory,
     identity: CallerIdentityStore,
 ) -> Literal["granted", "mismatch"]:
-    """The ONE rung-1 grant decision: does this contact CLAIM own that ORDER? — shared by the
-    order_status tool and the support-selection gate (they previously each ran this same
-    match->owner->compare->grant sequence, a drift risk between two auth surfaces).
+    """Grant an unbound guest's complete same-owner order set from one contact claim.
 
-    Grants THAT order for the session on a match (the code-matched guest-lookup pair — the
-    claim is never model-judged), and returns a CLOSED verdict; the caller owns its own
-    telemetry, response wording, and retry counters (they differ by surface). `mismatch`
-    covers wrong-pair, unknown claim, AND an unresolved `order_id` (owner is None) uniformly —
-    the existence-oracle discipline lives in the callers' single combined not-found line.
-
-    Callers MUST have already handled their own pre-checks (an existing authorization, an
-    empty claim): this function assumes a non-empty claim and performs no grant on mismatch.
+    The caller-facing owner supplies telemetry and copy. This seam only returns a closed
+    verdict and mutates after every target owner has resolved to the matched customer.
+    Bound sessions cannot acquire guest grants; a live principal remains authoritative.
     """
-    matched = customers.match_contact(claim)
-    owner = store.order_owner(order_id)
-    if matched is None or owner is None or owner != matched.customer_ref:
+    if not order_ids:
+        raise ValueError("contact grants require one or more order ids")
+    if identity.current() is not None:
         return "mismatch"
-    identity.grant_order(order_id)
+    matched = customers.match_contact(claim)
+    owners = tuple(store.order_owner(order_id) for order_id in order_ids)
+    if matched is None or any(owner is None or owner != matched.customer_ref for owner in owners):
+        return "mismatch"
+    identity.grant_orders(*order_ids)
     return "granted"

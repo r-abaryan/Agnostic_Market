@@ -42,6 +42,10 @@ def all_closes() -> tuple[str, ...]:
 # INSTEAD OF warm_close() on that path so the caller hears exactly one closing invitation.
 GUEST_LIST_CLOSE = "To pull up any other orders on an account, I can verify you - just let me know."
 
+# Shared factual question for flows that need the account contact. Authorization-specific
+# instructions and decline copy stay with their owning flows.
+ACCOUNT_CONTACT_QUESTION = "What email address or phone number is on the account?"
+
 
 def guest_list_close() -> str:
     return GUEST_LIST_CLOSE

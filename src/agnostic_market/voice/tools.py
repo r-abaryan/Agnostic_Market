@@ -9,26 +9,30 @@ rung-1 grant `order_status` records is authorization bookkeeping, not commerce s
 
 P7 OBJECT BINDING (order_status): low-entropy order ids (ORD-1001) must not be readable by
 anyone who can count — the guest-lookup pair (order id + the account contact, code-matched)
-gates the read. The gate is IN THE TOOL BODY, fail-closed: an unverified ask returns an
-instruction (no data), and a mismatch OR an unknown order returns ONE combined not-found
-line — the tool never confirms an order id exists (existence-oracle discipline). A contact
-match grants exactly THAT order for the session; account-wide enumeration (`list_orders`)
-requires the OTP-bound identity flow (rung 2).
+gates the read. The gate is IN THE TOOL BODY, fail-closed: an unbound ask without contact
+returns one neutral question; a mismatch OR unknown order returns one combined not-found
+line. A bound principal cannot consume or acquire a foreign guest grant and receives one
+access-neutral line instead. The tool never confirms an order id exists or who owns it. A
+contact match grants exactly THAT order for an unbound session; account-wide enumeration
+(`list_orders`) requires the OTP-bound identity flow (rung 2).
 """
 
 from __future__ import annotations
 
 from langchain_core.tools import BaseTool, tool
 
+from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
     order_read_allowed,
-    try_grant_by_contact,
+    try_grant_orders_by_contact,
 )
 from agnostic_market.commerce.orders import (
+    BOUND_ORDER_READ_UNAVAILABLE_LINE,
+    ORDER_CONTACT_NOT_FOUND_LINE,
     OrderStore,
     RecentOrderContext,
     lookup_catalog,
@@ -39,13 +43,17 @@ from agnostic_market.commerce.orders import (
 # The model-facing decline strings (fail-closed: NO order data, no existence confirmation).
 _ASK_CONTACT = (
     "Not verified for that order. Do not say whether the order exists. Ask the caller ONE "
-    "short question: the email or phone number on the account. Then call order_status again "
-    "with the order id AND account_contact."
+    f'short question exactly: "{ACCOUNT_CONTACT_QUESTION}" Then call order_status again with '
+    "the order id AND account_contact."
 )
 _COMBINED_NOT_FOUND = (
-    "No order matches those details. Do not say which detail failed. Tell the caller: "
-    "\"I couldn't find an order matching those details - could you double-check the order "
-    'number and the email or phone on the account?"'
+    "No order matches those details. Do not say which detail failed. Tell the caller exactly: "
+    f'"{ORDER_CONTACT_NOT_FOUND_LINE}"'
+)
+_BOUND_ORDER_READ_DENIED = (
+    "The caller is already verified on this call, but this order read is not authorized. "
+    "Do not say whether the order exists or which account owns it. Tell the caller exactly: "
+    f'"{BOUND_ORDER_READ_UNAVAILABLE_LINE}"'
 )
 # The "do not ask yourself" sentence is load-bearing (live call #12 F-12.3: the frontline
 # asked for the email itself, duplicating the identity flow's question and wasting a turn).
@@ -82,13 +90,21 @@ def build_voice_tools(
                 return _COMBINED_NOT_FOUND
             recent_orders.record([order_id], operation="read")
             return summary
+        if identity.current() is not None:
+            write_event(
+                {
+                    "event": "order_read_denied",
+                    "order_id_known": store.order_owner(order_id) is not None,
+                }
+            )
+            return _BOUND_ORDER_READ_DENIED
         claim = account_contact.strip()
         if not claim:
             write_event({"event": "order_read_denied", "order_id_known": False})
             return _ASK_CONTACT
         if (
-            try_grant_by_contact(
-                order_id, claim, store=store, customers=customers, identity=identity
+            try_grant_orders_by_contact(
+                claim, order_id, store=store, customers=customers, identity=identity
             )
             == "mismatch"
         ):

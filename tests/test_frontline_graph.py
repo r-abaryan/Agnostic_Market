@@ -93,8 +93,7 @@ def _granted(*order_ids: str) -> CallerIdentityStore:
     """A session identity store with rung-1 grants — for tests exercising what happens
     AFTER an authorized order read (the L3 render path), not the gate itself."""
     identity = CallerIdentityStore()
-    for oid in order_ids:
-        identity.grant_order(oid)
+    identity.grant_orders(*order_ids)
     return identity
 
 
@@ -2619,6 +2618,27 @@ async def test_unverified_explicit_state_check_does_not_bypass_order_authorizati
     final = out["messages"][-1]
     assert final.content == _TEXT_RESPONSE
     assert "waterproof rain jacket" not in final.content
+
+
+async def test_bound_status_followup_ignores_a_residual_foreign_guest_grant(
+    config_root: Path,
+) -> None:
+    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
+    recent_orders.record(["ORD-1002"], operation="read")
+    identity = CallerIdentityStore()
+    identity.grant_orders("ORD-1002")
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    graph = _graph(
+        config_root,
+        FakeChatModel(emit_tool_calls=False),
+        recent_orders=recent_orders,
+        identity=identity,
+    )
+
+    out = await graph.ainvoke({"messages": [HumanMessage("is it cancelled?")]})
+
+    assert out["messages"][-1].content == _TEXT_RESPONSE
+    assert "waterproof rain jacket" not in out["messages"][-1].content
 
 
 async def test_answered_turn_writes_telemetry_negative(config_root: Path, tmp_path) -> None:

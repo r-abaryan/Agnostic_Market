@@ -106,7 +106,7 @@ def test_transition_inspection_requires_every_postcondition_and_invalidation_is_
     assert inspection.outcome == "coherent"
     assert inspection.transition == transition
 
-    harness.identity.grant_order("ORD-1001")
+    harness.identity.grant_orders("ORD-1001")
     assert context.inspect_principal_transition().outcome == "inconsistent"
     assert context.invalidate_principal_transition(transition.transition_id) is True
     assert context.pending_transition() is None
@@ -218,7 +218,7 @@ async def test_every_partial_transition_terminalizes_without_rotation(
     elif corruption == "proof":
         harness.verification.clear()
     else:
-        harness.identity.grant_order("ORD-1001")
+        harness.identity.grant_orders("ORD-1001")
 
     events = await _events(harness, "queued request")
     snapshot = harness.engine._graph.get_state(harness.engine._config)
@@ -487,7 +487,7 @@ async def test_cancelled_identity_apply_resolves_principal_publication_fail_clos
     applying = asyncio.create_task(_events(harness, _OTP))
     assert await asyncio.to_thread(entered.wait, 5)
     if publication == "inconsistent":
-        harness.identity.grant_order("ORD-1002")
+        harness.identity.grant_orders("ORD-1002")
     applying.cancel("cancelled-identity-apply")
     release.set()
     with pytest.raises(asyncio.CancelledError) as cancelled:

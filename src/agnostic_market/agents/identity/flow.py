@@ -47,7 +47,11 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel, ConfigDict
 
-from agnostic_market.agents._copy import identity_status_line, principal_completion_line
+from agnostic_market.agents._copy import (
+    ACCOUNT_CONTACT_QUESTION,
+    identity_status_line,
+    principal_completion_line,
+)
 from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
 from agnostic_market.agents.clarification import (
     advance_clarification,
@@ -80,7 +84,6 @@ logger = logging.getLogger("agnostic_market.agents.identity")
 # asserting it is not on file — "I couldn't find that" confirms non-existence to a probing
 # caller, and an STT mishear (not absence) is the likely cause anyway.
 _REASK_LINE = "Could you double-check the email or phone number on the account for me?"
-_ASK_CONTACT_LINE = "What email address or phone number is on the account?"
 
 
 class _ProposeIdentity(BaseModel):
@@ -308,7 +311,7 @@ def build_identity_nodes(
             raise TypeError("identity ask-contact node requires IdentityClarification")
         return {
             "pending_clarification": None,
-            "messages": [AIMessage(_ASK_CONTACT_LINE)],
+            "messages": [AIMessage(ACCOUNT_CONTACT_QUESTION)],
         }
 
     def reask_node(state: ReasoningState) -> dict[str, object]:

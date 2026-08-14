@@ -57,13 +57,13 @@ def authorize_fixture_orders(harness: SupportHarness) -> SupportHarness:
     """Pre-authorize the fixture orders as if the caller had fully verified, so suites pinning
     post-authorization MONEY logic aren't re-testing the auth gate (the gate's OWN tests build
     unauthorized harnesses and never call this). Grants BOTH rungs:
-      - rung-1 read grant (`grant_order`) so each order appears in the model's scoped candidate
+      - rung-1 read grant (`grant_orders`) so each order appears in the model's scoped candidate
         list (`order_read_allowed`);
       - the TEST-ONLY rung-2 mutation grant (`grant_mutation_for_test`) so cancel/refund/return
         proceed (Fix 2: rung-1 alone no longer authorizes a mutation; a real bind can't span the
         two customers the fixture orders belong to — this is the sanctioned test seam)."""
     for order_id in _FIXTURE_ORDERS:
-        harness.identity.grant_order(order_id)
+        harness.identity.grant_orders(order_id)
         harness.identity.grant_mutation_for_test(order_id)
     return harness
 
