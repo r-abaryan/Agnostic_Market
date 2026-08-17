@@ -133,6 +133,18 @@ def _is_past_date_eta(eta: str | None, today: date) -> bool:
         return False
 
 
+# Security-sensitive order-read copy is code-authored and shared by every caller-facing
+# adapter. Model instructions may wrap these lines but must not independently paraphrase them.
+ORDER_CONTACT_NOT_FOUND_LINE = (
+    "I couldn't find an order matching those details - could you double-check the order "
+    "number and the email or phone on the account?"
+)
+BOUND_ORDER_READ_UNAVAILABLE_LINE = (
+    "I couldn't retrieve an order with that number on this call. Please double-check the "
+    "order number, or ask to switch accounts if you meant a different account."
+)
+
+
 def render_order_status_line(
     *, order_id: str, status: str, items: str, eta: str | None, today: date
 ) -> str:
@@ -537,10 +549,16 @@ class RecentOrderContext:
             raise ValueError("recent order context requires at least one order reference")
         complete = len(refs) <= self._max_refs
         bounded_refs = refs[-self._max_refs :]
-        focused = focused_order_ref.strip().upper() if focused_order_ref else bounded_refs[-1]
-        if focused not in refs:
+        focused = (
+            focused_order_ref.strip().upper()
+            if focused_order_ref
+            else bounded_refs[0]
+            if len(bounded_refs) == 1
+            else None
+        )
+        if focused is not None and focused not in refs:
             raise ValueError("focused order must be included in order_refs")
-        if focused not in bounded_refs:
+        if focused is not None and focused not in bounded_refs:
             bounded_refs = (*bounded_refs[1:], focused)
         normalized_outcomes = tuple((ref.strip().upper(), code) for ref, code in outcomes)
         if any(ref not in refs for ref, _code in normalized_outcomes):

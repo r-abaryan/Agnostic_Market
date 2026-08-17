@@ -22,6 +22,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 
@@ -29,6 +30,10 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 CancelScope = Literal["all_cancellable", "both_cancellable"]
 OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
+AnswerTopic = Literal["policy", "general"]
+ListOrderScope = Literal["session", "account"]
+CartOperation = Literal["add", "remove", "set_quantity"]
+OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
 
 
 class IntentRequestModel(BaseModel):
@@ -149,7 +154,7 @@ class AnswerQuestion(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.ANSWER_QUESTION] = CapabilityId.ANSWER_QUESTION
-    topic: Literal["policy", "general"]
+    topic: AnswerTopic
 
 
 class AnswerResponse(BaseModel):
@@ -182,6 +187,42 @@ class VerifyOrderStatus(IntentRequestModel):
 
     kind: Literal[CapabilityId.VERIFY_ORDER_STATUS] = CapabilityId.VERIFY_ORDER_STATUS
     target: OrderStatusSelector | None = None
+    explicit_target_turn_id: SkipJsonSchema[NonEmptyText | None] = None
+    explicit_target_confirmed: SkipJsonSchema[StrictBool] = False
+
+    @model_validator(mode="after")
+    def code_owned_target_evidence_is_coherent(self) -> VerifyOrderStatus:
+        if (
+            self.explicit_target_turn_id is not None or self.explicit_target_confirmed
+        ) and not isinstance(self.target, ExplicitOrderSet):
+            raise ValueError("only an explicit order-status target can carry caller evidence")
+        if self.explicit_target_confirmed and self.explicit_target_turn_id is None:
+            raise ValueError("order-status confirmation requires its admitted source turn")
+        return self
+
+    def with_explicit_target_turn(self, turn_id: str) -> VerifyOrderStatus:
+        if not isinstance(self.target, ExplicitOrderSet):
+            raise ValueError("order-status target evidence requires an explicit target")
+        normalized_turn_id = turn_id.strip()
+        if (
+            self.explicit_target_turn_id is not None
+            and self.explicit_target_turn_id != normalized_turn_id
+        ):
+            raise ValueError("order-status target evidence turn cannot be replaced")
+        return VerifyOrderStatus(
+            target=self.target,
+            explicit_target_turn_id=normalized_turn_id,
+            explicit_target_confirmed=self.explicit_target_confirmed,
+        )
+
+    def with_confirmed_explicit_target(self) -> VerifyOrderStatus:
+        if not isinstance(self.target, ExplicitOrderSet) or self.explicit_target_turn_id is None:
+            raise ValueError("order-status confirmation requires explicit target evidence")
+        return VerifyOrderStatus(
+            target=self.target,
+            explicit_target_turn_id=self.explicit_target_turn_id,
+            explicit_target_confirmed=True,
+        )
 
     def is_slot_complete(self) -> bool:
         return self.target is not None
@@ -191,7 +232,7 @@ class ListOrders(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.LIST_ORDERS] = CapabilityId.LIST_ORDERS
-    scope: Literal["session", "account"]
+    scope: ListOrderScope
 
 
 class ViewCart(_CompleteIntentRequest):
@@ -239,7 +280,7 @@ class ModifyCart(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.MODIFY_CART] = CapabilityId.MODIFY_CART
-    operation: Literal["add", "remove", "set_quantity"]
+    operation: CartOperation
     item: CartItemSelector | None = None
     quantity: int | None = Field(default=None, strict=True, ge=0)
 
@@ -410,8 +451,23 @@ ClarificationReason = Literal[
 ]
 
 
+class RouteProposal(BaseModel):
+    """Provider wire route; coarse ownership only, never authority or fine slots."""
+
+    model_config = _FROZEN
+
+    decision: Literal["clarify", "direct", "continue"]
+    capability: CapabilityId | None = None
+    clarification_reason: ClarificationReason | None = None
+    answer_topic: AnswerTopic | None = None
+    list_scope: ListOrderScope | None = None
+    cart_operation: CartOperation | None = None
+    profile_field: ProfileField | None = None
+    order_status_selector: OrderStatusRouteSelector | None = None
+
+
 class RouteDecision(BaseModel):
-    """Model-authored semantic route: clarify, one direct request, or current-owner continuation."""
+    """Validated internal route consumed by telemetry and capability dispatch."""
 
     model_config = _FROZEN
 
@@ -440,6 +496,11 @@ class RouteDecision(BaseModel):
                 self.request.item, (CartItemChoices, ResolvedCartItemRef)
             ):
                 raise ValueError("code-owned cart selectors are minted by the owning capability")
+            if isinstance(self.request, VerifyOrderStatus) and (
+                self.request.explicit_target_turn_id is not None
+                or self.request.explicit_target_confirmed
+            ):
+                raise ValueError("order-status target evidence is minted by its owning flow")
         elif self.request is not None or self.clarification_reason is not None:
             raise ValueError("continue carries no payload")
         return self
@@ -457,7 +518,12 @@ class RouteDecision(BaseModel):
         return cls(decision="continue")
 
 
-RoutingFailureReason = Literal["invalid_output", "routing_unavailable"]
+RoutingFailureReason = Literal[
+    "invalid_output",
+    "routing_unavailable",
+    "context_invalid",
+    "decision_rejected",
+]
 
 
 class RoutingFailure(BaseModel):

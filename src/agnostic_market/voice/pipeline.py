@@ -1,7 +1,7 @@
 """AgentSession assembly — the Phase-2 minimal voice loop (BUILD_PLAN Phase 2).
 
 Per-merchant, all from config: STT/TTS via the engine factories, the LLM via the
-Phase-1 gateway (`config.llm.routing`), tools from the orders fixture. VAD and audio
+Phase-1 gateway (`config.llm.response`), tools from the orders fixture. VAD and audio
 turn detection are livekit-agents 1.6 session DEFAULTS — deliberately not configured
 here (adopt built, VOICE_PIPELINE §1b); the built-in audio turn detector replaced the
 deprecated text turn-detector plugin (VOICE_PIPELINE §2 pending an update pass).
@@ -183,7 +183,7 @@ def build_voice_loop(
         for t in build_voice_tools(store, cart_store, recent_orders, identity_store, customers)
     ]
     assembly = build_frontline_graph(
-        chat_model=gateway.chat_model(config.llm.routing),
+        chat_model=gateway.chat_model(config.llm.response),
         read_only_tools=tools,
         display_name=config.display_name,
         tenant_id=config.merchant_id,
@@ -206,7 +206,7 @@ def build_voice_loop(
         customers=customers,
         payment_instruments=payment_instruments,
         lifecycle=caller_context,
-        structured_output_method=gateway.structured_output_method(config.llm.routing),
+        structured_output_method=gateway.structured_output_method(config.llm.response),
         caller_audible_model_text_max_chars=(config.runtime.caller_audible_model_text_max_chars),
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our

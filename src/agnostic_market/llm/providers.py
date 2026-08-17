@@ -14,9 +14,9 @@ recorded — infrastructure failure is never converted into a capability verdict
 Checks use async APIs (`ainvoke`/`astream`) to certify async tool, structured-output, and
 incremental-delivery capabilities. Production graph model nodes currently use synchronous
 `.invoke()`; exact production transport-path failure behavior is a separate certification concern.
-The structured-output check uses the real routing contract and the gateway-selected native
-transport. This pins the configured commerce model to the nested/discriminated shape production
-routing will consume.
+The structured-output check uses the real provider wire contracts and the gateway-selected
+native transport. Routing conformance covers the flat coarse `RouteProposal`; deterministic
+materialization into the nested internal `RouteDecision` is a separate local contract.
 """
 
 from __future__ import annotations
@@ -45,17 +45,14 @@ from agnostic_market.dtos.llm import (
 )
 from agnostic_market.dtos.orchestration import (
     AnswerResponse,
-    CancellableOrderScope,
-    CancelOrders,
-    CapabilityId,
     OrderTargetProposal,
-    RouteDecision,
+    RouteProposal,
 )
 
 # After the first report for this suite version is accepted, bump when checks or
 # transmitted schemas change so accepted reports fail closed. Before that, the version
 # is unreleased and its checks may still be completed without a meaningless bump.
-SUITE_VERSION = "3"
+SUITE_VERSION = "4"
 
 # Prompts name the required tool explicitly: the check verifies protocol conformance
 # (parse/emit/select), not semantic routing quality (that is Phase 6's behavioral eval).
@@ -63,10 +60,6 @@ _TOOL_CALL_PROMPT = (
     "Use the get_order_status tool to look up order 'ORD-1001'. Do not answer directly."
 )
 _EXPECTED_TOOL = "get_order_status"
-_STRUCTURED_PROMPT = (
-    "Return a direct route for this caller request: 'cancel all my orders'. Use one "
-    "cancel_orders request with the all_cancellable scope."
-)
 _STREAMING_PROMPT = "In two short sentences, describe a running shoe."
 
 
@@ -86,17 +79,8 @@ class _StructuredOutputCase:
     accepts: Callable[[BaseModel], bool]
 
 
-def _accepts_route(result: BaseModel) -> bool:
-    if not isinstance(result, RouteDecision):
-        return False
-    request = result.request
-    return (
-        result.decision == "direct"
-        and isinstance(request, CancelOrders)
-        and request.kind == CapabilityId.CANCEL_ORDERS
-        and isinstance(request.target, CancellableOrderScope)
-        and request.target.scope == "all_cancellable"
-    )
+def _accepts_route_proposal(expected: RouteProposal) -> Callable[[BaseModel], bool]:
+    return lambda result: isinstance(result, RouteProposal) and result == expected
 
 
 def _accepts_answer(decision: str) -> Callable[[BaseModel], bool]:
@@ -125,8 +109,63 @@ def _order_target_case(expected: OrderTargetProposal) -> _StructuredOutputCase:
     )
 
 
+def _route_case(name: str, prompt: str, expected: RouteProposal) -> _StructuredOutputCase:
+    return _StructuredOutputCase(name, RouteProposal, prompt, _accepts_route_proposal(expected))
+
+
 _STRUCTURED_OUTPUT_CASES = (
-    _StructuredOutputCase("route_direct", RouteDecision, _STRUCTURED_PROMPT, _accepts_route),
+    _route_case(
+        "route_direct",
+        "Return decision=direct and capability=search_catalog. Leave clarification_reason and "
+        "every coarse field null.",
+        RouteProposal(decision="direct", capability="search_catalog"),
+    ),
+    _route_case(
+        "route_clarify",
+        "Return decision=clarify with clarification_reason=ambiguous_intent. Leave capability "
+        "and every coarse field null.",
+        RouteProposal(decision="clarify", clarification_reason="ambiguous_intent"),
+    ),
+    _route_case(
+        "route_continue",
+        "Return decision=continue. Leave capability, clarification_reason, and every coarse field "
+        "null.",
+        RouteProposal(decision="continue"),
+    ),
+    _route_case(
+        "route_answer_topic",
+        "Return decision=direct, capability=answer_question, and answer_topic=policy. Leave every "
+        "other field null.",
+        RouteProposal(decision="direct", capability="answer_question", answer_topic="policy"),
+    ),
+    _route_case(
+        "route_list_scope",
+        "Return decision=direct, capability=list_orders, and list_scope=account. Leave every other "
+        "field null.",
+        RouteProposal(decision="direct", capability="list_orders", list_scope="account"),
+    ),
+    _route_case(
+        "route_cart_operation",
+        "Return decision=direct, capability=modify_cart, and cart_operation=add. Leave every other "
+        "field null.",
+        RouteProposal(decision="direct", capability="modify_cart", cart_operation="add"),
+    ),
+    _route_case(
+        "route_profile_field",
+        "Return decision=direct, capability=change_profile, and profile_field=address. Leave every "
+        "other field null.",
+        RouteProposal(decision="direct", capability="change_profile", profile_field="address"),
+    ),
+    _route_case(
+        "route_order_status_selector",
+        "Return decision=direct, capability=verify_order_status, and "
+        "order_status_selector=explicit. Leave every other field null.",
+        RouteProposal(
+            decision="direct",
+            capability="verify_order_status",
+            order_status_selector="explicit",
+        ),
+    ),
     _StructuredOutputCase(
         "answer",
         AnswerResponse,
@@ -365,7 +404,7 @@ class ConformanceRegistry:
 def check_llm_certification(config: MerchantConfig, registry: ConformanceRegistry) -> list[str]:
     """Config-time certification check — WARN-ONLY in Phase 1.
 
-    Flags a merchant whose llm.routing / llm.reasoning selects a non-certified model, so
+    Flags a merchant whose response, routing, or reasoning role selects a non-certified model, so
     it is caught at config time rather than mid-call at checkout. Phase 4's go-live gate
     makes this blocking. Lives here so the config plane stays free of llm-plane imports.
     """

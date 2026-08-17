@@ -8,11 +8,13 @@ fails closed until the identity flow binds the session.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from langchain_core.tools import BaseTool
 
+from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     BoundIdentity,
@@ -20,10 +22,21 @@ from agnostic_market.commerce.identity import (
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.orders import (
+    BOUND_ORDER_READ_UNAVAILABLE_LINE,
+    ORDER_CONTACT_NOT_FOUND_LINE,
+    OrderStore,
+    RecentOrderContext,
+    load_orders_fixture,
+)
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
-from agnostic_market.voice.tools import build_voice_tools
+from agnostic_market.voice.tools import (
+    _ASK_CONTACT,
+    _BOUND_ORDER_READ_DENIED,
+    _COMBINED_NOT_FOUND,
+    build_voice_tools,
+)
 
 # The fixture pair (config/fixtures/customers/acme_store.yaml): CUST-001 owns ORD-1001 +
 # ORD-1003 (phone on file); CUST-002 owns ORD-1002 (email on file).
@@ -51,6 +64,11 @@ class Harness:
         return self.tools["order_status"].invoke(args)
 
 
+def _telemetry(tmp_path: Path) -> list[dict]:
+    path = tmp_path / "telemetry.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def test_fixture_loads_and_validates(config_root: Path) -> None:
     fixture = load_orders_fixture(config_root, "acme_store")
     assert "ORD-1001" in fixture.orders
@@ -61,35 +79,49 @@ def test_fixture_loads_and_validates(config_root: Path) -> None:
 # --- the object-binding gate (P7 rung 1) ---------------------------------------------
 
 
-def test_order_status_fails_closed_without_a_verifier(config_root: Path) -> None:
+def test_order_status_fails_closed_without_a_verifier(config_root: Path, tmp_path: Path) -> None:
     # No contact, unbound session -> NO order data, NO existence confirmation; the result
     # instructs the ask-for-contact exchange. The pointer is untouched (a probe must not
     # hijack "that order").
     h = Harness(config_root)
     result = h.status("ORD-1001")
     assert "shipped" not in result and "shoes" not in result
-    assert "email or phone" in result
+    assert result == _ASK_CONTACT
     assert h.recent_orders.snapshot().focused_order_ref is None
+    assert _telemetry(tmp_path) == [{"event": "order_read_denied", "order_id_known": False}]
 
 
-def test_order_plus_matching_contact_answers_and_grants(config_root: Path) -> None:
+def test_order_plus_matching_contact_answers_and_grants(config_root: Path, tmp_path: Path) -> None:
     h = Harness(config_root)
     result = h.status(" ord-1001 ", _CUST1_PHONE)
     assert "shipped" in result  # answered (id normalized, case-insensitive)
     assert h.recent_orders.snapshot().focused_order_ref == "ORD-1001"
     # The grant is remembered: a repeat ask needs NO contact.
     assert "shipped" in h.status("ORD-1001")
+    assert _telemetry(tmp_path) == [
+        {
+            "event": "order_read_granted",
+            "order_id": "ORD-1001",
+            "method": "contact_match",
+        }
+    ]
 
 
-def test_wrong_pair_and_unknown_order_are_indistinguishable(config_root: Path) -> None:
+def test_wrong_pair_and_unknown_order_are_indistinguishable(
+    config_root: Path, tmp_path: Path
+) -> None:
     # THE existence-oracle pin: a wrong contact on a REAL order and any contact on a
     # NONEXISTENT order produce byte-identical responses — probing cannot confirm an id.
     h = Harness(config_root)
     wrong_pair = h.status("ORD-1001", _CUST2_EMAIL)  # real order, not their contact
     unknown = h.status("ORD-9999", _CUST2_EMAIL)  # no such order
-    assert wrong_pair == unknown
+    assert wrong_pair == unknown == _COMBINED_NOT_FOUND
     assert "shipped" not in wrong_pair and "ORD-1001 -" not in wrong_pair
     assert h.recent_orders.snapshot().focused_order_ref is None
+    assert _telemetry(tmp_path) == [
+        {"event": "order_read_denied", "order_id_known": True},
+        {"event": "order_read_denied", "order_id_known": False},
+    ]
 
 
 def test_contact_match_grants_only_that_order(config_root: Path) -> None:
@@ -113,7 +145,65 @@ def test_bound_identity_reads_owned_orders_only(config_root: Path) -> None:
     assert "shipped" in h.status("ORD-1001")
     assert "delivered" in h.status("ORD-1003")
     other = h.status("ORD-1002")  # CUST-002's order
-    assert "rain jacket" not in other and "processing" not in other
+    assert other == _BOUND_ORDER_READ_DENIED
+
+
+@pytest.mark.parametrize("order_id", ["ORD-1002", "ORD-9999", " "])
+@pytest.mark.parametrize("contact", ["", _CUST2_EMAIL])
+def test_bound_unreadable_order_uses_one_access_neutral_result(
+    config_root: Path,
+    tmp_path: Path,
+    order_id: str,
+    contact: str,
+) -> None:
+    h = Harness(config_root)
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+
+    assert h.status(order_id, contact) == _BOUND_ORDER_READ_DENIED
+    assert h.recent_orders.snapshot().focused_order_ref is None
+    assert _telemetry(tmp_path) == [
+        {
+            "event": "order_read_denied",
+            "order_id_known": order_id.strip().upper() == "ORD-1002",
+        }
+    ]
+
+
+def test_bound_principal_ignores_residual_grant_and_matching_foreign_contact(
+    config_root: Path,
+) -> None:
+    h = Harness(config_root)
+    h.identity.grant_orders("ORD-1002")
+    h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+
+    assert h.status("ORD-1002", _CUST2_EMAIL) == _BOUND_ORDER_READ_DENIED
+    assert not h.recent_orders.snapshot().order_refs
+
+
+def test_order_read_copy_contracts_are_embedded_once() -> None:
+    assert ACCOUNT_CONTACT_QUESTION == "What email address or phone number is on the account?"
+    assert ORDER_CONTACT_NOT_FOUND_LINE == (
+        "I couldn't find an order matching those details - could you double-check the order "
+        "number and the email or phone on the account?"
+    )
+    assert BOUND_ORDER_READ_UNAVAILABLE_LINE == (
+        "I couldn't retrieve an order with that number on this call. Please double-check the "
+        "order number, or ask to switch accounts if you meant a different account."
+    )
+    assert (
+        "Not verified for that order. Do not say whether the order exists. Ask the caller ONE "
+        f'short question exactly: "{ACCOUNT_CONTACT_QUESTION}" Then call order_status again with '
+        "the order id AND account_contact."
+    ) == _ASK_CONTACT
+    assert (
+        "No order matches those details. Do not say which detail failed. Tell the caller exactly: "
+        f'"{ORDER_CONTACT_NOT_FOUND_LINE}"'
+    ) == _COMBINED_NOT_FOUND
+    assert (
+        "The caller is already verified on this call, but this order read is not authorized. "
+        "Do not say whether the order exists or which account owns it. Tell the caller exactly: "
+        f'"{BOUND_ORDER_READ_UNAVAILABLE_LINE}"'
+    ) == _BOUND_ORDER_READ_DENIED
 
 
 def test_sequential_probe_discloses_nothing(config_root: Path) -> None:
@@ -121,8 +211,7 @@ def test_sequential_probe_discloses_nothing(config_root: Path) -> None:
     # (the low-entropy-id sequential-probing challenge that reversed decision 1).
     h = Harness(config_root)
     responses = {h.status(oid) for oid in ("ORD-1001", "ORD-1002", "ORD-1003")}
-    assert len(responses) == 1
-    assert "email or phone" in next(iter(responses))
+    assert responses == {_ASK_CONTACT}
 
 
 def test_session_placed_order_is_readable_immediately(config_root: Path) -> None:

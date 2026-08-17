@@ -40,6 +40,7 @@ class LLMConfig(BaseModel):
 
     model_config = _STRICT
 
+    response: ProviderModel
     routing: ProviderModel
     reasoning: ProviderModel
 
@@ -289,6 +290,8 @@ class RuntimeConfig(BaseModel):
 
     cancellation_quiescence_timeout_seconds: float = Field(gt=0)
     caller_audible_model_text_max_chars: int = Field(gt=0)
+    semantic_router_input_max_chars: int = Field(gt=0)
+    semantic_router_timeout_seconds: float = Field(gt=0)
 
 
 class MerchantConfig(BaseModel):

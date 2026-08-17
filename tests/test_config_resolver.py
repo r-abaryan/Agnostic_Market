@@ -19,6 +19,8 @@ def _base() -> dict:
             "policies.cancel_batch_max",
             "runtime.cancellation_quiescence_timeout_seconds",
             "runtime.caller_audible_model_text_max_chars",
+            "runtime.semantic_router_input_max_chars",
+            "runtime.semantic_router_timeout_seconds",
         ],
         "_platform": {
             "payment": {"out_of_band_only": True},
@@ -42,6 +44,8 @@ def _base() -> dict:
         "runtime": {
             "cancellation_quiescence_timeout_seconds": 2.0,
             "caller_audible_model_text_max_chars": 500,
+            "semantic_router_input_max_chars": 2048,
+            "semantic_router_timeout_seconds": 2.0,
         },
         "compliance": {"call_start_disclosure": "Hi, this is an AI assistant."},
         "policies": {
@@ -58,7 +62,8 @@ def _base() -> dict:
 def _template() -> dict:
     return {
         "llm": {
-            "routing": {"provider": "anthropic", "model": "claude-haiku-4-5"},
+            "response": {"provider": "anthropic", "model": "claude-haiku-4-5"},
+            "routing": {"provider": "openai", "model": "gpt-5.4-mini"},
             "reasoning": {"provider": "anthropic", "model": "claude-opus-4-8"},
         },
         "policies": {
@@ -173,6 +178,32 @@ def test_caller_audible_model_text_limit_comes_from_locked_base() -> None:
     with pytest.raises(
         SafetyLockViolationError,
         match="caller_audible_model_text_max_chars",
+    ):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_semantic_router_timeout_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.semantic_router_timeout_seconds == 2.0
+
+    bad = _override()
+    bad["runtime"] = {"semantic_router_timeout_seconds": 60.0}
+    with pytest.raises(
+        SafetyLockViolationError,
+        match="semantic_router_timeout_seconds",
+    ):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_semantic_router_input_limit_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.semantic_router_input_max_chars == 2048
+
+    bad = _override()
+    bad["runtime"] = {"semantic_router_input_max_chars": 50_000}
+    with pytest.raises(
+        SafetyLockViolationError,
+        match="semantic_router_input_max_chars",
     ):
         resolve_merchant_config(_base(), _template(), bad)
 

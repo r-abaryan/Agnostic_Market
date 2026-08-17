@@ -520,6 +520,7 @@ async def test_unverified_support_prompt_contains_no_order_data(config_root: Pat
 async def test_bound_caller_prompt_lists_only_owned_orders(config_root: Path) -> None:
     fake = FakeChatModel(emit_tool_calls=False, record_prompts=True)
     h = _harness(config_root, fake, thread_id="see-2")
+    h.identity.grant_orders("ORD-1002")
     h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     await _events(h.engine, "cancel my order please")
     prompt = fake._seen_prompts[-1]
@@ -1329,7 +1330,7 @@ async def test_rung1_read_grant_does_not_authorize_a_mutation(
         ),
         thread_id="scope-11",
     )
-    h.identity.grant_order("ORD-1002")  # rung-1 READ grant only
+    h.identity.grant_orders("ORD-1002")  # rung-1 READ grant only
     events = await _events(h.engine, "cancel order ORD-1002")
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0

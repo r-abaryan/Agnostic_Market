@@ -14,12 +14,34 @@ from agnostic_market.commerce.identity import (
     CustomerEntry,
     CustomersFixture,
     assert_orders_have_customers,
+    classify_contact_claims,
     load_customers_fixture,
+    order_mutation_allowed,
     order_read_allowed,
+    try_grant_orders_by_contact,
 )
 from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    (
+        "+1 555 010 0119 or 555 010 0119",
+        "casey@example.com, again casey at example dot com",
+    ),
+)
+def test_contact_claim_classification_deduplicates_by_directory_match_key(
+    utterance: str,
+) -> None:
+    assert classify_contact_claims(utterance).disposition == "single"
+
+
+def test_contact_claim_classification_rejects_two_distinct_claims() -> None:
+    selection = classify_contact_claims("casey@example.com or 555 010 0119")
+    assert selection.disposition == "multiple"
+    assert selection.claim is None
 
 
 def _directory(config_root: Path) -> CustomerDirectory:
@@ -84,7 +106,7 @@ def test_match_returns_the_masked_form_only(config_root: Path) -> None:
 
 def test_store_grants_are_per_order_and_clear_drops_both_rungs() -> None:
     store = CallerIdentityStore()
-    store.grant_order(" ord-1001 ")
+    store.grant_orders(" ord-1001 ")
     assert store.order_granted("ORD-1001")  # normalized
     assert not store.order_granted("ORD-1003")  # never siblings
     store.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
@@ -94,13 +116,95 @@ def test_store_grants_are_per_order_and_clear_drops_both_rungs() -> None:
     assert not store.order_granted("ORD-1001")
 
 
+def test_store_grants_validate_the_complete_set_before_mutating() -> None:
+    store = CallerIdentityStore()
+    store.grant_orders("ORD-1001")
+
+    with pytest.raises(ValueError, match="one or more non-blank"):
+        store.grant_orders("ORD-1003", " ")
+    with pytest.raises(ValueError, match="one or more non-blank"):
+        store.grant_orders()
+
+    assert store.order_granted("ORD-1001")
+    assert not store.order_granted("ORD-1003")
+
+
+def test_contact_grant_is_atomic_across_a_same_owner_set(config_root: Path) -> None:
+    orders = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    customers = _directory(config_root)
+    identity = CallerIdentityStore()
+
+    with pytest.raises(ValueError, match="one or more order ids"):
+        try_grant_orders_by_contact(
+            "+1 555 010 0119",
+            store=orders,
+            customers=customers,
+            identity=identity,
+        )
+
+    assert (
+        try_grant_orders_by_contact(
+            "+1 555 010 0119",
+            "ORD-1001",
+            "ORD-1003",
+            store=orders,
+            customers=customers,
+            identity=identity,
+        )
+        == "granted"
+    )
+    assert identity.order_granted("ORD-1001")
+    assert identity.order_granted("ORD-1003")
+
+
+def test_contact_grant_rejects_mixed_owners_without_partial_authority(
+    config_root: Path,
+) -> None:
+    orders = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    identity = CallerIdentityStore()
+    identity.grant_orders("ORD-1001")
+
+    assert (
+        try_grant_orders_by_contact(
+            "+1 555 010 0119",
+            "ORD-1003",
+            "ORD-1002",
+            store=orders,
+            customers=_directory(config_root),
+            identity=identity,
+        )
+        == "mismatch"
+    )
+    assert identity.order_granted("ORD-1001")
+    assert not identity.order_granted("ORD-1003")
+    assert not identity.order_granted("ORD-1002")
+
+
+def test_bound_principal_refuses_contact_grants(config_root: Path) -> None:
+    orders = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+
+    assert (
+        try_grant_orders_by_contact(
+            "casey@example.com",
+            "ORD-1002",
+            store=orders,
+            customers=_directory(config_root),
+            identity=identity,
+        )
+        == "mismatch"
+    )
+    assert not identity.order_granted("ORD-1002")
+
+
 def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     identity = CallerIdentityStore()
     # Unverified: nothing readable.
     assert not order_read_allowed("ORD-1001", store=store, identity=identity)
     # Rung 1: a grant unlocks exactly that order.
-    identity.grant_order("ORD-1001")
+    identity.grant_orders("ORD-1001")
     assert order_read_allowed("ORD-1001", store=store, identity=identity)
     assert not order_read_allowed("ORD-1003", store=store, identity=identity)
     # Rung 2: a binding unlocks all OWNED orders — and only those.
@@ -115,6 +219,18 @@ def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
         total_usd=14.5,
     )
     assert order_read_allowed(placed.order_id, store=store, identity=CallerIdentityStore())
+
+
+def test_bound_principal_cannot_be_widened_by_a_residual_guest_grant(
+    config_root: Path,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    identity = CallerIdentityStore()
+    identity.grant_orders("ORD-1002")
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+
+    assert not order_read_allowed("ORD-1002", store=store, identity=identity)
+    assert not order_mutation_allowed("ORD-1002", store=store, identity=identity)
 
 
 # --- fixture loader + build-time cross-check (fail-loud) ------------------------------------

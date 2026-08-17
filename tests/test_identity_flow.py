@@ -13,6 +13,7 @@ from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events, next_committed_turn
 
+from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
@@ -33,7 +34,6 @@ _CUST1_MASK = "number ending 0119"
 _CUST1_PHONE = "+1 555 010 0119"  # CUST-001 on file: owns ORD-1001 + ORD-1003
 _CUST2_EMAIL = "casey@example.com"
 _UNKNOWN_CLAIM = "nobody@nowhere.example"
-_ASK_CONTACT_LINE = "What email address or phone number is on the account?"
 _VERIFY_CONTEXT_WARNING = (
     "Verifying an account will clear this call's cart and recent order context. "
     "Orders already placed will remain placed, but they won't stay available in this "
@@ -167,7 +167,7 @@ def _assert_identity_contact_ask(
     expected_misses: int,
 ) -> None:
     assert [(event.node, event.text) for event in _spoken(events)] == [
-        ("identity_ask_contact", _ASK_CONTACT_LINE)
+        ("identity_ask_contact", ACCOUNT_CONTACT_QUESTION)
     ]
     assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
     snapshot = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
@@ -614,7 +614,7 @@ async def test_verified_account_switch_rotates_all_principal_context(
         thread_id="switch-success",
     )
     old_proof_id = _establish_customer_one(h)
-    h.identity.grant_order("ORD-1001")
+    h.identity.grant_orders("ORD-1001")
     h.identity.grant_mutation_for_test("ORD-1001")
     _seed_cart(h)
     h.recent_orders.record(["ORD-1001"], operation="read")

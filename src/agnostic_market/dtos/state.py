@@ -20,6 +20,7 @@ from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
     IntentRequest,
+    VerifyOrderStatus,
 )
 from agnostic_market.dtos.recovery import PendingRecovery
 
@@ -498,7 +499,13 @@ class ReasoningState(BaseModel):
 
         if not self.consumed_turn_ids:
             return None
-        turn_id = self.consumed_turn_ids[-1]
+        return self.committed_user_message(self.consumed_turn_ids[-1])
+
+    def committed_user_message(self, turn_id: str) -> HumanMessage | None:
+        """Return one admitted HumanMessage by its stable transport turn id."""
+
+        if turn_id not in self.consumed_turn_ids:
+            return None
         return next(
             (
                 message
@@ -521,12 +528,17 @@ class ReasoningState(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def invocation_opening_turn_was_admitted(self) -> ReasoningState:
-        if (
-            self.active_invocation is not None
-            and self.active_invocation.opened_turn_id not in self.consumed_turn_ids
-        ):
+    def invocation_turns_were_admitted(self) -> ReasoningState:
+        invocation = self.active_invocation
+        if invocation is not None and invocation.opened_turn_id not in self.consumed_turn_ids:
             raise ValueError("active invocation opening turn was not admitted")
+        if (
+            invocation is not None
+            and isinstance(invocation.request, VerifyOrderStatus)
+            and invocation.request.explicit_target_turn_id is not None
+            and invocation.request.explicit_target_turn_id not in self.consumed_turn_ids
+        ):
+            raise ValueError("order-status target source turn was not admitted")
         return self
 
 

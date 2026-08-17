@@ -41,6 +41,7 @@ from agnostic_market.dtos.orchestration import (
     ResolvedCartItemRef,
     ReturnOrder,
     RouteDecision,
+    RouteProposal,
     RoutingContext,
     RoutingFailure,
     SearchCatalog,
@@ -86,6 +87,30 @@ def test_answer_response_is_a_closed_three_arm_contract() -> None:
             AnswerResponse.model_validate(payload)
 
 
+def test_route_proposal_exposes_only_coarse_ownership_fields() -> None:
+    expected_fields = {
+        "decision",
+        "capability",
+        "clarification_reason",
+        "answer_topic",
+        "list_scope",
+        "cart_operation",
+        "profile_field",
+        "order_status_selector",
+    }
+
+    assert set(RouteProposal.model_fields) == expected_fields
+    assert set(RouteProposal.model_json_schema()["properties"]) == expected_fields
+    with pytest.raises(ValidationError):
+        RouteProposal.model_validate(
+            {
+                "decision": "direct",
+                "capability": "search_catalog",
+                "query": "trail shoes",
+            }
+        )
+
+
 def test_recent_order_set_is_plural_context_while_focus_remains_a_distinct_selector() -> None:
     recent = RecentOrderSet()
     assert recent.model_dump() == {"selector": "recent"}
@@ -99,6 +124,43 @@ def test_recent_order_set_is_plural_context_while_focus_remains_a_distinct_selec
     schema = TypeAdapter(OrderStatusSelector).json_schema()
     recent_schema = schema["$defs"]["RecentOrderSet"]
     assert "cardinality" not in recent_schema["properties"]
+
+
+def test_order_status_target_confirmation_is_code_owned() -> None:
+    request = VerifyOrderStatus(
+        target=ExplicitOrderSet(order_refs=("ORD-1002",)),
+    )
+    evidenced = request.with_explicit_target_turn("status-turn")
+    confirmed = evidenced.with_confirmed_explicit_target()
+
+    status_schema = VerifyOrderStatus.model_json_schema()["properties"]
+    route_status_schema = RouteDecision.model_json_schema()["$defs"]["VerifyOrderStatus"][
+        "properties"
+    ]
+    for schema in (status_schema, route_status_schema):
+        assert "explicit_target_turn_id" not in schema
+        assert "explicit_target_confirmed" not in schema
+    assert evidenced.explicit_target_turn_id == "status-turn"
+    assert confirmed.explicit_target_confirmed
+    assert confirmed.model_dump()["explicit_target_turn_id"] == "status-turn"
+    assert confirmed.model_dump()["explicit_target_confirmed"] is True
+    with pytest.raises(ValueError, match="cannot be replaced"):
+        evidenced.with_explicit_target_turn("different-turn")
+    with pytest.raises(ValidationError, match="source turn"):
+        VerifyOrderStatus(
+            target=ExplicitOrderSet(order_refs=("ORD-1002",)),
+            explicit_target_confirmed=True,
+        )
+    with pytest.raises(ValidationError, match="explicit order-status target"):
+        VerifyOrderStatus(
+            target=FocusedOrderSet(),
+            explicit_target_turn_id="status-turn",
+            explicit_target_confirmed=True,
+        )
+    with pytest.raises(ValidationError, match="owning flow"):
+        RouteDecision.direct(evidenced)
+    with pytest.raises(ValidationError, match="owning flow"):
+        RouteDecision.direct(confirmed)
 
 
 @pytest.mark.parametrize(
@@ -244,6 +306,16 @@ def test_invocation_opening_uses_only_the_admitted_ledger_tail() -> None:
             consumed_turn_ids=("turn-1",),
             active_invocation=invocation,
         )
+    with pytest.raises(ValidationError, match="target source turn was not admitted"):
+        ReasoningState(
+            consumed_turn_ids=("turn-1",),
+            active_invocation=ActiveInvocation(
+                request=VerifyOrderStatus(
+                    target=ExplicitOrderSet(order_refs=("ORD-1002",)),
+                ).with_explicit_target_turn("turn-2"),
+                opened_turn_id="turn-1",
+            ),
+        )
 
 
 def test_reasoning_state_distinguishes_latest_history_from_the_current_admitted_turn() -> None:
@@ -259,6 +331,8 @@ def test_reasoning_state_distinguishes_latest_history_from_the_current_admitted_
 
     assert state.last_user_text() == "current question"
     assert state.current_committed_user_message() is current
+    assert state.committed_user_message("turn-1").content == "older question"
+    assert state.committed_user_message("not-admitted") is None
 
     missing = ReasoningState(
         messages=[HumanMessage("older question", id="turn-1")],
@@ -266,6 +340,7 @@ def test_reasoning_state_distinguishes_latest_history_from_the_current_admitted_
     )
     assert missing.last_user_text() == "older question"
     assert missing.current_committed_user_message() is None
+    assert missing.committed_user_message("turn-1").content == "older question"
 
 
 def test_principal_transition_projection_is_closed_and_context_free() -> None:

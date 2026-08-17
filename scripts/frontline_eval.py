@@ -3,6 +3,7 @@
 Run: uv run python scripts/frontline_eval.py
 Structural gate only: uv run python scripts/frontline_eval.py --preflight-only
 Order-target semantic corpus: uv run python scripts/frontline_eval.py --order-target-eval
+Typed semantic-router corpus: uv run python scripts/frontline_eval.py --semantic-routing-eval
 Offline 6E gate: uv run python scripts/frontline_eval.py --recovery-certification offline
 Live retry gate: uv run python scripts/frontline_eval.py --recovery-certification live
 The routing eval needs the merchant model credentials; the live recovery tier needs every
@@ -28,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import math
 import sys
 import tempfile
 import uuid
@@ -58,16 +61,24 @@ from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech, build_ch
 from agnostic_market.agents.frontline import (
     FRONTLINE_SPEAKABLE_NODES,
     MODEL_SPEECH_NODES,
-    TRANSACTIONAL_MODEL_NODES,
+    NON_SPEAKING_MODEL_NODES,
     build_frontline_graph,
 )
+from agnostic_market.agents.frontline.prompt import ORDER_TARGET_PROPOSAL_PROMPT
 from agnostic_market.agents.frontline.read_flow import (
     ANSWER_CLARIFY_NODE,
     ANSWER_RESPONSE_NODE,
     ANSWER_UNSUPPORTED_NODE,
     CATALOG_RESPONSE_NODE,
+    ORDER_STATUS_TARGET_PROPOSE_NODE,
 )
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
+from agnostic_market.agents.routing import (
+    RoutingAttempt,
+    SemanticRouter,
+    project_routing_context,
+    resolve_route,
+)
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -107,9 +118,19 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AnswerQuestion,
+    ChangeProfile,
+    FocusedOrderSet,
     IntentRequest,
+    ListOrders,
+    ModifyCart,
     OrderTargetProposal,
+    RecentOrderSet,
+    RouteDecision,
+    RouteProposal,
+    RoutingContext,
+    RoutingFailure,
     SearchCatalog,
+    VerifyOrderStatus,
 )
 from agnostic_market.dtos.state import ReasoningState, open_active_invocation
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
@@ -145,6 +166,9 @@ _READ_OWNER_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_read_owners.yaml"
 _READ_OWNER_EVAL_SCHEMA_VERSION = "1"
 _ORDER_TARGET_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_order_targets.yaml"
 _ORDER_TARGET_EVAL_SCHEMA_VERSION = "1"
+_SEMANTIC_ROUTE_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_semantic_routes.yaml"
+_SEMANTIC_ROUTE_EVAL_SCHEMA_VERSION = "2"
+_SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
 _TRANSPORT_REPORT_PATHS = {
@@ -248,12 +272,99 @@ class OrderTargetEvalCorpus(BaseModel):
         return self
 
 
+SemanticRouteScenarioClass = Literal[
+    "direct",
+    "continuation",
+    "clarification",
+    "adversarial",
+    "counterfactual",
+    "asr_like",
+]
+SemanticRouteRiskClass = Literal["critical", "standard"]
+SemanticRouteEvaluationSplit = Literal["development", "acceptance"]
+SemanticRouteDisposition = Literal[
+    "exact",
+    "conservative_clarification",
+    "closed_failure",
+    "unsafe_executable_misroute",
+]
+
+
+class SemanticRouteEvalCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: str
+    scenario_class: SemanticRouteScenarioClass
+    risk_class: SemanticRouteRiskClass
+    evaluation_split: SemanticRouteEvaluationSplit
+    context: RoutingContext
+    expected: RouteDecision
+
+    @model_validator(mode="after")
+    def expected_route_is_executable_in_context(self) -> SemanticRouteEvalCase:
+        if isinstance(resolve_route(self.context, self.expected), RoutingFailure):
+            raise ValueError("semantic route ground truth must be executable in its context")
+        return self
+
+
+class ProjectedSemanticRouteEvalCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: str
+    scenario_class: SemanticRouteScenarioClass
+    risk_class: SemanticRouteRiskClass
+    evaluation_split: SemanticRouteEvaluationSplit
+    turn: CommittedTurn
+    expected_context: RoutingContext
+    expected: RouteDecision
+
+    @model_validator(mode="after")
+    def projection_ground_truth_is_coherent(self) -> ProjectedSemanticRouteEvalCase:
+        if self.turn.message_id is None:
+            raise ValueError("projected semantic-route case requires a committed-turn id")
+        if self.turn.text != self.expected_context.utterance:
+            raise ValueError("projected turn text must equal its expected context utterance")
+        if isinstance(resolve_route(self.expected_context, self.expected), RoutingFailure):
+            raise ValueError("projected route ground truth must be executable")
+        return self
+
+
+class SemanticRouteEvalCorpus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str
+    projected_case: ProjectedSemanticRouteEvalCase
+    cases: tuple[SemanticRouteEvalCase, ...]
+
+    @model_validator(mode="after")
+    def corpus_is_current_and_unique(self) -> SemanticRouteEvalCorpus:
+        if self.schema_version != _SEMANTIC_ROUTE_EVAL_SCHEMA_VERSION:
+            raise ValueError("unsupported semantic-route eval schema version")
+        ids = [self.projected_case.case_id, *(case.case_id for case in self.cases)]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("semantic-route eval requires non-empty unique case ids")
+        splits = {
+            self.projected_case.evaluation_split,
+            *(case.evaluation_split for case in self.cases),
+        }
+        if splits != {"development", "acceptance"}:
+            raise ValueError("semantic-route eval requires development and acceptance splits")
+        if not any(
+            case.evaluation_split == "acceptance" and case.risk_class == "critical"
+            for case in self.cases
+        ):
+            raise ValueError("semantic-route eval requires critical acceptance cases")
+        return self
+
+
 @dataclass(frozen=True)
 class _RoutingEvalSelection:
     config: MerchantConfig
     gateway: LLMGateway
-    chat_model: BaseChatModel
-    structured_output_method: StructuredOutputMethod
+    response_model: BaseChatModel
+    response_structured_output_method: StructuredOutputMethod
+    routing_model: BaseChatModel
+    routing_structured_output_method: StructuredOutputMethod
 
 
 @dataclass(frozen=True)
@@ -319,6 +430,7 @@ class EvalRuntime:
     otp: OtpProvider
     verification: VerificationStore
     identity_store: CallerIdentityStore
+    recent_orders: RecentOrderContext
     caller_context: CallerContext
 
 
@@ -349,6 +461,34 @@ class TransportCaseResult:
     after: dict[str, object]
     state: dict[str, object]
     turn_failed: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class SemanticRouteCaseResult:
+    case_id: str
+    scenario_class: str
+    risk_class: SemanticRouteRiskClass
+    evaluation_split: SemanticRouteEvaluationSplit
+    expected: RouteDecision
+    attempt: RoutingAttempt
+
+    @property
+    def disposition(self) -> SemanticRouteDisposition:
+        return _semantic_route_disposition(self.expected, self.attempt.resolution)
+
+
+@dataclass(frozen=True)
+class ProjectedSemanticRouteCaseResult:
+    case_id: str
+    scenario_class: str
+    risk_class: SemanticRouteRiskClass
+    evaluation_split: SemanticRouteEvaluationSplit
+    expected_context: RoutingContext
+    actual_context: RoutingContext | RoutingFailure
+
+    @property
+    def passed(self) -> bool:
+        return self.actual_context == self.expected_context
 
 
 def _audible_observation(event: TurnEvent) -> AudibleObservation:
@@ -491,6 +631,7 @@ def _build_eval_runtime(
         otp=otp,
         verification=verification,
         identity_store=identity_store,
+        recent_orders=recent_orders,
         caller_context=caller_context,
     )
 
@@ -590,7 +731,7 @@ def _speech_authority_failures() -> tuple[str, ...]:
     """Exercise production speech-source policy against every transactional model node."""
     failures: list[str] = []
 
-    for node in sorted(TRANSACTIONAL_MODEL_NODES):
+    for node in sorted(NON_SPEAKING_MODEL_NODES):
         meta = {"langgraph_node": node}
         completed_speech = _TurnSpeech(frozenset(), MODEL_SPEECH_NODES)
         event = completed_speech.feed(
@@ -678,6 +819,12 @@ def _load_order_target_corpus(path: Path = _ORDER_TARGET_EVAL_PATH) -> OrderTarg
     return OrderTargetEvalCorpus.model_validate(load_yaml_layer(path))
 
 
+def _load_semantic_route_corpus(
+    path: Path = _SEMANTIC_ROUTE_EVAL_PATH,
+) -> SemanticRouteEvalCorpus:
+    return SemanticRouteEvalCorpus.model_validate(load_yaml_layer(path))
+
+
 def _load_routing_eval_selection() -> _RoutingEvalSelection:
     load_dotenv()
     credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
@@ -686,19 +833,11 @@ def _load_routing_eval_selection() -> _RoutingEvalSelection:
     return _RoutingEvalSelection(
         config=config,
         gateway=gateway,
-        chat_model=gateway.chat_model(config.llm.routing),
-        structured_output_method=gateway.structured_output_method(config.llm.routing),
+        response_model=gateway.chat_model(config.llm.response),
+        response_structured_output_method=gateway.structured_output_method(config.llm.response),
+        routing_model=gateway.chat_model(config.llm.routing),
+        routing_structured_output_method=gateway.structured_output_method(config.llm.routing),
     )
-
-
-_ORDER_TARGET_EVAL_PROMPT = """Classify only the order references stated in the caller's message.
-Return single for one intended order, plural for multiple intended orders, alternative when the
-caller presents choices, and ambiguous when a reference is merely quoted or disclaimed, or when
-fragmentary, conflicting, or unresolved wording does not establish an executable target. A clear
-correction keeps only the corrected-to reference. Preserve every observed order reference on
-non-single arms; do not select
-one alternative or infer an order from conversational context. Normalize a clear labelled numeric
-reference to ORD-<digits>."""
 
 
 def _score_order_target_output(
@@ -728,7 +867,7 @@ async def _run_order_target_cases(
     for case in corpus.cases:
         try:
             result = await structured.ainvoke(
-                [SystemMessage(_ORDER_TARGET_EVAL_PROMPT), HumanMessage(case.utterance)]
+                [SystemMessage(ORDER_TARGET_PROPOSAL_PROMPT), HumanMessage(case.utterance)]
             )
         except (OutputParserException, ValidationError) as exc:
             failures[case.case_id] = (f"output failed schema ({type(exc).__name__})",)
@@ -764,8 +903,8 @@ async def _evaluate_order_targets(
 async def _run_order_target_eval() -> int:
     selection = _load_routing_eval_selection()
     failures = await _evaluate_order_targets(
-        selection.chat_model,
-        selection.structured_output_method,
+        selection.response_model,
+        selection.response_structured_output_method,
     )
     if failures:
         print("\nFRONTLINE ORDER-TARGET EVAL FAILED. [FAIL]")
@@ -775,6 +914,454 @@ async def _run_order_target_eval() -> int:
         "Coverage limit: text-only structured extraction; no graph, authorization, effect, or STT."
     )
     return 0
+
+
+async def _run_semantic_route_cases(
+    router: SemanticRouter,
+    corpus: SemanticRouteEvalCorpus,
+) -> tuple[SemanticRouteCaseResult, ...]:
+    results: list[SemanticRouteCaseResult] = []
+    for case in corpus.cases:
+        results.append(
+            SemanticRouteCaseResult(
+                case_id=case.case_id,
+                scenario_class=case.scenario_class,
+                risk_class=case.risk_class,
+                evaluation_split=case.evaluation_split,
+                expected=case.expected,
+                attempt=await router.route(case.context),
+            )
+        )
+    return tuple(results)
+
+
+_ROUTE_SIGNATURE_DISCRIMINATORS = frozenset(
+    {
+        "answer_topic",
+        "list_scope",
+        "cart_operation",
+        "profile_field",
+        "order_status_selector",
+    }
+)
+_ACTUAL_ROUTE_PROPOSAL_DISCRIMINATORS = frozenset(RouteProposal.model_fields) - {
+    "decision",
+    "capability",
+    "clarification_reason",
+}
+if _ACTUAL_ROUTE_PROPOSAL_DISCRIMINATORS != _ROUTE_SIGNATURE_DISCRIMINATORS:
+    raise RuntimeError(
+        "semantic-route report must explicitly classify every retained route discriminator"
+    )
+
+
+def _semantic_route_disposition(
+    expected: RouteDecision,
+    actual: RouteDecision | RoutingFailure,
+) -> SemanticRouteDisposition:
+    if actual == expected:
+        return "exact"
+    if isinstance(actual, RoutingFailure):
+        return "closed_failure"
+    if actual.decision == "clarify":
+        return "conservative_clarification"
+    if actual.decision in {"direct", "continue"}:
+        return "unsafe_executable_misroute"
+    raise AssertionError(f"unclassified route decision {actual.decision!r}")
+
+
+def _route_signature(
+    resolution: RouteDecision | RoutingFailure,
+) -> dict[str, str | None]:
+    signature: dict[str, str | None] = {
+        "decision": None,
+        "capability": None,
+        "clarification_reason": None,
+        "answer_topic": None,
+        "list_scope": None,
+        "cart_operation": None,
+        "profile_field": None,
+        "order_status_selector": None,
+        "failure_reason": None,
+    }
+    if isinstance(resolution, RoutingFailure):
+        signature["decision"] = "routing_failure"
+        signature["failure_reason"] = resolution.reason
+        return signature
+
+    signature["decision"] = resolution.decision
+    signature["clarification_reason"] = resolution.clarification_reason
+    request = resolution.request
+    if request is None:
+        return signature
+    signature["capability"] = request.kind.value
+    if isinstance(request, AnswerQuestion):
+        signature["answer_topic"] = request.topic
+    elif isinstance(request, ListOrders):
+        signature["list_scope"] = request.scope
+    elif isinstance(request, ModifyCart):
+        signature["cart_operation"] = request.operation
+    elif isinstance(request, ChangeProfile):
+        signature["profile_field"] = request.field
+    elif isinstance(request, VerifyOrderStatus):
+        if request.target is None:
+            signature["order_status_selector"] = "explicit"
+        elif isinstance(request.target, FocusedOrderSet):
+            signature["order_status_selector"] = "focused"
+        elif isinstance(request.target, RecentOrderSet):
+            signature["order_status_selector"] = "recent"
+        else:
+            signature["order_status_selector"] = "explicit"
+    return signature
+
+
+def _optional_sum(values: Sequence[int | None]) -> int | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
+
+
+def _semantic_route_group(
+    results: Sequence[SemanticRouteCaseResult],
+) -> dict[str, object]:
+    latencies = sorted(result.attempt.elapsed_ms for result in results)
+    p95_index = max(math.ceil(len(latencies) * 0.95) - 1, 0)
+    dispositions = {
+        disposition: sum(result.disposition == disposition for result in results)
+        for disposition in (
+            "exact",
+            "conservative_clarification",
+            "closed_failure",
+            "unsafe_executable_misroute",
+        )
+    }
+    return {
+        "cases": len(results),
+        "dispositions": dispositions,
+        "latency_ms_mean": sum(latencies) / len(latencies),
+        "latency_ms_p95": latencies[p95_index],
+        "input_tokens": _optional_sum([result.attempt.input_tokens for result in results]),
+        "cache_read_tokens": _optional_sum(
+            [result.attempt.cache_read_tokens for result in results]
+        ),
+        "output_tokens": _optional_sum([result.attempt.output_tokens for result in results]),
+    }
+
+
+def _group_semantic_route_results(
+    results: Sequence[SemanticRouteCaseResult],
+    attribute: Literal["scenario_class", "risk_class", "evaluation_split"],
+) -> dict[str, dict[str, object]]:
+    values = dict.fromkeys(getattr(result, attribute) for result in results)
+    return {
+        value: _semantic_route_group(
+            [result for result in results if getattr(result, attribute) == value]
+        )
+        for value in values
+    }
+
+
+def _semantic_model_report(
+    results: Sequence[SemanticRouteCaseResult],
+) -> dict[str, object]:
+    if not results:
+        raise ValueError("semantic-route model report requires at least one result")
+    first = results[0].attempt
+    return {
+        "provider": first.provider,
+        "model": first.model,
+        "structured_output_method": first.structured_output_method,
+        "route_schema_fingerprint": first.route_schema_fingerprint,
+        "prompt_fingerprint": first.prompt_fingerprint,
+        "registry_fingerprint": first.registry_fingerprint,
+        "input_max_chars": first.input_max_chars,
+        "projector_version": first.projector_version,
+        "totals": _semantic_route_group(results),
+        "by_evaluation_split": _group_semantic_route_results(results, "evaluation_split"),
+        "by_scenario_class": _group_semantic_route_results(results, "scenario_class"),
+        "by_risk_class": _group_semantic_route_results(results, "risk_class"),
+        "cases": [
+            {
+                "case_id": result.case_id,
+                "scenario_class": result.scenario_class,
+                "risk_class": result.risk_class,
+                "evaluation_split": result.evaluation_split,
+                "disposition": result.disposition,
+                "expected": _route_signature(result.expected),
+                "actual": _route_signature(result.attempt.resolution),
+                "latency_ms": result.attempt.elapsed_ms,
+                "input_tokens": result.attempt.input_tokens,
+                "cache_read_tokens": result.attempt.cache_read_tokens,
+                "output_tokens": result.attempt.output_tokens,
+            }
+            for result in results
+        ],
+    }
+
+
+def _corpus_fingerprint(corpus: SemanticRouteEvalCorpus) -> str:
+    encoded = json.dumps(
+        corpus.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _count_disposition(
+    results: Sequence[SemanticRouteCaseResult],
+    disposition: SemanticRouteDisposition,
+    *,
+    evaluation_split: SemanticRouteEvaluationSplit | None = None,
+    risk_class: SemanticRouteRiskClass | None = None,
+) -> int:
+    return sum(
+        result.disposition == disposition
+        and (evaluation_split is None or result.evaluation_split == evaluation_split)
+        and (risk_class is None or result.risk_class == risk_class)
+        for result in results
+    )
+
+
+def _assert_semantic_results_are_comparable(
+    candidate: Sequence[SemanticRouteCaseResult],
+    incumbent: Sequence[SemanticRouteCaseResult],
+) -> None:
+    def identity(result: SemanticRouteCaseResult) -> tuple[object, ...]:
+        return (
+            result.case_id,
+            result.scenario_class,
+            result.risk_class,
+            result.evaluation_split,
+            result.expected,
+        )
+
+    if [identity(result) for result in candidate] != [identity(result) for result in incumbent]:
+        raise ValueError("candidate and incumbent results must cover the same ordered cases")
+
+
+def _semantic_gate_failures(
+    candidate: Sequence[SemanticRouteCaseResult],
+    incumbent: Sequence[SemanticRouteCaseResult],
+    *,
+    projection: ProjectedSemanticRouteCaseResult,
+    gate: Literal["shadow", "cutover"],
+) -> tuple[str, ...]:
+    _assert_semantic_results_are_comparable(candidate, incumbent)
+    failures: list[str] = []
+    if not projection.passed:
+        failures.append("production context projection did not match the frozen fixture")
+    if gate == "shadow":
+        if _count_disposition(candidate, "closed_failure"):
+            failures.append("candidate produced a closed failure")
+        candidate_development = _count_disposition(
+            candidate, "exact", evaluation_split="development"
+        )
+        incumbent_development = _count_disposition(
+            incumbent, "exact", evaluation_split="development"
+        )
+        if candidate_development <= incumbent_development:
+            failures.append("candidate is not more exact than incumbent on development")
+        candidate_acceptance = _count_disposition(candidate, "exact", evaluation_split="acceptance")
+        incumbent_acceptance = _count_disposition(incumbent, "exact", evaluation_split="acceptance")
+        if candidate_acceptance < incumbent_acceptance:
+            failures.append("candidate is inferior to incumbent on acceptance")
+        candidate_critical = _count_disposition(
+            candidate,
+            "exact",
+            evaluation_split="acceptance",
+            risk_class="critical",
+        )
+        incumbent_critical = _count_disposition(
+            incumbent,
+            "exact",
+            evaluation_split="acceptance",
+            risk_class="critical",
+        )
+        if candidate_critical < incumbent_critical:
+            failures.append("candidate is inferior to incumbent on critical acceptance")
+        return tuple(failures)
+
+    acceptance = [result for result in candidate if result.evaluation_split == "acceptance"]
+    if _count_disposition(acceptance, "closed_failure"):
+        failures.append("candidate produced a closed failure on acceptance")
+    if _count_disposition(acceptance, "unsafe_executable_misroute"):
+        failures.append("candidate produced an unsafe executable misroute on acceptance")
+    critical = [result for result in acceptance if result.risk_class == "critical"]
+    if _count_disposition(critical, "exact") != len(critical):
+        failures.append("not every critical acceptance case was exact")
+    if _count_disposition(acceptance, "exact") / len(acceptance) < 0.95:
+        failures.append("acceptance exact rate was below 95%")
+    return tuple(failures)
+
+
+def _semantic_route_report(
+    candidate: Sequence[SemanticRouteCaseResult],
+    incumbent: Sequence[SemanticRouteCaseResult],
+    *,
+    corpus: SemanticRouteEvalCorpus,
+    projection: ProjectedSemanticRouteCaseResult,
+    gate: Literal["shadow", "cutover"],
+    gate_failures: Sequence[str],
+) -> dict[str, object]:
+    _assert_semantic_results_are_comparable(candidate, incumbent)
+    return {
+        "schema_version": _SEMANTIC_ROUTE_EVAL_SCHEMA_VERSION,
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "corpus_fingerprint": _corpus_fingerprint(corpus),
+        "route_schema_bytes": len(
+            json.dumps(RouteProposal.model_json_schema(), separators=(",", ":")).encode("utf-8")
+        ),
+        "projection": {
+            "case_id": projection.case_id,
+            "scenario_class": projection.scenario_class,
+            "risk_class": projection.risk_class,
+            "evaluation_split": projection.evaluation_split,
+            "exact": projection.passed,
+            "actual": (
+                "context"
+                if isinstance(projection.actual_context, RoutingContext)
+                else projection.actual_context.reason
+            ),
+        },
+        "gate": {
+            "mode": gate,
+            "passed": not gate_failures,
+            "failures": list(gate_failures),
+        },
+        "models": {
+            "candidate": _semantic_model_report(candidate),
+            "incumbent": _semantic_model_report(incumbent),
+        },
+    }
+
+
+def _write_semantic_route_report(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+async def _run_semantic_route_eval(
+    report_path: Path,
+    gate: Literal["shadow", "cutover"] = "cutover",
+) -> int:
+    selection = _load_routing_eval_selection()
+    config = selection.config
+    runtime = _build_eval_runtime(
+        config,
+        selection.response_model,
+        selection.gateway.chat_model(config.llm.reasoning),
+        thread_id=f"semantic-route-eval-{uuid.uuid4().hex}",
+        structured_output_method=selection.response_structured_output_method,
+    )
+    try:
+        candidate_router = SemanticRouter(
+            selection.routing_model,
+            selection=config.llm.routing,
+            structured_output_method=selection.routing_structured_output_method,
+            timeout_seconds=config.runtime.semantic_router_timeout_seconds,
+            input_max_chars=config.runtime.semantic_router_input_max_chars,
+            registry=runtime.capability_registry,
+        )
+        incumbent_router = SemanticRouter(
+            selection.response_model,
+            selection=config.llm.response,
+            structured_output_method=selection.response_structured_output_method,
+            timeout_seconds=config.runtime.semantic_router_timeout_seconds,
+            input_max_chars=config.runtime.semantic_router_input_max_chars,
+            registry=runtime.capability_registry,
+        )
+        corpus = _load_semantic_route_corpus()
+        config_key = {"configurable": {"thread_id": runtime.engine.thread_id}}
+        state = ReasoningState.model_validate(runtime.graph.get_state(config_key).values)
+        projected = project_routing_context(
+            corpus.projected_case.turn,
+            state,
+            identity_store=runtime.identity_store,
+            cart_store=runtime.cart_store,
+            recent_orders=runtime.recent_orders,
+            registry=runtime.capability_registry,
+        )
+        projection = ProjectedSemanticRouteCaseResult(
+            case_id=corpus.projected_case.case_id,
+            scenario_class=corpus.projected_case.scenario_class,
+            risk_class=corpus.projected_case.risk_class,
+            evaluation_split=corpus.projected_case.evaluation_split,
+            expected_context=corpus.projected_case.expected_context,
+            actual_context=projected,
+        )
+        candidate_results = list(await _run_semantic_route_cases(candidate_router, corpus))
+        incumbent_results = list(await _run_semantic_route_cases(incumbent_router, corpus))
+        if projection.passed:
+            assert isinstance(projected, RoutingContext)
+            candidate_results.insert(
+                0,
+                SemanticRouteCaseResult(
+                    case_id=corpus.projected_case.case_id,
+                    scenario_class=corpus.projected_case.scenario_class,
+                    risk_class=corpus.projected_case.risk_class,
+                    evaluation_split=corpus.projected_case.evaluation_split,
+                    expected=corpus.projected_case.expected,
+                    attempt=await candidate_router.route(projected),
+                ),
+            )
+            incumbent_results.insert(
+                0,
+                SemanticRouteCaseResult(
+                    case_id=corpus.projected_case.case_id,
+                    scenario_class=corpus.projected_case.scenario_class,
+                    risk_class=corpus.projected_case.risk_class,
+                    evaluation_split=corpus.projected_case.evaluation_split,
+                    expected=corpus.projected_case.expected,
+                    attempt=await incumbent_router.route(projected),
+                ),
+            )
+        gate_failures = _semantic_gate_failures(
+            candidate_results,
+            incumbent_results,
+            projection=projection,
+            gate=gate,
+        )
+        report = _semantic_route_report(
+            candidate_results,
+            incumbent_results,
+            corpus=corpus,
+            projection=projection,
+            gate=gate,
+            gate_failures=gate_failures,
+        )
+        await asyncio.to_thread(_write_semantic_route_report, report_path, report)
+        candidate_exact = _count_disposition(candidate_results, "exact")
+        incumbent_exact = _count_disposition(incumbent_results, "exact")
+        route_cases = len(candidate_results)
+        print(f"[semantic_routes] candidate exact: {candidate_exact}/{route_cases}")
+        print(f"[semantic_routes] incumbent exact: {incumbent_exact}/{route_cases}")
+        print(f"[semantic_routes] projector: {int(projection.passed)}/1")
+        if not projection.passed:
+            print(f"    {projection.case_id}: production context projection did not match fixture")
+        for result in candidate_results:
+            if result.disposition != "exact":
+                print(
+                    f"    {result.case_id}: {result.disposition}; "
+                    f"expected {_route_signature(result.expected)}, "
+                    f"got {_route_signature(result.attempt.resolution)}"
+                )
+        print(f"    sanitized report: {report_path}")
+        if gate_failures:
+            for failure in gate_failures:
+                print(f"    gate failure: {failure}")
+            print(f"\nSEMANTIC ROUTING {gate.upper()} GATE FAILED. [FAIL]")
+            return 1
+        print(f"\nSEMANTIC ROUTING {gate.upper()} GATE PASSED. [SEMANTIC-QUALITY PASS]")
+        print(
+            "Coverage limit: offline text/provider routing only; no live dispatch, speech, "
+            "checkpoint, tool, or effect ran."
+        )
+        return 0
+    finally:
+        runtime.caller_context.close_session()
 
 
 def _score_read_owner_output(
@@ -916,6 +1503,13 @@ _TRANSPORT_OWNER_SCENARIOS = (
         origin_node=ANSWER_RESPONSE_NODE,
         utterance="What is your return policy?",
         initial_request=AnswerQuestion(topic="policy"),
+    ),
+    TransportOwnerScenario(
+        scenario_id="order_status_target_proposal",
+        owner="frontline",
+        origin_node=ORDER_STATUS_TARGET_PROPOSE_NODE,
+        utterance="Order 1002.",
+        initial_request=VerifyOrderStatus(),
     ),
 )
 _EMPTY_RECOVERY_STATE = GraphObservation(
@@ -1345,13 +1939,13 @@ async def _run(*, preflight_only: bool = False) -> int:
     telemetry._TELEMETRY_PATH = telemetry._TELEMETRY_PATH.with_name("frontline_eval.jsonl")
     selection = _load_routing_eval_selection()
     config = selection.config
-    chat_model = selection.chat_model
+    chat_model = selection.response_model
     runtime = _build_eval_runtime(
         config,
         chat_model,
         selection.gateway.chat_model(config.llm.reasoning),
         thread_id=f"frontline-eval-{uuid.uuid4().hex}",
-        structured_output_method=selection.structured_output_method,
+        structured_output_method=selection.response_structured_output_method,
     )
     graph = runtime.graph
     data = load_yaml_layer(_EVAL_PATH)
@@ -1404,7 +1998,7 @@ async def _run(*, preflight_only: bool = False) -> int:
 
     order_target_failures = await _evaluate_order_targets(
         chat_model,
-        selection.structured_output_method,
+        selection.response_structured_output_method,
     )
 
     if recall < _RECALL_BAR:
@@ -1439,6 +2033,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="run the text-only credentialed order-target semantic corpus",
     )
     mode.add_argument(
+        "--semantic-routing-eval",
+        action="store_true",
+        help="run the typed semantic-router corpus without dispatching the live graph",
+    )
+    mode.add_argument(
         "--recovery-certification",
         choices=("offline", "live"),
         help=(
@@ -1450,6 +2049,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--transport-report",
         type=Path,
         help="report destination (defaults to a tier-specific transport report)",
+    )
+    parser.add_argument(
+        "--semantic-routing-report",
+        type=Path,
+        help="sanitized semantic-router report destination",
+    )
+    parser.add_argument(
+        "--semantic-routing-gate",
+        choices=("shadow", "cutover"),
+        help="semantic-router qualification gate (defaults to cutover)",
     )
     parser.add_argument(
         "--transport-request-ceiling",
@@ -1481,8 +2090,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.recovery_certification is None and custom_transport_options:
         parser.error("transport options require --recovery-certification")
+    if args.semantic_routing_report is not None and not args.semantic_routing_eval:
+        parser.error("--semantic-routing-report requires --semantic-routing-eval")
+    if args.semantic_routing_gate is not None and not args.semantic_routing_eval:
+        parser.error("--semantic-routing-gate requires --semantic-routing-eval")
     if args.order_target_eval:
         return asyncio.run(_run_order_target_eval())
+    if args.semantic_routing_eval:
+        return asyncio.run(
+            _run_semantic_route_eval(
+                args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
+                args.semantic_routing_gate or "cutover",
+            )
+        )
     if args.recovery_certification is not None:
         return asyncio.run(
             _run_transport_certification(

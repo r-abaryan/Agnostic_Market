@@ -13,6 +13,14 @@ from agnostic_market.commerce.orders import CatalogLookup
 from agnostic_market.dtos.orchestration import AnswerQuestion
 from agnostic_market.dtos.state import PolicyContext
 
+ORDER_TARGET_PROPOSAL_PROMPT = """Classify only the order references stated in the caller's message.
+Return single for one intended order, plural for multiple intended orders, alternative when the
+caller presents choices, and ambiguous when a reference is merely quoted or disclaimed, or when
+fragmentary, conflicting, or unresolved wording does not establish an executable target. A clear
+correction keeps only the corrected-to reference. Preserve every observed order reference on
+non-single arms; do not select one alternative or infer an order from conversational context.
+Normalize a clear labelled numeric reference to ORD-<digits>."""
+
 _INSTRUCTIONS = (
     "YOUR part: you answer order-status questions (use order_status), product questions "
     "(use catalog_search), and 'what's in my cart' (use view_cart - a READ). You take NO "
