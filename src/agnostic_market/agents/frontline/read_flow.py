@@ -52,7 +52,6 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.state import HandoffRequest, PolicyContext, ReasoningState
 
 CATALOG_ENTRY_NODE = "catalog_entry"
-CATALOG_QUERY_CLARIFY_NODE = "catalog_query_clarify"
 CATALOG_QUERY_REJECT_NODE = "catalog_query_reject"
 CATALOG_RESPONSE_NODE = "catalog_response"
 ANSWER_RESPONSE_NODE = "answer_response"
@@ -66,7 +65,6 @@ ORDER_STATUS_TARGET_REJECT_NODE = "order_status_target_reject"
 ORDER_STATUS_FULFILL_NODE = "order_status_fulfill"
 READ_FLOW_SPEAKABLE_NODES = frozenset(
     {
-        CATALOG_QUERY_CLARIFY_NODE,
         CATALOG_QUERY_REJECT_NODE,
         ANSWER_CLARIFY_NODE,
         ANSWER_UNSUPPORTED_NODE,
@@ -77,7 +75,6 @@ READ_FLOW_SPEAKABLE_NODES = frozenset(
 )
 READ_FLOW_MODEL_SPEECH_NODES = frozenset({CATALOG_RESPONSE_NODE, ANSWER_RESPONSE_NODE})
 
-_CATALOG_QUERY_QUESTION = "What product would you like me to look for?"
 _CATALOG_QUERY_REJECTED = "I didn't get a product to look for. What else can I help with?"
 _ANSWER_CONTEXT_QUESTION = "What would you like me to explain?"
 _ANSWER_UNSUPPORTED_RETRY = (
@@ -89,7 +86,6 @@ _ANSWER_UNSUPPORTED_RETRY = (
 @dataclass(frozen=True)
 class ReadFlowNodes:
     catalog_entry: Callable[[ReasoningState], Command]
-    catalog_query_clarify: Callable[[ReasoningState], dict[str, object]]
     catalog_query_reject: Callable[[ReasoningState], dict[str, object]]
     catalog_response: Callable[[ReasoningState], Command]
     answer_response: Callable[[ReasoningState], Command]
@@ -152,8 +148,6 @@ def build_read_flow_nodes(
             raise TypeError("order-status entry requires a verify-order-status invocation")
         if invocation.request.target is not None:
             return Command(goto=ORDER_STATUS_FULFILL_NODE)
-        if invocation.opened_turn_id == state.consumed_turn_ids[-1]:
-            return Command(goto=ORDER_STATUS_TARGET_ASK_NODE)
         return Command(goto=ORDER_STATUS_TARGET_PROPOSE_NODE)
 
     def order_status_target_ask_node(state: ReasoningState) -> dict[str, object]:
@@ -185,10 +179,7 @@ def build_read_flow_nodes(
             and all(re.fullmatch(r"ORD-\d+", ref) is not None for ref in refs)
         )
         if not accepted:
-            return Command(
-                goto=ORDER_STATUS_TARGET_REJECT_NODE,
-                update={"active_invocation": None},
-            )
+            return Command(goto=ORDER_STATUS_TARGET_ASK_NODE)
         request = VerifyOrderStatus(target=ExplicitOrderSet(order_refs=refs))
         return Command(
             goto=ORDER_STATUS_FULFILL_NODE,
@@ -388,9 +379,6 @@ def build_read_flow_nodes(
         current = state.current_committed_user_message()
         if current is None:
             raise ValueError("catalog entry requires the current committed caller message")
-        if invocation.opened_turn_id == state.consumed_turn_ids[-1]:
-            return Command(goto=CATALOG_QUERY_CLARIFY_NODE)
-
         if not isinstance(current.content, str):
             return Command(
                 goto=CATALOG_QUERY_REJECT_NODE,
@@ -406,16 +394,6 @@ def build_read_flow_nodes(
             goto=CATALOG_RESPONSE_NODE,
             update={"active_invocation": invocation.with_request(SearchCatalog(query=query))},
         )
-
-    def catalog_query_clarify_node(state: ReasoningState) -> dict[str, object]:
-        invocation = state.active_invocation
-        if (
-            invocation is None
-            or not isinstance(invocation.request, SearchCatalog)
-            or invocation.request.query is not None
-        ):
-            raise TypeError("catalog query clarification requires an incomplete catalog request")
-        return {"messages": [AIMessage(_CATALOG_QUERY_QUESTION)]}
 
     def catalog_query_reject_node(state: ReasoningState) -> dict[str, object]:
         if state.active_invocation is not None:
@@ -517,7 +495,6 @@ def build_read_flow_nodes(
 
     return ReadFlowNodes(
         catalog_entry=catalog_entry_node,
-        catalog_query_clarify=catalog_query_clarify_node,
         catalog_query_reject=catalog_query_reject_node,
         catalog_response=catalog_response_node,
         answer_response=answer_response_node,

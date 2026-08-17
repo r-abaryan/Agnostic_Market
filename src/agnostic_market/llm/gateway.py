@@ -1,6 +1,7 @@
 """LLM-agnostic gateway — provider:model selection and provider transport policy.
 
-Per-merchant + per-node selection: callers pass `config.llm.routing` or `config.llm.reasoning`
+Per-merchant + per-node selection: callers pass `config.llm.response`,
+`config.llm.routing`, or `config.llm.reasoning`
 (a `ProviderModel`) — there is no second selection shape. API keys resolve through the
 SecretResolver seam from the platform provider-credentials file (config/base/providers.yaml)
 and are passed to `init_chat_model` explicitly — never inline in config, and never assumed

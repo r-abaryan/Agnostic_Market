@@ -40,22 +40,43 @@ class RecordingResolver:
 CONFORMANT_ARGS: dict[str, dict[str, Any]] = {
     "get_order_status": {"order_id": "ORD-1001"},
     "search_catalog": {"query": "running shoes"},
-    "RouteDecision": {
-        "decision": "direct",
-        "request": {
-            "kind": "cancel_orders",
-            "target": {"selector": "cancellable_scope", "scope": "all_cancellable"},
-        },
-    },
-}
-
-# Fails RouteDecision validation (direct decisions require exactly one valid request).
-BROKEN_ROUTE_ARGS: dict[str, dict[str, Any]] = {
-    **CONFORMANT_ARGS,
-    "RouteDecision": {"decision": "direct", "request": None},
+    "RouteProposal": {"decision": "direct", "capability": "search_catalog"},
 }
 
 CONFORMANT_STRUCTURED_ARGS: dict[str, tuple[dict[str, Any], ...]] = {
+    "RouteProposal": (
+        CONFORMANT_ARGS["RouteProposal"],
+        {
+            "decision": "clarify",
+            "clarification_reason": "ambiguous_intent",
+        },
+        {"decision": "continue"},
+        {
+            "decision": "direct",
+            "capability": "answer_question",
+            "answer_topic": "policy",
+        },
+        {
+            "decision": "direct",
+            "capability": "list_orders",
+            "list_scope": "account",
+        },
+        {
+            "decision": "direct",
+            "capability": "modify_cart",
+            "cart_operation": "add",
+        },
+        {
+            "decision": "direct",
+            "capability": "change_profile",
+            "profile_field": "address",
+        },
+        {
+            "decision": "direct",
+            "capability": "verify_order_status",
+            "order_status_selector": "explicit",
+        },
+    ),
     "AnswerResponse": (
         {"decision": "answer", "answer": "Returns are accepted within 30 days."},
         {"decision": "clarify", "answer": None},

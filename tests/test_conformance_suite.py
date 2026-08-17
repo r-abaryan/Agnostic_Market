@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 from llm_fakes import (
-    BROKEN_ROUTE_ARGS,
     CONFORMANT_STRUCTURED_ARGS,
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
@@ -15,7 +14,7 @@ from llm_fakes import (
 from pydantic import ValidationError
 
 from agnostic_market.config.loader import ConfigError
-from agnostic_market.dtos.config import MerchantConfig, ProviderModel
+from agnostic_market.dtos.config import LLMConfig, MerchantConfig, ProviderModel
 from agnostic_market.dtos.llm import ConformanceCheck, ConformanceReport
 from agnostic_market.llm.providers import (
     SUITE_VERSION,
@@ -48,7 +47,7 @@ async def test_conformant_model_is_commerce_ready() -> None:
     assert report.verdict == "commerce-ready", _failed_checks(report)
     assert report.suite_version == SUITE_VERSION
     assert [c.name for c in report.checks] == ["tool_call", "structured_output", "streaming"]
-    assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,) * 8
+    assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,) * 15
 
 
 async def test_no_tool_calls_flagged_chat_only() -> None:
@@ -76,7 +75,12 @@ async def test_wrong_tool_selection_flagged_chat_only() -> None:
 
 async def test_invalid_structured_output_flagged_chat_only() -> None:
     report = await run_conformance(
-        FakeChatModel(canned_args=BROKEN_ROUTE_ARGS),
+        FakeChatModel(
+            structured_args={
+                **CONFORMANT_STRUCTURED_ARGS,
+                "RouteProposal": ({"decision": "direct", "capability": "not_a_capability"},),
+            }
+        ),
         provider="fake",
         model="bad-schema",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -91,11 +95,12 @@ async def test_invalid_answer_response_case_names_the_failed_internal_case() -> 
     report = await run_conformance(
         FakeChatModel(
             structured_args={
+                **CONFORMANT_STRUCTURED_ARGS,
                 "AnswerResponse": (
                     {"decision": "answer", "answer": "A bounded answer."},
                     {"decision": "clarify", "answer": None},
                     {"decision": "unsupported", "answer": "contradictory prose"},
-                )
+                ),
             }
         ),
         provider="fake",
@@ -112,11 +117,7 @@ async def test_invalid_order_target_case_names_the_failed_internal_case() -> Non
     report = await run_conformance(
         FakeChatModel(
             structured_args={
-                "AnswerResponse": (
-                    {"decision": "answer", "answer": "A bounded answer."},
-                    {"decision": "clarify", "answer": None},
-                    {"decision": "unsupported", "answer": None},
-                ),
+                **CONFORMANT_STRUCTURED_ARGS,
                 "OrderTargetProposal": (
                     {"relationship": "single", "order_refs": ["ORD-1002"]},
                     {"relationship": "plural", "order_refs": ["ORD-1001", "ORD-1002"]},
@@ -295,6 +296,7 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
             "display_name": "M One",
             "locale": "en-US",
             "llm": {
+                "response": {"provider": provider, "model": model},
                 "routing": {"provider": provider, "model": model},
                 "reasoning": {"provider": provider, "model": model},
             },
@@ -324,6 +326,8 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
             "runtime": {
                 "cancellation_quiescence_timeout_seconds": 2.0,
                 "caller_audible_model_text_max_chars": 500,
+                "semantic_router_input_max_chars": 2048,
+                "semantic_router_timeout_seconds": 2.0,
             },
             "vector_namespace": "m1",
             "secrets_ref": "vault://m1",
@@ -334,11 +338,41 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
 def test_check_llm_certification_warns_on_uncertified(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     warnings = check_llm_certification(_merchant_config("fake", "uncertified"), registry)
-    assert len(warnings) == 2  # routing + reasoning
+    assert len(warnings) == 3  # response + routing + reasoning
     assert all("not certified commerce-ready" in w for w in warnings)
+    assert {warning.split("llm.", 1)[1].split(" ", 1)[0] for warning in warnings} == {
+        "response",
+        "routing",
+        "reasoning",
+    }
 
 
 def test_check_llm_certification_silent_when_certified(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.record(_report())
     assert check_llm_certification(_merchant_config("fake", "good"), registry) == []
+
+
+def test_check_llm_certification_checks_each_required_role_once() -> None:
+    config = _merchant_config("fake", "unused")
+    config.llm = LLMConfig(
+        response=ProviderModel(provider="fake", model="response"),
+        routing=ProviderModel(provider="fake", model="routing"),
+        reasoning=ProviderModel(provider="fake", model="reasoning"),
+    )
+    calls: list[tuple[str, str]] = []
+
+    class RecordingRegistry:
+        def is_commerce_ready(self, provider: str, model: str) -> bool:
+            calls.append((provider, model))
+            return model != "routing"
+
+    warnings = check_llm_certification(config, RecordingRegistry())  # type: ignore[arg-type]
+
+    assert calls == [
+        ("fake", "response"),
+        ("fake", "routing"),
+        ("fake", "reasoning"),
+    ]
+    assert len(warnings) == 1
+    assert "llm.routing" in warnings[0]

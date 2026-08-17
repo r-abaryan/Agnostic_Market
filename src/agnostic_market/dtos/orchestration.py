@@ -30,6 +30,10 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 CancelScope = Literal["all_cancellable", "both_cancellable"]
 OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
+AnswerTopic = Literal["policy", "general"]
+ListOrderScope = Literal["session", "account"]
+CartOperation = Literal["add", "remove", "set_quantity"]
+OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
 
 
 class IntentRequestModel(BaseModel):
@@ -150,7 +154,7 @@ class AnswerQuestion(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.ANSWER_QUESTION] = CapabilityId.ANSWER_QUESTION
-    topic: Literal["policy", "general"]
+    topic: AnswerTopic
 
 
 class AnswerResponse(BaseModel):
@@ -228,7 +232,7 @@ class ListOrders(_CompleteIntentRequest):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.LIST_ORDERS] = CapabilityId.LIST_ORDERS
-    scope: Literal["session", "account"]
+    scope: ListOrderScope
 
 
 class ViewCart(_CompleteIntentRequest):
@@ -276,7 +280,7 @@ class ModifyCart(IntentRequestModel):
     model_config = _FROZEN
 
     kind: Literal[CapabilityId.MODIFY_CART] = CapabilityId.MODIFY_CART
-    operation: Literal["add", "remove", "set_quantity"]
+    operation: CartOperation
     item: CartItemSelector | None = None
     quantity: int | None = Field(default=None, strict=True, ge=0)
 
@@ -447,8 +451,23 @@ ClarificationReason = Literal[
 ]
 
 
+class RouteProposal(BaseModel):
+    """Provider wire route; coarse ownership only, never authority or fine slots."""
+
+    model_config = _FROZEN
+
+    decision: Literal["clarify", "direct", "continue"]
+    capability: CapabilityId | None = None
+    clarification_reason: ClarificationReason | None = None
+    answer_topic: AnswerTopic | None = None
+    list_scope: ListOrderScope | None = None
+    cart_operation: CartOperation | None = None
+    profile_field: ProfileField | None = None
+    order_status_selector: OrderStatusRouteSelector | None = None
+
+
 class RouteDecision(BaseModel):
-    """Model-authored semantic route: clarify, one direct request, or current-owner continuation."""
+    """Validated internal route consumed by telemetry and capability dispatch."""
 
     model_config = _FROZEN
 
@@ -499,7 +518,12 @@ class RouteDecision(BaseModel):
         return cls(decision="continue")
 
 
-RoutingFailureReason = Literal["invalid_output", "routing_unavailable"]
+RoutingFailureReason = Literal[
+    "invalid_output",
+    "routing_unavailable",
+    "context_invalid",
+    "decision_rejected",
+]
 
 
 class RoutingFailure(BaseModel):

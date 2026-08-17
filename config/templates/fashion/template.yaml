@@ -4,7 +4,8 @@
 
 # Sensible category LLM tiers (merchant may override provider/model, conformance-gated).
 llm:
-  routing:   { provider: "anthropic", model: "claude-haiku-4-5" }
+  response:  { provider: "anthropic", model: "claude-haiku-4-5" }
+  routing:   { provider: "openai", model: "gpt-5.4-mini" }
   reasoning: { provider: "anthropic", model: "claude-opus-4-8" }
 
 # Category policy defaults (bounded; merchant may tighten/adjust within platform limits).

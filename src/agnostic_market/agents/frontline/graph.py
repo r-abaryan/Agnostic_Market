@@ -69,7 +69,6 @@ from agnostic_market.agents.frontline.read_flow import (
     ANSWER_RESPONSE_NODE,
     ANSWER_UNSUPPORTED_NODE,
     CATALOG_ENTRY_NODE,
-    CATALOG_QUERY_CLARIFY_NODE,
     CATALOG_QUERY_REJECT_NODE,
     CATALOG_RESPONSE_NODE,
     ORDER_STATUS_ENTRY_NODE,
@@ -1506,15 +1505,8 @@ def build_frontline_graph(
         AbandonmentKind.PURE_ABORT,
         destinations=(
             CATALOG_RESPONSE_NODE,
-            CATALOG_QUERY_CLARIFY_NODE,
             CATALOG_QUERY_REJECT_NODE,
         ),
-    )
-    node_registry.register(
-        CATALOG_QUERY_CLARIFY_NODE,
-        reads.catalog_query_clarify,
-        ExceptionAction.SAFE_ABORT,
-        AbandonmentKind.PURE_ABORT,
     )
     node_registry.register(
         CATALOG_QUERY_REJECT_NODE,
@@ -1981,7 +1973,6 @@ def build_frontline_graph(
     graph.add_edge(_SUPPORT_CAPABILITY_RENDER_NODE, END)
     graph.add_edge(_CART_VIEW_RENDER_NODE, END)  # code-authored typed read ENDs, no model pass
     graph.add_edge(_IDENTITY_STATUS_RENDER_NODE, END)
-    graph.add_edge(CATALOG_QUERY_CLARIFY_NODE, END)
     graph.add_edge(CATALOG_QUERY_REJECT_NODE, END)
     graph.add_edge(ANSWER_CLARIFY_NODE, END)
     graph.add_edge(ANSWER_UNSUPPORTED_NODE, END)

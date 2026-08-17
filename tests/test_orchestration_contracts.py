@@ -41,6 +41,7 @@ from agnostic_market.dtos.orchestration import (
     ResolvedCartItemRef,
     ReturnOrder,
     RouteDecision,
+    RouteProposal,
     RoutingContext,
     RoutingFailure,
     SearchCatalog,
@@ -84,6 +85,30 @@ def test_answer_response_is_a_closed_three_arm_contract() -> None:
     for payload in malformed:
         with pytest.raises(ValidationError):
             AnswerResponse.model_validate(payload)
+
+
+def test_route_proposal_exposes_only_coarse_ownership_fields() -> None:
+    expected_fields = {
+        "decision",
+        "capability",
+        "clarification_reason",
+        "answer_topic",
+        "list_scope",
+        "cart_operation",
+        "profile_field",
+        "order_status_selector",
+    }
+
+    assert set(RouteProposal.model_fields) == expected_fields
+    assert set(RouteProposal.model_json_schema()["properties"]) == expected_fields
+    with pytest.raises(ValidationError):
+        RouteProposal.model_validate(
+            {
+                "decision": "direct",
+                "capability": "search_catalog",
+                "query": "trail shoes",
+            }
+        )
 
 
 def test_recent_order_set_is_plural_context_while_focus_remains_a_distinct_selector() -> None:

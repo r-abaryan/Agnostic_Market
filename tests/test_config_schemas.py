@@ -16,7 +16,8 @@ def _valid_merchant_dict() -> dict:
         "display_name": "M One",
         "locale": "en-US",
         "llm": {
-            "routing": {"provider": "anthropic", "model": "claude-haiku-4-5"},
+            "response": {"provider": "anthropic", "model": "claude-haiku-4-5"},
+            "routing": {"provider": "openai", "model": "gpt-5.4-mini"},
             "reasoning": {"provider": "anthropic", "model": "claude-opus-4-8"},
         },
         "voice": {
@@ -45,6 +46,8 @@ def _valid_merchant_dict() -> dict:
         "runtime": {
             "cancellation_quiescence_timeout_seconds": 2.0,
             "caller_audible_model_text_max_chars": 500,
+            "semantic_router_input_max_chars": 2048,
+            "semantic_router_timeout_seconds": 2.0,
         },
         "vector_namespace": "m1",
         "secrets_ref": "vault://m1",
@@ -57,6 +60,8 @@ def test_valid_config_validates() -> None:
     assert config.isolation.tier == "shared"
     assert config.runtime.cancellation_quiescence_timeout_seconds == 2.0
     assert config.runtime.caller_audible_model_text_max_chars == 500
+    assert config.runtime.semantic_router_input_max_chars == 2048
+    assert config.runtime.semantic_router_timeout_seconds == 2.0
 
 
 def test_runtime_quiescence_timeout_is_required_and_positive() -> None:
@@ -73,6 +78,16 @@ def test_runtime_quiescence_timeout_is_required_and_positive() -> None:
     invalid = _valid_merchant_dict()
     invalid["runtime"]["caller_audible_model_text_max_chars"] = 0
     with pytest.raises(ValidationError, match="caller_audible_model_text_max_chars"):
+        MerchantConfig.model_validate(invalid)
+
+    invalid = _valid_merchant_dict()
+    invalid["runtime"]["semantic_router_input_max_chars"] = 0
+    with pytest.raises(ValidationError, match="semantic_router_input_max_chars"):
+        MerchantConfig.model_validate(invalid)
+
+    invalid = _valid_merchant_dict()
+    invalid["runtime"]["semantic_router_timeout_seconds"] = 0
+    with pytest.raises(ValidationError, match="semantic_router_timeout_seconds"):
         MerchantConfig.model_validate(invalid)
 
 

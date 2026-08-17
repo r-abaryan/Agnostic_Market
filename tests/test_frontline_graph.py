@@ -267,7 +267,6 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     assert registry.resolve(SearchCatalog(query="shoes")).node_name == "catalog_entry"
     assert graph.builder.nodes["catalog_entry"].ends == (
         "catalog_response",
-        "catalog_query_clarify",
         "catalog_query_reject",
     )
     assert graph.builder.nodes["catalog_response"].ends == (END,)
@@ -1399,7 +1398,7 @@ def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
     ]
 
 
-def test_catalog_owner_asks_once_then_fills_only_the_query_from_the_next_committed_turn(
+def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -1412,25 +1411,12 @@ def test_catalog_owner_asks_once_then_fills_only_the_query_from_the_next_committ
         text="What do you sell?",
     )
 
-    assert _only_spoken(opening) == "What product would you like me to look for?"
-    assert _answered_rows(tmp_path) == []
-    retained = opening["active_invocation"]
-    assert retained is not None and retained.request == SearchCatalog()
-    continuation = graph.invoke(
-        _admitted_turn(
-            "everyday socks",
-            turn_id="catalog-followup",
-            active_invocation=retained,
-            consumed_turn_ids=("catalog-opening", "catalog-followup"),
-        )
-    )
-
     assert response_model.invoke_count == 1
-    assert continuation["active_invocation"] is None
-    assert _only_spoken(continuation) == "We carry everyday socks."
+    assert opening["active_invocation"] is None
+    assert _only_spoken(opening) == "We carry everyday socks."
     assert _answered_rows(tmp_path) == [
         {
-            "utterance": "everyday socks",
+            "utterance": "What do you sell?",
             "outcome": "answered",
             "outcome_detail": "capability_answer",
             "capability": "search_catalog",
@@ -1567,12 +1553,12 @@ def test_catalog_owner_fails_closed_when_the_admitted_turn_has_no_matching_messa
     assert _answered_rows(tmp_path) == []
 
 
-def test_catalog_speech_authority_is_owned_by_the_response_and_code_question_nodes(
+def test_catalog_speech_authority_is_owned_by_the_response_and_code_rejection_nodes(
     config_root: Path,
 ) -> None:
     graph = _graph(config_root, FakeChatModel())
 
-    assert {"catalog_query_clarify", "catalog_query_reject"} <= graph.speakable_nodes
+    assert "catalog_query_reject" in graph.speakable_nodes
     assert "catalog_response" in graph.model_speech_nodes
     assert "catalog_response" not in graph.speakable_nodes
     assert {"catalog_entry", "catalog_response"}.isdisjoint(
@@ -2147,7 +2133,10 @@ def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
 ) -> None:
     model = FakeChatModel(
         structured_args={
-            "OrderTargetProposal": ({"relationship": "single", "order_refs": ["ORD-1002"]},)
+            "OrderTargetProposal": (
+                {"relationship": "ambiguous", "order_refs": []},
+                {"relationship": "single", "order_refs": ["ORD-1002"]},
+            )
         }
     )
     graph = _graph(config_root, model)
@@ -2170,7 +2159,7 @@ def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
         )
     )
 
-    assert model.invoke_count == 1
+    assert model.invoke_count == 2
     assert result["active_invocation"] is None
     assert "Your order ORD-1002" in _only_spoken(result)
     assert "order_status_target_propose" in frontline_graph.NON_SPEAKING_MODEL_NODES
@@ -2253,7 +2242,7 @@ def test_order_status_recent_selector_uses_the_complete_bounded_set(
     assert "Your order ORD-1001" in line and "Your order ORD-1003" in line
 
 
-def test_order_status_rejects_alternatives_without_read_or_grant(
+def test_order_status_alternatives_retain_the_owner_and_ask_without_read_or_grant(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
@@ -2282,7 +2271,7 @@ def test_order_status_rejects_alternatives_without_read_or_grant(
         )
     )
 
-    assert result["active_invocation"] is None
+    assert result["active_invocation"] == invocation
     assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
     assert not identity.order_granted("ORD-1001")
     assert not identity.order_granted("ORD-1002")
@@ -2597,7 +2586,6 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "cart_view_render",
             "identity_status_render",
             "catalog_entry",
-            "catalog_query_clarify",
             "catalog_query_reject",
             "catalog_response",
             "answer_response",
@@ -2699,7 +2687,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 73
+    assert len(policies) == 72
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -2711,7 +2699,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 72
+    assert len(graph.recovery_handled_nodes) == 71
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

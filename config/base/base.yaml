@@ -13,6 +13,8 @@ _safety_locked:
   - policies.cancel_batch_max   # safety bound (fits the LangGraph step budget), not a merchant knob
   - runtime.cancellation_quiescence_timeout_seconds
   - runtime.caller_audible_model_text_max_chars
+  - runtime.semantic_router_input_max_chars
+  - runtime.semantic_router_timeout_seconds
 
 _platform:
   # Guardrails / verification / PCI / egress — enforced in code; declared here as the locked
@@ -67,6 +69,14 @@ runtime:
   # Hard containment for completed model prose sent to TTS. Prompts remain shorter by design;
   # this ceiling rejects runaway output rather than truncating a caller-facing claim.
   caller_audible_model_text_max_chars: 500
+  # Full committed utterance admitted to the semantic-router provider. Reject rather than
+  # truncate so routing never acts on a changed caller meaning.
+  semantic_router_input_max_chars: 2048
+  # Full semantic-router provider call, including configured SDK retries. This is the
+  # application deadline; provider defaults do not own voice-turn latency. The initial
+  # ceiling matches the documented provisional complex-turn processing budget and must be
+  # revisited from 3C latency evidence before shadow activation.
+  semantic_router_timeout_seconds: 2.0
 
 # Platform-owned structural policy values. This partial block deep-merges with the category
 # template and merchant override; the safety lock above prevents either later layer changing it.

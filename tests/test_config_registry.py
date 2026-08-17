@@ -31,9 +31,12 @@ secrets_ref: "vault://m1"
 _BASE_BODY = (
     "_safety_locked: [policies.cancel_batch_max, "
     "runtime.cancellation_quiescence_timeout_seconds, "
-    'runtime.caller_audible_model_text_max_chars]\nschema_version: "0.2"\n'
+    "runtime.caller_audible_model_text_max_chars, "
+    "runtime.semantic_router_input_max_chars, "
+    'runtime.semantic_router_timeout_seconds]\nschema_version: "0.2"\n'
     "runtime: { cancellation_quiescence_timeout_seconds: 2.0, "
-    "caller_audible_model_text_max_chars: 500 }\n"
+    "caller_audible_model_text_max_chars: 500, semantic_router_input_max_chars: 2048, "
+    "semantic_router_timeout_seconds: 2.0 }\n"
     'compliance: { call_start_disclosure: "Hi, this is an AI assistant." }\n'
     "policies:\n"
     "  cancel_batch_max: 10\n"
@@ -42,7 +45,8 @@ _BASE_BODY = (
 
 _TEMPLATE_BODY = """\
 llm:
-  routing: { provider: "anthropic", model: "claude-haiku-4-5" }
+  response: { provider: "anthropic", model: "claude-haiku-4-5" }
+  routing: { provider: "openai", model: "gpt-5.4-mini" }
   reasoning: { provider: "anthropic", model: "claude-opus-4-8" }
 policies:
   max_order_value_usd: 1500
@@ -70,6 +74,27 @@ def test_valid_template_name_loads(tmp_path: Path) -> None:
     _make_tree(tmp_path, extends_template="fashion")
     registry = ConfigRegistry(tmp_path).load()
     assert registry.get("m1").config.merchant_id == "m1"
+
+
+def test_both_repository_templates_resolve_the_closed_llm_role_map(
+    config_root: Path,
+) -> None:
+    registry = ConfigRegistry(config_root).load()
+
+    for merchant_id in ("acme_store", "demo_shop"):
+        llm = registry.get(merchant_id).config.llm
+        assert (llm.response.provider, llm.response.model) == (
+            "anthropic",
+            "claude-haiku-4-5",
+        )
+        assert (llm.routing.provider, llm.routing.model) == (
+            "openai",
+            "gpt-5.4-mini",
+        )
+        assert (llm.reasoning.provider, llm.reasoning.model) == (
+            "anthropic",
+            "claude-opus-4-8",
+        )
 
 
 @pytest.mark.parametrize(

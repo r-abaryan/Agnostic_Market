@@ -13,7 +13,7 @@ import pytest
 from livekit.agents import Agent
 from livekit.plugins import cartesia, deepgram
 from livekit.plugins import langchain as lk_langchain
-from llm_fakes import RecordingResolver
+from llm_fakes import FakeChatModel, RecordingResolver
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
@@ -71,6 +71,44 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
     # low-confidence turns without cutting natural multi-clause speech; min stays 0.3s.
     assert loop.session.options.endpointing["max_delay"] == 1.5
     assert loop.session.options.endpointing["min_delay"] == 0.3  # streaming default kept
+
+
+async def test_voice_graph_uses_response_and_reasoning_roles_only(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agnostic_market.voice import pipeline
+
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    response_model = FakeChatModel()
+    reasoning_model = FakeChatModel()
+    chat_selections = []
+    method_selections = []
+
+    class RecordingGateway:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def chat_model(self, selection):
+            chat_selections.append(selection)
+            if selection == config.llm.response:
+                return response_model
+            if selection == config.llm.reasoning:
+                return reasoning_model
+            raise AssertionError(f"unexpected voice-graph role {selection}")
+
+        def structured_output_method(self, selection):
+            method_selections.append(selection)
+            if selection != config.llm.response:
+                raise AssertionError(f"unexpected structured-output role {selection}")
+            return "function_calling"
+
+    monkeypatch.setattr(pipeline, "LLMGateway", RecordingGateway)
+    await _loop(config_root, RecordingResolver())
+
+    assert chat_selections == [config.llm.response, config.llm.reasoning]
+    assert method_selections == [config.llm.response]
+    assert config.llm.routing not in chat_selections
 
 
 async def test_background_audio_has_a_thinking_sound_and_no_ambient(config_root: Path) -> None:
