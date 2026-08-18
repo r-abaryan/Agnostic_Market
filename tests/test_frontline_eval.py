@@ -1,8 +1,10 @@
 """The sole frontline evaluator's zero-network readiness and scenario contracts."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_args
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -54,6 +56,7 @@ from scripts.frontline_eval import (
     ScenarioObservation,
     SemanticRouteCaseResult,
     SemanticRouteEvalCorpus,
+    SemanticRouteRiskDomain,
     TransportOwnerScenario,
     TurnObservation,
     _build_eval_runtime,
@@ -562,6 +565,10 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
         "acceptance_continue_refund",
     } <= by_id.keys()
     assert all(case.risk_class in {"critical", "standard"} for case in corpus.cases)
+    assert set(get_args(SemanticRouteRiskDomain)) == {
+        case.risk_domain for case in (*corpus.cases, corpus.projected_case)
+    }
+    assert by_id["acceptance_cancel_negated_then_list"].risk_domain == "commerce_effect"
 
 
 def test_production_projector_matches_the_fixture_built_registry(config_root: Path) -> None:
@@ -613,11 +620,12 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
         available_capabilities=(CapabilityId.VIEW_CART,),
     )
     corpus = SemanticRouteEvalCorpus(
-        schema_version="2",
+        schema_version="3",
         projected_case=frontline_eval.ProjectedSemanticRouteEvalCase(
             case_id="projected_cart",
             scenario_class="direct",
             risk_class="standard",
+            risk_domain="commerce_read",
             evaluation_split="development",
             turn=CommittedTurn(text="Show my cart", message_id="projected-turn"),
             expected_context=projected_context,
@@ -628,6 +636,7 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
                 case_id="direct_cart",
                 scenario_class="direct",
                 risk_class="standard",
+                risk_domain="commerce_read",
                 evaluation_split="development",
                 context=RoutingContext(
                     utterance="Show my cart",
@@ -641,6 +650,7 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
                 case_id="needs_clarification",
                 scenario_class="clarification",
                 risk_class="critical",
+                risk_domain="ordinary_intent",
                 evaluation_split="acceptance",
                 context=RoutingContext(
                     utterance="Change that",
@@ -694,6 +704,7 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
             case_id="catalog",
             scenario_class="direct",
             risk_class="standard",
+            risk_domain="commerce_read",
             evaluation_split="development",
             expected=expected,
             attempt=RoutingAttempt(
@@ -709,12 +720,15 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
                 prompt_fingerprint="router-prompt",
                 registry_fingerprint="registry",
                 input_max_chars=2048,
+                timeout_seconds=2.0,
+                provider_call_outcome="completed",
             ),
         ),
         SemanticRouteCaseResult(
             case_id="outage",
             scenario_class="adversarial",
             risk_class="critical",
+            risk_domain="commerce_effect",
             evaluation_split="acceptance",
             expected=RouteDecision.clarify("unsupported_capability"),
             attempt=RoutingAttempt(
@@ -730,6 +744,8 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
                 prompt_fingerprint="router-prompt",
                 registry_fingerprint="registry",
                 input_max_chars=2048,
+                timeout_seconds=2.0,
+                provider_call_outcome="provider_error",
             ),
         ),
     )
@@ -740,17 +756,17 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         case_id=projected.case_id,
         scenario_class=projected.scenario_class,
         risk_class=projected.risk_class,
+        risk_domain=projected.risk_domain,
         evaluation_split=projected.evaluation_split,
         expected_context=projected.expected_context,
         actual_context=projected.expected_context,
     )
     report = _semantic_route_report(
-        results,
-        results,
+        (results, results, results),
+        (results, results, results),
         corpus=corpus,
         projection=projection,
         gate="cutover",
-        gate_failures=("synthetic failure",),
     )
     serialized = str(report)
 
@@ -759,17 +775,85 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
     assert report["gate"] == {
         "mode": "cutover",
         "passed": False,
-        "failures": ["synthetic failure"],
+        "failures": [
+            "repetition 1: candidate produced a closed failure",
+            "repetition 1: not every critical acceptance case was exact",
+            "repetition 1: acceptance exact count 0 was below required 1 of 1",
+            "repetition 2: candidate produced a closed failure",
+            "repetition 2: not every critical acceptance case was exact",
+            "repetition 2: acceptance exact count 0 was below required 1 of 1",
+            "repetition 3: candidate produced a closed failure",
+            "repetition 3: not every critical acceptance case was exact",
+            "repetition 3: acceptance exact count 0 was below required 1 of 1",
+            "pooled: candidate produced a closed failure",
+            "pooled: not every critical acceptance case was exact",
+            "pooled: acceptance exact count 0 was below required 3 of 3",
+        ],
+    }
+    assert report["schema_version"] == "4"
+    assert report["repetitions"] == 3
+    assert report["acceptance_budget"] == {
+        "cases": 1,
+        "required_exact_count": 1,
+        "allowed_nonexact_count": 0,
     }
     candidate = report["models"]["candidate"]
     assert candidate["input_max_chars"] == 2048
+    assert candidate["timeout_seconds"] == 2.0
+    assert candidate["by_risk_domain"]["commerce_read"]["cases"] == 3
+    assert candidate["by_risk_domain"]["commerce_read"]["dispositions"]["exact"] == 3
+    assert candidate["by_risk_domain"]["commerce_effect"]["cases"] == 3
+    assert candidate["by_risk_domain"]["commerce_effect"]["dispositions"]["closed_failure"] == 3
     assert candidate["totals"]["dispositions"] == {
-        "exact": 1,
+        "exact": 3,
         "conservative_clarification": 0,
-        "closed_failure": 1,
+        "closed_failure": 3,
         "unsafe_executable_misroute": 0,
     }
+    assert candidate["totals"]["provider_call_outcomes"] == {
+        "completed": 3,
+        "deadline_exceeded": 0,
+        "provider_error": 3,
+        "not_attempted": 0,
+    }
+    assert candidate["totals"]["cache_read_cohorts"] == {
+        "positive": 0,
+        "zero": 0,
+        "unreported": 6,
+    }
+    assert candidate["totals"]["latency_ms_p50"] == 12.0
+    assert candidate["totals"]["latency_ms_p95"] == 20.0
+    assert candidate["totals"]["latency_ms_max"] == 20.0
     assert candidate["cases"][0]["cache_read_tokens"] is None
+    assert candidate["cases"][0]["provider_call_outcome"] == "completed"
+    assert candidate["cases"][0]["risk_domain"] == "commerce_read"
+    assert report["runs"][1]["models"]["candidate"]["cases"][0]["repetition"] == 2
+
+    diagnostic = _semantic_route_report(
+        (results,),
+        (results,),
+        corpus=corpus,
+        projection=projection,
+        gate="diagnostic",
+    )
+    assert diagnostic["gate"] == {
+        "mode": "diagnostic",
+        "passed": None,
+        "failures": [],
+    }
+
+    positive_cache = replace(
+        results[0],
+        attempt=replace(results[0].attempt, cache_read_tokens=5),
+    )
+    zero_cache = replace(
+        results[0],
+        attempt=replace(results[0].attempt, cache_read_tokens=0),
+    )
+    cache_cohorts = frontline_eval._semantic_route_group((positive_cache, zero_cache, results[1]))[
+        "cache_read_cohorts"
+    ]
+    assert cache_cohorts == {"positive": 1, "zero": 1, "unreported": 1}
 
 
 @pytest.mark.parametrize(
@@ -848,6 +932,7 @@ def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
             case_id=case_id,
             scenario_class="adversarial",
             risk_class="critical",
+            risk_domain="commerce_read",
             evaluation_split=split,
             expected=expected,
             attempt=RoutingAttempt(
@@ -863,6 +948,8 @@ def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
                 prompt_fingerprint="router-prompt",
                 registry_fingerprint="registry",
                 input_max_chars=2048,
+                timeout_seconds=2.0,
+                provider_call_outcome="completed",
             ),
         )
 
@@ -900,6 +987,7 @@ def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
         case_id="projection",
         scenario_class="direct",
         risk_class="standard",
+        risk_domain="commerce_read",
         evaluation_split="development",
         expected_context=context,
         actual_context=context,
@@ -920,8 +1008,193 @@ def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
         projection=projection,
         gate="cutover",
     )
-    assert "candidate produced an unsafe executable misroute on acceptance" in cutover_failures
+    assert "candidate produced an unsafe executable misroute" in cutover_failures
     assert "not every critical acceptance case was exact" in cutover_failures
+
+
+def test_cutover_rejects_an_unsafe_development_result() -> None:
+    expected = RouteDecision.direct(ViewCart())
+
+    def result(
+        case_id: str,
+        resolution: RouteDecision,
+        split: str,
+    ) -> SemanticRouteCaseResult:
+        return SemanticRouteCaseResult(
+            case_id=case_id,
+            scenario_class="adversarial",
+            risk_class="standard",
+            risk_domain="commerce_read",
+            evaluation_split=split,
+            expected=expected,
+            attempt=RoutingAttempt(
+                resolution=resolution,
+                provider="fake",
+                model="router",
+                structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+                elapsed_ms=1.0,
+                input_tokens=1,
+                cache_read_tokens=0,
+                output_tokens=1,
+                route_schema_fingerprint="route-schema",
+                prompt_fingerprint="router-prompt",
+                registry_fingerprint="registry",
+                input_max_chars=2048,
+                timeout_seconds=2.0,
+                provider_call_outcome="completed",
+            ),
+        )
+
+    candidate = (
+        result("development", RouteDecision.direct(SearchCatalog()), "development"),
+        result("acceptance", expected, "acceptance"),
+    )
+    context = RoutingContext(
+        utterance="Show my cart",
+        bound_customer=False,
+        cart_state="empty",
+        available_capabilities=(CapabilityId.VIEW_CART,),
+    )
+    projection = frontline_eval.ProjectedSemanticRouteCaseResult(
+        case_id="projection",
+        scenario_class="direct",
+        risk_class="standard",
+        risk_domain="commerce_read",
+        evaluation_split="development",
+        expected_context=context,
+        actual_context=context,
+    )
+
+    failures = _semantic_gate_failures(
+        candidate,
+        candidate,
+        projection=projection,
+        gate="cutover",
+    )
+
+    assert "candidate produced an unsafe executable misroute" in failures
+
+
+@pytest.mark.parametrize(
+    ("acceptance_cases", "exact_budget_fails"),
+    ((14, True), (20, False)),
+)
+def test_cutover_uses_an_explicit_integer_acceptance_budget(
+    acceptance_cases: int,
+    exact_budget_fails: bool,
+) -> None:
+    expected = RouteDecision.direct(ViewCart())
+    clarification = RouteDecision.clarify("ambiguous_intent")
+
+    def result(case_id: str, resolution: RouteDecision) -> SemanticRouteCaseResult:
+        return SemanticRouteCaseResult(
+            case_id=case_id,
+            scenario_class="clarification",
+            risk_class="standard",
+            risk_domain="commerce_read",
+            evaluation_split="acceptance",
+            expected=expected,
+            attempt=RoutingAttempt(
+                resolution=resolution,
+                provider="fake",
+                model="router",
+                structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+                elapsed_ms=1.0,
+                input_tokens=1,
+                cache_read_tokens=0,
+                output_tokens=1,
+                route_schema_fingerprint="route-schema",
+                prompt_fingerprint="router-prompt",
+                registry_fingerprint="registry",
+                input_max_chars=2048,
+                timeout_seconds=2.0,
+                provider_call_outcome="completed",
+            ),
+        )
+
+    candidate = tuple(
+        result(
+            f"acceptance-{index}",
+            clarification if index == acceptance_cases - 1 else expected,
+        )
+        for index in range(acceptance_cases)
+    )
+    context = RoutingContext(
+        utterance="Show my cart",
+        bound_customer=False,
+        cart_state="empty",
+        available_capabilities=(CapabilityId.VIEW_CART,),
+    )
+    projection = frontline_eval.ProjectedSemanticRouteCaseResult(
+        case_id="projection",
+        scenario_class="direct",
+        risk_class="standard",
+        risk_domain="commerce_read",
+        evaluation_split="development",
+        expected_context=context,
+        actual_context=context,
+    )
+
+    failures = _semantic_gate_failures(
+        candidate,
+        candidate,
+        projection=projection,
+        gate="cutover",
+    )
+
+    assert any("acceptance exact count" in failure for failure in failures) is exact_budget_fails
+
+
+def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path) -> None:
+    expected = RouteDecision.direct(ViewCart())
+    result = SemanticRouteCaseResult(
+        case_id="acceptance",
+        scenario_class="direct",
+        risk_class="standard",
+        risk_domain="commerce_read",
+        evaluation_split="acceptance",
+        expected=expected,
+        attempt=RoutingAttempt(
+            resolution=expected,
+            provider="fake",
+            model="router",
+            structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+            elapsed_ms=1.0,
+            input_tokens=1,
+            cache_read_tokens=0,
+            output_tokens=1,
+            route_schema_fingerprint="route-schema",
+            prompt_fingerprint="router-prompt",
+            registry_fingerprint="registry",
+            input_max_chars=2048,
+            timeout_seconds=2.0,
+            provider_call_outcome="completed",
+        ),
+    )
+    changed_deadline = replace(
+        result,
+        attempt=replace(result.attempt, timeout_seconds=3.0),
+    )
+    corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
+    projected = corpus.projected_case
+    projection = frontline_eval.ProjectedSemanticRouteCaseResult(
+        case_id=projected.case_id,
+        scenario_class=projected.scenario_class,
+        risk_class=projected.risk_class,
+        risk_domain=projected.risk_domain,
+        evaluation_split=projected.evaluation_split,
+        expected_context=projected.expected_context,
+        actual_context=projected.expected_context,
+    )
+
+    with pytest.raises(ValueError, match="mixed run identities"):
+        _semantic_route_report(
+            ((result,), (changed_deadline,), (result,)),
+            ((result,), (result,), (result,)),
+            corpus=corpus,
+            projection=projection,
+            gate="cutover",
+        )
 
 
 async def test_read_owner_corpus_runs_through_the_production_graph_without_network(
@@ -1034,10 +1307,16 @@ def test_cli_dispatches_semantic_route_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report_path = tmp_path / "semantic-routing.json"
-    received: list[tuple[Path, str]] = []
+    received: list[tuple[Path, str, int, float | None]] = []
 
-    async def run(path: Path, gate: str) -> int:
-        received.append((path, gate))
+    async def run(
+        path: Path,
+        gate: str,
+        *,
+        repetitions: int,
+        diagnostic_timeout_seconds: float | None,
+    ) -> int:
+        received.append((path, gate, repetitions, diagnostic_timeout_seconds))
         return 0
 
     monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", run)
@@ -1048,7 +1327,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received == [(report_path, "cutover")]
+    assert received == [(report_path, "cutover", 3, None)]
 
     assert (
         frontline_eval.main(
@@ -1062,12 +1341,63 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "shadow")
+    assert received[-1] == (report_path, "shadow", 3, None)
+
+    assert (
+        frontline_eval.main(
+            [
+                "--semantic-routing-eval",
+                "--semantic-routing-gate",
+                "diagnostic",
+                "--semantic-routing-diagnostic-timeout-seconds",
+                "3.0",
+                "--semantic-routing-report",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    assert received[-1] == (report_path, "diagnostic", 1, 3.0)
 
 
 def test_cli_rejects_semantic_gate_without_semantic_eval() -> None:
     with pytest.raises(SystemExit):
         frontline_eval.main(["--semantic-routing-gate", "shadow"])
+
+
+def test_cli_rejects_unbounded_semantic_run_modes() -> None:
+    with pytest.raises(SystemExit):
+        frontline_eval.main(
+            [
+                "--semantic-routing-eval",
+                "--semantic-routing-gate",
+                "diagnostic",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        frontline_eval.main(
+            [
+                "--semantic-routing-eval",
+                "--semantic-routing-repetitions",
+                "1",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        frontline_eval.main(
+            [
+                "--semantic-routing-eval",
+                "--semantic-routing-repetitions",
+                "0",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        frontline_eval.main(
+            [
+                "--semantic-routing-eval",
+                "--semantic-routing-diagnostic-timeout-seconds",
+                "3.0",
+            ]
+        )
 
 
 async def test_semantic_route_eval_runs_projector_and_routes_without_network(
@@ -1076,13 +1406,14 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
-    route_outputs = (
+    one_repetition_outputs = (
         *(_proposal_payload_for_expected(case.context, case.expected) for case in corpus.cases),
         _proposal_payload_for_expected(
             corpus.projected_case.expected_context,
             corpus.projected_case.expected,
         ),
     )
+    route_outputs = one_repetition_outputs * 3
     routing_model = FakeChatModel(structured_args={"RouteProposal": route_outputs})
     response_model = FakeChatModel(structured_args={"RouteProposal": route_outputs})
     reasoning_model = FakeChatModel()
@@ -1108,8 +1439,8 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
 
     report_text = report_path.read_text(encoding="utf-8")
     report = json.loads(report_text)
-    assert routing_model.invoke_count == len(corpus.cases) + 1
-    assert response_model.invoke_count == len(corpus.cases) + 1
+    assert routing_model.invoke_count == (len(corpus.cases) + 1) * 3
+    assert response_model.invoke_count == (len(corpus.cases) + 1) * 3
     assert routing_model.structured_methods == ("json_schema",)
     assert response_model.structured_methods[-1] == TEST_STRUCTURED_OUTPUT_METHOD
     assert report["projection"] == {
@@ -1118,10 +1449,13 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
         "evaluation_split": corpus.projected_case.evaluation_split,
         "exact": True,
         "risk_class": corpus.projected_case.risk_class,
+        "risk_domain": corpus.projected_case.risk_domain,
         "scenario_class": corpus.projected_case.scenario_class,
     }
     assert report["models"]["candidate"]["model"] == config.llm.routing.model
     assert report["models"]["incumbent"]["model"] == config.llm.response.model
+    assert report["repetitions"] == 3
+    assert len(report["runs"]) == 3
     assert corpus.projected_case.turn.text not in report_text
 
 

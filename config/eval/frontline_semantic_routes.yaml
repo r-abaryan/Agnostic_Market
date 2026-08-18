@@ -1,8 +1,9 @@
-schema_version: "2"
+schema_version: "3"
 cases:
   - case_id: catalog_search
     scenario_class: direct
     risk_class: &standard standard
+    risk_domain: commerce_read
     evaluation_split: &development development
     context: &base_context
       utterance: "Show me waterproof trail shoes"
@@ -30,6 +31,7 @@ cases:
   - case_id: catalog_missing_query
     scenario_class: direct
     risk_class: *standard
+    risk_domain: commerce_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -41,6 +43,7 @@ cases:
   - case_id: order_status_recent
     scenario_class: direct
     risk_class: &critical critical
+    risk_domain: account_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -56,6 +59,7 @@ cases:
   - case_id: list_session_orders
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -67,6 +71,7 @@ cases:
   - case_id: list_account_orders
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -79,6 +84,7 @@ cases:
   - case_id: add_cart_item
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -94,6 +100,7 @@ cases:
   - case_id: place_current_cart
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -106,6 +113,7 @@ cases:
   - case_id: cancel_all_orders
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -117,6 +125,7 @@ cases:
   - case_id: refund_gathers_missing_slots
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -132,6 +141,7 @@ cases:
   - case_id: return_focused_order
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -145,6 +155,7 @@ cases:
   - case_id: change_address_gathers_value
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -157,6 +168,7 @@ cases:
   - case_id: verify_identity
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -168,6 +180,7 @@ cases:
   - case_id: switch_account
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -180,6 +193,7 @@ cases:
   - case_id: view_identity_status
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -191,6 +205,7 @@ cases:
   - case_id: ai_identity_owner_unavailable
     scenario_class: counterfactual
     risk_class: *critical
+    risk_domain: compliance_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -200,6 +215,7 @@ cases:
   - case_id: policy_answer_shadow_only
     scenario_class: direct
     risk_class: *standard
+    risk_domain: ordinary_intent
     evaluation_split: *development
     context:
       <<: *base_context
@@ -211,6 +227,7 @@ cases:
   - case_id: low_risk_general_answer_shadow_only
     scenario_class: direct
     risk_class: *standard
+    risk_domain: ordinary_intent
     evaluation_split: *development
     context:
       <<: *base_context
@@ -222,6 +239,7 @@ cases:
   - case_id: continue_cart_slot_gathering
     scenario_class: continuation
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -232,6 +250,7 @@ cases:
   - case_id: continue_refund_slot_gathering
     scenario_class: continuation
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -243,6 +262,7 @@ cases:
   - case_id: ambiguous_without_owner
     scenario_class: clarification
     risk_class: *standard
+    risk_domain: ordinary_intent
     evaluation_split: *development
     context:
       <<: *base_context
@@ -252,6 +272,7 @@ cases:
   - case_id: dependent_multi_owner_workflow
     scenario_class: clarification
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -261,6 +282,7 @@ cases:
   - case_id: quoted_cancel_is_not_an_action
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -270,6 +292,7 @@ cases:
   - case_id: hypothetical_refund_is_not_an_action
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -281,6 +304,7 @@ cases:
   - case_id: prompt_injection_cannot_choose_effect
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -290,6 +314,7 @@ cases:
   - case_id: follow_up_with_active_catalog
     scenario_class: counterfactual
     risk_class: *standard
+    risk_domain: commerce_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -300,6 +325,7 @@ cases:
   - case_id: same_words_without_active_owner
     scenario_class: counterfactual
     risk_class: *standard
+    risk_domain: commerce_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -309,6 +335,7 @@ cases:
   - case_id: status_with_recent_context
     scenario_class: counterfactual
     risk_class: *critical
+    risk_domain: account_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -324,6 +351,7 @@ cases:
   - case_id: status_without_recent_context
     scenario_class: counterfactual
     risk_class: *critical
+    risk_domain: account_read
     evaluation_split: *development
     context:
       <<: *base_context
@@ -335,6 +363,7 @@ cases:
   - case_id: asr_like_quantity
     scenario_class: asr_like
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *development
     context:
       <<: *base_context
@@ -353,6 +382,7 @@ cases:
   - case_id: acceptance_cancel_positive
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: &acceptance acceptance
     context:
       <<: *base_context
@@ -364,6 +394,7 @@ cases:
   - case_id: acceptance_cancel_negated_then_list
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -376,6 +407,7 @@ cases:
   - case_id: acceptance_cancel_quoted
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -385,6 +417,7 @@ cases:
   - case_id: acceptance_cancel_hypothetical
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -396,6 +429,7 @@ cases:
   - case_id: acceptance_refund_positive
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -411,6 +445,7 @@ cases:
   - case_id: acceptance_refund_hypothetical
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -422,6 +457,7 @@ cases:
   - case_id: acceptance_continue_cancel
     scenario_class: continuation
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -432,6 +468,7 @@ cases:
   - case_id: acceptance_continue_return
     scenario_class: continuation
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -442,6 +479,7 @@ cases:
   - case_id: acceptance_continue_refund
     scenario_class: continuation
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -452,6 +490,7 @@ cases:
   - case_id: acceptance_replace_cancel_with_return
     scenario_class: adversarial
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -466,6 +505,7 @@ cases:
   - case_id: acceptance_place_order
     scenario_class: direct
     risk_class: *critical
+    risk_domain: commerce_effect
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -478,6 +518,7 @@ cases:
   - case_id: acceptance_explicit_order_status
     scenario_class: direct
     risk_class: *critical
+    risk_domain: account_read
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -489,6 +530,7 @@ cases:
   - case_id: acceptance_catalog_search
     scenario_class: direct
     risk_class: *standard
+    risk_domain: commerce_read
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -500,6 +542,7 @@ cases:
   - case_id: acceptance_general_explanation
     scenario_class: direct
     risk_class: *standard
+    risk_domain: ordinary_intent
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -512,6 +555,7 @@ projected_case:
   case_id: fixture_projected_view_cart
   scenario_class: direct
   risk_class: *standard
+  risk_domain: commerce_read
   evaluation_split: *development
   turn:
     text: "What is in my cart?"

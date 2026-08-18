@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -56,6 +57,12 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.state import ReasoningState
 
 CONTEXT_PROJECTOR_VERSION = "2"
+ProviderCallOutcome = Literal[
+    "completed",
+    "deadline_exceeded",
+    "provider_error",
+    "not_attempted",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +371,8 @@ class RoutingAttempt:
     prompt_fingerprint: str
     registry_fingerprint: str
     input_max_chars: int
+    timeout_seconds: float
+    provider_call_outcome: ProviderCallOutcome
     projector_version: str = CONTEXT_PROJECTOR_VERSION
 
 
@@ -399,9 +408,14 @@ class SemanticRouter:
     async def route(self, context: RoutingContext) -> RoutingAttempt:
         started = time.perf_counter()
         if len(context.utterance) > self._input_max_chars:
-            return self._attempt(RoutingFailure(reason="context_invalid"), started=started)
+            return self._attempt(
+                RoutingFailure(reason="context_invalid"),
+                started=started,
+                provider_call_outcome="not_attempted",
+            )
+        deadline = asyncio.timeout(self._timeout_seconds)
         try:
-            async with asyncio.timeout(self._timeout_seconds):
+            async with deadline:
                 envelope = await self._structured.ainvoke(
                     [
                         SystemMessage(ROUTER_SYSTEM_PROMPT),
@@ -412,14 +426,27 @@ class SemanticRouter:
                 )
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            return self._attempt(
+                RoutingFailure(reason="routing_unavailable"),
+                started=started,
+                provider_call_outcome=(
+                    "deadline_exceeded" if deadline.expired() else "provider_error"
+                ),
+            )
         except Exception:
             return self._attempt(
                 RoutingFailure(reason="routing_unavailable"),
                 started=started,
+                provider_call_outcome="provider_error",
             )
 
         if not isinstance(envelope, dict):
-            return self._attempt(RoutingFailure(reason="invalid_output"), started=started)
+            return self._attempt(
+                RoutingFailure(reason="invalid_output"),
+                started=started,
+                provider_call_outcome="completed",
+            )
         raw = envelope.get("raw")
         parsed = envelope.get("parsed")
         parsing_error = envelope.get("parsing_error")
@@ -427,13 +454,19 @@ class SemanticRouter:
             resolution: RouteResolution = RoutingFailure(reason="invalid_output")
         else:
             resolution = materialize_route(context, parsed)
-        return self._attempt(resolution, started=started, raw=raw)
+        return self._attempt(
+            resolution,
+            started=started,
+            raw=raw,
+            provider_call_outcome="completed",
+        )
 
     def _attempt(
         self,
         resolution: RouteResolution,
         *,
         started: float,
+        provider_call_outcome: ProviderCallOutcome,
         raw: object = None,
     ) -> RoutingAttempt:
         input_tokens: int | None = None
@@ -459,6 +492,8 @@ class SemanticRouter:
             prompt_fingerprint=ROUTER_PROMPT_FINGERPRINT,
             registry_fingerprint=self._registry_fingerprint,
             input_max_chars=self._input_max_chars,
+            timeout_seconds=self._timeout_seconds,
+            provider_call_outcome=provider_call_outcome,
         )
 
 

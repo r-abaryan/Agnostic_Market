@@ -411,6 +411,8 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
     assert attempt.prompt_fingerprint == ROUTER_PROMPT_FINGERPRINT
     assert attempt.registry_fingerprint == registry_fingerprint(registry)
     assert attempt.input_max_chars == 2048
+    assert attempt.timeout_seconds == 1.0
+    assert attempt.provider_call_outcome == "completed"
     assert attempt.projector_version == CONTEXT_PROJECTOR_VERSION
     assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,)
     assert "cancel all my orders" in model._seen_prompts[-1]
@@ -427,6 +429,8 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
         "prompt_fingerprint",
         "registry_fingerprint",
         "input_max_chars",
+        "timeout_seconds",
+        "provider_call_outcome",
         "projector_version",
     }
 
@@ -466,7 +470,9 @@ async def test_semantic_router_classifies_invalid_and_unavailable_without_fallba
     )
 
     assert invalid.resolution == RoutingFailure(reason="invalid_output")
+    assert invalid.provider_call_outcome == "completed"
     assert unavailable.resolution == RoutingFailure(reason="routing_unavailable")
+    assert unavailable.provider_call_outcome == "provider_error"
     assert unavailable_model.invoke_count == 1
 
 
@@ -483,6 +489,7 @@ async def test_semantic_router_rejects_oversized_input_without_truncation_or_pro
 
     assert rejected.resolution == RoutingFailure(reason="context_invalid")
     assert rejected.input_max_chars == 10
+    assert rejected.provider_call_outcome == "not_attempted"
     assert rejected_model.invoke_count == 0
     assert not rejected_model._seen_prompts
 
@@ -516,11 +523,26 @@ async def test_semantic_router_timeout_is_closed_but_external_cancellation_propa
         def with_structured_output(self, schema, *, include_raw=False, **kwargs):
             return RunnableLambda(block)
 
+    async def provider_timeout(_messages):
+        raise TimeoutError("upstream transport timed out")
+
+    class ProviderTimeoutModel(FakeChatModel):
+        def with_structured_output(self, schema, *, include_raw=False, **kwargs):
+            return RunnableLambda(provider_timeout)
+
     registry = _registry(CancelOrders)
+    provider_timed_out = await _router(ProviderTimeoutModel(), registry).route(
+        _context(CapabilityId.CANCEL_ORDERS)
+    )
+    assert provider_timed_out.resolution == RoutingFailure(reason="routing_unavailable")
+    assert provider_timed_out.provider_call_outcome == "provider_error"
+
     timed_out = await _router(BlockingModel(), registry, timeout_seconds=0.01).route(
         _context(CapabilityId.CANCEL_ORDERS)
     )
     assert timed_out.resolution == RoutingFailure(reason="routing_unavailable")
+    assert timed_out.timeout_seconds == 0.01
+    assert timed_out.provider_call_outcome == "deadline_exceeded"
 
     started.clear()
     task = asyncio.create_task(

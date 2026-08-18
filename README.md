@@ -45,15 +45,16 @@ src/agnostic_market/
   voice/      STT/TTS factories, read-only tools, LiveKit adapter, call-start disclosure
   commerce/   fixture-backed catalog, orders, cart, profile, verification
   agents/     the tiered reasoning graph and its engine
-scripts/      worker entrypoint, evaluator, conformance and smoke runners
-tests/        42 modules, zero network
+scripts/      worker entrypoint, evaluator, conformance, transport-fault and smoke runners
+tests/        38 test modules, zero network
 ```
 
 Inside `agents/`, each gated flow is a package pairing graph logic with its model-facing prompt:
 `frontline/` routes, while `cart/`, `support/`, and `identity/` own their effects. `gate.py` is a
 deterministic pre-generation safety floor, `engine.py` the thread and resume seam, `recovery.py`
 the per-node failure policy, and `capabilities.py` the per-session capability registry the graph
-dispatcher resolves against.
+dispatcher resolves against. `routing.py` holds a semantic router that is scored offline and
+carries no live authority.
 
 ## Run
 
@@ -83,8 +84,13 @@ value at use time.
 ## Status
 
 Phases 0 through 3 are built: config and tenancy, the LLM gateway and conformance gate, the voice
-loop, and the gated commerce graph. Routing is currently migrating from keyword gates to typed
-capability requests resolved through an immutable per-session registry.
+loop, and the gated commerce graph. Routing is migrating from keyword gates to typed capability
+requests resolved through an immutable per-session registry. Several read owners already resolve
+that way and answer from code with no model call.
+
+A semantic router for the remaining keyword gates is built but not adopted. It is scored offline
+against the live route on a fixed corpus, and the current candidate did not clear the thresholds
+fixed before the run, so the keyword route still owns every live turn.
 
 Deliberately not built yet:
 

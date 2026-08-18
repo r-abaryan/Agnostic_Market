@@ -40,7 +40,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from dotenv import load_dotenv
 from langchain_core.exceptions import OutputParserException
@@ -74,6 +74,7 @@ from agnostic_market.agents.frontline.read_flow import (
 )
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.routing import (
+    ProviderCallOutcome,
     RoutingAttempt,
     SemanticRouter,
     project_routing_context,
@@ -167,8 +168,13 @@ _READ_OWNER_EVAL_SCHEMA_VERSION = "1"
 _ORDER_TARGET_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_order_targets.yaml"
 _ORDER_TARGET_EVAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_semantic_routes.yaml"
-_SEMANTIC_ROUTE_EVAL_SCHEMA_VERSION = "2"
+_SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "3"
+_SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = "4"
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
+_SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS = 3
+_SEMANTIC_ROUTE_MIN_ACCEPTANCE_EXACT_RATE = 0.95
+_SEMANTIC_ROUTE_P50_QUANTILE = 0.50
+_SEMANTIC_ROUTE_P95_QUANTILE = 0.95
 _MERCHANT_ID = "acme_store"
 _RECALL_BAR = 0.90
 _TRANSPORT_REPORT_PATHS = {
@@ -281,7 +287,16 @@ SemanticRouteScenarioClass = Literal[
     "asr_like",
 ]
 SemanticRouteRiskClass = Literal["critical", "standard"]
+SemanticRouteRiskDomain = Literal[
+    "ordinary_intent",
+    "commerce_read",
+    "account_read",
+    "account_control",
+    "commerce_effect",
+    "compliance_control",
+]
 SemanticRouteEvaluationSplit = Literal["development", "acceptance"]
+SemanticRouteGate = Literal["diagnostic", "shadow", "cutover"]
 SemanticRouteDisposition = Literal[
     "exact",
     "conservative_clarification",
@@ -296,6 +311,7 @@ class SemanticRouteEvalCase(BaseModel):
     case_id: str
     scenario_class: SemanticRouteScenarioClass
     risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
     evaluation_split: SemanticRouteEvaluationSplit
     context: RoutingContext
     expected: RouteDecision
@@ -313,6 +329,7 @@ class ProjectedSemanticRouteEvalCase(BaseModel):
     case_id: str
     scenario_class: SemanticRouteScenarioClass
     risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
     evaluation_split: SemanticRouteEvaluationSplit
     turn: CommittedTurn
     expected_context: RoutingContext
@@ -338,7 +355,7 @@ class SemanticRouteEvalCorpus(BaseModel):
 
     @model_validator(mode="after")
     def corpus_is_current_and_unique(self) -> SemanticRouteEvalCorpus:
-        if self.schema_version != _SEMANTIC_ROUTE_EVAL_SCHEMA_VERSION:
+        if self.schema_version != _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION:
             raise ValueError("unsupported semantic-route eval schema version")
         ids = [self.projected_case.case_id, *(case.case_id for case in self.cases)]
         if not ids or len(ids) != len(set(ids)):
@@ -468,6 +485,7 @@ class SemanticRouteCaseResult:
     case_id: str
     scenario_class: str
     risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
     evaluation_split: SemanticRouteEvaluationSplit
     expected: RouteDecision
     attempt: RoutingAttempt
@@ -482,6 +500,7 @@ class ProjectedSemanticRouteCaseResult:
     case_id: str
     scenario_class: str
     risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
     evaluation_split: SemanticRouteEvaluationSplit
     expected_context: RoutingContext
     actual_context: RoutingContext | RoutingFailure
@@ -927,6 +946,7 @@ async def _run_semantic_route_cases(
                 case_id=case.case_id,
                 scenario_class=case.scenario_class,
                 risk_class=case.risk_class,
+                risk_domain=case.risk_domain,
                 evaluation_split=case.evaluation_split,
                 expected=case.expected,
                 attempt=await router.route(case.context),
@@ -1023,22 +1043,35 @@ def _optional_sum(values: Sequence[int | None]) -> int | None:
 def _semantic_route_group(
     results: Sequence[SemanticRouteCaseResult],
 ) -> dict[str, object]:
+    if not results:
+        raise ValueError("semantic-route group requires at least one result")
     latencies = sorted(result.attempt.elapsed_ms for result in results)
-    p95_index = max(math.ceil(len(latencies) * 0.95) - 1, 0)
+    p50_index = max(math.ceil(len(latencies) * _SEMANTIC_ROUTE_P50_QUANTILE) - 1, 0)
+    p95_index = max(math.ceil(len(latencies) * _SEMANTIC_ROUTE_P95_QUANTILE) - 1, 0)
     dispositions = {
         disposition: sum(result.disposition == disposition for result in results)
-        for disposition in (
-            "exact",
-            "conservative_clarification",
-            "closed_failure",
-            "unsafe_executable_misroute",
-        )
+        for disposition in get_args(SemanticRouteDisposition)
     }
     return {
         "cases": len(results),
         "dispositions": dispositions,
+        "provider_call_outcomes": {
+            outcome: sum(result.attempt.provider_call_outcome == outcome for result in results)
+            for outcome in get_args(ProviderCallOutcome)
+        },
+        "cache_read_cohorts": {
+            "positive": sum(
+                result.attempt.cache_read_tokens is not None
+                and result.attempt.cache_read_tokens > 0
+                for result in results
+            ),
+            "zero": sum(result.attempt.cache_read_tokens == 0 for result in results),
+            "unreported": sum(result.attempt.cache_read_tokens is None for result in results),
+        },
         "latency_ms_mean": sum(latencies) / len(latencies),
+        "latency_ms_p50": latencies[p50_index],
         "latency_ms_p95": latencies[p95_index],
+        "latency_ms_max": latencies[-1],
         "input_tokens": _optional_sum([result.attempt.input_tokens for result in results]),
         "cache_read_tokens": _optional_sum(
             [result.attempt.cache_read_tokens for result in results]
@@ -1049,7 +1082,12 @@ def _semantic_route_group(
 
 def _group_semantic_route_results(
     results: Sequence[SemanticRouteCaseResult],
-    attribute: Literal["scenario_class", "risk_class", "evaluation_split"],
+    attribute: Literal[
+        "scenario_class",
+        "risk_class",
+        "risk_domain",
+        "evaluation_split",
+    ],
 ) -> dict[str, dict[str, object]]:
     values = dict.fromkeys(getattr(result, attribute) for result in results)
     return {
@@ -1062,10 +1100,42 @@ def _group_semantic_route_results(
 
 def _semantic_model_report(
     results: Sequence[SemanticRouteCaseResult],
+    *,
+    repetitions: Sequence[int] | None = None,
 ) -> dict[str, object]:
     if not results:
         raise ValueError("semantic-route model report requires at least one result")
+    if repetitions is None:
+        repetitions = (1,) * len(results)
+    if len(repetitions) != len(results):
+        raise ValueError("semantic-route repetitions must align with results")
     first = results[0].attempt
+    expected_identity = (
+        first.provider,
+        first.model,
+        first.structured_output_method,
+        first.route_schema_fingerprint,
+        first.prompt_fingerprint,
+        first.registry_fingerprint,
+        first.input_max_chars,
+        first.timeout_seconds,
+        first.projector_version,
+    )
+    for result in results[1:]:
+        attempt = result.attempt
+        identity = (
+            attempt.provider,
+            attempt.model,
+            attempt.structured_output_method,
+            attempt.route_schema_fingerprint,
+            attempt.prompt_fingerprint,
+            attempt.registry_fingerprint,
+            attempt.input_max_chars,
+            attempt.timeout_seconds,
+            attempt.projector_version,
+        )
+        if identity != expected_identity:
+            raise ValueError("semantic-route model report cannot pool mixed run identities")
     return {
         "provider": first.provider,
         "model": first.model,
@@ -1074,26 +1144,32 @@ def _semantic_model_report(
         "prompt_fingerprint": first.prompt_fingerprint,
         "registry_fingerprint": first.registry_fingerprint,
         "input_max_chars": first.input_max_chars,
+        "timeout_seconds": first.timeout_seconds,
         "projector_version": first.projector_version,
         "totals": _semantic_route_group(results),
         "by_evaluation_split": _group_semantic_route_results(results, "evaluation_split"),
         "by_scenario_class": _group_semantic_route_results(results, "scenario_class"),
         "by_risk_class": _group_semantic_route_results(results, "risk_class"),
+        "by_risk_domain": _group_semantic_route_results(results, "risk_domain"),
         "cases": [
             {
+                "repetition": repetition,
                 "case_id": result.case_id,
                 "scenario_class": result.scenario_class,
                 "risk_class": result.risk_class,
+                "risk_domain": result.risk_domain,
                 "evaluation_split": result.evaluation_split,
                 "disposition": result.disposition,
                 "expected": _route_signature(result.expected),
                 "actual": _route_signature(result.attempt.resolution),
                 "latency_ms": result.attempt.elapsed_ms,
+                "provider_call_outcome": result.attempt.provider_call_outcome,
+                "timeout_seconds": result.attempt.timeout_seconds,
                 "input_tokens": result.attempt.input_tokens,
                 "cache_read_tokens": result.attempt.cache_read_tokens,
                 "output_tokens": result.attempt.output_tokens,
             }
-            for result in results
+            for repetition, result in zip(repetitions, results, strict=True)
         ],
     }
 
@@ -1131,6 +1207,7 @@ def _assert_semantic_results_are_comparable(
             result.case_id,
             result.scenario_class,
             result.risk_class,
+            result.risk_domain,
             result.evaluation_split,
             result.expected,
         )
@@ -1181,33 +1258,152 @@ def _semantic_gate_failures(
             failures.append("candidate is inferior to incumbent on critical acceptance")
         return tuple(failures)
 
+    if _count_disposition(candidate, "closed_failure"):
+        failures.append("candidate produced a closed failure")
+    if _count_disposition(candidate, "unsafe_executable_misroute"):
+        failures.append("candidate produced an unsafe executable misroute")
     acceptance = [result for result in candidate if result.evaluation_split == "acceptance"]
-    if _count_disposition(acceptance, "closed_failure"):
-        failures.append("candidate produced a closed failure on acceptance")
-    if _count_disposition(acceptance, "unsafe_executable_misroute"):
-        failures.append("candidate produced an unsafe executable misroute on acceptance")
     critical = [result for result in acceptance if result.risk_class == "critical"]
     if _count_disposition(critical, "exact") != len(critical):
         failures.append("not every critical acceptance case was exact")
-    if _count_disposition(acceptance, "exact") / len(acceptance) < 0.95:
-        failures.append("acceptance exact rate was below 95%")
+    budget = _semantic_acceptance_budget(acceptance)
+    exact = _count_disposition(acceptance, "exact")
+    if exact < budget["required_exact_count"]:
+        failures.append(
+            "acceptance exact count "
+            f"{exact} was below required {budget['required_exact_count']} "
+            f"of {budget['cases']}"
+        )
+    return tuple(failures)
+
+
+def _semantic_acceptance_budget(
+    results: Sequence[SemanticRouteCaseResult],
+) -> dict[str, int]:
+    cases = len(results)
+    if cases == 0:
+        raise ValueError("semantic-route qualification requires acceptance cases")
+    required = math.ceil(cases * _SEMANTIC_ROUTE_MIN_ACCEPTANCE_EXACT_RATE)
+    return {
+        "cases": cases,
+        "required_exact_count": required,
+        "allowed_nonexact_count": cases - required,
+    }
+
+
+def _semantic_series_gate_failures(
+    candidate_runs: Sequence[Sequence[SemanticRouteCaseResult]],
+    incumbent_runs: Sequence[Sequence[SemanticRouteCaseResult]],
+    *,
+    projection: ProjectedSemanticRouteCaseResult,
+    gate: Literal["shadow", "cutover"],
+) -> tuple[str, ...]:
+    if not candidate_runs or len(candidate_runs) != len(incumbent_runs):
+        raise ValueError("semantic-route qualification requires paired repetitions")
+    failures: list[str] = []
+    for repetition, (candidate, incumbent) in enumerate(
+        zip(candidate_runs, incumbent_runs, strict=True),
+        start=1,
+    ):
+        for failure in _semantic_gate_failures(
+            candidate,
+            incumbent,
+            projection=projection,
+            gate=gate,
+        ):
+            failures.append(f"repetition {repetition}: {failure}")
+    pooled_candidate = tuple(result for run in candidate_runs for result in run)
+    pooled_incumbent = tuple(result for run in incumbent_runs for result in run)
+    for failure in _semantic_gate_failures(
+        pooled_candidate,
+        pooled_incumbent,
+        projection=projection,
+        gate=gate,
+    ):
+        failures.append(f"pooled: {failure}")
     return tuple(failures)
 
 
 def _semantic_route_report(
-    candidate: Sequence[SemanticRouteCaseResult],
-    incumbent: Sequence[SemanticRouteCaseResult],
+    candidate_runs: Sequence[Sequence[SemanticRouteCaseResult]],
+    incumbent_runs: Sequence[Sequence[SemanticRouteCaseResult]],
     *,
     corpus: SemanticRouteEvalCorpus,
     projection: ProjectedSemanticRouteCaseResult,
-    gate: Literal["shadow", "cutover"],
-    gate_failures: Sequence[str],
+    gate: SemanticRouteGate,
 ) -> dict[str, object]:
-    _assert_semantic_results_are_comparable(candidate, incumbent)
+    if not candidate_runs or len(candidate_runs) != len(incumbent_runs):
+        raise ValueError("semantic-route report requires paired repetitions")
+    if gate == "diagnostic" and len(candidate_runs) != 1:
+        raise ValueError("semantic-route diagnostic requires one repetition")
+    if gate != "diagnostic" and len(candidate_runs) != _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS:
+        raise ValueError(
+            "semantic-route qualification requires exactly "
+            f"{_SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS} repetitions"
+        )
+    first_candidate = candidate_runs[0]
+    first_incumbent = incumbent_runs[0]
+    for candidate, incumbent in zip(candidate_runs, incumbent_runs, strict=True):
+        _assert_semantic_results_are_comparable(candidate, incumbent)
+        _assert_semantic_results_are_comparable(first_candidate, candidate)
+        _assert_semantic_results_are_comparable(first_incumbent, incumbent)
+    pooled_candidate = tuple(result for run in candidate_runs for result in run)
+    pooled_incumbent = tuple(result for run in incumbent_runs for result in run)
+    candidate_repetitions = tuple(
+        repetition for repetition, run in enumerate(candidate_runs, start=1) for _ in run
+    )
+    incumbent_repetitions = tuple(
+        repetition for repetition, run in enumerate(incumbent_runs, start=1) for _ in run
+    )
+    gate_failures: tuple[str, ...] = ()
+    if gate != "diagnostic":
+        gate_failures = _semantic_series_gate_failures(
+            candidate_runs,
+            incumbent_runs,
+            projection=projection,
+            gate=gate,
+        )
+    acceptance = [result for result in first_candidate if result.evaluation_split == "acceptance"]
+    run_reports: list[dict[str, object]] = []
+    for repetition, (candidate, incumbent) in enumerate(
+        zip(candidate_runs, incumbent_runs, strict=True),
+        start=1,
+    ):
+        run_failures: tuple[str, ...] = ()
+        if gate != "diagnostic":
+            run_failures = _semantic_gate_failures(
+                candidate,
+                incumbent,
+                projection=projection,
+                gate=gate,
+            )
+        run_reports.append(
+            {
+                "repetition": repetition,
+                "gate": {
+                    "mode": gate,
+                    "passed": None if gate == "diagnostic" else not run_failures,
+                    "failures": list(run_failures),
+                },
+                "models": {
+                    "candidate": _semantic_model_report(
+                        candidate,
+                        repetitions=(repetition,) * len(candidate),
+                    ),
+                    "incumbent": _semantic_model_report(
+                        incumbent,
+                        repetitions=(repetition,) * len(incumbent),
+                    ),
+                },
+            }
+        )
     return {
-        "schema_version": _SEMANTIC_ROUTE_EVAL_SCHEMA_VERSION,
+        "schema_version": _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION,
+        "corpus_schema_version": corpus.schema_version,
         "run_at": datetime.now(tz=UTC).isoformat(),
         "corpus_fingerprint": _corpus_fingerprint(corpus),
+        "repetitions": len(candidate_runs),
+        "acceptance_budget": _semantic_acceptance_budget(acceptance),
         "route_schema_bytes": len(
             json.dumps(RouteProposal.model_json_schema(), separators=(",", ":")).encode("utf-8")
         ),
@@ -1215,6 +1411,7 @@ def _semantic_route_report(
             "case_id": projection.case_id,
             "scenario_class": projection.scenario_class,
             "risk_class": projection.risk_class,
+            "risk_domain": projection.risk_domain,
             "evaluation_split": projection.evaluation_split,
             "exact": projection.passed,
             "actual": (
@@ -1225,13 +1422,20 @@ def _semantic_route_report(
         },
         "gate": {
             "mode": gate,
-            "passed": not gate_failures,
+            "passed": None if gate == "diagnostic" else not gate_failures,
             "failures": list(gate_failures),
         },
         "models": {
-            "candidate": _semantic_model_report(candidate),
-            "incumbent": _semantic_model_report(incumbent),
+            "candidate": _semantic_model_report(
+                pooled_candidate,
+                repetitions=candidate_repetitions,
+            ),
+            "incumbent": _semantic_model_report(
+                pooled_incumbent,
+                repetitions=incumbent_repetitions,
+            ),
         },
+        "runs": run_reports,
     }
 
 
@@ -1245,10 +1449,32 @@ def _write_semantic_route_report(path: Path, report: dict[str, object]) -> None:
 
 async def _run_semantic_route_eval(
     report_path: Path,
-    gate: Literal["shadow", "cutover"] = "cutover",
+    gate: SemanticRouteGate = "cutover",
+    *,
+    repetitions: int = _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS,
+    diagnostic_timeout_seconds: float | None = None,
 ) -> int:
     selection = _load_routing_eval_selection()
     config = selection.config
+    if gate == "diagnostic":
+        if repetitions != 1:
+            raise ValueError("semantic-route diagnostic requires one repetition")
+        if (
+            diagnostic_timeout_seconds is None
+            or not math.isfinite(diagnostic_timeout_seconds)
+            or diagnostic_timeout_seconds <= 0
+        ):
+            raise ValueError("semantic-route diagnostic requires a positive finite timeout")
+        timeout_seconds = diagnostic_timeout_seconds
+    else:
+        if repetitions != _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS:
+            raise ValueError(
+                "semantic-route qualification requires exactly "
+                f"{_SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS} repetitions"
+            )
+        if diagnostic_timeout_seconds is not None:
+            raise ValueError("diagnostic timeout is valid only in diagnostic mode")
+        timeout_seconds = config.runtime.semantic_router_timeout_seconds
     runtime = _build_eval_runtime(
         config,
         selection.response_model,
@@ -1261,7 +1487,7 @@ async def _run_semantic_route_eval(
             selection.routing_model,
             selection=config.llm.routing,
             structured_output_method=selection.routing_structured_output_method,
-            timeout_seconds=config.runtime.semantic_router_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             input_max_chars=config.runtime.semantic_router_input_max_chars,
             registry=runtime.capability_registry,
         )
@@ -1269,7 +1495,7 @@ async def _run_semantic_route_eval(
             selection.response_model,
             selection=config.llm.response,
             structured_output_method=selection.response_structured_output_method,
-            timeout_seconds=config.runtime.semantic_router_timeout_seconds,
+            timeout_seconds=timeout_seconds,
             input_max_chars=config.runtime.semantic_router_input_max_chars,
             registry=runtime.capability_registry,
         )
@@ -1288,67 +1514,90 @@ async def _run_semantic_route_eval(
             case_id=corpus.projected_case.case_id,
             scenario_class=corpus.projected_case.scenario_class,
             risk_class=corpus.projected_case.risk_class,
+            risk_domain=corpus.projected_case.risk_domain,
             evaluation_split=corpus.projected_case.evaluation_split,
             expected_context=corpus.projected_case.expected_context,
             actual_context=projected,
         )
-        candidate_results = list(await _run_semantic_route_cases(candidate_router, corpus))
-        incumbent_results = list(await _run_semantic_route_cases(incumbent_router, corpus))
-        if projection.passed:
-            assert isinstance(projected, RoutingContext)
-            candidate_results.insert(
-                0,
-                SemanticRouteCaseResult(
-                    case_id=corpus.projected_case.case_id,
-                    scenario_class=corpus.projected_case.scenario_class,
-                    risk_class=corpus.projected_case.risk_class,
-                    evaluation_split=corpus.projected_case.evaluation_split,
-                    expected=corpus.projected_case.expected,
-                    attempt=await candidate_router.route(projected),
-                ),
+        candidate_runs: list[tuple[SemanticRouteCaseResult, ...]] = []
+        incumbent_runs: list[tuple[SemanticRouteCaseResult, ...]] = []
+        for _ in range(repetitions):
+            candidate_results = list(await _run_semantic_route_cases(candidate_router, corpus))
+            incumbent_results = list(await _run_semantic_route_cases(incumbent_router, corpus))
+            if projection.passed:
+                assert isinstance(projected, RoutingContext)
+                candidate_results.insert(
+                    0,
+                    SemanticRouteCaseResult(
+                        case_id=corpus.projected_case.case_id,
+                        scenario_class=corpus.projected_case.scenario_class,
+                        risk_class=corpus.projected_case.risk_class,
+                        risk_domain=corpus.projected_case.risk_domain,
+                        evaluation_split=corpus.projected_case.evaluation_split,
+                        expected=corpus.projected_case.expected,
+                        attempt=await candidate_router.route(projected),
+                    ),
+                )
+                incumbent_results.insert(
+                    0,
+                    SemanticRouteCaseResult(
+                        case_id=corpus.projected_case.case_id,
+                        scenario_class=corpus.projected_case.scenario_class,
+                        risk_class=corpus.projected_case.risk_class,
+                        risk_domain=corpus.projected_case.risk_domain,
+                        evaluation_split=corpus.projected_case.evaluation_split,
+                        expected=corpus.projected_case.expected,
+                        attempt=await incumbent_router.route(projected),
+                    ),
+                )
+            candidate_runs.append(tuple(candidate_results))
+            incumbent_runs.append(tuple(incumbent_results))
+        gate_failures: tuple[str, ...] = ()
+        if gate != "diagnostic":
+            gate_failures = _semantic_series_gate_failures(
+                candidate_runs,
+                incumbent_runs,
+                projection=projection,
+                gate=gate,
             )
-            incumbent_results.insert(
-                0,
-                SemanticRouteCaseResult(
-                    case_id=corpus.projected_case.case_id,
-                    scenario_class=corpus.projected_case.scenario_class,
-                    risk_class=corpus.projected_case.risk_class,
-                    evaluation_split=corpus.projected_case.evaluation_split,
-                    expected=corpus.projected_case.expected,
-                    attempt=await incumbent_router.route(projected),
-                ),
-            )
-        gate_failures = _semantic_gate_failures(
-            candidate_results,
-            incumbent_results,
-            projection=projection,
-            gate=gate,
-        )
         report = _semantic_route_report(
-            candidate_results,
-            incumbent_results,
+            candidate_runs,
+            incumbent_runs,
             corpus=corpus,
             projection=projection,
             gate=gate,
-            gate_failures=gate_failures,
         )
         await asyncio.to_thread(_write_semantic_route_report, report_path, report)
-        candidate_exact = _count_disposition(candidate_results, "exact")
-        incumbent_exact = _count_disposition(incumbent_results, "exact")
-        route_cases = len(candidate_results)
-        print(f"[semantic_routes] candidate exact: {candidate_exact}/{route_cases}")
-        print(f"[semantic_routes] incumbent exact: {incumbent_exact}/{route_cases}")
+        for repetition, (candidate_results, incumbent_results) in enumerate(
+            zip(candidate_runs, incumbent_runs, strict=True),
+            start=1,
+        ):
+            candidate_exact = _count_disposition(candidate_results, "exact")
+            incumbent_exact = _count_disposition(incumbent_results, "exact")
+            route_cases = len(candidate_results)
+            print(
+                f"[semantic_routes] repetition {repetition} candidate exact: "
+                f"{candidate_exact}/{route_cases}"
+            )
+            print(
+                f"[semantic_routes] repetition {repetition} incumbent exact: "
+                f"{incumbent_exact}/{route_cases}"
+            )
+            for result in candidate_results:
+                if result.disposition != "exact":
+                    print(
+                        f"    repetition {repetition} {result.case_id}: "
+                        f"{result.disposition}; expected "
+                        f"{_route_signature(result.expected)}, got "
+                        f"{_route_signature(result.attempt.resolution)}"
+                    )
         print(f"[semantic_routes] projector: {int(projection.passed)}/1")
         if not projection.passed:
             print(f"    {projection.case_id}: production context projection did not match fixture")
-        for result in candidate_results:
-            if result.disposition != "exact":
-                print(
-                    f"    {result.case_id}: {result.disposition}; "
-                    f"expected {_route_signature(result.expected)}, "
-                    f"got {_route_signature(result.attempt.resolution)}"
-                )
         print(f"    sanitized report: {report_path}")
+        if gate == "diagnostic":
+            print("\nSEMANTIC ROUTING DIAGNOSTIC COMPLETED. [NO QUALIFICATION]")
+            return 0
         if gate_failures:
             for failure in gate_failures:
                 print(f"    gate failure: {failure}")
@@ -2057,8 +2306,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--semantic-routing-gate",
-        choices=("shadow", "cutover"),
+        choices=("diagnostic", "shadow", "cutover"),
         help="semantic-router qualification gate (defaults to cutover)",
+    )
+    parser.add_argument(
+        "--semantic-routing-repetitions",
+        type=int,
+        help="one diagnostic repetition or exactly three qualification repetitions",
+    )
+    parser.add_argument(
+        "--semantic-routing-diagnostic-timeout-seconds",
+        type=float,
+        help="evaluation-only router timeout; valid only with the diagnostic gate",
     )
     parser.add_argument(
         "--transport-request-ceiling",
@@ -2094,13 +2353,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--semantic-routing-report requires --semantic-routing-eval")
     if args.semantic_routing_gate is not None and not args.semantic_routing_eval:
         parser.error("--semantic-routing-gate requires --semantic-routing-eval")
+    if args.semantic_routing_repetitions is not None and not args.semantic_routing_eval:
+        parser.error("--semantic-routing-repetitions requires --semantic-routing-eval")
+    if (
+        args.semantic_routing_diagnostic_timeout_seconds is not None
+        and not args.semantic_routing_eval
+    ):
+        parser.error(
+            "--semantic-routing-diagnostic-timeout-seconds requires --semantic-routing-eval"
+        )
     if args.order_target_eval:
         return asyncio.run(_run_order_target_eval())
     if args.semantic_routing_eval:
+        semantic_gate = args.semantic_routing_gate or "cutover"
+        if semantic_gate == "diagnostic":
+            repetitions = (
+                1
+                if args.semantic_routing_repetitions is None
+                else args.semantic_routing_repetitions
+            )
+            if repetitions != 1:
+                parser.error("semantic-routing diagnostic requires one repetition")
+            diagnostic_timeout_seconds = args.semantic_routing_diagnostic_timeout_seconds
+            if (
+                diagnostic_timeout_seconds is None
+                or not math.isfinite(diagnostic_timeout_seconds)
+                or diagnostic_timeout_seconds <= 0
+            ):
+                parser.error(
+                    "semantic-routing diagnostic requires a positive finite "
+                    "--semantic-routing-diagnostic-timeout-seconds"
+                )
+        else:
+            repetitions = (
+                _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS
+                if args.semantic_routing_repetitions is None
+                else args.semantic_routing_repetitions
+            )
+            if repetitions != _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS:
+                parser.error(
+                    "semantic-routing qualification requires exactly "
+                    f"{_SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS} repetitions"
+                )
+            if args.semantic_routing_diagnostic_timeout_seconds is not None:
+                parser.error(
+                    "--semantic-routing-diagnostic-timeout-seconds requires the diagnostic gate"
+                )
+            diagnostic_timeout_seconds = None
         return asyncio.run(
             _run_semantic_route_eval(
                 args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
-                args.semantic_routing_gate or "cutover",
+                semantic_gate,
+                repetitions=repetitions,
+                diagnostic_timeout_seconds=diagnostic_timeout_seconds,
             )
         )
     if args.recovery_certification is not None:
