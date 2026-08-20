@@ -1,7 +1,10 @@
 """The sole frontline evaluator's zero-network readiness and scenario contracts."""
 
+import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import get_args
@@ -14,6 +17,7 @@ from llm_fakes import (
     FakeChatModel,
 )
 from policy_helpers import make_policy
+from pydantic import ValidationError
 from support_helpers import authorize_fixture_orders, build_support_engine
 
 from agnostic_market.agents import telemetry
@@ -68,6 +72,9 @@ from scripts.frontline_eval import (
     _order_reference_failures,
     _outcome,
     _route_signature,
+    _routing_data_contract,
+    _routing_data_manifest_set_fingerprint,
+    _routing_data_readiness_report,
     _run_order_target_cases,
     _run_read_owner_cases,
     _run_semantic_route_cases,
@@ -127,6 +134,205 @@ _TERMINAL_LINE = (
     "I can't continue with automated assistance on this call. "
     "Please contact the store directly for further help."
 )
+
+
+def _routing_data_case(
+    case_id: str,
+    *,
+    cluster_id: str,
+    available_capabilities: tuple[CapabilityId, ...],
+    source_id: str | None = None,
+    source_kind: str = "fixture",
+    storage_scope: str = "repository_sanitized",
+    legacy_diagnostic_lineage: bool = False,
+    context_origin: str = "projected_fixture",
+    availability_origin: str = "registry_cohort",
+    expected: RouteDecision | None = None,
+) -> frontline_eval.RoutingDataCase:
+    return frontline_eval.RoutingDataCase(
+        example_id=case_id,
+        source_id=source_id or f"source:{case_id}",
+        source_cluster_id=cluster_id,
+        provenance=frontline_eval.RoutingDataProvenance(
+            source_kind=source_kind,
+            source_reference=f"source-ref:{case_id}",
+            lineage_review_reference=f"lineage-ref:{case_id}",
+            training_use_authority=(
+                "compliance_approval" if source_kind == "real_caller" else "license"
+            ),
+            training_use_reference=f"training-ref:{case_id}",
+            access_control_reference=f"access-ref:{case_id}",
+            deletion_policy_reference=f"deletion-ref:{case_id}",
+            retention_authority_reference=f"retention-ref:{case_id}",
+            storage_scope=storage_scope,
+            sanitized=True,
+            legacy_diagnostic_lineage=legacy_diagnostic_lineage,
+        ),
+        locale="en-GB",
+        annotation_policy_version="routing-annotation-v1",
+        context=RoutingContext(
+            utterance=f"Show my cart {case_id}",
+            bound_customer=False,
+            cart_state="empty",
+            available_capabilities=available_capabilities,
+        ),
+        expected=expected or RouteDecision.direct(ViewCart()),
+        risk_class="standard",
+        risk_domain="commerce_read",
+        scenario_class="direct",
+        context_origin=context_origin,
+        availability_origin=availability_origin,
+        context_evidence_reference=(
+            f"fixture:{case_id}" if context_origin == "projected_fixture" else None
+        ),
+        review_status="approved",
+        reviewer_id=f"reviewer:{case_id}",
+    )
+
+
+def _routing_data_manifest(
+    partition: str,
+    case: frontline_eval.RoutingDataCase,
+    *,
+    contract: dict[str, object],
+) -> frontline_eval.RoutingDataPartitionManifest:
+    sealed = partition in {"acceptance", "ood"}
+    return frontline_eval.RoutingDataPartitionManifest(
+        schema_version="1",
+        partition=partition,
+        route_schema_fingerprint=contract["route_schema_fingerprint"],
+        registry_fingerprint=contract["registry_fingerprint"],
+        context_projector_version=contract["context_projector_version"],
+        available_capabilities=tuple(
+            CapabilityId(value) for value in contract["available_capabilities"]
+        ),
+        label_access="steward_only" if sealed else "builder_visible",
+        steward_id=f"steward:{partition}" if sealed else None,
+        cases=(case,),
+    )
+
+
+def _routing_data_acquisition_plan(
+    manifests: tuple[tuple[Path, frontline_eval.RoutingDataPartitionManifest], ...],
+    *,
+    contract: dict[str, object],
+) -> frontline_eval.RoutingDataAcquisitionPlan:
+    partition_cases = [
+        (manifest.partition, case) for _, manifest in manifests for case in manifest.cases
+    ]
+    source_cases: dict[str, list[frontline_eval.RoutingDataCase]] = {}
+    for _, case in partition_cases:
+        source_cases.setdefault(case.source_id, []).append(case)
+    reviewer_load: dict[str, int] = {}
+    reviewer_roles: dict[str, str] = {}
+    for _, case in partition_cases:
+        reviewer_load[case.reviewer_id] = reviewer_load.get(case.reviewer_id, 0) + 1
+        reviewer_roles[case.reviewer_id] = "primary"
+        if case.second_reviewer_id is not None:
+            reviewer_load[case.second_reviewer_id] = (
+                reviewer_load.get(case.second_reviewer_id, 0) + 1
+            )
+            reviewer_roles[case.second_reviewer_id] = "secondary"
+    adjudicator_id = "reviewer:adjudicator"
+    return frontline_eval.RoutingDataAcquisitionPlan(
+        schema_version="1",
+        route_schema_fingerprint=contract["route_schema_fingerprint"],
+        registry_fingerprint=contract["registry_fingerprint"],
+        context_projector_version=contract["context_projector_version"],
+        available_capabilities=tuple(
+            CapabilityId(value) for value in contract["available_capabilities"]
+        ),
+        activation_risk_domains=tuple(
+            dict.fromkeys(case.risk_domain for _, case in partition_cases)
+        ),
+        activation_locales=tuple(dict.fromkeys(case.locale for _, case in partition_cases)),
+        required_decisions=tuple(
+            dict.fromkeys(case.expected.decision for _, case in partition_cases)
+        ),
+        required_protected_families=tuple(
+            dict.fromkeys(
+                family for _, case in partition_cases for family in case.protected_families
+            )
+        ),
+        coverage_rationale="Steward-reviewed bounded test acquisition coverage.",
+        annotation_pilot_reference="annotation-pilot:test-report",
+        annotation_guide_version="routing-annotation-v1",
+        approved_by="data-steward",
+        approved_at=datetime.now(tz=UTC),
+        steward_control_reference="steward-control:test-plan",
+        adjudication_owner_id=adjudicator_id,
+        adjudication_reserve=0,
+        sources=tuple(
+            frontline_eval.RoutingDataSourcePlan(
+                source_id=source_id,
+                source_kind=cases[0].provenance.source_kind,
+                source_reference=cases[0].provenance.source_reference,
+                training_use_authority=cases[0].provenance.training_use_authority,
+                training_use_reference=cases[0].provenance.training_use_reference,
+                access_control_reference=cases[0].provenance.access_control_reference,
+                deletion_policy_reference=cases[0].provenance.deletion_policy_reference,
+                retention_authority_reference=cases[0].provenance.retention_authority_reference,
+                sanitization_control_reference=f"sanitization:{source_id}",
+                storage_scope=cases[0].provenance.storage_scope,
+                locales=tuple(dict.fromkeys(case.locale for case in cases)),
+                max_examples=len(cases),
+                estimated_cost_minor_units=0,
+            )
+            for source_id, cases in source_cases.items()
+        ),
+        reviewer_capacity=(
+            *(
+                frontline_eval.RoutingDataReviewerCapacity(
+                    reviewer_id=reviewer_id,
+                    role=reviewer_roles[reviewer_id],
+                    review_capacity=capacity,
+                )
+                for reviewer_id, capacity in reviewer_load.items()
+            ),
+            frontline_eval.RoutingDataReviewerCapacity(
+                reviewer_id=adjudicator_id,
+                role="adjudicator",
+                review_capacity=1,
+            ),
+        ),
+        stop_budget=frontline_eval.RoutingDataStopBudget(
+            max_examples=len(partition_cases),
+            max_cost_minor_units=0,
+            currency="GBP",
+            max_calendar_days=30,
+        ),
+        coverage_cells=tuple(
+            frontline_eval.RoutingDataCoverageCell(
+                cell_id=f"cell:{case.example_id}",
+                partition=partition,
+                expected=case.expected,
+                risk_class=case.risk_class,
+                risk_domain=case.risk_domain,
+                scenario_class=case.scenario_class,
+                locale=case.locale,
+                source_allocations=(
+                    frontline_eval.RoutingDataCoverageSource(
+                        source_id=case.source_id,
+                        planned_examples=1,
+                    ),
+                ),
+                context_origin=case.context_origin,
+                availability_origin=case.availability_origin,
+                bound_customer=case.context.bound_customer,
+                active_capability=case.context.active_capability,
+                recent_order_operation=case.context.recent_order_operation,
+                recent_order_count=case.context.recent_order_count,
+                cart_state=case.context.cart_state,
+                available_capabilities=case.context.available_capabilities,
+                protected_families=case.protected_families,
+                planned_examples=1,
+                min_independent_clusters=1,
+                primary_reviewer_id=case.reviewer_id,
+                secondary_reviewer_id=case.second_reviewer_id,
+            )
+            for partition, case in partition_cases
+        ),
+    )
 
 
 def _model_calls(*models: FakeChatModel) -> int:
@@ -196,6 +402,110 @@ def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Pat
     # registry the dispatcher resolves against, never rebuild its own alongside it.
     assert runtime.capability_registry is runtime.graph.capability_registry
     assert runtime.capability_registry.capability_ids
+
+
+async def test_legacy_route_observer_uses_production_handover_and_flow_tools(
+    config_root: Path,
+) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {
+                "destination": "support",
+                "reason_code": "cancel_order",
+            }
+        },
+        tool_call_limit=1,
+    )
+    reasoning = FakeChatModel(
+        force_tool="propose_cancel",
+        canned_args={
+            "propose_cancel": {
+                "order_keys": None,
+                "scope": "all_cancellable",
+            }
+        },
+        tool_call_limit=1,
+    )
+    runtime = _build_eval_runtime(
+        config,
+        frontline,
+        reasoning,
+        thread_id="legacy-route-observer",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    observation = await frontline_eval._observe_legacy_route(
+        runtime,
+        "Cancel all my orders.",
+    )
+
+    assert observation.capability_candidates == (CapabilityId.CANCEL_ORDERS,)
+    assert observation.tool_names == ("request_handover", "propose_cancel")
+    assert observation.handover_source == "model"
+    assert observation.handover_reason == "cancel_order"
+    assert observation.owner_surface == "hitl_guarded_write"
+    assert observation.state_deltas == ()
+
+
+async def test_legacy_route_observer_detects_reversible_cart_change(
+    config_root: Path,
+) -> None:
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    frontline = FakeChatModel(
+        force_tool="request_handover",
+        canned_args={
+            "request_handover": {
+                "destination": "checkout",
+                "reason_code": "cart_write",
+            }
+        },
+        tool_call_limit=1,
+    )
+    reasoning = FakeChatModel(
+        force_tool="add_to_cart",
+        canned_args={"add_to_cart": {"candidate_key": "1", "quantity": 1}},
+        tool_call_limit=1,
+    )
+    runtime = _build_eval_runtime(
+        config,
+        frontline,
+        reasoning,
+        thread_id="legacy-route-cart-change",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    observation = await frontline_eval._observe_legacy_route(
+        runtime,
+        "Add one trail shoe to my cart.",
+    )
+
+    assert observation.capability_candidates == (CapabilityId.MODIFY_CART,)
+    assert observation.owner_surface == "reversible_write"
+    assert observation.state_deltas == ("cart",)
+    assert runtime.cart_store.view()
+
+
+def test_legacy_state_deltas_are_independent_and_exhaustive() -> None:
+    before = CommerceObservation(0, 0, 0, 0, 0, 0, 0, False)
+    after = CommerceObservation(1, 1, 1, 1, 1, 1, 1, True)
+
+    assert frontline_eval._legacy_state_deltas(
+        before,
+        after,
+        cart_changed=True,
+    ) == (
+        "cart",
+        "placement",
+        "cancel",
+        "refund",
+        "return",
+        "profile",
+        "otp",
+        "verification",
+        "identity",
+    )
 
 
 def test_evaluator_runtime_uses_the_production_checkpointer(
@@ -571,6 +881,468 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     assert by_id["acceptance_cancel_negated_then_list"].risk_domain == "commerce_effect"
 
 
+def test_routing_data_contract_reuses_the_production_registry(config_root: Path) -> None:
+    contract = _routing_data_contract()
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+    runtime = _build_eval_runtime(
+        config,
+        FakeChatModel(),
+        FakeChatModel(),
+        thread_id="eval-routing-data-contract",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+
+    try:
+        assert contract["available_capabilities"] == [
+            capability.value for capability in runtime.capability_registry.capability_ids
+        ]
+        assert contract["registry_fingerprint"] == frontline_eval.registry_fingerprint(
+            runtime.capability_registry
+        )
+    finally:
+        runtime.caller_context.close_session()
+
+
+def test_routing_data_readiness_requires_bound_steward_authorization(
+    tmp_path: Path,
+) -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    manifests = tuple(
+        (
+            tmp_path / f"{partition}.yaml",
+            _routing_data_manifest(
+                partition,
+                _routing_data_case(
+                    f"{partition}-cart",
+                    cluster_id=f"cluster:{partition}",
+                    available_capabilities=capabilities,
+                ),
+                contract=contract,
+            ),
+        )
+        for partition in ("training", "calibration", "acceptance", "ood")
+    )
+    acquisition_plan = _routing_data_acquisition_plan(manifests, contract=contract)
+    acquisition_plan_path = tmp_path / "acquisition-plan.json"
+
+    unauthorized = _routing_data_readiness_report(
+        manifests,
+        acquisition_plan=acquisition_plan,
+        acquisition_plan_path=acquisition_plan_path,
+        authorization=None,
+    )
+    assert unauthorized["disposition"] == "insufficient_evidence"
+    assert unauthorized["blockers"] == ["pilot_authorization_missing"]
+    assert unauthorized["acquisition_plan"]["status"] == "authorized"
+
+    authorization = frontline_eval.RoutingDataPilotAuthorization(
+        schema_version="2",
+        manifest_set_fingerprint=_routing_data_manifest_set_fingerprint(manifests),
+        acquisition_plan_fingerprint=frontline_eval._routing_data_acquisition_plan_fingerprint(
+            acquisition_plan
+        ),
+        reviewer_id="data-steward",
+        reviewed_at=datetime.now(tz=UTC),
+        coverage_rationale="Reviewed independent source-cluster and route-family coverage.",
+        legal_basis_rationale="Reviewed every declared training-use and retention authority.",
+        steward_control_reference="steward-control:pilot-1",
+    )
+    authorized = _routing_data_readiness_report(
+        manifests,
+        acquisition_plan=acquisition_plan,
+        acquisition_plan_path=acquisition_plan_path,
+        authorization=authorization,
+        authorization_path=tmp_path / "authorization.json",
+    )
+
+    assert authorized["disposition"] == "classifier_pilot_authorized"
+    assert authorized["blockers"] == []
+    assert authorized["acquisition_plan"]["annotation_guide_version"] == (
+        acquisition_plan.annotation_guide_version
+    )
+    assert "route_shapes" in authorized["partitions"]["training"]
+    assert "risk_domains" in authorized["partitions"]["calibration"]
+    assert "route_shapes" not in authorized["partitions"]["acceptance"]
+    assert "risk_domains" not in authorized["partitions"]["ood"]
+    assert authorized["partitions"]["acceptance"]["context_coverage"] == {
+        "bound_customer": [False],
+        "active_capability": ["none"],
+        "recent_order_operation": ["none"],
+        "recent_order_count": [0],
+        "cart_state": ["empty"],
+    }
+    assert "Show my cart" not in json.dumps(authorized)
+
+    wrong_plan_authorization = authorization.model_copy(
+        update={"acquisition_plan_fingerprint": "different-plan"}
+    )
+    mismatched = _routing_data_readiness_report(
+        manifests,
+        acquisition_plan=acquisition_plan,
+        acquisition_plan_path=acquisition_plan_path,
+        authorization=wrong_plan_authorization,
+        authorization_path=tmp_path / "authorization.json",
+    )
+    assert mismatched["disposition"] == "insufficient_evidence"
+    assert mismatched["blockers"] == ["pilot_authorization_plan_mismatch"]
+
+
+def test_routing_data_readiness_enforces_planned_examples_and_clusters(
+    tmp_path: Path,
+) -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    manifests = tuple(
+        (
+            tmp_path / f"{partition}.yaml",
+            _routing_data_manifest(
+                partition,
+                _routing_data_case(
+                    f"{partition}-cart",
+                    cluster_id=f"cluster:{partition}",
+                    available_capabilities=capabilities,
+                ),
+                contract=contract,
+            ),
+        )
+        for partition in ("training", "calibration", "acceptance", "ood")
+    )
+    plan_payload = _routing_data_acquisition_plan(manifests, contract=contract).model_dump()
+    planned_cell = plan_payload["coverage_cells"][0]
+    planned_cell["planned_examples"] = 2
+    planned_cell["min_independent_clusters"] = 2
+    source_id = planned_cell["source_allocations"][0]["source_id"]
+    second_source_id = f"{source_id}:second-cluster"
+    planned_cell["source_allocations"] = (
+        *planned_cell["source_allocations"],
+        {"source_id": second_source_id, "planned_examples": 1},
+    )
+    primary_id = planned_cell["primary_reviewer_id"]
+    first_source = next(
+        source for source in plan_payload["sources"] if source["source_id"] == source_id
+    )
+    second_source = dict(first_source)
+    second_source.update(
+        source_id=second_source_id,
+        source_reference=f"source-ref:{second_source_id}",
+        training_use_reference=f"training-ref:{second_source_id}",
+        access_control_reference=f"access-ref:{second_source_id}",
+        deletion_policy_reference=f"deletion-ref:{second_source_id}",
+        retention_authority_reference=f"retention-ref:{second_source_id}",
+        sanitization_control_reference=f"sanitization:{second_source_id}",
+    )
+    plan_payload["sources"] = (*plan_payload["sources"], second_source)
+    next(
+        reviewer
+        for reviewer in plan_payload["reviewer_capacity"]
+        if reviewer["reviewer_id"] == primary_id
+    )["review_capacity"] = 2
+    plan_payload["stop_budget"]["max_examples"] = 5
+    acquisition_plan = frontline_eval.RoutingDataAcquisitionPlan.model_validate(plan_payload)
+
+    report = _routing_data_readiness_report(
+        manifests,
+        acquisition_plan=acquisition_plan,
+        acquisition_plan_path=tmp_path / "acquisition-plan.json",
+    )
+
+    assert report["disposition"] == "insufficient_evidence"
+    assert "coverage_examples_unmet:cell:training-cart" in report["blockers"]
+    assert "coverage_clusters_unmet:cell:training-cart" in report["blockers"]
+    assert (
+        f"coverage_source_examples_unmet:cell:training-cart:{second_source_id}"
+        in report["blockers"]
+    )
+    assert report["acquisition_plan"]["planned_examples"] == 5
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (
+            lambda payload: (
+                payload["coverage_cells"][0].update(planned_examples=2),
+                payload["coverage_cells"][0]["source_allocations"][0].update(planned_examples=2),
+            ),
+            "review load exceeds",
+        ),
+        (
+            lambda payload: payload["stop_budget"].update(max_examples=3),
+            "planned examples exceed",
+        ),
+        (
+            lambda payload: payload.update(annotation_pilot_reference=" "),
+            "acquisition-plan fields must be normalized",
+        ),
+        (
+            lambda payload: payload.update(annotation_guide_version=" "),
+            "acquisition-plan fields must be normalized",
+        ),
+    ),
+)
+def test_routing_data_acquisition_plan_rejects_invalid_governance_capacity_and_budget(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, object]], None],
+    message: str,
+) -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    manifests = tuple(
+        (
+            tmp_path / f"{partition}.yaml",
+            _routing_data_manifest(
+                partition,
+                _routing_data_case(
+                    f"{partition}-cart",
+                    cluster_id=f"cluster:{partition}",
+                    available_capabilities=capabilities,
+                ),
+                contract=contract,
+            ),
+        )
+        for partition in ("training", "calibration", "acceptance", "ood")
+    )
+    payload = _routing_data_acquisition_plan(manifests, contract=contract).model_dump()
+    mutate(payload)
+
+    with pytest.raises(ValidationError, match=message):
+        frontline_eval.RoutingDataAcquisitionPlan.model_validate(payload)
+
+
+def test_routing_data_readiness_rejects_acquired_reviewer_capacity_overrun(
+    tmp_path: Path,
+) -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    manifests = tuple(
+        (
+            tmp_path / f"{partition}.yaml",
+            _routing_data_manifest(
+                partition,
+                _routing_data_case(
+                    f"{partition}-cart",
+                    cluster_id=f"cluster:{partition}",
+                    available_capabilities=capabilities,
+                ),
+                contract=contract,
+            ),
+        )
+        for partition in ("training", "calibration", "acceptance", "ood")
+    )
+    plan_payload = _routing_data_acquisition_plan(manifests, contract=contract).model_dump()
+    training_case = manifests[0][1].cases[0]
+    source = next(
+        item for item in plan_payload["sources"] if item["source_id"] == training_case.source_id
+    )
+    source["max_examples"] = 2
+    plan_payload["stop_budget"]["max_examples"] = 5
+    acquisition_plan = frontline_eval.RoutingDataAcquisitionPlan.model_validate(plan_payload)
+    extra_case_payload = training_case.model_dump()
+    extra_case_payload["example_id"] = "training-cart-extra"
+    extra_case = frontline_eval.RoutingDataCase.model_validate(extra_case_payload)
+    training_manifest_payload = manifests[0][1].model_dump()
+    training_manifest_payload["cases"] = (
+        *training_manifest_payload["cases"],
+        extra_case.model_dump(),
+    )
+    training_manifest = frontline_eval.RoutingDataPartitionManifest.model_validate(
+        training_manifest_payload
+    )
+
+    report = _routing_data_readiness_report(
+        ((manifests[0][0], training_manifest), *manifests[1:]),
+        acquisition_plan=acquisition_plan,
+        acquisition_plan_path=tmp_path / "acquisition-plan.json",
+    )
+
+    assert report["disposition"] == "insufficient_evidence"
+    assert f"reviewer_capacity_exceeded:{training_case.reviewer_id}" in report["blockers"]
+
+
+def test_routing_data_authorization_rejects_the_pre_plan_schema() -> None:
+    with pytest.raises(ValidationError, match="unsupported routing-data authorization"):
+        frontline_eval.RoutingDataPilotAuthorization(
+            schema_version="1",
+            manifest_set_fingerprint="manifests",
+            acquisition_plan_fingerprint="plan",
+            reviewer_id="data-steward",
+            reviewed_at=datetime.now(tz=UTC),
+            coverage_rationale="Legacy authorization without the plan binding.",
+            legal_basis_rationale="Legacy authorization.",
+            steward_control_reference="steward-control:legacy",
+        )
+
+
+def test_routing_data_readiness_rejects_cluster_and_source_leakage(
+    tmp_path: Path,
+) -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    training = _routing_data_manifest(
+        "training",
+        _routing_data_case(
+            "training-cart",
+            cluster_id="shared-cluster",
+            source_id="shared-source",
+            available_capabilities=capabilities,
+        ),
+        contract=contract,
+    )
+    calibration = _routing_data_manifest(
+        "calibration",
+        _routing_data_case(
+            "calibration-cart",
+            cluster_id="different-cluster",
+            source_id="shared-source",
+            available_capabilities=capabilities,
+        ),
+        contract=contract,
+    )
+    acceptance = _routing_data_manifest(
+        "acceptance",
+        _routing_data_case(
+            "acceptance-cart",
+            cluster_id="shared-cluster",
+            available_capabilities=capabilities,
+        ),
+        contract=contract,
+    )
+    ood = _routing_data_manifest(
+        "ood",
+        _routing_data_case(
+            "ood-cart",
+            cluster_id="ood-cluster",
+            available_capabilities=capabilities,
+        ),
+        contract=contract,
+    )
+
+    report = _routing_data_readiness_report(
+        (
+            (tmp_path / "training.yaml", training),
+            (tmp_path / "calibration.yaml", calibration),
+            (tmp_path / "acceptance.yaml", acceptance),
+            (tmp_path / "ood.yaml", ood),
+        ),
+        authorization=None,
+    )
+
+    assert report["disposition"] == "insufficient_evidence"
+    assert "source_cluster_conflict:shared-source" in report["blockers"]
+    assert "cluster_partition_leak:shared-cluster" in report["blockers"]
+
+
+def test_routing_data_readiness_rejects_stale_contract_and_repository_caller_data() -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    case = _routing_data_case(
+        "caller-cart",
+        cluster_id="caller-cluster",
+        available_capabilities=capabilities,
+        source_kind="real_caller",
+        storage_scope="external_restricted",
+    )
+    manifest = _routing_data_manifest("training", case, contract=contract).model_copy(
+        update={"route_schema_fingerprint": "stale-route-schema"}
+    )
+
+    report = _routing_data_readiness_report(
+        ((Path(__file__), manifest),),
+        authorization=None,
+    )
+
+    assert "route_schema_mismatch:training" in report["blockers"]
+    assert "restricted_data_inside_repository:training" in report["blockers"]
+
+
+def test_routing_data_readiness_rejects_checkout_visible_holdout_control() -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    manifest = _routing_data_manifest(
+        "acceptance",
+        _routing_data_case(
+            "acceptance-cart",
+            cluster_id="acceptance-cluster",
+            available_capabilities=capabilities,
+        ),
+        contract=contract,
+    )
+    manifests = ((Path(__file__), manifest),)
+    authorization = frontline_eval.RoutingDataPilotAuthorization(
+        schema_version="2",
+        manifest_set_fingerprint=_routing_data_manifest_set_fingerprint(manifests),
+        acquisition_plan_fingerprint="acquisition-plan",
+        reviewer_id="data-steward",
+        reviewed_at=datetime.now(tz=UTC),
+        coverage_rationale="Reviewed held-out route coverage.",
+        legal_basis_rationale="Reviewed declared use and retention evidence.",
+        steward_control_reference="steward-control:pilot-1",
+    )
+
+    report = _routing_data_readiness_report(
+        manifests,
+        authorization=authorization,
+        authorization_path=Path(__file__),
+    )
+
+    assert "sealed_labels_inside_repository:acceptance" in report["blockers"]
+    assert "pilot_authorization_not_path_isolated" in report["blockers"]
+
+
+def test_routing_data_manifest_rejects_ineligible_lineage_and_unreachable_context() -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    legacy = _routing_data_case(
+        "legacy-cart",
+        cluster_id="legacy-cluster",
+        available_capabilities=capabilities,
+        legacy_diagnostic_lineage=True,
+    )
+    with pytest.raises(ValidationError, match="legacy semantic diagnostic lineage"):
+        _routing_data_manifest("training", legacy, contract=contract)
+
+    unreachable = _routing_data_case(
+        "unreachable-cart",
+        cluster_id="unreachable-cluster",
+        available_capabilities=(CapabilityId.VIEW_CART,),
+    )
+    with pytest.raises(ValidationError, match="manifest capability set exactly"):
+        _routing_data_manifest("training", unreachable, contract=contract)
+
+    rejection = _routing_data_case(
+        "unavailable-owner",
+        cluster_id="unavailable-cluster",
+        available_capabilities=(CapabilityId.VIEW_CART,),
+        context_origin="authored_counterfactual",
+        availability_origin="rejection_counterfactual",
+        expected=RouteDecision.clarify("unsupported_capability"),
+    )
+    assert _routing_data_manifest("ood", rejection, contract=contract).cases == (rejection,)
+
+
+def test_routing_data_protected_and_synthetic_review_contracts_are_closed() -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    payload = _routing_data_case(
+        "quoted-cancel",
+        cluster_id="quoted-cluster",
+        available_capabilities=capabilities,
+    ).model_dump()
+    payload["protected_families"] = ("quoted",)
+    with pytest.raises(ValidationError, match="independent second reviewer"):
+        frontline_eval.RoutingDataCase.model_validate(payload)
+
+    synthetic = _routing_data_case(
+        "synthetic-cart",
+        cluster_id="synthetic-cluster",
+        available_capabilities=capabilities,
+        source_kind="synthetic",
+    ).model_copy(update={"generator_version": "generator-v1"})
+    with pytest.raises(ValidationError, match="training-only"):
+        _routing_data_manifest("calibration", synthetic, contract=contract)
+
+
 def test_production_projector_matches_the_fixture_built_registry(config_root: Path) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
     runtime = _build_eval_runtime(
@@ -761,12 +1533,20 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         expected_context=projected.expected_context,
         actual_context=projected.expected_context,
     )
-    report = _semantic_route_report(
-        (results, results, results),
-        (results, results, results),
-        corpus=corpus,
+    candidate_runs = (results, results, results)
+    incumbent_runs = (results, results, results)
+    verdict = frontline_eval._semantic_series_verdict(
+        candidate_runs,
+        incumbent_runs,
         projection=projection,
         gate="cutover",
+    )
+    report = _semantic_route_report(
+        candidate_runs,
+        incumbent_runs,
+        corpus=corpus,
+        projection=projection,
+        verdict=verdict,
     )
     serialized = str(report)
 
@@ -785,14 +1565,11 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
             "repetition 3: candidate produced a closed failure",
             "repetition 3: not every critical acceptance case was exact",
             "repetition 3: acceptance exact count 0 was below required 1 of 1",
-            "pooled: candidate produced a closed failure",
-            "pooled: not every critical acceptance case was exact",
-            "pooled: acceptance exact count 0 was below required 3 of 3",
         ],
     }
-    assert report["schema_version"] == "4"
+    assert report["schema_version"] == "5"
     assert report["repetitions"] == 3
-    assert report["acceptance_budget"] == {
+    assert report["acceptance_budget_per_repetition"] == {
         "cases": 1,
         "required_exact_count": 1,
         "allowed_nonexact_count": 0,
@@ -824,17 +1601,26 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
     assert candidate["totals"]["latency_ms_p50"] == 12.0
     assert candidate["totals"]["latency_ms_p95"] == 20.0
     assert candidate["totals"]["latency_ms_max"] == 20.0
-    assert candidate["cases"][0]["cache_read_tokens"] is None
-    assert candidate["cases"][0]["provider_call_outcome"] == "completed"
-    assert candidate["cases"][0]["risk_domain"] == "commerce_read"
-    assert report["runs"][1]["models"]["candidate"]["cases"][0]["repetition"] == 2
+    assert "cases" not in candidate
+    run_case = report["runs"][1]["models"]["candidate"]["cases"][0]
+    assert run_case["repetition"] == 2
+    assert run_case["cache_read_tokens"] is None
+    assert run_case["provider_call_outcome"] == "completed"
+    assert run_case["risk_domain"] == "commerce_read"
+    assert "timeout_seconds" not in run_case
 
+    diagnostic_verdict = frontline_eval._semantic_series_verdict(
+        (results,),
+        (results,),
+        projection=projection,
+        gate="diagnostic",
+    )
     diagnostic = _semantic_route_report(
         (results,),
         (results,),
         corpus=corpus,
         projection=projection,
-        gate="diagnostic",
+        verdict=diagnostic_verdict,
     )
     assert diagnostic["gate"] == {
         "mode": "diagnostic",
@@ -854,6 +1640,250 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         "cache_read_cohorts"
     ]
     assert cache_cohorts == {"positive": 1, "zero": 1, "unreported": 1}
+
+
+def test_legacy_route_replay_boundary_is_explicit_and_registry_bound() -> None:
+    corpus = _load_semantic_route_corpus()
+    registry = frontline_eval._build_frontline_capability_registry()
+
+    exclusions = {
+        case.case_id: frontline_eval._legacy_replay_exclusion(case, registry)
+        for case in corpus.cases
+    }
+
+    assert sum(reason is None for reason in exclusions.values()) == 27
+    assert sum(reason is not None for reason in exclusions.values()) == 16
+    assert exclusions["quoted_cancel_is_not_an_action"] is None
+    assert "active capability" in exclusions["acceptance_continue_cancel"]
+    assert "nonempty cart" in exclusions["acceptance_place_order"]
+    assert "bound identity" in exclusions["list_account_orders"]
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "surface"),
+    (
+        ((), "none"),
+        ((CapabilityId.SEARCH_CATALOG,), "unprotected"),
+        ((CapabilityId.LIST_ORDERS,), "protected_read"),
+        ((CapabilityId.SWITCH_ACCOUNT,), "account_control"),
+        ((CapabilityId.PLACE_ORDER,), "hitl_guarded_write"),
+        ((CapabilityId.MODIFY_CART,), "reversible_write"),
+        (
+            (CapabilityId.PLACE_ORDER, CapabilityId.MODIFY_CART),
+            "reversible_write",
+        ),
+    ),
+)
+def test_legacy_owner_surface_uses_the_closed_highest_risk_mapping(
+    capabilities: tuple[CapabilityId, ...],
+    surface: str,
+) -> None:
+    assert frontline_eval._legacy_owner_surface(capabilities) == surface
+
+
+@pytest.mark.parametrize(
+    ("expected", "observation", "disposition"),
+    (
+        (
+            RouteDecision.clarify("ambiguous_intent"),
+            frontline_eval.LegacyRouteObservation(
+                capability_candidates=(CapabilityId.CANCEL_ORDERS,),
+                tool_names=("propose_cancel",),
+                active_flow="support",
+                handover_destination="support",
+                handover_reason="cancel_order",
+                handover_source="model",
+                non_tool_ai_text_without_owner=False,
+                state_deltas=(),
+            ),
+            "hitl_guarded_write_owner_entry",
+        ),
+        (
+            RouteDecision.clarify("ambiguous_intent"),
+            frontline_eval.LegacyRouteObservation(
+                capability_candidates=(),
+                tool_names=(),
+                active_flow=None,
+                handover_destination=None,
+                handover_reason=None,
+                handover_source=None,
+                non_tool_ai_text_without_owner=True,
+                state_deltas=(),
+            ),
+            "conservative_no_action",
+        ),
+        (
+            RouteDecision.direct(ListOrders(scope="session")),
+            frontline_eval.LegacyRouteObservation(
+                capability_candidates=(CapabilityId.LIST_ORDERS,),
+                tool_names=("list_orders",),
+                active_flow=None,
+                handover_destination=None,
+                handover_reason=None,
+                handover_source=None,
+                non_tool_ai_text_without_owner=False,
+                state_deltas=(),
+            ),
+            "owner_compatible",
+        ),
+        (
+            RouteDecision.direct(AnswerQuestion(topic="general")),
+            frontline_eval.LegacyRouteObservation(
+                capability_candidates=(),
+                tool_names=(),
+                active_flow=None,
+                handover_destination=None,
+                handover_reason=None,
+                handover_source=None,
+                non_tool_ai_text_without_owner=True,
+                state_deltas=(),
+            ),
+            "owner_compatible",
+        ),
+        (
+            RouteDecision.clarify("ambiguous_intent"),
+            frontline_eval.LegacyRouteObservation(
+                capability_candidates=(CapabilityId.MODIFY_CART,),
+                tool_names=("add_to_cart",),
+                active_flow="cart",
+                handover_destination="checkout",
+                handover_reason="cart_write",
+                handover_source="model",
+                non_tool_ai_text_without_owner=False,
+                state_deltas=("cart",),
+            ),
+            "protected_state_changed",
+        ),
+    ),
+)
+def test_legacy_route_disposition_separates_protected_owner_entry(
+    expected: RouteDecision,
+    observation: frontline_eval.LegacyRouteObservation,
+    disposition: str,
+) -> None:
+    assert frontline_eval._legacy_route_disposition(expected, observation) == disposition
+
+
+def test_legacy_route_report_is_sanitized_and_non_qualifying() -> None:
+    corpus = _load_semantic_route_corpus()
+    registry = frontline_eval._build_frontline_capability_registry()
+    result = frontline_eval.LegacyRouteCaseResult(
+        case_id="quoted_cancel",
+        scenario_class="adversarial",
+        risk_class="critical",
+        risk_domain="commerce_effect",
+        evaluation_split="acceptance",
+        expected=RouteDecision.clarify("ambiguous_intent"),
+        observation=frontline_eval.LegacyRouteObservation(
+            capability_candidates=(),
+            tool_names=(),
+            active_flow=None,
+            handover_destination=None,
+            handover_reason=None,
+            handover_source=None,
+            non_tool_ai_text_without_owner=True,
+            state_deltas=(),
+        ),
+        exclusion_reason=None,
+    )
+
+    report = frontline_eval._legacy_route_report(
+        (result,),
+        corpus=corpus,
+        registry=registry,
+        provider="provider",
+        model="model",
+    )
+    serialized = json.dumps(report)
+
+    assert report["qualification"] is None
+    assert report["schema_version"] == "2"
+    assert report["corpus_schema_version"] == corpus.schema_version
+    assert report["corpus_fingerprint"] == frontline_eval._corpus_fingerprint(corpus)
+    assert report["route_schema_fingerprint"] == frontline_eval.ROUTE_SCHEMA_FINGERPRINT
+    assert report["registry_fingerprint"] == frontline_eval.registry_fingerprint(registry)
+    assert report["context_projector_version"] == frontline_eval.CONTEXT_PROJECTOR_VERSION
+    assert report["totals"]["replayed"] == 1
+    assert report["totals"]["owner_surfaces"] == {
+        "none": 1,
+        "unprotected": 0,
+        "protected_read": 0,
+        "account_control": 0,
+        "reversible_write": 0,
+        "hitl_guarded_write": 0,
+    }
+    assert all(count == 0 for count in report["totals"]["state_deltas"].values())
+    assert "cancel this order" not in serialized
+    assert all("utterance" not in case for case in report["cases"])
+
+
+def _legacy_v1_source_report() -> tuple[
+    dict[str, object],
+    SemanticRouteEvalCorpus,
+    object,
+]:
+    corpus = _load_semantic_route_corpus()
+    registry = frontline_eval._build_frontline_capability_registry()
+    return (
+        {
+            "schema_version": "1",
+            "mode": "production_legacy_route_diagnostic",
+            "qualification": None,
+            "coverage": {
+                "replay_contract": frontline_eval._LEGACY_ROUTE_REPLAY_CONTRACT,
+            },
+            "cases": [
+                frontline_eval._legacy_case_contract(case, registry) for case in corpus.cases
+            ],
+        },
+        corpus,
+        registry,
+    )
+
+
+def test_legacy_v1_compatibility_attestation_preserves_history_and_names_current_only(
+    tmp_path: Path,
+) -> None:
+    source, corpus, registry = _legacy_v1_source_report()
+    source_path = tmp_path / "legacy-v1.json"
+    source_bytes = (json.dumps(source, indent=2, sort_keys=True) + "\n").encode()
+    source_path.write_bytes(source_bytes)
+
+    report = frontline_eval._legacy_compatibility_attestation(
+        source_path,
+        corpus=corpus,
+        registry=registry,
+    )
+
+    assert source_path.read_bytes() == source_bytes
+    assert report["status"] == "compatible_current_corpus"
+    assert report["source_artifact_sha256"] == hashlib.sha256(source_bytes).hexdigest()
+    assert report["blockers"] == []
+    current_contract = report["current_contract"]
+    assert current_contract["corpus_relationship"] == "compatible_current_corpus"
+    assert current_contract["corpus_fingerprint"] == frontline_eval._corpus_fingerprint(corpus)
+    assert "original_run_corpus" not in json.dumps(report)
+
+
+def test_legacy_v1_compatibility_rejects_changed_case_contract(
+    tmp_path: Path,
+) -> None:
+    source, corpus, registry = _legacy_v1_source_report()
+    cases = source["cases"]
+    assert isinstance(cases, list) and isinstance(cases[0], dict)
+    cases[0]["risk_domain"] = "ordinary_intent"
+    source_path = tmp_path / "legacy-v1-tampered.json"
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    report = frontline_eval._legacy_compatibility_attestation(
+        source_path,
+        corpus=corpus,
+        registry=registry,
+    )
+
+    assert report["status"] == "incompatible"
+    assert report["blockers"] == ["case_contract_matches"]
+    assert "corpus_fingerprint" not in report["current_contract"]
 
 
 @pytest.mark.parametrize(
@@ -1188,12 +2218,20 @@ def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path
     )
 
     with pytest.raises(ValueError, match="mixed run identities"):
-        _semantic_route_report(
-            ((result,), (changed_deadline,), (result,)),
-            ((result,), (result,), (result,)),
-            corpus=corpus,
+        candidate_runs = ((result,), (changed_deadline,), (result,))
+        incumbent_runs = ((result,), (result,), (result,))
+        verdict = frontline_eval._semantic_series_verdict(
+            candidate_runs,
+            incumbent_runs,
             projection=projection,
             gate="cutover",
+        )
+        _semantic_route_report(
+            candidate_runs,
+            incumbent_runs,
+            corpus=corpus,
+            projection=projection,
+            verdict=verdict,
         )
 
 
@@ -1302,21 +2340,80 @@ def test_cli_dispatches_order_target_only_mode(monkeypatch: pytest.MonkeyPatch) 
     assert calls == 1
 
 
+def test_cli_dispatches_legacy_route_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "legacy-routing.json"
+    received: list[Path] = []
+
+    async def run(path: Path) -> int:
+        received.append(path)
+        return 0
+
+    monkeypatch.setattr(frontline_eval, "_run_legacy_route_diagnostic", run)
+
+    assert (
+        frontline_eval.main(
+            [
+                "--legacy-routing-diagnostic",
+                "--legacy-routing-report",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    assert received == [report_path]
+
+    with pytest.raises(SystemExit):
+        frontline_eval.main(["--legacy-routing-report", str(report_path)])
+
+
+def test_cli_dispatches_legacy_route_compatibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "legacy-v1.json"
+    report_path = tmp_path / "legacy-v1.compatibility.json"
+    received: list[tuple[Path, Path]] = []
+
+    def run(source: Path, report: Path) -> int:
+        received.append((source, report))
+        return 0
+
+    monkeypatch.setattr(frontline_eval, "_run_legacy_compatibility_attestation", run)
+
+    assert (
+        frontline_eval.main(
+            [
+                "--legacy-routing-compatibility",
+                str(source_path),
+                "--legacy-routing-compatibility-report",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    assert received == [(source_path, report_path)]
+
+    with pytest.raises(SystemExit):
+        frontline_eval.main(["--legacy-routing-compatibility-report", str(report_path)])
+
+
 def test_cli_dispatches_semantic_route_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report_path = tmp_path / "semantic-routing.json"
-    received: list[tuple[Path, str, int, float | None]] = []
+    received: list[tuple[Path, str, float | None]] = []
 
     async def run(
         path: Path,
         gate: str,
         *,
-        repetitions: int,
         diagnostic_timeout_seconds: float | None,
     ) -> int:
-        received.append((path, gate, repetitions, diagnostic_timeout_seconds))
+        received.append((path, gate, diagnostic_timeout_seconds))
         return 0
 
     monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", run)
@@ -1327,7 +2424,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received == [(report_path, "cutover", 3, None)]
+    assert received == [(report_path, "cutover", None)]
 
     assert (
         frontline_eval.main(
@@ -1341,7 +2438,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "shadow", 3, None)
+    assert received[-1] == (report_path, "shadow", None)
 
     assert (
         frontline_eval.main(
@@ -1357,12 +2454,109 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "diagnostic", 1, 3.0)
+    assert received[-1] == (report_path, "diagnostic", 3.0)
+
+
+def test_cli_runs_zero_network_routing_data_audit(
+    tmp_path: Path,
+) -> None:
+    contract = _routing_data_contract()
+    capabilities = tuple(CapabilityId(value) for value in contract["available_capabilities"])
+    manifest_items = tuple(
+        (
+            tmp_path / f"{partition}.json",
+            _routing_data_manifest(
+                partition,
+                _routing_data_case(
+                    f"{partition}-cart",
+                    cluster_id=f"cluster:{partition}",
+                    available_capabilities=capabilities,
+                ),
+                contract=contract,
+            ),
+        )
+        for partition in ("training", "calibration", "acceptance", "ood")
+    )
+    for path, manifest in manifest_items:
+        path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+    acquisition_plan = _routing_data_acquisition_plan(manifest_items, contract=contract)
+    acquisition_plan_path = tmp_path / "acquisition-plan.json"
+    acquisition_plan_path.write_text(acquisition_plan.model_dump_json(indent=2), encoding="utf-8")
+    authorization_path = tmp_path / "authorization.json"
+    authorization_path.write_text(
+        frontline_eval.RoutingDataPilotAuthorization(
+            schema_version="2",
+            manifest_set_fingerprint=_routing_data_manifest_set_fingerprint(manifest_items),
+            acquisition_plan_fingerprint=frontline_eval._routing_data_acquisition_plan_fingerprint(
+                acquisition_plan
+            ),
+            reviewer_id="data-steward",
+            reviewed_at=datetime.now(tz=UTC),
+            coverage_rationale="Reviewed independent cluster coverage.",
+            legal_basis_rationale="Reviewed declared training and retention authorities.",
+            steward_control_reference="steward-control:pilot-1",
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "readiness.json"
+    args = ["--semantic-routing-data-audit"]
+    for path, _ in manifest_items:
+        args.extend(["--semantic-routing-data-partition", str(path)])
+    args.extend(
+        [
+            "--semantic-routing-acquisition-plan",
+            str(acquisition_plan_path),
+            "--semantic-routing-data-authorization",
+            str(authorization_path),
+            "--semantic-routing-data-report",
+            str(report_path),
+        ]
+    )
+
+    assert frontline_eval.main(args) == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["disposition"] == "classifier_pilot_authorized"
+    assert report["blockers"] == []
+    assert report["acquisition_plan"]["status"] == "authorized"
+
+
+def test_cli_without_acquired_routing_data_reports_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "readiness.json"
+
+    assert (
+        frontline_eval.main(
+            [
+                "--semantic-routing-data-audit",
+                "--semantic-routing-data-report",
+                str(report_path),
+            ]
+        )
+        == 1
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["disposition"] == "insufficient_evidence"
+    assert report["blockers"] == [
+        "acquisition_plan_missing",
+        "missing_partition:acceptance",
+        "missing_partition:calibration",
+        "missing_partition:ood",
+        "missing_partition:training",
+        "pilot_authorization_missing",
+    ]
 
 
 def test_cli_rejects_semantic_gate_without_semantic_eval() -> None:
     with pytest.raises(SystemExit):
         frontline_eval.main(["--semantic-routing-gate", "shadow"])
+
+
+def test_cli_rejects_routing_data_options_without_data_audit(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        frontline_eval.main(["--semantic-routing-data-report", str(tmp_path / "readiness.json")])
+    with pytest.raises(SystemExit):
+        frontline_eval.main(["--semantic-routing-acquisition-plan", str(tmp_path / "plan.json")])
 
 
 def test_cli_rejects_unbounded_semantic_run_modes() -> None:
@@ -1386,14 +2580,6 @@ def test_cli_rejects_unbounded_semantic_run_modes() -> None:
         frontline_eval.main(
             [
                 "--semantic-routing-eval",
-                "--semantic-routing-repetitions",
-                "0",
-            ]
-        )
-    with pytest.raises(SystemExit):
-        frontline_eval.main(
-            [
-                "--semantic-routing-eval",
                 "--semantic-routing-diagnostic-timeout-seconds",
                 "3.0",
             ]
@@ -1407,11 +2593,11 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
 ) -> None:
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     one_repetition_outputs = (
-        *(_proposal_payload_for_expected(case.context, case.expected) for case in corpus.cases),
         _proposal_payload_for_expected(
             corpus.projected_case.expected_context,
             corpus.projected_case.expected,
         ),
+        *(_proposal_payload_for_expected(case.context, case.expected) for case in corpus.cases),
     )
     route_outputs = one_repetition_outputs * 3
     routing_model = FakeChatModel(structured_args={"RouteProposal": route_outputs})
@@ -1434,6 +2620,15 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     report_path = tmp_path / "semantic-routing.json"
     monkeypatch.setattr(frontline_eval, "_load_routing_eval_selection", lambda: selection)
     monkeypatch.setattr(frontline_eval, "_load_semantic_route_corpus", lambda: corpus)
+    verdict_calls = 0
+    series_verdict = frontline_eval._semantic_series_verdict
+
+    def count_verdict(*args: object, **kwargs: object) -> object:
+        nonlocal verdict_calls
+        verdict_calls += 1
+        return series_verdict(*args, **kwargs)
+
+    monkeypatch.setattr(frontline_eval, "_semantic_series_verdict", count_verdict)
 
     assert await frontline_eval._run_semantic_route_eval(report_path) == 0
 
@@ -1441,6 +2636,7 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     report = json.loads(report_text)
     assert routing_model.invoke_count == (len(corpus.cases) + 1) * 3
     assert response_model.invoke_count == (len(corpus.cases) + 1) * 3
+    assert verdict_calls == 1
     assert routing_model.structured_methods == ("json_schema",)
     assert response_model.structured_methods[-1] == TEST_STRUCTURED_OUTPUT_METHOD
     assert report["projection"] == {
@@ -1454,9 +2650,74 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     }
     assert report["models"]["candidate"]["model"] == config.llm.routing.model
     assert report["models"]["incumbent"]["model"] == config.llm.response.model
+    assert "cases" not in report["models"]["candidate"]
+    assert [case["case_id"] for case in report["runs"][0]["models"]["candidate"]["cases"]] == [
+        corpus.projected_case.case_id,
+        *(case.case_id for case in corpus.cases),
+    ]
     assert report["repetitions"] == 3
     assert len(report["runs"]) == 3
     assert corpus.projected_case.turn.text not in report_text
+
+
+async def test_semantic_route_diagnostic_projection_drift_is_invalid_without_provider_calls(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
+    routing_model = FakeChatModel()
+    response_model = FakeChatModel()
+    reasoning_model = FakeChatModel()
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+
+    def reasoning_for(selection: ProviderModel) -> FakeChatModel:
+        assert selection == config.llm.reasoning
+        return reasoning_model
+
+    selection = SimpleNamespace(
+        config=config,
+        gateway=SimpleNamespace(chat_model=reasoning_for),
+        response_model=response_model,
+        response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        routing_model=routing_model,
+        routing_structured_output_method="json_schema",
+    )
+    report_path = tmp_path / "semantic-routing-invalid.json"
+    monkeypatch.setattr(frontline_eval, "_load_routing_eval_selection", lambda: selection)
+    monkeypatch.setattr(frontline_eval, "_load_semantic_route_corpus", lambda: corpus)
+    monkeypatch.setattr(
+        frontline_eval,
+        "project_routing_context",
+        lambda *_args, **_kwargs: RoutingFailure(reason="context_invalid"),
+    )
+
+    assert (
+        await frontline_eval._run_semantic_route_eval(
+            report_path,
+            "diagnostic",
+            diagnostic_timeout_seconds=3.0,
+        )
+        == 1
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert routing_model.invoke_count == 0
+    assert response_model.invoke_count == 0
+    assert report["gate"] == {
+        "mode": "diagnostic",
+        "passed": None,
+        "failures": [],
+    }
+    assert report["invalid_run"] == {
+        "reason": "projection_mismatch",
+        "expected_repetitions": 1,
+        "observed_repetitions": 0,
+        "expected_cases_per_model_per_repetition": len(corpus.cases) + 1,
+        "observed_cases_per_model": 0,
+    }
+    assert report["models"] == {}
+    assert report["runs"] == []
 
 
 def test_order_target_corpus_covers_each_spoken_and_conflict_class(config_root: Path) -> None:

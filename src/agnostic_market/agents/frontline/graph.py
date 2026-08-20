@@ -171,6 +171,43 @@ class FrontlineGraphAssembly:
     capability_registry: CapabilityRegistry
 
 
+def _build_frontline_capability_registry() -> CapabilityRegistry:
+    support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
+    identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
+    cart_entry = CapabilityEntry(_CART_CAPABILITY_ENTRY_NODE)
+    cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
+    identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
+    catalog_entry = CapabilityEntry(CATALOG_ENTRY_NODE)
+    answer_entry = CapabilityEntry(ANSWER_RESPONSE_NODE)
+    order_status_entry = CapabilityEntry(ORDER_STATUS_ENTRY_NODE)
+    return CapabilityRegistry(
+        (
+            CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
+            CapabilitySpec(CapabilityId.CANCEL_ORDERS, CancelOrders, support_entry),
+            CapabilitySpec(CapabilityId.REFUND_ORDER, RefundOrder, support_entry),
+            CapabilitySpec(CapabilityId.RETURN_ORDER, ReturnOrder, support_entry),
+            CapabilitySpec(CapabilityId.CHANGE_PROFILE, ChangeProfile, support_entry),
+            CapabilitySpec(CapabilityId.VIEW_CART, ViewCart, cart_view_entry),
+            CapabilitySpec(
+                CapabilityId.VIEW_IDENTITY_STATUS,
+                ViewIdentityStatus,
+                identity_status_entry,
+            ),
+            CapabilitySpec(CapabilityId.VERIFY_IDENTITY, VerifyIdentity, identity_entry),
+            CapabilitySpec(CapabilityId.SWITCH_ACCOUNT, SwitchAccount, identity_entry),
+            CapabilitySpec(CapabilityId.MODIFY_CART, ModifyCart, cart_entry),
+            CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
+            CapabilitySpec(CapabilityId.SEARCH_CATALOG, SearchCatalog, catalog_entry),
+            CapabilitySpec(CapabilityId.ANSWER_QUESTION, AnswerQuestion, answer_entry),
+            CapabilitySpec(
+                CapabilityId.VERIFY_ORDER_STATUS,
+                VerifyOrderStatus,
+                order_status_entry,
+            ),
+        )
+    )
+
+
 # Graph topology is the source of truth for model-authored speech provenance. These nodes invoke
 # a model for typed proposals or transactional decisions but never own caller prose, so none may
 # be caller-speakable (asserted at compile).
@@ -1099,44 +1136,7 @@ def build_frontline_graph(
         identity_store=identity_store,
         customers=customers,
     )
-    support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
-    identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
-    cart_entry = CapabilityEntry(_CART_CAPABILITY_ENTRY_NODE)
-    cart_view_entry = CapabilityEntry(_CART_VIEW_RENDER_NODE)
-    identity_status_entry = CapabilityEntry(_IDENTITY_STATUS_RENDER_NODE)
-    catalog_entry = CapabilityEntry(CATALOG_ENTRY_NODE)
-    answer_entry = CapabilityEntry(ANSWER_RESPONSE_NODE)
-    order_status_entry = CapabilityEntry(ORDER_STATUS_ENTRY_NODE)
-    capability_registry = CapabilityRegistry(
-        (
-            CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
-            CapabilitySpec(CapabilityId.CANCEL_ORDERS, CancelOrders, support_entry),
-            CapabilitySpec(CapabilityId.REFUND_ORDER, RefundOrder, support_entry),
-            CapabilitySpec(CapabilityId.RETURN_ORDER, ReturnOrder, support_entry),
-            CapabilitySpec(
-                CapabilityId.CHANGE_PROFILE,
-                ChangeProfile,
-                support_entry,
-            ),
-            CapabilitySpec(CapabilityId.VIEW_CART, ViewCart, cart_view_entry),
-            CapabilitySpec(
-                CapabilityId.VIEW_IDENTITY_STATUS,
-                ViewIdentityStatus,
-                identity_status_entry,
-            ),
-            CapabilitySpec(CapabilityId.VERIFY_IDENTITY, VerifyIdentity, identity_entry),
-            CapabilitySpec(CapabilityId.SWITCH_ACCOUNT, SwitchAccount, identity_entry),
-            CapabilitySpec(CapabilityId.MODIFY_CART, ModifyCart, cart_entry),
-            CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
-            CapabilitySpec(CapabilityId.SEARCH_CATALOG, SearchCatalog, catalog_entry),
-            CapabilitySpec(CapabilityId.ANSWER_QUESTION, AnswerQuestion, answer_entry),
-            CapabilitySpec(
-                CapabilityId.VERIFY_ORDER_STATUS,
-                VerifyOrderStatus,
-                order_status_entry,
-            ),
-        )
-    )
+    capability_registry = _build_frontline_capability_registry()
 
     def capability_dispatch(state: ReasoningState) -> Command:
         """Route the active request to its owning node. Nothing else.

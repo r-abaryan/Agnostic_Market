@@ -4,6 +4,8 @@ Run: uv run python scripts/frontline_eval.py
 Structural gate only: uv run python scripts/frontline_eval.py --preflight-only
 Order-target semantic corpus: uv run python scripts/frontline_eval.py --order-target-eval
 Typed semantic-router corpus: uv run python scripts/frontline_eval.py --semantic-routing-eval
+Production legacy-route diagnostic:
+uv run python scripts/frontline_eval.py --legacy-routing-diagnostic
 Offline 6E gate: uv run python scripts/frontline_eval.py --recovery-certification offline
 Live retry gate: uv run python scripts/frontline_eval.py --recovery-certification live
 The routing eval needs the merchant model credentials; the live recovery tier needs every
@@ -53,7 +55,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langgraph.graph.state import CompiledStateGraph
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.capabilities import CapabilityRegistry
@@ -64,6 +66,7 @@ from agnostic_market.agents.frontline import (
     NON_SPEAKING_MODEL_NODES,
     build_frontline_graph,
 )
+from agnostic_market.agents.frontline.graph import _build_frontline_capability_registry
 from agnostic_market.agents.frontline.prompt import ORDER_TARGET_PROPOSAL_PROMPT
 from agnostic_market.agents.frontline.read_flow import (
     ANSWER_CLARIFY_NODE,
@@ -72,12 +75,16 @@ from agnostic_market.agents.frontline.read_flow import (
     CATALOG_RESPONSE_NODE,
     ORDER_STATUS_TARGET_PROPOSE_NODE,
 )
+from agnostic_market.agents.gate import gate_check
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.routing import (
+    CONTEXT_PROJECTOR_VERSION,
+    ROUTE_SCHEMA_FINGERPRINT,
     ProviderCallOutcome,
     RoutingAttempt,
     SemanticRouter,
     project_routing_context,
+    registry_fingerprint,
     resolve_route,
 )
 from agnostic_market.agents.tooling import wrap_readonly_tool
@@ -105,7 +112,7 @@ from agnostic_market.commerce.verification import (
     VerificationStore,
     load_verification_fixture,
 )
-from agnostic_market.config.loader import load_yaml_layer
+from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.config import MerchantConfig, ProviderModel
 from agnostic_market.dtos.events import (
@@ -119,11 +126,13 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AnswerQuestion,
+    CapabilityId,
     ChangeProfile,
     FocusedOrderSet,
     IntentRequest,
     ListOrders,
     ModifyCart,
+    OrderContextOperation,
     OrderTargetProposal,
     RecentOrderSet,
     RouteDecision,
@@ -169,8 +178,16 @@ _ORDER_TARGET_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_order_targets.yaml"
 _ORDER_TARGET_EVAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_semantic_routes.yaml"
 _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "3"
-_SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = "4"
+_SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
+_LEGACY_ROUTE_REPORT_SCHEMA_VERSION = "2"
+_LEGACY_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "legacy_routing_diagnostic.json"
+_LEGACY_ROUTE_COMPATIBILITY_SCHEMA_VERSION = "1"
+_ROUTING_DATA_MANIFEST_SCHEMA_VERSION = "1"
+_ROUTING_DATA_ACQUISITION_PLAN_SCHEMA_VERSION = "1"
+_ROUTING_DATA_AUTHORIZATION_SCHEMA_VERSION = "2"
+_ROUTING_DATA_REPORT_SCHEMA_VERSION = "2"
+_ROUTING_DATA_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_data_readiness.json"
 _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS = 3
 _SEMANTIC_ROUTE_MIN_ACCEPTANCE_EXACT_RATE = 0.95
 _SEMANTIC_ROUTE_P50_QUANTILE = 0.50
@@ -374,6 +391,579 @@ class SemanticRouteEvalCorpus(BaseModel):
         return self
 
 
+RoutingDataPartition = Literal["training", "calibration", "acceptance", "ood"]
+RoutingDataSourceKind = Literal["fixture", "public", "synthetic", "real_caller"]
+RoutingDataContextOrigin = Literal["authored_counterfactual", "projected_fixture"]
+RoutingDataAvailabilityOrigin = Literal["registry_cohort", "rejection_counterfactual"]
+RoutingDataProtectedFamily = Literal[
+    "ambiguous",
+    "compound",
+    "negated",
+    "quoted",
+    "hypothetical",
+    "corrective",
+    "adversarial_instruction",
+]
+
+
+class RoutingDataProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_kind: RoutingDataSourceKind
+    source_reference: str
+    lineage_review_reference: str
+    training_use_authority: Literal["license", "compliance_approval"]
+    training_use_reference: str
+    access_control_reference: str
+    deletion_policy_reference: str
+    retention_authority_reference: str
+    storage_scope: Literal["repository_sanitized", "external_restricted"]
+    sanitized: bool
+    legacy_diagnostic_lineage: bool = False
+
+    @model_validator(mode="after")
+    def authority_is_complete_and_coherent(self) -> RoutingDataProvenance:
+        references = (
+            self.source_reference,
+            self.lineage_review_reference,
+            self.training_use_reference,
+            self.access_control_reference,
+            self.deletion_policy_reference,
+            self.retention_authority_reference,
+        )
+        if any(not value.strip() or value != value.strip() for value in references):
+            raise ValueError("routing-data provenance references must be normalized and non-empty")
+        if not self.sanitized:
+            raise ValueError("routing-data input must complete sanitization before eligibility")
+        if self.source_kind == "public" and self.training_use_authority != "license":
+            raise ValueError("public routing data requires licence-backed training authority")
+        if self.source_kind == "real_caller":
+            if self.training_use_authority != "compliance_approval":
+                raise ValueError("real-caller data requires compliance-approved training use")
+            if self.storage_scope != "external_restricted":
+                raise ValueError("real-caller data must remain in external restricted storage")
+        return self
+
+
+class RoutingDataCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    example_id: str
+    source_id: str
+    source_cluster_id: str
+    provenance: RoutingDataProvenance
+    locale: str
+    generator_version: str | None = None
+    annotation_policy_version: str
+    context: RoutingContext
+    expected: RouteDecision
+    risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
+    scenario_class: SemanticRouteScenarioClass
+    context_origin: RoutingDataContextOrigin
+    availability_origin: RoutingDataAvailabilityOrigin
+    context_evidence_reference: str | None = None
+    protected_families: tuple[RoutingDataProtectedFamily, ...] = ()
+    review_status: Literal["approved", "adjudicated"]
+    reviewer_id: str
+    second_reviewer_id: str | None = None
+    adjudicator_id: str | None = None
+    adjudication_reference: str | None = None
+
+    @model_validator(mode="after")
+    def annotation_is_complete_and_executable(self) -> RoutingDataCase:
+        identifiers = (
+            self.example_id,
+            self.source_id,
+            self.source_cluster_id,
+            self.locale,
+            self.annotation_policy_version,
+            self.reviewer_id,
+        )
+        if any(not value.strip() or value != value.strip() for value in identifiers):
+            raise ValueError("routing-data identifiers must be normalized and non-empty")
+        if self.generator_version is not None and (
+            not self.generator_version.strip()
+            or self.generator_version != self.generator_version.strip()
+        ):
+            raise ValueError("routing-data generator version must be normalized and non-empty")
+        if len(set(self.protected_families)) != len(self.protected_families):
+            raise ValueError("routing-data protected-family labels must be unique")
+        if self.context_origin == "projected_fixture":
+            if (
+                self.context_evidence_reference is None
+                or not self.context_evidence_reference.strip()
+            ):
+                raise ValueError("projected fixture context requires an evidence reference")
+        elif self.context_evidence_reference is not None:
+            raise ValueError("authored counterfactual cannot claim projected-fixture evidence")
+        if self.protected_families:
+            if (
+                self.second_reviewer_id is None
+                or not self.second_reviewer_id.strip()
+                or self.second_reviewer_id == self.reviewer_id
+            ):
+                raise ValueError("protected routing data requires an independent second reviewer")
+        elif self.second_reviewer_id is not None:
+            raise ValueError("unprotected routing data must not claim a second-review contract")
+        if self.review_status == "adjudicated":
+            if (
+                self.adjudicator_id is None
+                or not self.adjudicator_id.strip()
+                or self.adjudicator_id in {self.reviewer_id, self.second_reviewer_id}
+                or self.adjudication_reference is None
+                or not self.adjudication_reference.strip()
+            ):
+                raise ValueError(
+                    "adjudicated routing data requires an independent adjudicator and record"
+                )
+        elif self.adjudicator_id is not None or self.adjudication_reference is not None:
+            raise ValueError("approved routing data must not carry adjudication fields")
+        if isinstance(resolve_route(self.context, self.expected), RoutingFailure):
+            raise ValueError("routing-data ground truth must be executable in its context")
+        return self
+
+
+class RoutingDataPartitionManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: str
+    partition: RoutingDataPartition
+    route_schema_fingerprint: str
+    registry_fingerprint: str
+    context_projector_version: str
+    available_capabilities: tuple[CapabilityId, ...]
+    label_access: Literal["builder_visible", "steward_only"]
+    steward_id: str | None = None
+    cases: tuple[RoutingDataCase, ...]
+
+    @model_validator(mode="after")
+    def partition_contract_is_coherent(self) -> RoutingDataPartitionManifest:
+        if self.schema_version != _ROUTING_DATA_MANIFEST_SCHEMA_VERSION:
+            raise ValueError("unsupported routing-data manifest schema version")
+        fingerprints = (
+            self.route_schema_fingerprint,
+            self.registry_fingerprint,
+            self.context_projector_version,
+        )
+        if any(not value.strip() or value != value.strip() for value in fingerprints):
+            raise ValueError("routing-data contract identities must be normalized and non-empty")
+        if not self.available_capabilities or len(set(self.available_capabilities)) != len(
+            self.available_capabilities
+        ):
+            raise ValueError("routing-data manifest requires unique available capabilities")
+        if not self.cases:
+            raise ValueError("routing-data partition must contain at least one case")
+        ids = [case.example_id for case in self.cases]
+        if len(ids) != len(set(ids)):
+            raise ValueError("routing-data example ids must be unique within a partition")
+        sealed = self.partition in {"acceptance", "ood"}
+        if sealed:
+            if self.label_access != "steward_only":
+                raise ValueError("acceptance and OOD labels must remain steward-only")
+            if self.steward_id is None or not self.steward_id.strip():
+                raise ValueError("acceptance and OOD partitions require a steward")
+        elif self.label_access != "builder_visible" or self.steward_id is not None:
+            raise ValueError("training and calibration partitions are builder-visible")
+        for case in self.cases:
+            if case.provenance.legacy_diagnostic_lineage:
+                raise ValueError("legacy semantic diagnostic lineage is ineligible")
+            if case.provenance.source_kind == "synthetic":
+                if self.partition != "training" or case.generator_version is None:
+                    raise ValueError(
+                        "synthetic routing data is training-only and requires a generator version"
+                    )
+            elif case.generator_version is not None:
+                raise ValueError("non-synthetic routing data must not carry a generator version")
+            if case.availability_origin == "registry_cohort":
+                if case.context.available_capabilities != self.available_capabilities:
+                    raise ValueError(
+                        "registry-cohort context must use the manifest capability set exactly"
+                    )
+            elif (
+                self.partition != "ood"
+                or case.context_origin != "authored_counterfactual"
+                or case.expected != RouteDecision.clarify("unsupported_capability")
+            ):
+                raise ValueError(
+                    "availability rejection counterfactuals are OOD unsupported-capability cases"
+                )
+        return self
+
+
+RoutingDataReviewerRole = Literal["primary", "secondary", "adjudicator"]
+
+
+class RoutingDataSourcePlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str
+    source_kind: RoutingDataSourceKind
+    source_reference: str
+    training_use_authority: Literal["license", "compliance_approval"]
+    training_use_reference: str
+    access_control_reference: str
+    deletion_policy_reference: str
+    retention_authority_reference: str
+    sanitization_control_reference: str
+    storage_scope: Literal["repository_sanitized", "external_restricted"]
+    locales: tuple[str, ...]
+    max_examples: int = Field(ge=1)
+    estimated_cost_minor_units: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def source_is_lawful_and_bounded(self) -> RoutingDataSourcePlan:
+        text = (
+            self.source_id,
+            self.source_reference,
+            self.training_use_reference,
+            self.access_control_reference,
+            self.deletion_policy_reference,
+            self.retention_authority_reference,
+            self.sanitization_control_reference,
+            *self.locales,
+        )
+        if any(not value.strip() or value != value.strip() for value in text):
+            raise ValueError("routing-data source-plan fields must be normalized and non-empty")
+        if not self.locales or len(set(self.locales)) != len(self.locales):
+            raise ValueError("routing-data source plan requires unique locales")
+        if self.source_kind == "public" and self.training_use_authority != "license":
+            raise ValueError("public routing-data source plan requires licence authority")
+        if self.source_kind == "real_caller" and (
+            self.training_use_authority != "compliance_approval"
+            or self.storage_scope != "external_restricted"
+        ):
+            raise ValueError(
+                "real-caller source plan requires compliance approval and restricted storage"
+            )
+        return self
+
+
+class RoutingDataReviewerCapacity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reviewer_id: str
+    role: RoutingDataReviewerRole
+    review_capacity: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def reviewer_is_named(self) -> RoutingDataReviewerCapacity:
+        if not self.reviewer_id.strip() or self.reviewer_id != self.reviewer_id.strip():
+            raise ValueError("routing-data reviewer id must be normalized and non-empty")
+        return self
+
+
+class RoutingDataStopBudget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_examples: int = Field(ge=1)
+    max_cost_minor_units: int = Field(ge=0)
+    currency: str
+    max_calendar_days: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def currency_is_closed_for_one_plan(self) -> RoutingDataStopBudget:
+        if len(self.currency) != 3 or not self.currency.isascii() or not self.currency.isupper():
+            raise ValueError("routing-data stop-budget currency must be an ISO-style code")
+        return self
+
+
+class RoutingDataCoverageSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str
+    planned_examples: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def source_is_named(self) -> RoutingDataCoverageSource:
+        if not self.source_id.strip() or self.source_id != self.source_id.strip():
+            raise ValueError("routing-data coverage source id must be normalized and non-empty")
+        return self
+
+
+class RoutingDataCoverageCell(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    cell_id: str
+    partition: RoutingDataPartition
+    expected: RouteDecision
+    risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
+    scenario_class: SemanticRouteScenarioClass
+    locale: str
+    source_allocations: tuple[RoutingDataCoverageSource, ...] = Field(min_length=1)
+    context_origin: RoutingDataContextOrigin
+    availability_origin: RoutingDataAvailabilityOrigin
+    bound_customer: bool
+    active_capability: CapabilityId | None = None
+    recent_order_operation: OrderContextOperation | None = None
+    recent_order_count: int = Field(default=0, ge=0)
+    cart_state: Literal["empty", "nonempty"]
+    available_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
+    protected_families: tuple[RoutingDataProtectedFamily, ...] = ()
+    planned_examples: int = Field(ge=1)
+    min_independent_clusters: int = Field(ge=1)
+    primary_reviewer_id: str
+    secondary_reviewer_id: str | None = None
+
+    @model_validator(mode="after")
+    def coverage_cell_is_executable_and_reviewable(self) -> RoutingDataCoverageCell:
+        text = (self.cell_id, self.locale, self.primary_reviewer_id)
+        if any(not value.strip() or value != value.strip() for value in text):
+            raise ValueError("routing-data coverage-cell ids must be normalized and non-empty")
+        source_ids = [allocation.source_id for allocation in self.source_allocations]
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("coverage-cell source allocations must be unique")
+        if sum(allocation.planned_examples for allocation in self.source_allocations) != (
+            self.planned_examples
+        ):
+            raise ValueError("coverage-cell source allocations must equal planned examples")
+        if self.min_independent_clusters > len(self.source_allocations):
+            raise ValueError(
+                "independent-cluster requirement cannot exceed planned source allocations"
+            )
+        if len(set(self.available_capabilities)) != len(self.available_capabilities):
+            raise ValueError("coverage-cell capabilities must be unique")
+        if len(set(self.protected_families)) != len(self.protected_families):
+            raise ValueError("coverage-cell protected families must be unique")
+        if self.protected_families:
+            if (
+                self.risk_class != "critical"
+                or self.secondary_reviewer_id is None
+                or not self.secondary_reviewer_id.strip()
+                or self.secondary_reviewer_id == self.primary_reviewer_id
+            ):
+                raise ValueError(
+                    "protected coverage requires critical risk and an independent second reviewer"
+                )
+        elif self.secondary_reviewer_id is not None:
+            raise ValueError("unprotected coverage must not reserve a second reviewer")
+        context = RoutingContext(
+            utterance=self.cell_id,
+            bound_customer=self.bound_customer,
+            active_capability=self.active_capability,
+            recent_order_operation=self.recent_order_operation,
+            recent_order_count=self.recent_order_count,
+            cart_state=self.cart_state,
+            available_capabilities=self.available_capabilities,
+        )
+        if isinstance(resolve_route(context, self.expected), RoutingFailure):
+            raise ValueError("coverage-cell expected route must be executable in its context")
+        if self.availability_origin == "rejection_counterfactual" and (
+            self.partition != "ood"
+            or self.context_origin != "authored_counterfactual"
+            or self.expected != RouteDecision.clarify("unsupported_capability")
+        ):
+            raise ValueError(
+                "availability rejection coverage must be an authored OOD no-action cell"
+            )
+        return self
+
+
+class RoutingDataAcquisitionPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: str
+    route_schema_fingerprint: str
+    registry_fingerprint: str
+    context_projector_version: str
+    available_capabilities: tuple[CapabilityId, ...]
+    activation_risk_domains: tuple[SemanticRouteRiskDomain, ...]
+    activation_locales: tuple[str, ...]
+    required_decisions: tuple[Literal["clarify", "direct", "continue"], ...]
+    required_protected_families: tuple[RoutingDataProtectedFamily, ...] = ()
+    coverage_rationale: str
+    annotation_pilot_reference: str
+    annotation_guide_version: str
+    approved_by: str
+    approved_at: datetime
+    steward_control_reference: str
+    adjudication_owner_id: str
+    adjudication_reserve: int = Field(ge=0)
+    sources: tuple[RoutingDataSourcePlan, ...]
+    reviewer_capacity: tuple[RoutingDataReviewerCapacity, ...]
+    stop_budget: RoutingDataStopBudget
+    coverage_cells: tuple[RoutingDataCoverageCell, ...]
+
+    @model_validator(mode="after")
+    def acquisition_is_complete_and_within_capacity(self) -> RoutingDataAcquisitionPlan:
+        if self.schema_version != _ROUTING_DATA_ACQUISITION_PLAN_SCHEMA_VERSION:
+            raise ValueError("unsupported routing-data acquisition-plan schema version")
+        text = (
+            self.route_schema_fingerprint,
+            self.registry_fingerprint,
+            self.context_projector_version,
+            self.coverage_rationale,
+            self.annotation_pilot_reference,
+            self.annotation_guide_version,
+            self.approved_by,
+            self.steward_control_reference,
+            self.adjudication_owner_id,
+            *self.activation_locales,
+        )
+        if any(not value.strip() or value != value.strip() for value in text):
+            raise ValueError(
+                "routing-data acquisition-plan fields must be normalized and non-empty"
+            )
+        if self.approved_at.tzinfo is None:
+            raise ValueError("routing-data acquisition-plan timestamp must be timezone-aware")
+        unique_fields = (
+            (self.available_capabilities, "capabilities"),
+            (self.activation_risk_domains, "risk domains"),
+            (self.activation_locales, "locales"),
+            (self.required_decisions, "decisions"),
+            (self.required_protected_families, "protected families"),
+        )
+        if any(not values or len(set(values)) != len(values) for values, _ in unique_fields[:4]):
+            raise ValueError("routing-data acquisition-plan activation dimensions must be unique")
+        if len(set(self.required_protected_families)) != len(self.required_protected_families):
+            raise ValueError("required protected families must be unique")
+        if not self.sources or not self.reviewer_capacity or not self.coverage_cells:
+            raise ValueError("routing-data acquisition plan requires sources, reviewers, and cells")
+        source_by_id = {source.source_id: source for source in self.sources}
+        reviewer_by_id = {reviewer.reviewer_id: reviewer for reviewer in self.reviewer_capacity}
+        if len(source_by_id) != len(self.sources):
+            raise ValueError("routing-data acquisition source ids must be unique")
+        if len(reviewer_by_id) != len(self.reviewer_capacity):
+            raise ValueError("routing-data reviewer ids must be unique across roles")
+        if len({cell.cell_id for cell in self.coverage_cells}) != len(self.coverage_cells):
+            raise ValueError("routing-data coverage-cell ids must be unique")
+        coverage_contracts = [
+            json.dumps(
+                cell.model_dump(
+                    mode="json",
+                    exclude={
+                        "cell_id",
+                        "planned_examples",
+                        "min_independent_clusters",
+                        "primary_reviewer_id",
+                        "secondary_reviewer_id",
+                    },
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for cell in self.coverage_cells
+        ]
+        if len(set(coverage_contracts)) != len(coverage_contracts):
+            raise ValueError("routing-data coverage obligations must not overlap exactly")
+        adjudicator = reviewer_by_id.get(self.adjudication_owner_id)
+        if adjudicator is None or adjudicator.role != "adjudicator":
+            raise ValueError("adjudication owner must have adjudicator capacity")
+        if adjudicator.review_capacity < self.adjudication_reserve:
+            raise ValueError("adjudication reserve exceeds owner capacity")
+
+        planned_by_source: dict[str, int] = {}
+        assigned_reviews: dict[str, int] = {}
+        for cell in self.coverage_cells:
+            for allocation in cell.source_allocations:
+                source = source_by_id.get(allocation.source_id)
+                if source is None or cell.locale not in source.locales:
+                    raise ValueError("coverage cell must use a declared source and locale")
+                if cell.context_origin == "projected_fixture" and source.source_kind != "fixture":
+                    raise ValueError("projected-fixture coverage requires a fixture source")
+                planned_by_source[allocation.source_id] = (
+                    planned_by_source.get(allocation.source_id, 0) + allocation.planned_examples
+                )
+            if (
+                cell.availability_origin == "registry_cohort"
+                and cell.available_capabilities != self.available_capabilities
+            ):
+                raise ValueError("registry-cohort cell must use the activation capability set")
+            if cell.risk_domain not in self.activation_risk_domains:
+                raise ValueError("coverage cell risk domain is outside the activation cohort")
+            if cell.locale not in self.activation_locales:
+                raise ValueError("coverage cell locale is outside the activation cohort")
+            primary = reviewer_by_id.get(cell.primary_reviewer_id)
+            if primary is None or primary.role != "primary":
+                raise ValueError("coverage cell primary reviewer lacks primary capacity")
+            assigned_reviews[cell.primary_reviewer_id] = (
+                assigned_reviews.get(cell.primary_reviewer_id, 0) + cell.planned_examples
+            )
+            if cell.secondary_reviewer_id is not None:
+                secondary = reviewer_by_id.get(cell.secondary_reviewer_id)
+                if secondary is None or secondary.role != "secondary":
+                    raise ValueError("protected coverage reviewer lacks secondary capacity")
+                assigned_reviews[cell.secondary_reviewer_id] = (
+                    assigned_reviews.get(cell.secondary_reviewer_id, 0) + cell.planned_examples
+                )
+        for reviewer_id, assigned in assigned_reviews.items():
+            if assigned > reviewer_by_id[reviewer_id].review_capacity:
+                raise ValueError("planned review load exceeds named reviewer capacity")
+        for source_id, planned in planned_by_source.items():
+            if planned > source_by_id[source_id].max_examples:
+                raise ValueError("planned examples exceed source ceiling")
+        if set(planned_by_source) != set(source_by_id):
+            raise ValueError("every planned source must own at least one coverage cell")
+
+        planned_examples = sum(cell.planned_examples for cell in self.coverage_cells)
+        if planned_examples > self.stop_budget.max_examples:
+            raise ValueError("planned examples exceed the stop budget")
+        planned_cost = sum(source.estimated_cost_minor_units for source in self.sources)
+        if planned_cost > self.stop_budget.max_cost_minor_units:
+            raise ValueError("planned source cost exceeds the stop budget")
+
+        partitions = set(get_args(RoutingDataPartition))
+        for partition in partitions:
+            for domain in self.activation_risk_domains:
+                for locale in self.activation_locales:
+                    if not any(
+                        cell.partition == partition
+                        and cell.risk_domain == domain
+                        and cell.locale == locale
+                        for cell in self.coverage_cells
+                    ):
+                        raise ValueError(
+                            "every partition must cover each activation risk-domain/locale pair"
+                        )
+        for partition in ("training", "calibration", "acceptance"):
+            for decision in self.required_decisions:
+                if not any(
+                    cell.partition == partition and cell.expected.decision == decision
+                    for cell in self.coverage_cells
+                ):
+                    raise ValueError("required decisions must cover fitting and evaluation sets")
+        for partition in ("acceptance", "ood"):
+            for family in self.required_protected_families:
+                if not any(
+                    cell.partition == partition and family in cell.protected_families
+                    for cell in self.coverage_cells
+                ):
+                    raise ValueError("protected families must cover acceptance and OOD")
+        return self
+
+
+class RoutingDataPilotAuthorization(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str
+    manifest_set_fingerprint: str
+    acquisition_plan_fingerprint: str
+    reviewer_id: str
+    reviewed_at: datetime
+    coverage_rationale: str
+    legal_basis_rationale: str
+    steward_control_reference: str
+
+    @model_validator(mode="after")
+    def authorization_is_reviewable(self) -> RoutingDataPilotAuthorization:
+        if self.schema_version != _ROUTING_DATA_AUTHORIZATION_SCHEMA_VERSION:
+            raise ValueError("unsupported routing-data authorization schema version")
+        text = (
+            self.manifest_set_fingerprint,
+            self.acquisition_plan_fingerprint,
+            self.reviewer_id,
+            self.coverage_rationale,
+            self.legal_basis_rationale,
+            self.steward_control_reference,
+        )
+        if any(not value.strip() or value != value.strip() for value in text):
+            raise ValueError("routing-data authorization fields must be normalized and non-empty")
+        if self.reviewed_at.tzinfo is None:
+            raise ValueError("routing-data authorization timestamp must be timezone-aware")
+        return self
+
+
 @dataclass(frozen=True)
 class _RoutingEvalSelection:
     config: MerchantConfig
@@ -495,6 +1085,73 @@ class SemanticRouteCaseResult:
         return _semantic_route_disposition(self.expected, self.attempt.resolution)
 
 
+LegacyRouteDisposition = Literal[
+    "owner_compatible",
+    "conservative_no_action",
+    "missed_owner",
+    "wrong_owner",
+    "protected_read_owner_entry",
+    "account_control_owner_entry",
+    "reversible_write_owner_entry",
+    "hitl_guarded_write_owner_entry",
+    "protected_state_changed",
+]
+LegacyOwnerSurface = Literal[
+    "none",
+    "unprotected",
+    "protected_read",
+    "account_control",
+    "reversible_write",
+    "hitl_guarded_write",
+]
+LegacyStateDelta = Literal[
+    "cart",
+    "placement",
+    "cancel",
+    "refund",
+    "return",
+    "profile",
+    "otp",
+    "verification",
+    "identity",
+]
+
+
+@dataclass(frozen=True)
+class LegacyRouteObservation:
+    capability_candidates: tuple[CapabilityId, ...]
+    tool_names: tuple[str, ...]
+    active_flow: str | None
+    handover_destination: str | None
+    handover_reason: str | None
+    handover_source: str | None
+    non_tool_ai_text_without_owner: bool
+    state_deltas: tuple[LegacyStateDelta, ...]
+
+    @property
+    def owner_surface(self) -> LegacyOwnerSurface:
+        return _legacy_owner_surface(self.capability_candidates)
+
+
+@dataclass(frozen=True)
+class LegacyRouteCaseResult:
+    case_id: str
+    scenario_class: str
+    risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
+    evaluation_split: SemanticRouteEvaluationSplit
+    expected: RouteDecision
+    observation: LegacyRouteObservation | None
+    exclusion_reason: str | None
+
+    @property
+    def disposition(self) -> LegacyRouteDisposition | Literal["excluded"]:
+        if self.exclusion_reason is not None:
+            return "excluded"
+        assert self.observation is not None
+        return _legacy_route_disposition(self.expected, self.observation)
+
+
 @dataclass(frozen=True)
 class ProjectedSemanticRouteCaseResult:
     case_id: str
@@ -508,6 +1165,17 @@ class ProjectedSemanticRouteCaseResult:
     @property
     def passed(self) -> bool:
         return self.actual_context == self.expected_context
+
+
+@dataclass(frozen=True)
+class _SemanticSeriesVerdict:
+    gate: SemanticRouteGate
+    run_failures: tuple[tuple[str, ...], ...]
+    failures: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool | None:
+        return None if self.gate == "diagnostic" else not self.failures
 
 
 def _audible_observation(event: TurnEvent) -> AudibleObservation:
@@ -955,6 +1623,525 @@ async def _run_semantic_route_cases(
     return tuple(results)
 
 
+_LEGACY_HANDOVER_TOOL_NAME = "request_handover"
+_LEGACY_READ_TOOL_CAPABILITIES = {
+    "order_status": (CapabilityId.VERIFY_ORDER_STATUS,),
+    "list_orders": (CapabilityId.LIST_ORDERS,),
+    "catalog_search": (CapabilityId.SEARCH_CATALOG,),
+    "view_cart": (CapabilityId.VIEW_CART,),
+}
+_LEGACY_FLOW_TOOL_CAPABILITIES = {
+    "propose_refund": (CapabilityId.REFUND_ORDER,),
+    "propose_cancel": (CapabilityId.CANCEL_ORDERS,),
+    "propose_return": (CapabilityId.RETURN_ORDER,),
+    "propose_profile_change": (CapabilityId.CHANGE_PROFILE,),
+    "add_to_cart": (CapabilityId.MODIFY_CART,),
+    "remove_from_cart": (CapabilityId.MODIFY_CART,),
+    "set_quantity": (CapabilityId.MODIFY_CART,),
+    "review_cart": (CapabilityId.VIEW_CART,),
+    "buy_now": (CapabilityId.MODIFY_CART, CapabilityId.PLACE_ORDER),
+    "go_to_checkout": (CapabilityId.PLACE_ORDER,),
+    "propose_identity": (CapabilityId.VERIFY_IDENTITY, CapabilityId.SWITCH_ACCOUNT),
+}
+_LEGACY_HANDOVER_CAPABILITIES = {
+    "address_change": (CapabilityId.CHANGE_PROFILE,),
+    "contact_change": (CapabilityId.CHANGE_PROFILE,),
+    "cancel_order": (CapabilityId.CANCEL_ORDERS,),
+    "refund": (CapabilityId.REFUND_ORDER, CapabilityId.RETURN_ORDER),
+    "cart_write": (CapabilityId.MODIFY_CART, CapabilityId.PLACE_ORDER),
+    "list_orders": (CapabilityId.LIST_ORDERS,),
+    "verification_required": (CapabilityId.VERIFY_IDENTITY,),
+    "switch_account": (CapabilityId.SWITCH_ACCOUNT,),
+}
+_LEGACY_FLOW_CAPABILITIES = {
+    "support": (
+        CapabilityId.CANCEL_ORDERS,
+        CapabilityId.REFUND_ORDER,
+        CapabilityId.RETURN_ORDER,
+        CapabilityId.CHANGE_PROFILE,
+    ),
+    "cart": (CapabilityId.MODIFY_CART, CapabilityId.PLACE_ORDER),
+    "identity": (
+        CapabilityId.VERIFY_IDENTITY,
+        CapabilityId.SWITCH_ACCOUNT,
+        CapabilityId.LIST_ORDERS,
+    ),
+}
+_LEGACY_ROUTE_REPLAY_CONTRACT = (
+    "fresh unbound session, empty cart, no active invocation or recent orders"
+)
+_LEGACY_CAPABILITY_SURFACES: dict[CapabilityId, LegacyOwnerSurface] = {
+    CapabilityId.LIST_ORDERS: "protected_read",
+    CapabilityId.VERIFY_ORDER_STATUS: "protected_read",
+    CapabilityId.VIEW_IDENTITY_STATUS: "protected_read",
+    CapabilityId.VERIFY_IDENTITY: "account_control",
+    CapabilityId.SWITCH_ACCOUNT: "account_control",
+    CapabilityId.CANCEL_ORDERS: "hitl_guarded_write",
+    CapabilityId.REFUND_ORDER: "hitl_guarded_write",
+    CapabilityId.RETURN_ORDER: "hitl_guarded_write",
+    CapabilityId.CHANGE_PROFILE: "hitl_guarded_write",
+    CapabilityId.PLACE_ORDER: "hitl_guarded_write",
+    CapabilityId.MODIFY_CART: "reversible_write",
+}
+_LEGACY_OWNER_SURFACE_PRIORITY: dict[LegacyOwnerSurface, int] = {
+    "none": 0,
+    "unprotected": 1,
+    "protected_read": 2,
+    "account_control": 3,
+    "hitl_guarded_write": 4,
+    "reversible_write": 5,
+}
+_LEGACY_SURFACE_DISPOSITIONS: dict[
+    LegacyOwnerSurface,
+    LegacyRouteDisposition,
+] = {
+    "protected_read": "protected_read_owner_entry",
+    "account_control": "account_control_owner_entry",
+    "reversible_write": "reversible_write_owner_entry",
+    "hitl_guarded_write": "hitl_guarded_write_owner_entry",
+}
+
+
+def _ordered_capabilities(
+    groups: Sequence[Sequence[CapabilityId]],
+) -> tuple[CapabilityId, ...]:
+    return tuple(dict.fromkeys(capability for group in groups for capability in group))
+
+
+def _legacy_owner_surface(
+    capabilities: Sequence[CapabilityId],
+) -> LegacyOwnerSurface:
+    if not capabilities:
+        return "none"
+    surfaces = {
+        _LEGACY_CAPABILITY_SURFACES.get(capability, "unprotected") for capability in capabilities
+    }
+    return max(surfaces, key=_LEGACY_OWNER_SURFACE_PRIORITY.__getitem__)
+
+
+def _legacy_state_deltas(
+    before: CommerceObservation,
+    after: CommerceObservation,
+    *,
+    cart_changed: bool,
+) -> tuple[LegacyStateDelta, ...]:
+    deltas: list[LegacyStateDelta] = []
+    if cart_changed:
+        deltas.append("cart")
+    if after.placed != before.placed:
+        deltas.append("placement")
+    if after.cancelled != before.cancelled:
+        deltas.append("cancel")
+    if after.refunded != before.refunded:
+        deltas.append("refund")
+    if after.returned != before.returned:
+        deltas.append("return")
+    if after.profile_changes != before.profile_changes:
+        deltas.append("profile")
+    if after.otp_dispatches != before.otp_dispatches:
+        deltas.append("otp")
+    if after.verification_level != before.verification_level:
+        deltas.append("verification")
+    if after.identity_bound != before.identity_bound:
+        deltas.append("identity")
+    return tuple(deltas)
+
+
+def _legacy_replay_exclusion(
+    case: SemanticRouteEvalCase,
+    registry: CapabilityRegistry,
+) -> str | None:
+    reasons: list[str] = []
+    context = case.context
+    if context.available_capabilities != registry.capability_ids:
+        reasons.append("available_capabilities differs from production registry")
+    if context.bound_customer:
+        reasons.append("bound identity requires fixture-specific authority state")
+    if context.active_capability is not None:
+        reasons.append("active capability lacks a replayable typed invocation")
+    if context.recent_order_operation is not None or context.recent_order_count:
+        reasons.append("recent-order context requires fixture-specific authorized references")
+    if context.cart_state != "empty":
+        reasons.append("nonempty cart requires fixture-specific cart lines")
+    return "; ".join(reasons) or None
+
+
+def _legacy_route_disposition(
+    expected: RouteDecision,
+    observation: LegacyRouteObservation,
+) -> LegacyRouteDisposition:
+    candidates = frozenset(observation.capability_candidates)
+    unexpected_protected_disposition = _LEGACY_SURFACE_DISPOSITIONS.get(observation.owner_surface)
+    if expected.decision == "clarify":
+        if observation.state_deltas:
+            return "protected_state_changed"
+        if unexpected_protected_disposition is not None:
+            return unexpected_protected_disposition
+        return "conservative_no_action" if not candidates else "wrong_owner"
+
+    request = expected.request
+    if request is None:
+        return "missed_owner"
+    if isinstance(request, AnswerQuestion):
+        if (
+            observation.non_tool_ai_text_without_owner
+            and not candidates
+            and not observation.state_deltas
+        ):
+            return "owner_compatible"
+        if observation.state_deltas:
+            return "protected_state_changed"
+        if unexpected_protected_disposition is not None:
+            return unexpected_protected_disposition
+        return "wrong_owner" if candidates else "missed_owner"
+    if request.kind in candidates:
+        return "owner_compatible"
+    if observation.state_deltas:
+        return "protected_state_changed"
+    if unexpected_protected_disposition is not None:
+        return unexpected_protected_disposition
+    return "wrong_owner" if candidates else "missed_owner"
+
+
+async def _observe_legacy_route(
+    runtime: EvalRuntime,
+    utterance: str,
+) -> LegacyRouteObservation:
+    config = {"configurable": {"thread_id": runtime.engine.thread_id}}
+    turn_id = uuid.uuid4().hex
+    cart_before = runtime.cart_store.view()
+    before = _commerce_observation(
+        runtime.store,
+        runtime.profile_store,
+        runtime.otp,
+        runtime.verification,
+        runtime.identity_store,
+    )
+    out = await runtime.graph.ainvoke(
+        {
+            "messages": [HumanMessage(content=utterance, id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+        },
+        config,
+    )
+    after = _commerce_observation(
+        runtime.store,
+        runtime.profile_store,
+        runtime.otp,
+        runtime.verification,
+        runtime.identity_store,
+    )
+    tool_calls = tuple(
+        call
+        for message in out.get("messages", ())
+        if isinstance(message, AIMessage)
+        for call in message.tool_calls
+    )
+    tool_names = tuple(str(call["name"]) for call in tool_calls)
+    groups: list[Sequence[CapabilityId]] = []
+    for tool_name in tool_names:
+        groups.extend(
+            mapping[tool_name]
+            for mapping in (_LEGACY_READ_TOOL_CAPABILITIES, _LEGACY_FLOW_TOOL_CAPABILITIES)
+            if tool_name in mapping
+        )
+
+    handover = out.get("handover")
+    handover_destination = getattr(handover, "destination", None)
+    handover_reason = getattr(handover, "reason_code", None)
+    handover_source = getattr(handover, "source", None)
+    for call in tool_calls:
+        if call["name"] != _LEGACY_HANDOVER_TOOL_NAME:
+            continue
+        args = call.get("args", {})
+        if isinstance(args, dict):
+            handover_destination = str(args.get("destination") or "") or handover_destination
+            handover_reason = str(args.get("reason_code") or "") or handover_reason
+            handover_source = "model"
+    active_flow = out.get("active_flow")
+    if not groups and handover_reason in _LEGACY_HANDOVER_CAPABILITIES:
+        groups.append(_LEGACY_HANDOVER_CAPABILITIES[handover_reason])
+    if not groups and active_flow in _LEGACY_FLOW_CAPABILITIES:
+        groups.append(_LEGACY_FLOW_CAPABILITIES[active_flow])
+
+    gate_hit = gate_check(utterance)
+    if not groups and gate_hit is not None and (active_flow is not None or handover is not None):
+        gate_reason, gate_destination = gate_hit
+        handover_reason = gate_reason
+        handover_destination = gate_destination
+        handover_source = "gate"
+        groups.append(_LEGACY_HANDOVER_CAPABILITIES.get(gate_reason, ()))
+
+    candidates = _ordered_capabilities(groups)
+    non_tool_ai_text_without_owner = not candidates and any(
+        isinstance(message, AIMessage)
+        and not message.tool_calls
+        and bool(str(message.content).strip())
+        for message in out.get("messages", ())
+    )
+    cart_after = runtime.cart_store.view()
+    return LegacyRouteObservation(
+        capability_candidates=candidates,
+        tool_names=tool_names,
+        active_flow=active_flow,
+        handover_destination=handover_destination,
+        handover_reason=handover_reason,
+        handover_source=handover_source,
+        non_tool_ai_text_without_owner=non_tool_ai_text_without_owner,
+        state_deltas=_legacy_state_deltas(
+            before,
+            after,
+            cart_changed=cart_after != cart_before,
+        ),
+    )
+
+
+def _legacy_route_group(
+    results: Sequence[LegacyRouteCaseResult],
+) -> dict[str, object]:
+    observations = [result.observation for result in results if result.observation is not None]
+    return {
+        "cases": len(results),
+        "replayed": sum(result.exclusion_reason is None for result in results),
+        "excluded": sum(result.exclusion_reason is not None for result in results),
+        "dispositions": {
+            disposition: sum(result.disposition == disposition for result in results)
+            for disposition in (*get_args(LegacyRouteDisposition), "excluded")
+        },
+        "owner_surfaces": {
+            surface: sum(observation.owner_surface == surface for observation in observations)
+            for surface in get_args(LegacyOwnerSurface)
+        },
+        "state_deltas": {
+            delta: sum(delta in observation.state_deltas for observation in observations)
+            for delta in get_args(LegacyStateDelta)
+        },
+    }
+
+
+def _legacy_route_report(
+    results: Sequence[LegacyRouteCaseResult],
+    *,
+    corpus: SemanticRouteEvalCorpus,
+    registry: CapabilityRegistry,
+    provider: str,
+    model: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": _LEGACY_ROUTE_REPORT_SCHEMA_VERSION,
+        **_legacy_contract_identities(corpus, registry),
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "mode": "production_legacy_route_diagnostic",
+        "qualification": None,
+        "provider": provider,
+        "model": model,
+        "coverage": {
+            "replay_contract": _LEGACY_ROUTE_REPLAY_CONTRACT,
+            "limitations": [
+                "owner compatibility is not typed-route exactness",
+                "non-tool AI text is neither authorship nor speech evidence",
+                "excluded stateful cases are not inferred from utterance-only replay",
+            ],
+        },
+        "totals": _legacy_route_group(results),
+        "by_risk_domain": {
+            domain: _legacy_route_group(
+                [result for result in results if result.risk_domain == domain]
+            )
+            for domain in dict.fromkeys(result.risk_domain for result in results)
+        },
+        "by_evaluation_split": {
+            split: _legacy_route_group(
+                [result for result in results if result.evaluation_split == split]
+            )
+            for split in dict.fromkeys(result.evaluation_split for result in results)
+        },
+        "cases": [
+            {
+                "case_id": result.case_id,
+                "scenario_class": result.scenario_class,
+                "risk_class": result.risk_class,
+                "risk_domain": result.risk_domain,
+                "evaluation_split": result.evaluation_split,
+                "expected": _route_signature(result.expected),
+                "disposition": result.disposition,
+                "exclusion_reason": result.exclusion_reason,
+                "observation": (
+                    None
+                    if result.observation is None
+                    else {
+                        **asdict(result.observation),
+                        "owner_surface": result.observation.owner_surface,
+                        "capability_candidates": [
+                            capability.value
+                            for capability in result.observation.capability_candidates
+                        ],
+                    }
+                ),
+            }
+            for result in results
+        ],
+    }
+
+
+def _legacy_contract_identities(
+    corpus: SemanticRouteEvalCorpus,
+    registry: CapabilityRegistry,
+) -> dict[str, str]:
+    return {
+        "corpus_schema_version": corpus.schema_version,
+        "corpus_fingerprint": _corpus_fingerprint(corpus),
+        "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
+        "registry_fingerprint": registry_fingerprint(registry),
+        "context_projector_version": CONTEXT_PROJECTOR_VERSION,
+    }
+
+
+def _legacy_case_contract(
+    case: SemanticRouteEvalCase,
+    registry: CapabilityRegistry,
+) -> dict[str, object]:
+    return {
+        "case_id": case.case_id,
+        "scenario_class": case.scenario_class,
+        "risk_class": case.risk_class,
+        "risk_domain": case.risk_domain,
+        "evaluation_split": case.evaluation_split,
+        "expected": _route_signature(case.expected),
+        "exclusion_reason": _legacy_replay_exclusion(case, registry),
+    }
+
+
+def _legacy_compatibility_attestation(
+    source_path: Path,
+    *,
+    corpus: SemanticRouteEvalCorpus,
+    registry: CapabilityRegistry,
+) -> dict[str, object]:
+    source_bytes = source_path.read_bytes()
+    source = json.loads(source_bytes)
+    if not isinstance(source, dict):
+        raise ValueError("legacy compatibility source must be a JSON object")
+    source_cases = source.get("cases")
+    source_contract: list[dict[str, object]] | None = None
+    if isinstance(source_cases, list) and all(isinstance(case, dict) for case in source_cases):
+        contract_fields = tuple(_legacy_case_contract(corpus.cases[0], registry))
+        source_contract = [
+            {field: case.get(field) for field in contract_fields} for case in source_cases
+        ]
+    current_contract = [_legacy_case_contract(case, registry) for case in corpus.cases]
+    coverage = source.get("coverage")
+    checks = {
+        "source_schema_is_v1": source.get("schema_version") == "1",
+        "source_mode_is_legacy_diagnostic": (
+            source.get("mode") == "production_legacy_route_diagnostic"
+        ),
+        "source_is_non_qualifying": source.get("qualification") is None,
+        "replay_contract_matches": (
+            isinstance(coverage, dict)
+            and coverage.get("replay_contract") == _LEGACY_ROUTE_REPLAY_CONTRACT
+        ),
+        "case_contract_matches": source_contract == current_contract,
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    compatible = not blockers
+    identities: dict[str, object] = {
+        "corpus_relationship": (
+            "compatible_current_corpus" if compatible else "incompatible_current_corpus"
+        ),
+        "corpus_schema_version": corpus.schema_version,
+        "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
+        "registry_fingerprint": registry_fingerprint(registry),
+        "context_projector_version": CONTEXT_PROJECTOR_VERSION,
+    }
+    if compatible:
+        identities["corpus_fingerprint"] = _corpus_fingerprint(corpus)
+    return {
+        "schema_version": _LEGACY_ROUTE_COMPATIBILITY_SCHEMA_VERSION,
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "mode": "legacy_route_compatibility_attestation",
+        "status": "compatible_current_corpus" if compatible else "incompatible",
+        "source_artifact_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_report_schema_version": source.get("schema_version"),
+        "current_contract": identities,
+        "checks": checks,
+        "blockers": blockers,
+    }
+
+
+def _default_legacy_compatibility_report_path(source_path: Path) -> Path:
+    return source_path.with_name(f"{source_path.stem}.compatibility.json")
+
+
+def _run_legacy_compatibility_attestation(
+    source_path: Path,
+    report_path: Path,
+) -> int:
+    report = _legacy_compatibility_attestation(
+        source_path,
+        corpus=_load_semantic_route_corpus(),
+        registry=_build_frontline_capability_registry(),
+    )
+    _write_json_report(report_path, report)
+    print(f"[legacy_routes] compatibility: {report['status']}; sanitized report: {report_path}")
+    return 0 if report["status"] == "compatible_current_corpus" else 1
+
+
+async def _run_legacy_route_diagnostic(report_path: Path) -> int:
+    selection = _load_routing_eval_selection()
+    corpus = _load_semantic_route_corpus()
+    registry = _build_frontline_capability_registry()
+    results: list[LegacyRouteCaseResult] = []
+    telemetry._TELEMETRY_PATH = telemetry._TELEMETRY_PATH.with_name(
+        "frontline_legacy_diagnostic.jsonl"
+    )
+    for case in corpus.cases:
+        exclusion_reason = _legacy_replay_exclusion(case, registry)
+        observation = None
+        if exclusion_reason is None:
+            runtime = _build_eval_runtime(
+                selection.config,
+                selection.response_model,
+                selection.gateway.chat_model(selection.config.llm.reasoning),
+                thread_id=f"legacy-route:{case.case_id}:{uuid.uuid4().hex}",
+                structured_output_method=selection.response_structured_output_method,
+            )
+            observation = await _observe_legacy_route(runtime, case.context.utterance)
+        results.append(
+            LegacyRouteCaseResult(
+                case_id=case.case_id,
+                scenario_class=case.scenario_class,
+                risk_class=case.risk_class,
+                risk_domain=case.risk_domain,
+                evaluation_split=case.evaluation_split,
+                expected=case.expected,
+                observation=observation,
+                exclusion_reason=exclusion_reason,
+            )
+        )
+
+    report = _legacy_route_report(
+        results,
+        corpus=corpus,
+        registry=registry,
+        provider=selection.config.llm.response.provider,
+        model=selection.config.llm.response.model,
+    )
+    await asyncio.to_thread(_write_json_report, report_path, report)
+    totals = report["totals"]
+    assert isinstance(totals, dict)
+    print(
+        f"[legacy_routes] replayed {totals['replayed']}/{totals['cases']}; "
+        f"excluded {totals['excluded']}"
+    )
+    for result in results:
+        if result.disposition not in {"owner_compatible", "conservative_no_action", "excluded"}:
+            print(f"    {result.case_id}: {result.disposition}")
+    print(f"    sanitized report: {report_path}")
+    print("\nPRODUCTION LEGACY ROUTING DIAGNOSTIC COMPLETED. [NO QUALIFICATION]")
+    return 0
+
+
 _ROUTE_SIGNATURE_DISCRIMINATORS = frozenset(
     {
         "answer_topic",
@@ -1101,14 +2288,10 @@ def _group_semantic_route_results(
 def _semantic_model_report(
     results: Sequence[SemanticRouteCaseResult],
     *,
-    repetitions: Sequence[int] | None = None,
+    repetition: int | None,
 ) -> dict[str, object]:
     if not results:
         raise ValueError("semantic-route model report requires at least one result")
-    if repetitions is None:
-        repetitions = (1,) * len(results)
-    if len(repetitions) != len(results):
-        raise ValueError("semantic-route repetitions must align with results")
     first = results[0].attempt
     expected_identity = (
         first.provider,
@@ -1136,7 +2319,7 @@ def _semantic_model_report(
         )
         if identity != expected_identity:
             raise ValueError("semantic-route model report cannot pool mixed run identities")
-    return {
+    report: dict[str, object] = {
         "provider": first.provider,
         "model": first.model,
         "structured_output_method": first.structured_output_method,
@@ -1151,7 +2334,9 @@ def _semantic_model_report(
         "by_scenario_class": _group_semantic_route_results(results, "scenario_class"),
         "by_risk_class": _group_semantic_route_results(results, "risk_class"),
         "by_risk_domain": _group_semantic_route_results(results, "risk_domain"),
-        "cases": [
+    }
+    if repetition is not None:
+        report["cases"] = [
             {
                 "repetition": repetition,
                 "case_id": result.case_id,
@@ -1164,23 +2349,466 @@ def _semantic_model_report(
                 "actual": _route_signature(result.attempt.resolution),
                 "latency_ms": result.attempt.elapsed_ms,
                 "provider_call_outcome": result.attempt.provider_call_outcome,
-                "timeout_seconds": result.attempt.timeout_seconds,
                 "input_tokens": result.attempt.input_tokens,
                 "cache_read_tokens": result.attempt.cache_read_tokens,
                 "output_tokens": result.attempt.output_tokens,
             }
-            for repetition, result in zip(repetitions, results, strict=True)
-        ],
-    }
+            for result in results
+        ]
+    return report
+
+
+def _json_fingerprint(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _corpus_fingerprint(corpus: SemanticRouteEvalCorpus) -> str:
-    encoded = json.dumps(
-        corpus.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _json_fingerprint(corpus.model_dump(mode="json"))
+
+
+def _routing_data_contract() -> dict[str, object]:
+    registry = _build_frontline_capability_registry()
+    return {
+        "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
+        "registry_fingerprint": registry_fingerprint(registry),
+        "context_projector_version": CONTEXT_PROJECTOR_VERSION,
+        "available_capabilities": [capability.value for capability in registry.capability_ids],
+    }
+
+
+def _load_routing_data_manifests(
+    paths: Sequence[Path],
+) -> tuple[tuple[Path, RoutingDataPartitionManifest], ...]:
+    resolved = [path.resolve() for path in paths]
+    if len(resolved) != len(set(resolved)):
+        raise ValueError("routing-data partition paths must be unique")
+    return tuple(
+        (path, RoutingDataPartitionManifest.model_validate(load_yaml_layer(path)))
+        for path in resolved
+    )
+
+
+def _load_routing_data_authorization(path: Path) -> RoutingDataPilotAuthorization:
+    return RoutingDataPilotAuthorization.model_validate(load_yaml_layer(path))
+
+
+def _load_routing_data_acquisition_plan(path: Path) -> RoutingDataAcquisitionPlan:
+    return RoutingDataAcquisitionPlan.model_validate(load_yaml_layer(path))
+
+
+def _routing_data_manifest_set_fingerprint(
+    manifests: Sequence[tuple[Path, RoutingDataPartitionManifest]],
+) -> str:
+    return _json_fingerprint(
+        [
+            manifest.model_dump(mode="json")
+            for _, manifest in sorted(manifests, key=lambda item: item[1].partition)
+        ]
+    )
+
+
+def _routing_data_acquisition_plan_fingerprint(plan: RoutingDataAcquisitionPlan) -> str:
+    return _json_fingerprint(plan.model_dump(mode="json"))
+
+
+def _routing_data_case_matches_cell(
+    case: RoutingDataCase,
+    cell: RoutingDataCoverageCell,
+) -> bool:
+    context = case.context
+    return (
+        _route_signature(case.expected) == _route_signature(cell.expected)
+        and case.risk_class == cell.risk_class
+        and case.risk_domain == cell.risk_domain
+        and case.scenario_class == cell.scenario_class
+        and case.locale == cell.locale
+        and case.source_id in {allocation.source_id for allocation in cell.source_allocations}
+        and case.context_origin == cell.context_origin
+        and case.availability_origin == cell.availability_origin
+        and context.bound_customer == cell.bound_customer
+        and context.active_capability == cell.active_capability
+        and context.recent_order_operation == cell.recent_order_operation
+        and context.recent_order_count == cell.recent_order_count
+        and context.cart_state == cell.cart_state
+        and context.available_capabilities == cell.available_capabilities
+        and set(cell.protected_families).issubset(case.protected_families)
+        and case.reviewer_id == cell.primary_reviewer_id
+        and case.second_reviewer_id == cell.secondary_reviewer_id
+    )
+
+
+def _routing_data_acquisition_blockers(
+    plan: RoutingDataAcquisitionPlan,
+    by_partition: dict[str, RoutingDataPartitionManifest],
+) -> list[str]:
+    blockers: list[str] = []
+    source_by_id = {source.source_id: source for source in plan.sources}
+    reviewer_by_id = {reviewer.reviewer_id: reviewer for reviewer in plan.reviewer_capacity}
+    matched_examples: set[str] = set()
+    matched_cells: dict[str, set[str]] = {}
+    source_examples: dict[str, int] = {}
+    reviewer_examples: dict[str, int] = {}
+    adjudicated_examples = 0
+
+    for partition, manifest in by_partition.items():
+        for case in manifest.cases:
+            source = source_by_id.get(case.source_id)
+            if source is None:
+                blockers.append(f"unplanned_source:{case.source_id}")
+                continue
+            provenance = case.provenance
+            source_contract = (
+                provenance.source_kind == source.source_kind
+                and provenance.source_reference == source.source_reference
+                and provenance.training_use_authority == source.training_use_authority
+                and provenance.training_use_reference == source.training_use_reference
+                and provenance.access_control_reference == source.access_control_reference
+                and provenance.deletion_policy_reference == source.deletion_policy_reference
+                and provenance.retention_authority_reference == source.retention_authority_reference
+                and provenance.storage_scope == source.storage_scope
+                and case.locale in source.locales
+            )
+            if not source_contract:
+                blockers.append(f"source_contract_mismatch:{case.source_id}")
+            source_examples[case.source_id] = source_examples.get(case.source_id, 0) + 1
+            reviewer_examples[case.reviewer_id] = reviewer_examples.get(case.reviewer_id, 0) + 1
+            if case.second_reviewer_id is not None:
+                reviewer_examples[case.second_reviewer_id] = (
+                    reviewer_examples.get(case.second_reviewer_id, 0) + 1
+                )
+            if case.review_status == "adjudicated" and (
+                case.adjudicator_id != plan.adjudication_owner_id
+            ):
+                blockers.append(f"adjudication_owner_mismatch:{case.example_id}")
+            if case.review_status == "adjudicated":
+                adjudicated_examples += 1
+
+        cells = [cell for cell in plan.coverage_cells if cell.partition == partition]
+        for cell in cells:
+            matching = [
+                case for case in manifest.cases if _routing_data_case_matches_cell(case, cell)
+            ]
+            if len(matching) < cell.planned_examples:
+                blockers.append(f"coverage_examples_unmet:{cell.cell_id}")
+            clusters = {case.source_cluster_id for case in matching}
+            if len(clusters) < cell.min_independent_clusters:
+                blockers.append(f"coverage_clusters_unmet:{cell.cell_id}")
+            for allocation in cell.source_allocations:
+                source_matches = [
+                    case for case in matching if case.source_id == allocation.source_id
+                ]
+                if len(source_matches) < allocation.planned_examples:
+                    blockers.append(
+                        f"coverage_source_examples_unmet:{cell.cell_id}:{allocation.source_id}"
+                    )
+            for case in matching:
+                matched_cells.setdefault(case.example_id, set()).add(cell.cell_id)
+            matched_examples.update(case.example_id for case in matching)
+
+    for source_id, count in source_examples.items():
+        source = source_by_id.get(source_id)
+        if source is not None and count > source.max_examples:
+            blockers.append(f"source_ceiling_exceeded:{source_id}")
+    for reviewer_id, count in reviewer_examples.items():
+        reviewer = reviewer_by_id.get(reviewer_id)
+        if reviewer is None:
+            blockers.append(f"unplanned_reviewer:{reviewer_id}")
+        elif count > reviewer.review_capacity:
+            blockers.append(f"reviewer_capacity_exceeded:{reviewer_id}")
+    if adjudicated_examples > plan.adjudication_reserve:
+        blockers.append("adjudication_reserve_exceeded")
+    for example_id, cells in matched_cells.items():
+        if len(cells) > 1:
+            blockers.append(f"overlapping_coverage_cells:{example_id}")
+    all_cases = [case for manifest in by_partition.values() for case in manifest.cases]
+    if len(all_cases) > plan.stop_budget.max_examples:
+        blockers.append("acquired_examples_exceed_stop_budget")
+    for case in all_cases:
+        if case.example_id not in matched_examples:
+            blockers.append(f"unplanned_example:{case.example_id}")
+    return blockers
+
+
+def _routing_data_acquisition_summary(plan: RoutingDataAcquisitionPlan) -> dict[str, object]:
+    return {
+        "status": "authorized",
+        "artifact_fingerprint": _routing_data_acquisition_plan_fingerprint(plan),
+        "approved_by": plan.approved_by,
+        "approved_at": plan.approved_at.isoformat(),
+        "annotation_guide_version": plan.annotation_guide_version,
+        "coverage_cells": len(plan.coverage_cells),
+        "planned_examples": sum(cell.planned_examples for cell in plan.coverage_cells),
+        "required_independent_clusters": sum(
+            cell.min_independent_clusters for cell in plan.coverage_cells
+        ),
+        "protected_second_reviews": sum(
+            cell.planned_examples for cell in plan.coverage_cells if cell.protected_families
+        ),
+        "adjudication_reserve": plan.adjudication_reserve,
+        "planned_source_cost_minor_units": sum(
+            source.estimated_cost_minor_units for source in plan.sources
+        ),
+        "stop_budget": plan.stop_budget.model_dump(mode="json"),
+    }
+
+
+def _routing_data_partition_summary(
+    manifest: RoutingDataPartitionManifest,
+) -> dict[str, object]:
+    cases = manifest.cases
+    summary: dict[str, object] = {
+        "artifact_fingerprint": _json_fingerprint(manifest.model_dump(mode="json")),
+        "examples": len(cases),
+        "independent_clusters": len({case.source_cluster_id for case in cases}),
+        "independent_sources": len({case.source_id for case in cases}),
+        "locales": sorted({case.locale for case in cases}),
+        "source_kinds": sorted({case.provenance.source_kind for case in cases}),
+        "training_use_authorities": sorted(
+            {case.provenance.training_use_authority for case in cases}
+        ),
+        "context_origins": sorted({case.context_origin for case in cases}),
+        "availability_origins": sorted({case.availability_origin for case in cases}),
+        "context_coverage": {
+            "bound_customer": sorted({case.context.bound_customer for case in cases}),
+            "active_capability": sorted(
+                {
+                    (
+                        case.context.active_capability.value
+                        if case.context.active_capability is not None
+                        else "none"
+                    )
+                    for case in cases
+                }
+            ),
+            "recent_order_operation": sorted(
+                {case.context.recent_order_operation or "none" for case in cases}
+            ),
+            "recent_order_count": sorted({case.context.recent_order_count for case in cases}),
+            "cart_state": sorted({case.context.cart_state for case in cases}),
+        },
+    }
+    if manifest.label_access == "builder_visible":
+        signatures = {
+            json.dumps(_route_signature(case.expected), sort_keys=True, separators=(",", ":"))
+            for case in cases
+        }
+        summary.update(
+            {
+                "route_shapes": [json.loads(signature) for signature in sorted(signatures)],
+                "risk_classes": sorted({case.risk_class for case in cases}),
+                "risk_domains": sorted({case.risk_domain for case in cases}),
+                "scenario_classes": sorted({case.scenario_class for case in cases}),
+                "protected_families": sorted(
+                    {family for case in cases for family in case.protected_families}
+                ),
+            }
+        )
+    return summary
+
+
+def _routing_data_readiness_report(
+    manifests: Sequence[tuple[Path, RoutingDataPartitionManifest]],
+    *,
+    acquisition_plan: RoutingDataAcquisitionPlan | None = None,
+    acquisition_plan_path: Path | None = None,
+    authorization: RoutingDataPilotAuthorization | None = None,
+    authorization_path: Path | None = None,
+) -> dict[str, object]:
+    contract = _routing_data_contract()
+    expected_capabilities = tuple(
+        CapabilityId(value) for value in contract["available_capabilities"]
+    )
+    required_partitions = set(get_args(RoutingDataPartition))
+    by_partition: dict[str, RoutingDataPartitionManifest] = {}
+    blockers: list[str] = []
+    example_partitions: dict[str, str] = {}
+    source_clusters: dict[str, str] = {}
+    cluster_partitions: dict[str, str] = {}
+    project_root = _CONFIG_ROOT.parent.resolve()
+    acquisition_plan_fingerprint: str | None = None
+    acquisition_plan_valid = acquisition_plan is not None
+
+    if acquisition_plan is None:
+        blockers.append("acquisition_plan_missing")
+    else:
+        acquisition_plan_fingerprint = _routing_data_acquisition_plan_fingerprint(acquisition_plan)
+        if acquisition_plan_path is None or acquisition_plan_path.resolve().is_relative_to(
+            project_root
+        ):
+            blockers.append("acquisition_plan_not_path_isolated")
+            acquisition_plan_valid = False
+        if acquisition_plan.route_schema_fingerprint != contract["route_schema_fingerprint"]:
+            blockers.append("acquisition_plan_route_schema_mismatch")
+            acquisition_plan_valid = False
+        if acquisition_plan.registry_fingerprint != contract["registry_fingerprint"]:
+            blockers.append("acquisition_plan_registry_mismatch")
+            acquisition_plan_valid = False
+        if acquisition_plan.context_projector_version != contract["context_projector_version"]:
+            blockers.append("acquisition_plan_projector_mismatch")
+            acquisition_plan_valid = False
+        if acquisition_plan.available_capabilities != expected_capabilities:
+            blockers.append("acquisition_plan_capability_cohort_mismatch")
+            acquisition_plan_valid = False
+
+    for path, manifest in manifests:
+        if manifest.partition in by_partition:
+            blockers.append(f"duplicate_partition:{manifest.partition}")
+            continue
+        by_partition[manifest.partition] = manifest
+        if manifest.route_schema_fingerprint != contract["route_schema_fingerprint"]:
+            blockers.append(f"route_schema_mismatch:{manifest.partition}")
+        if manifest.registry_fingerprint != contract["registry_fingerprint"]:
+            blockers.append(f"registry_mismatch:{manifest.partition}")
+        if manifest.context_projector_version != contract["context_projector_version"]:
+            blockers.append(f"context_projector_mismatch:{manifest.partition}")
+        if manifest.available_capabilities != expected_capabilities:
+            blockers.append(f"capability_cohort_mismatch:{manifest.partition}")
+        if path.is_relative_to(project_root) and any(
+            case.provenance.storage_scope == "external_restricted" for case in manifest.cases
+        ):
+            blockers.append(f"restricted_data_inside_repository:{manifest.partition}")
+        if manifest.partition in {"acceptance", "ood"} and path.is_relative_to(project_root):
+            blockers.append(f"sealed_labels_inside_repository:{manifest.partition}")
+        for case in manifest.cases:
+            prior_partition = example_partitions.setdefault(case.example_id, manifest.partition)
+            if prior_partition != manifest.partition:
+                blockers.append(f"example_partition_leak:{case.example_id}")
+            prior_cluster = source_clusters.setdefault(
+                case.source_id,
+                case.source_cluster_id,
+            )
+            if prior_cluster != case.source_cluster_id:
+                blockers.append(f"source_cluster_conflict:{case.source_id}")
+            cluster_partition = cluster_partitions.setdefault(
+                case.source_cluster_id,
+                manifest.partition,
+            )
+            if cluster_partition != manifest.partition:
+                blockers.append(f"cluster_partition_leak:{case.source_cluster_id}")
+
+    for partition in sorted(required_partitions - set(by_partition)):
+        blockers.append(f"missing_partition:{partition}")
+
+    if acquisition_plan is not None and acquisition_plan_valid:
+        blockers.extend(_routing_data_acquisition_blockers(acquisition_plan, by_partition))
+
+    manifest_set_fingerprint = _routing_data_manifest_set_fingerprint(manifests)
+    if authorization is None:
+        blockers.append("pilot_authorization_missing")
+    else:
+        if authorization.manifest_set_fingerprint != manifest_set_fingerprint:
+            blockers.append("pilot_authorization_manifest_mismatch")
+        if authorization.acquisition_plan_fingerprint != acquisition_plan_fingerprint:
+            blockers.append("pilot_authorization_plan_mismatch")
+        if authorization_path is None or authorization_path.resolve().is_relative_to(project_root):
+            blockers.append("pilot_authorization_not_path_isolated")
+
+    unique_blockers = list(dict.fromkeys(blockers))
+    disposition = "classifier_pilot_authorized" if not unique_blockers else "insufficient_evidence"
+    return {
+        "schema_version": _ROUTING_DATA_REPORT_SCHEMA_VERSION,
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "disposition": disposition,
+        "contract": contract,
+        "manifest_set_fingerprint": manifest_set_fingerprint,
+        "acquisition_plan": (
+            None
+            if acquisition_plan is None
+            else {
+                **_routing_data_acquisition_summary(acquisition_plan),
+                "status": "authorized" if acquisition_plan_valid else "rejected",
+            }
+        ),
+        "partitions": {
+            partition: _routing_data_partition_summary(manifest)
+            for partition, manifest in sorted(by_partition.items())
+        },
+        "blockers": unique_blockers,
+        "authorization": (
+            None
+            if authorization is None
+            else {
+                "reviewer_id": authorization.reviewer_id,
+                "reviewed_at": authorization.reviewed_at.isoformat(),
+            }
+        ),
+    }
+
+
+def _routing_data_invalid_report(reason: str) -> dict[str, object]:
+    return {
+        "schema_version": _ROUTING_DATA_REPORT_SCHEMA_VERSION,
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "disposition": "insufficient_evidence",
+        "contract": _routing_data_contract(),
+        "manifest_set_fingerprint": None,
+        "acquisition_plan": None,
+        "partitions": {},
+        "blockers": [reason],
+        "authorization": None,
+    }
+
+
+def _run_routing_data_audit(
+    manifest_paths: Sequence[Path],
+    *,
+    acquisition_plan_path: Path | None,
+    authorization_path: Path | None,
+    report_path: Path,
+) -> int:
+    if acquisition_plan_path is None:
+        acquisition_plan = None
+    else:
+        try:
+            acquisition_plan = _load_routing_data_acquisition_plan(acquisition_plan_path)
+        except ConfigError:
+            report = _routing_data_invalid_report("acquisition_plan_file_invalid")
+            _write_json_report(report_path, report)
+            print("[routing_data] insufficient_evidence: acquisition_plan_file_invalid")
+            return 1
+        except ValidationError:
+            report = _routing_data_invalid_report("acquisition_plan_schema_invalid")
+            _write_json_report(report_path, report)
+            print("[routing_data] insufficient_evidence: acquisition_plan_schema_invalid")
+            return 1
+    try:
+        manifests = _load_routing_data_manifests(manifest_paths)
+    except ConfigError:
+        report = _routing_data_invalid_report("manifest_file_invalid")
+    except ValidationError:
+        report = _routing_data_invalid_report("manifest_schema_invalid")
+    except ValueError:
+        report = _routing_data_invalid_report("manifest_set_invalid")
+    else:
+        if authorization_path is None:
+            authorization = None
+        else:
+            try:
+                authorization = _load_routing_data_authorization(authorization_path)
+            except ConfigError:
+                report = _routing_data_invalid_report("authorization_file_invalid")
+                _write_json_report(report_path, report)
+                print("[routing_data] insufficient_evidence: authorization_file_invalid")
+                return 1
+            except ValidationError:
+                report = _routing_data_invalid_report("authorization_schema_invalid")
+                _write_json_report(report_path, report)
+                print("[routing_data] insufficient_evidence: authorization_schema_invalid")
+                return 1
+        report = _routing_data_readiness_report(
+            manifests,
+            acquisition_plan=acquisition_plan,
+            acquisition_plan_path=acquisition_plan_path,
+            authorization=authorization,
+            authorization_path=authorization_path,
+        )
+    _write_json_report(report_path, report)
+    print(f"[routing_data] {report['disposition']}")
+    for blocker in report["blockers"]:
+        print(f"    {blocker}")
+    print(f"    sanitized report: {report_path}")
+    return 0 if report["disposition"] == "classifier_pilot_authorized" else 1
 
 
 def _count_disposition(
@@ -1291,37 +2919,43 @@ def _semantic_acceptance_budget(
     }
 
 
-def _semantic_series_gate_failures(
+def _semantic_series_verdict(
     candidate_runs: Sequence[Sequence[SemanticRouteCaseResult]],
     incumbent_runs: Sequence[Sequence[SemanticRouteCaseResult]],
     *,
     projection: ProjectedSemanticRouteCaseResult,
-    gate: Literal["shadow", "cutover"],
-) -> tuple[str, ...]:
+    gate: SemanticRouteGate,
+) -> _SemanticSeriesVerdict:
     if not candidate_runs or len(candidate_runs) != len(incumbent_runs):
         raise ValueError("semantic-route qualification requires paired repetitions")
+    if not projection.passed:
+        raise ValueError("semantic-route projection must pass before provider evaluation")
+    if gate == "diagnostic":
+        return _SemanticSeriesVerdict(
+            gate=gate,
+            run_failures=tuple(() for _ in candidate_runs),
+            failures=(),
+        )
+    run_failures: list[tuple[str, ...]] = []
     failures: list[str] = []
     for repetition, (candidate, incumbent) in enumerate(
         zip(candidate_runs, incumbent_runs, strict=True),
         start=1,
     ):
-        for failure in _semantic_gate_failures(
+        current = _semantic_gate_failures(
             candidate,
             incumbent,
             projection=projection,
             gate=gate,
-        ):
+        )
+        run_failures.append(current)
+        for failure in current:
             failures.append(f"repetition {repetition}: {failure}")
-    pooled_candidate = tuple(result for run in candidate_runs for result in run)
-    pooled_incumbent = tuple(result for run in incumbent_runs for result in run)
-    for failure in _semantic_gate_failures(
-        pooled_candidate,
-        pooled_incumbent,
-        projection=projection,
+    return _SemanticSeriesVerdict(
         gate=gate,
-    ):
-        failures.append(f"pooled: {failure}")
-    return tuple(failures)
+        run_failures=tuple(run_failures),
+        failures=tuple(failures),
+    )
 
 
 def _semantic_route_report(
@@ -1330,8 +2964,9 @@ def _semantic_route_report(
     *,
     corpus: SemanticRouteEvalCorpus,
     projection: ProjectedSemanticRouteCaseResult,
-    gate: SemanticRouteGate,
+    verdict: _SemanticSeriesVerdict,
 ) -> dict[str, object]:
+    gate = verdict.gate
     if not candidate_runs or len(candidate_runs) != len(incumbent_runs):
         raise ValueError("semantic-route report requires paired repetitions")
     if gate == "diagnostic" and len(candidate_runs) != 1:
@@ -1349,34 +2984,15 @@ def _semantic_route_report(
         _assert_semantic_results_are_comparable(first_incumbent, incumbent)
     pooled_candidate = tuple(result for run in candidate_runs for result in run)
     pooled_incumbent = tuple(result for run in incumbent_runs for result in run)
-    candidate_repetitions = tuple(
-        repetition for repetition, run in enumerate(candidate_runs, start=1) for _ in run
-    )
-    incumbent_repetitions = tuple(
-        repetition for repetition, run in enumerate(incumbent_runs, start=1) for _ in run
-    )
-    gate_failures: tuple[str, ...] = ()
-    if gate != "diagnostic":
-        gate_failures = _semantic_series_gate_failures(
-            candidate_runs,
-            incumbent_runs,
-            projection=projection,
-            gate=gate,
-        )
+    if len(verdict.run_failures) != len(candidate_runs):
+        raise ValueError("semantic-route verdict must align with repetitions")
     acceptance = [result for result in first_candidate if result.evaluation_split == "acceptance"]
     run_reports: list[dict[str, object]] = []
     for repetition, (candidate, incumbent) in enumerate(
         zip(candidate_runs, incumbent_runs, strict=True),
         start=1,
     ):
-        run_failures: tuple[str, ...] = ()
-        if gate != "diagnostic":
-            run_failures = _semantic_gate_failures(
-                candidate,
-                incumbent,
-                projection=projection,
-                gate=gate,
-            )
+        run_failures = verdict.run_failures[repetition - 1]
         run_reports.append(
             {
                 "repetition": repetition,
@@ -1388,11 +3004,11 @@ def _semantic_route_report(
                 "models": {
                     "candidate": _semantic_model_report(
                         candidate,
-                        repetitions=(repetition,) * len(candidate),
+                        repetition=repetition,
                     ),
                     "incumbent": _semantic_model_report(
                         incumbent,
-                        repetitions=(repetition,) * len(incumbent),
+                        repetition=repetition,
                     ),
                 },
             }
@@ -1403,7 +3019,7 @@ def _semantic_route_report(
         "run_at": datetime.now(tz=UTC).isoformat(),
         "corpus_fingerprint": _corpus_fingerprint(corpus),
         "repetitions": len(candidate_runs),
-        "acceptance_budget": _semantic_acceptance_budget(acceptance),
+        "acceptance_budget_per_repetition": _semantic_acceptance_budget(acceptance),
         "route_schema_bytes": len(
             json.dumps(RouteProposal.model_json_schema(), separators=(",", ":")).encode("utf-8")
         ),
@@ -1422,24 +3038,72 @@ def _semantic_route_report(
         },
         "gate": {
             "mode": gate,
-            "passed": None if gate == "diagnostic" else not gate_failures,
-            "failures": list(gate_failures),
+            "passed": verdict.passed,
+            "failures": list(verdict.failures),
         },
         "models": {
             "candidate": _semantic_model_report(
                 pooled_candidate,
-                repetitions=candidate_repetitions,
+                repetition=None,
             ),
             "incumbent": _semantic_model_report(
                 pooled_incumbent,
-                repetitions=incumbent_repetitions,
+                repetition=None,
             ),
         },
         "runs": run_reports,
     }
 
 
-def _write_semantic_route_report(path: Path, report: dict[str, object]) -> None:
+def _semantic_invalid_projection_report(
+    corpus: SemanticRouteEvalCorpus,
+    projection: ProjectedSemanticRouteCaseResult,
+    *,
+    gate: SemanticRouteGate,
+    expected_repetitions: int,
+) -> dict[str, object]:
+    acceptance = [case for case in corpus.cases if case.evaluation_split == "acceptance"]
+    return {
+        "schema_version": _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION,
+        "corpus_schema_version": corpus.schema_version,
+        "run_at": datetime.now(tz=UTC).isoformat(),
+        "corpus_fingerprint": _corpus_fingerprint(corpus),
+        "repetitions": 0,
+        "acceptance_budget_per_repetition": _semantic_acceptance_budget(acceptance),
+        "route_schema_bytes": len(
+            json.dumps(RouteProposal.model_json_schema(), separators=(",", ":")).encode("utf-8")
+        ),
+        "projection": {
+            "case_id": projection.case_id,
+            "scenario_class": projection.scenario_class,
+            "risk_class": projection.risk_class,
+            "risk_domain": projection.risk_domain,
+            "evaluation_split": projection.evaluation_split,
+            "exact": False,
+            "actual": (
+                "context"
+                if isinstance(projection.actual_context, RoutingContext)
+                else projection.actual_context.reason
+            ),
+        },
+        "invalid_run": {
+            "reason": "projection_mismatch",
+            "expected_repetitions": expected_repetitions,
+            "observed_repetitions": 0,
+            "expected_cases_per_model_per_repetition": len(corpus.cases) + 1,
+            "observed_cases_per_model": 0,
+        },
+        "gate": {
+            "mode": gate,
+            "passed": None,
+            "failures": [],
+        },
+        "models": {},
+        "runs": [],
+    }
+
+
+def _write_json_report(path: Path, report: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
@@ -1451,14 +3115,12 @@ async def _run_semantic_route_eval(
     report_path: Path,
     gate: SemanticRouteGate = "cutover",
     *,
-    repetitions: int = _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS,
     diagnostic_timeout_seconds: float | None = None,
 ) -> int:
     selection = _load_routing_eval_selection()
     config = selection.config
+    repetitions = 1 if gate == "diagnostic" else _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS
     if gate == "diagnostic":
-        if repetitions != 1:
-            raise ValueError("semantic-route diagnostic requires one repetition")
         if (
             diagnostic_timeout_seconds is None
             or not math.isfinite(diagnostic_timeout_seconds)
@@ -1467,11 +3129,6 @@ async def _run_semantic_route_eval(
             raise ValueError("semantic-route diagnostic requires a positive finite timeout")
         timeout_seconds = diagnostic_timeout_seconds
     else:
-        if repetitions != _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS:
-            raise ValueError(
-                "semantic-route qualification requires exactly "
-                f"{_SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS} repetitions"
-            )
         if diagnostic_timeout_seconds is not None:
             raise ValueError("diagnostic timeout is valid only in diagnostic mode")
         timeout_seconds = config.runtime.semantic_router_timeout_seconds
@@ -1483,22 +3140,6 @@ async def _run_semantic_route_eval(
         structured_output_method=selection.response_structured_output_method,
     )
     try:
-        candidate_router = SemanticRouter(
-            selection.routing_model,
-            selection=config.llm.routing,
-            structured_output_method=selection.routing_structured_output_method,
-            timeout_seconds=timeout_seconds,
-            input_max_chars=config.runtime.semantic_router_input_max_chars,
-            registry=runtime.capability_registry,
-        )
-        incumbent_router = SemanticRouter(
-            selection.response_model,
-            selection=config.llm.response,
-            structured_output_method=selection.response_structured_output_method,
-            timeout_seconds=timeout_seconds,
-            input_max_chars=config.runtime.semantic_router_input_max_chars,
-            registry=runtime.capability_registry,
-        )
         corpus = _load_semantic_route_corpus()
         config_key = {"configurable": {"thread_id": runtime.engine.thread_id}}
         state = ReasoningState.model_validate(runtime.graph.get_state(config_key).values)
@@ -1519,55 +3160,80 @@ async def _run_semantic_route_eval(
             expected_context=corpus.projected_case.expected_context,
             actual_context=projected,
         )
+        if not projection.passed:
+            report = _semantic_invalid_projection_report(
+                corpus,
+                projection,
+                gate=gate,
+                expected_repetitions=repetitions,
+            )
+            await asyncio.to_thread(_write_json_report, report_path, report)
+            print("[semantic_routes] projector: 0/1")
+            print(f"    {projection.case_id}: production context projection did not match fixture")
+            print(f"    sanitized report: {report_path}")
+            print("\nSEMANTIC ROUTING EVALUATION INVALID. [FAIL]")
+            return 1
+
+        assert isinstance(projected, RoutingContext)
+        candidate_router = SemanticRouter(
+            selection.routing_model,
+            selection=config.llm.routing,
+            structured_output_method=selection.routing_structured_output_method,
+            timeout_seconds=timeout_seconds,
+            input_max_chars=config.runtime.semantic_router_input_max_chars,
+            registry=runtime.capability_registry,
+        )
+        incumbent_router = SemanticRouter(
+            selection.response_model,
+            selection=config.llm.response,
+            structured_output_method=selection.response_structured_output_method,
+            timeout_seconds=timeout_seconds,
+            input_max_chars=config.runtime.semantic_router_input_max_chars,
+            registry=runtime.capability_registry,
+        )
         candidate_runs: list[tuple[SemanticRouteCaseResult, ...]] = []
         incumbent_runs: list[tuple[SemanticRouteCaseResult, ...]] = []
         for _ in range(repetitions):
-            candidate_results = list(await _run_semantic_route_cases(candidate_router, corpus))
-            incumbent_results = list(await _run_semantic_route_cases(incumbent_router, corpus))
-            if projection.passed:
-                assert isinstance(projected, RoutingContext)
-                candidate_results.insert(
-                    0,
-                    SemanticRouteCaseResult(
-                        case_id=corpus.projected_case.case_id,
-                        scenario_class=corpus.projected_case.scenario_class,
-                        risk_class=corpus.projected_case.risk_class,
-                        risk_domain=corpus.projected_case.risk_domain,
-                        evaluation_split=corpus.projected_case.evaluation_split,
-                        expected=corpus.projected_case.expected,
-                        attempt=await candidate_router.route(projected),
-                    ),
-                )
-                incumbent_results.insert(
-                    0,
-                    SemanticRouteCaseResult(
-                        case_id=corpus.projected_case.case_id,
-                        scenario_class=corpus.projected_case.scenario_class,
-                        risk_class=corpus.projected_case.risk_class,
-                        risk_domain=corpus.projected_case.risk_domain,
-                        evaluation_split=corpus.projected_case.evaluation_split,
-                        expected=corpus.projected_case.expected,
-                        attempt=await incumbent_router.route(projected),
-                    ),
-                )
+            candidate_results = [
+                SemanticRouteCaseResult(
+                    case_id=corpus.projected_case.case_id,
+                    scenario_class=corpus.projected_case.scenario_class,
+                    risk_class=corpus.projected_case.risk_class,
+                    risk_domain=corpus.projected_case.risk_domain,
+                    evaluation_split=corpus.projected_case.evaluation_split,
+                    expected=corpus.projected_case.expected,
+                    attempt=await candidate_router.route(projected),
+                ),
+                *await _run_semantic_route_cases(candidate_router, corpus),
+            ]
+            incumbent_results = [
+                SemanticRouteCaseResult(
+                    case_id=corpus.projected_case.case_id,
+                    scenario_class=corpus.projected_case.scenario_class,
+                    risk_class=corpus.projected_case.risk_class,
+                    risk_domain=corpus.projected_case.risk_domain,
+                    evaluation_split=corpus.projected_case.evaluation_split,
+                    expected=corpus.projected_case.expected,
+                    attempt=await incumbent_router.route(projected),
+                ),
+                *await _run_semantic_route_cases(incumbent_router, corpus),
+            ]
             candidate_runs.append(tuple(candidate_results))
             incumbent_runs.append(tuple(incumbent_results))
-        gate_failures: tuple[str, ...] = ()
-        if gate != "diagnostic":
-            gate_failures = _semantic_series_gate_failures(
-                candidate_runs,
-                incumbent_runs,
-                projection=projection,
-                gate=gate,
-            )
+        verdict = _semantic_series_verdict(
+            candidate_runs,
+            incumbent_runs,
+            projection=projection,
+            gate=gate,
+        )
         report = _semantic_route_report(
             candidate_runs,
             incumbent_runs,
             corpus=corpus,
             projection=projection,
-            gate=gate,
+            verdict=verdict,
         )
-        await asyncio.to_thread(_write_semantic_route_report, report_path, report)
+        await asyncio.to_thread(_write_json_report, report_path, report)
         for repetition, (candidate_results, incumbent_results) in enumerate(
             zip(candidate_runs, incumbent_runs, strict=True),
             start=1,
@@ -1598,8 +3264,8 @@ async def _run_semantic_route_eval(
         if gate == "diagnostic":
             print("\nSEMANTIC ROUTING DIAGNOSTIC COMPLETED. [NO QUALIFICATION]")
             return 0
-        if gate_failures:
-            for failure in gate_failures:
+        if verdict.failures:
+            for failure in verdict.failures:
                 print(f"    gate failure: {failure}")
             print(f"\nSEMANTIC ROUTING {gate.upper()} GATE FAILED. [FAIL]")
             return 1
@@ -2287,6 +3953,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="run the typed semantic-router corpus without dispatching the live graph",
     )
     mode.add_argument(
+        "--legacy-routing-diagnostic",
+        action="store_true",
+        help="replay eligible semantic cases through the production legacy graph",
+    )
+    mode.add_argument(
+        "--legacy-routing-compatibility",
+        type=Path,
+        metavar="SCHEMA_V1_REPORT",
+        help="attest an immutable schema-v1 legacy report against the current corpus",
+    )
+    mode.add_argument(
+        "--semantic-routing-data-audit",
+        action="store_true",
+        help="validate source-clustered routing-data partitions without loading a model",
+    )
+    mode.add_argument(
         "--recovery-certification",
         choices=("offline", "live"),
         help=(
@@ -2305,19 +3987,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="sanitized semantic-router report destination",
     )
     parser.add_argument(
+        "--legacy-routing-report",
+        type=Path,
+        help="sanitized production legacy-route diagnostic destination",
+    )
+    parser.add_argument(
+        "--legacy-routing-compatibility-report",
+        type=Path,
+        help="legacy compatibility sidecar destination",
+    )
+    parser.add_argument(
         "--semantic-routing-gate",
         choices=("diagnostic", "shadow", "cutover"),
         help="semantic-router qualification gate (defaults to cutover)",
     )
     parser.add_argument(
-        "--semantic-routing-repetitions",
-        type=int,
-        help="one diagnostic repetition or exactly three qualification repetitions",
-    )
-    parser.add_argument(
         "--semantic-routing-diagnostic-timeout-seconds",
         type=float,
         help="evaluation-only router timeout; valid only with the diagnostic gate",
+    )
+    parser.add_argument(
+        "--semantic-routing-data-partition",
+        action="append",
+        type=Path,
+        default=[],
+        help="routing-data partition manifest; repeat once per available partition",
+    )
+    parser.add_argument(
+        "--semantic-routing-acquisition-plan",
+        type=Path,
+        help="external steward-approved routing-data acquisition plan",
+    )
+    parser.add_argument(
+        "--semantic-routing-data-authorization",
+        type=Path,
+        help="steward authorization bound to the complete manifest-set fingerprint",
+    )
+    parser.add_argument(
+        "--semantic-routing-data-report",
+        type=Path,
+        help="sanitized routing-data readiness report destination",
     )
     parser.add_argument(
         "--transport-request-ceiling",
@@ -2351,10 +4060,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("transport options require --recovery-certification")
     if args.semantic_routing_report is not None and not args.semantic_routing_eval:
         parser.error("--semantic-routing-report requires --semantic-routing-eval")
+    if args.legacy_routing_report is not None and not args.legacy_routing_diagnostic:
+        parser.error("--legacy-routing-report requires --legacy-routing-diagnostic")
+    if (
+        args.legacy_routing_compatibility_report is not None
+        and args.legacy_routing_compatibility is None
+    ):
+        parser.error(
+            "--legacy-routing-compatibility-report requires --legacy-routing-compatibility"
+        )
     if args.semantic_routing_gate is not None and not args.semantic_routing_eval:
         parser.error("--semantic-routing-gate requires --semantic-routing-eval")
-    if args.semantic_routing_repetitions is not None and not args.semantic_routing_eval:
-        parser.error("--semantic-routing-repetitions requires --semantic-routing-eval")
     if (
         args.semantic_routing_diagnostic_timeout_seconds is not None
         and not args.semantic_routing_eval
@@ -2362,18 +4078,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "--semantic-routing-diagnostic-timeout-seconds requires --semantic-routing-eval"
         )
+    custom_routing_data_options = (
+        bool(args.semantic_routing_data_partition)
+        or args.semantic_routing_acquisition_plan is not None
+        or args.semantic_routing_data_authorization is not None
+        or args.semantic_routing_data_report is not None
+    )
+    if custom_routing_data_options and not args.semantic_routing_data_audit:
+        parser.error("semantic-routing data options require --semantic-routing-data-audit")
     if args.order_target_eval:
         return asyncio.run(_run_order_target_eval())
+    if args.legacy_routing_diagnostic:
+        return asyncio.run(
+            _run_legacy_route_diagnostic(args.legacy_routing_report or _LEGACY_ROUTE_REPORT_PATH)
+        )
+    if args.legacy_routing_compatibility is not None:
+        return _run_legacy_compatibility_attestation(
+            args.legacy_routing_compatibility,
+            args.legacy_routing_compatibility_report
+            or _default_legacy_compatibility_report_path(args.legacy_routing_compatibility),
+        )
+    if args.semantic_routing_data_audit:
+        return _run_routing_data_audit(
+            args.semantic_routing_data_partition,
+            acquisition_plan_path=args.semantic_routing_acquisition_plan,
+            authorization_path=args.semantic_routing_data_authorization,
+            report_path=args.semantic_routing_data_report or _ROUTING_DATA_REPORT_PATH,
+        )
     if args.semantic_routing_eval:
         semantic_gate = args.semantic_routing_gate or "cutover"
         if semantic_gate == "diagnostic":
-            repetitions = (
-                1
-                if args.semantic_routing_repetitions is None
-                else args.semantic_routing_repetitions
-            )
-            if repetitions != 1:
-                parser.error("semantic-routing diagnostic requires one repetition")
             diagnostic_timeout_seconds = args.semantic_routing_diagnostic_timeout_seconds
             if (
                 diagnostic_timeout_seconds is None
@@ -2385,16 +4119,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--semantic-routing-diagnostic-timeout-seconds"
                 )
         else:
-            repetitions = (
-                _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS
-                if args.semantic_routing_repetitions is None
-                else args.semantic_routing_repetitions
-            )
-            if repetitions != _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS:
-                parser.error(
-                    "semantic-routing qualification requires exactly "
-                    f"{_SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS} repetitions"
-                )
             if args.semantic_routing_diagnostic_timeout_seconds is not None:
                 parser.error(
                     "--semantic-routing-diagnostic-timeout-seconds requires the diagnostic gate"
@@ -2404,7 +4128,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_semantic_route_eval(
                 args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
                 semantic_gate,
-                repetitions=repetitions,
                 diagnostic_timeout_seconds=diagnostic_timeout_seconds,
             )
         )
