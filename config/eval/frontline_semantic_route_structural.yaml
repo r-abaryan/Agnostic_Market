@@ -1,0 +1,227 @@
+schema_version: "1"
+purpose: development_only
+frozen_corpus_fingerprint: ff346892f16fb7e3bdd21e6da774f50321bdc243b5a343deb61c92dbc37dbe6c
+route_schema_fingerprint: f762a654099edd19a75481015358efd8f3690d0eb20917d7b8e071615b2c736d
+registry_fingerprint: 1931334b172a62b527ef8c8e97ffea499d8af7965a8a4e4a0b2484a6c1ad4d5c
+context_projector_version: "2"
+
+cases:
+  - case_id: structural_remove_base
+    scenario_class: direct
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &remove_base_context
+      utterance: "Remove the trail shoes from my cart"
+      bound_customer: false
+      active_capability: null
+      recent_order_operation: cancel
+      recent_order_count: 1
+      cart_state: empty
+      available_capabilities: &capabilities
+        - list_orders
+        - cancel_orders
+        - refund_order
+        - return_order
+        - change_profile
+        - view_cart
+        - view_identity_status
+        - verify_identity
+        - switch_account
+        - modify_cart
+        - place_order
+        - search_catalog
+        - answer_question
+        - verify_order_status
+    proposal: &remove_proposal
+      decision: direct
+      capability: modify_cart
+      cart_operation: remove
+    expected: &remove_expected
+      decision: direct
+      request: { kind: modify_cart, operation: remove, item: null, quantity: null }
+    checklist_cell: bound=0|active=0|cart=0|recent=1
+    required_route_leaf: modify_cart:remove
+
+  - case_id: structural_remove_cart_nonempty
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context:
+      <<: *remove_base_context
+      cart_state: nonempty
+    proposal: *remove_proposal
+    expected: *remove_expected
+    checklist_cell: bound=0|active=0|cart=1|recent=1
+    counterfactual_of: structural_remove_base
+    changed_dimension: cart_state
+
+  - case_id: structural_set_quantity_base
+    scenario_class: direct
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &set_base_context
+      utterance: "Set the trail shoes quantity to two"
+      bound_customer: false
+      active_capability: null
+      recent_order_operation: null
+      recent_order_count: 0
+      cart_state: nonempty
+      available_capabilities: *capabilities
+    proposal: &set_proposal
+      decision: direct
+      capability: modify_cart
+      cart_operation: set_quantity
+    expected: &set_expected
+      decision: direct
+      request: { kind: modify_cart, operation: set_quantity, item: null, quantity: null }
+    checklist_cell: bound=0|active=0|cart=1|recent=0
+    required_route_leaf: modify_cart:set_quantity
+
+  - case_id: structural_set_quantity_active
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &set_active_context
+      <<: *set_base_context
+      active_capability: modify_cart
+    proposal: *set_proposal
+    expected: *set_expected
+    checklist_cell: bound=0|active=1|cart=1|recent=0
+    counterfactual_of: structural_set_quantity_base
+    changed_dimension: active_capability
+
+  - case_id: structural_set_quantity_active_recent
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context:
+      <<: *set_active_context
+      recent_order_operation: cancel
+      recent_order_count: 1
+    proposal: *set_proposal
+    expected: *set_expected
+    checklist_cell: bound=0|active=1|cart=1|recent=1
+    counterfactual_of: structural_set_quantity_active
+    changed_dimension: recent_order
+
+  - case_id: structural_contact_base
+    scenario_class: direct
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &contact_base_context
+      utterance: "Change the contact information on my profile"
+      bound_customer: true
+      active_capability: null
+      recent_order_operation: null
+      recent_order_count: 0
+      cart_state: empty
+      available_capabilities: *capabilities
+    proposal: &contact_proposal
+      decision: direct
+      capability: change_profile
+      profile_field: contact
+    expected: &contact_expected
+      decision: direct
+      request: { kind: change_profile, field: contact, new_value: null }
+    checklist_cell: bound=1|active=0|cart=0|recent=0
+    required_route_leaf: change_profile:contact
+
+  - case_id: structural_contact_recent
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &contact_recent_context
+      <<: *contact_base_context
+      recent_order_operation: cancel
+      recent_order_count: 1
+    proposal: *contact_proposal
+    expected: *contact_expected
+    checklist_cell: bound=1|active=0|cart=0|recent=1
+    counterfactual_of: structural_contact_base
+    changed_dimension: recent_order
+
+  - case_id: structural_contact_recent_cart
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &contact_recent_cart_context
+      <<: *contact_recent_context
+      cart_state: nonempty
+    proposal: *contact_proposal
+    expected: *contact_expected
+    checklist_cell: bound=1|active=0|cart=1|recent=1
+    counterfactual_of: structural_contact_recent
+    changed_dimension: cart_state
+
+  - case_id: structural_contact_recent_cart_active
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context:
+      <<: *contact_recent_cart_context
+      active_capability: change_profile
+    proposal: *contact_proposal
+    expected: *contact_expected
+    checklist_cell: bound=1|active=1|cart=1|recent=1
+    counterfactual_of: structural_contact_recent_cart
+    changed_dimension: active_capability
+
+  - case_id: structural_contact_recent_active
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context:
+      <<: *contact_recent_context
+      active_capability: change_profile
+    proposal: *contact_proposal
+    expected: *contact_expected
+    checklist_cell: bound=1|active=1|cart=0|recent=1
+    counterfactual_of: structural_contact_recent
+    changed_dimension: active_capability
+
+  - case_id: structural_missing_value_base
+    scenario_class: clarification
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &missing_value_base_context
+      utterance: "Change it to the other one"
+      bound_customer: true
+      active_capability: null
+      recent_order_operation: null
+      recent_order_count: 0
+      cart_state: empty
+      available_capabilities: *capabilities
+    proposal: &missing_value_proposal
+      decision: clarify
+      clarification_reason: missing_value
+    expected: &missing_value_expected
+      decision: clarify
+      clarification_reason: missing_value
+    checklist_cell: bound=1|active=0|cart=0|recent=0
+    required_route_leaf: clarify:missing_value
+
+  - case_id: structural_missing_value_cart
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context: &missing_value_cart_context
+      <<: *missing_value_base_context
+      cart_state: nonempty
+    proposal: *missing_value_proposal
+    expected: *missing_value_expected
+    checklist_cell: bound=1|active=0|cart=1|recent=0
+    counterfactual_of: structural_missing_value_base
+    changed_dimension: cart_state
+
+  - case_id: structural_missing_value_cart_active
+    scenario_class: counterfactual
+    risk_class: critical
+    risk_domain: commerce_effect
+    context:
+      <<: *missing_value_cart_context
+      active_capability: change_profile
+    proposal: *missing_value_proposal
+    expected: *missing_value_expected
+    checklist_cell: bound=1|active=1|cart=1|recent=0
+    counterfactual_of: structural_missing_value_cart
+    changed_dimension: active_capability

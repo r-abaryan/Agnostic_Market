@@ -881,6 +881,107 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     assert by_id["acceptance_cancel_negated_then_list"].risk_domain == "commerce_effect"
 
 
+def test_structural_supplement_closes_route_and_checklist_debt_without_mutating_corpus(
+    config_root: Path,
+) -> None:
+    corpus_path = config_root / "eval" / "frontline_semantic_routes.yaml"
+    before = hashlib.sha256(corpus_path.read_bytes()).hexdigest()
+    corpus = _load_semantic_route_corpus(corpus_path)
+    supplement = frontline_eval._load_semantic_route_structural_supplement(
+        config_root / "eval" / "frontline_semantic_route_structural.yaml"
+    )
+    report = frontline_eval._semantic_route_structural_report(corpus, supplement)
+
+    assert hashlib.sha256(corpus_path.read_bytes()).hexdigest() == before
+    assert len(supplement.cases) == 13
+    assert report["qualification"] is None
+    assert report["purpose"] == "development_only"
+    assert report["canonical_route_leaf_count"] == 27
+    assert report["checklist"]["total_cells"] == 16
+    assert len(report["checklist"]["frozen_cells"]) == 7
+    assert len(report["checklist"]["supplement_cells"]) == 9
+    assert report["checklist"]["uncovered_cells"] == ()
+    assert {
+        case.required_route_leaf
+        for case in supplement.cases
+        if case.required_route_leaf is not None
+    } == {
+        "modify_cart:remove",
+        "modify_cart:set_quantity",
+        "change_profile:contact",
+        "clarify:missing_value",
+    }
+
+
+def test_structural_supplement_rejects_missing_obligation_and_stale_contract(
+    config_root: Path,
+) -> None:
+    corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
+    supplement = frontline_eval._load_semantic_route_structural_supplement(
+        config_root / "eval" / "frontline_semantic_route_structural.yaml"
+    )
+
+    missing_cell = supplement.model_copy(
+        update={
+            "cases": tuple(
+                case
+                for case in supplement.cases
+                if case.case_id != "structural_contact_recent_cart_active"
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="each missing checklist cell once"):
+        frontline_eval._validate_semantic_route_structural_supplement(corpus, missing_cell)
+
+    stale = supplement.model_copy(update={"registry_fingerprint": "stale-registry"})
+    with pytest.raises(ValueError, match="contract fingerprint is stale"):
+        frontline_eval._validate_semantic_route_structural_supplement(corpus, stale)
+
+
+def test_structural_supplement_rejects_multi_dimension_counterfactual(
+    config_root: Path,
+) -> None:
+    supplement = frontline_eval._load_semantic_route_structural_supplement(
+        config_root / "eval" / "frontline_semantic_route_structural.yaml"
+    )
+    payload = supplement.model_dump(mode="json")
+    target = next(
+        case for case in payload["cases"] if case["case_id"] == "structural_contact_recent"
+    )
+    target["context"]["cart_state"] = "nonempty"
+    target["checklist_cell"] = "bound=1|active=0|cart=1|recent=1"
+
+    with pytest.raises(ValueError, match="exactly its declared dimension"):
+        frontline_eval.SemanticRouteStructuralSupplement.model_validate(payload)
+
+
+def test_cli_runs_structural_coverage_without_provider_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "structural.json"
+
+    def provider_must_not_load() -> None:
+        raise AssertionError("structural coverage must not construct a provider")
+
+    monkeypatch.setattr(frontline_eval, "_load_routing_eval_selection", provider_must_not_load)
+
+    assert (
+        frontline_eval.main(
+            [
+                "--semantic-routing-structural-coverage",
+                "--semantic-routing-structural-report",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["qualification"] is None
+    assert report["canonical_route_leaf_count"] == 27
+    assert report["checklist"]["uncovered_cells"] == []
+
+
 def test_routing_data_contract_reuses_the_production_registry(config_root: Path) -> None:
     contract = _routing_data_contract()
     config = ConfigRegistry(config_root).load().get("acme_store").config

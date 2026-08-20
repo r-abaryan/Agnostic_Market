@@ -83,6 +83,7 @@ from agnostic_market.agents.routing import (
     ProviderCallOutcome,
     RoutingAttempt,
     SemanticRouter,
+    materialize_route,
     project_routing_context,
     registry_fingerprint,
     resolve_route,
@@ -177,9 +178,18 @@ _READ_OWNER_EVAL_SCHEMA_VERSION = "1"
 _ORDER_TARGET_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_order_targets.yaml"
 _ORDER_TARGET_EVAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_semantic_routes.yaml"
+_SEMANTIC_ROUTE_STRUCTURAL_SUPPLEMENT_PATH = (
+    _CONFIG_ROOT / "eval" / "frontline_semantic_route_structural.yaml"
+)
 _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "3"
+_SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
+_SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 27
 _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
+_SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
+    _CONFIG_ROOT / "telemetry" / "semantic_routing_structural_coverage.json"
+)
 _LEGACY_ROUTE_REPORT_SCHEMA_VERSION = "2"
 _LEGACY_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "legacy_routing_diagnostic.json"
 _LEGACY_ROUTE_COMPATIBILITY_SCHEMA_VERSION = "1"
@@ -388,6 +398,136 @@ class SemanticRouteEvalCorpus(BaseModel):
             for case in self.cases
         ):
             raise ValueError("semantic-route eval requires critical acceptance cases")
+        return self
+
+
+StructuralRouteLeaf = Literal[
+    "modify_cart:remove",
+    "modify_cart:set_quantity",
+    "change_profile:contact",
+    "clarify:missing_value",
+]
+StructuralContextDimension = Literal[
+    "bound_customer",
+    "active_capability",
+    "cart_state",
+    "recent_order",
+]
+
+
+def _structural_route_leaf(decision: RouteDecision) -> StructuralRouteLeaf | None:
+    if decision.decision == "clarify" and decision.clarification_reason == "missing_value":
+        return "clarify:missing_value"
+    request = decision.request
+    if isinstance(request, ModifyCart) and request.operation in {"remove", "set_quantity"}:
+        return f"modify_cart:{request.operation}"
+    if isinstance(request, ChangeProfile) and request.field == "contact":
+        return "change_profile:contact"
+    return None
+
+
+def _structural_checklist_cell(context: RoutingContext) -> str:
+    return "|".join(
+        (
+            f"bound={int(context.bound_customer)}",
+            f"active={int(context.active_capability is not None)}",
+            f"cart={int(context.cart_state == 'nonempty')}",
+            f"recent={int(context.recent_order_count > 0)}",
+        )
+    )
+
+
+class SemanticRouteStructuralCase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    case_id: str
+    scenario_class: SemanticRouteScenarioClass
+    risk_class: SemanticRouteRiskClass
+    risk_domain: SemanticRouteRiskDomain
+    context: RoutingContext
+    proposal: RouteProposal
+    expected: RouteDecision
+    checklist_cell: str
+    required_route_leaf: StructuralRouteLeaf | None = None
+    counterfactual_of: str | None = None
+    changed_dimension: StructuralContextDimension | None = None
+
+    @model_validator(mode="after")
+    def route_and_obligations_are_exact(self) -> SemanticRouteStructuralCase:
+        if not self.case_id.strip() or self.case_id != self.case_id.strip():
+            raise ValueError("structural route case id must be normalized and non-empty")
+        materialized = materialize_route(self.context, self.proposal)
+        if materialized != self.expected:
+            raise ValueError("structural proposal must materialize to the expected route")
+        if resolve_route(self.context, self.expected) != self.expected:
+            raise ValueError("structural expected route must resolve as executable")
+        if self.checklist_cell != _structural_checklist_cell(self.context):
+            raise ValueError("structural checklist-cell declaration does not match context")
+        if self.required_route_leaf is not None and (
+            _structural_route_leaf(self.expected) != self.required_route_leaf
+        ):
+            raise ValueError("structural route-leaf declaration does not match expected route")
+        if (self.counterfactual_of is None) != (self.changed_dimension is None):
+            raise ValueError("counterfactual reference and changed dimension must appear together")
+        return self
+
+
+class SemanticRouteStructuralSupplement(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: str
+    purpose: Literal["development_only"]
+    frozen_corpus_fingerprint: str
+    route_schema_fingerprint: str
+    registry_fingerprint: str
+    context_projector_version: str
+    cases: tuple[SemanticRouteStructuralCase, ...]
+
+    @model_validator(mode="after")
+    def supplement_is_closed_and_counterfactuals_are_exact(
+        self,
+    ) -> SemanticRouteStructuralSupplement:
+        if self.schema_version != _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION:
+            raise ValueError("unsupported semantic-route structural schema version")
+        fingerprints = (
+            self.frozen_corpus_fingerprint,
+            self.route_schema_fingerprint,
+            self.registry_fingerprint,
+            self.context_projector_version,
+        )
+        if any(not value.strip() or value != value.strip() for value in fingerprints):
+            raise ValueError("structural supplement fingerprints must be normalized")
+        by_id = {case.case_id: case for case in self.cases}
+        if not self.cases or len(by_id) != len(self.cases):
+            raise ValueError("structural supplement requires non-empty unique case ids")
+        for case in self.cases:
+            if case.counterfactual_of is None:
+                continue
+            baseline = by_id.get(case.counterfactual_of)
+            if baseline is None or baseline.case_id == case.case_id:
+                raise ValueError("counterfactual must reference another supplement case")
+            if (
+                baseline.context.utterance != case.context.utterance
+                or baseline.proposal != case.proposal
+                or baseline.expected != case.expected
+            ):
+                raise ValueError("counterfactual must preserve utterance, proposal, and label")
+            before = baseline.context.model_dump()
+            after = case.context.model_dump()
+            changed = {key for key in before if before[key] != after[key]}
+            expected_changed = {
+                "bound_customer": {"bound_customer"},
+                "active_capability": {"active_capability"},
+                "cart_state": {"cart_state"},
+                "recent_order": {"recent_order_operation", "recent_order_count"},
+            }[case.changed_dimension]
+            if changed != expected_changed:
+                raise ValueError("counterfactual must change exactly its declared dimension")
+        leaves = tuple(
+            case.required_route_leaf for case in self.cases if case.required_route_leaf is not None
+        )
+        if set(leaves) != set(get_args(StructuralRouteLeaf)) or len(leaves) != len(set(leaves)):
+            raise ValueError("structural supplement must declare each missing route leaf once")
         return self
 
 
@@ -1512,6 +1652,17 @@ def _load_semantic_route_corpus(
     return SemanticRouteEvalCorpus.model_validate(load_yaml_layer(path))
 
 
+def _load_semantic_route_structural_supplement(
+    path: Path = _SEMANTIC_ROUTE_STRUCTURAL_SUPPLEMENT_PATH,
+) -> SemanticRouteStructuralSupplement:
+    supplement = SemanticRouteStructuralSupplement.model_validate(load_yaml_layer(path))
+    _validate_semantic_route_structural_supplement(
+        _load_semantic_route_corpus(),
+        supplement,
+    )
+    return supplement
+
+
 def _load_routing_eval_selection() -> _RoutingEvalSelection:
     load_dotenv()
     credentials = load_provider_credentials(_CONFIG_ROOT / "base" / "providers.yaml")
@@ -2365,6 +2516,150 @@ def _json_fingerprint(value: object) -> str:
 
 def _corpus_fingerprint(corpus: SemanticRouteEvalCorpus) -> str:
     return _json_fingerprint(corpus.model_dump(mode="json"))
+
+
+def _semantic_route_corpus_contexts(
+    corpus: SemanticRouteEvalCorpus,
+) -> tuple[RoutingContext, ...]:
+    return (
+        *(case.context for case in corpus.cases),
+        corpus.projected_case.expected_context,
+    )
+
+
+def _semantic_route_corpus_decisions(
+    corpus: SemanticRouteEvalCorpus,
+) -> tuple[RouteDecision, ...]:
+    return (
+        *(case.expected for case in corpus.cases),
+        corpus.projected_case.expected,
+    )
+
+
+def _all_structural_checklist_cells() -> frozenset[str]:
+    return frozenset(
+        "|".join(
+            (
+                f"bound={bound}",
+                f"active={active}",
+                f"cart={cart}",
+                f"recent={recent}",
+            )
+        )
+        for bound in (0, 1)
+        for active in (0, 1)
+        for cart in (0, 1)
+        for recent in (0, 1)
+    )
+
+
+def _canonical_route_signatures(
+    decisions: Sequence[RouteDecision],
+) -> tuple[dict[str, str | None], ...]:
+    by_key = {
+        json.dumps(_route_signature(decision), sort_keys=True): _route_signature(decision)
+        for decision in decisions
+    }
+    return tuple(by_key[key] for key in sorted(by_key))
+
+
+def _validate_semantic_route_structural_supplement(
+    corpus: SemanticRouteEvalCorpus,
+    supplement: SemanticRouteStructuralSupplement,
+) -> None:
+    registry = _build_frontline_capability_registry()
+    expected_contract = {
+        "frozen_corpus_fingerprint": _corpus_fingerprint(corpus),
+        "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
+        "registry_fingerprint": registry_fingerprint(registry),
+        "context_projector_version": CONTEXT_PROJECTOR_VERSION,
+    }
+    actual_contract = {
+        "frozen_corpus_fingerprint": supplement.frozen_corpus_fingerprint,
+        "route_schema_fingerprint": supplement.route_schema_fingerprint,
+        "registry_fingerprint": supplement.registry_fingerprint,
+        "context_projector_version": supplement.context_projector_version,
+    }
+    if actual_contract != expected_contract:
+        raise ValueError("structural supplement contract fingerprint is stale")
+
+    frozen_cells = {
+        _structural_checklist_cell(context) for context in _semantic_route_corpus_contexts(corpus)
+    }
+    missing_cells = _all_structural_checklist_cells() - frozen_cells
+    supplement_cells = [case.checklist_cell for case in supplement.cases]
+    if {cell: supplement_cells.count(cell) for cell in missing_cells} != dict.fromkeys(
+        missing_cells, 1
+    ):
+        raise ValueError("structural supplement must cover each missing checklist cell once")
+
+    frozen_leaves = {
+        leaf
+        for decision in _semantic_route_corpus_decisions(corpus)
+        if (leaf := _structural_route_leaf(decision)) is not None
+    }
+    if frozen_leaves:
+        raise ValueError("frozen corpus unexpectedly contains a declared missing route leaf")
+    union_signatures = _canonical_route_signatures(
+        (
+            *_semantic_route_corpus_decisions(corpus),
+            *(case.expected for case in supplement.cases),
+        )
+    )
+    if len(union_signatures) != _SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT:
+        raise ValueError("structural route-signature union is not the canonical 27 leaves")
+
+
+def _semantic_route_structural_report(
+    corpus: SemanticRouteEvalCorpus,
+    supplement: SemanticRouteStructuralSupplement,
+) -> dict[str, object]:
+    _validate_semantic_route_structural_supplement(corpus, supplement)
+    frozen_cells = frozenset(
+        _structural_checklist_cell(context) for context in _semantic_route_corpus_contexts(corpus)
+    )
+    supplement_cells = frozenset(case.checklist_cell for case in supplement.cases)
+    union_cells = frozen_cells | supplement_cells
+    signatures = _canonical_route_signatures(
+        (
+            *_semantic_route_corpus_decisions(corpus),
+            *(case.expected for case in supplement.cases),
+        )
+    )
+    return {
+        "schema_version": _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION,
+        "purpose": supplement.purpose,
+        "qualification": None,
+        "frozen_corpus_fingerprint": _corpus_fingerprint(corpus),
+        "supplement_fingerprint": _json_fingerprint(supplement.model_dump(mode="json")),
+        "route_schema_fingerprint": supplement.route_schema_fingerprint,
+        "registry_fingerprint": supplement.registry_fingerprint,
+        "context_projector_version": supplement.context_projector_version,
+        "canonical_route_leaf_count": len(signatures),
+        "canonical_route_leaves": signatures,
+        "checklist": {
+            "dimensions": (
+                "bound_customer",
+                "active_present",
+                "cart_nonempty",
+                "recent_present",
+            ),
+            "total_cells": len(_all_structural_checklist_cells()),
+            "frozen_cells": tuple(sorted(frozen_cells)),
+            "supplement_cells": tuple(sorted(supplement_cells - frozen_cells)),
+            "union_cells": tuple(sorted(union_cells)),
+            "uncovered_cells": tuple(sorted(_all_structural_checklist_cells() - union_cells)),
+        },
+    }
+
+
+def _run_semantic_route_structural_coverage(report_path: Path) -> int:
+    corpus = _load_semantic_route_corpus()
+    supplement = _load_semantic_route_structural_supplement()
+    report = _semantic_route_structural_report(corpus, supplement)
+    _write_json_report(report_path, report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 def _routing_data_contract() -> dict[str, object]:
@@ -3953,6 +4248,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="run the typed semantic-router corpus without dispatching the live graph",
     )
     mode.add_argument(
+        "--semantic-routing-structural-coverage",
+        action="store_true",
+        help="validate development-only route/checklist coverage without loading a model",
+    )
+    mode.add_argument(
         "--legacy-routing-diagnostic",
         action="store_true",
         help="replay eligible semantic cases through the production legacy graph",
@@ -3985,6 +4285,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--semantic-routing-report",
         type=Path,
         help="sanitized semantic-router report destination",
+    )
+    parser.add_argument(
+        "--semantic-routing-structural-report",
+        type=Path,
+        help="development-only structural coverage report destination",
     )
     parser.add_argument(
         "--legacy-routing-report",
@@ -4060,6 +4365,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("transport options require --recovery-certification")
     if args.semantic_routing_report is not None and not args.semantic_routing_eval:
         parser.error("--semantic-routing-report requires --semantic-routing-eval")
+    if (
+        args.semantic_routing_structural_report is not None
+        and not args.semantic_routing_structural_coverage
+    ):
+        parser.error(
+            "--semantic-routing-structural-report requires --semantic-routing-structural-coverage"
+        )
     if args.legacy_routing_report is not None and not args.legacy_routing_diagnostic:
         parser.error("--legacy-routing-report requires --legacy-routing-diagnostic")
     if (
@@ -4088,6 +4400,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("semantic-routing data options require --semantic-routing-data-audit")
     if args.order_target_eval:
         return asyncio.run(_run_order_target_eval())
+    if args.semantic_routing_structural_coverage:
+        return _run_semantic_route_structural_coverage(
+            args.semantic_routing_structural_report or _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH
+        )
     if args.legacy_routing_diagnostic:
         return asyncio.run(
             _run_legacy_route_diagnostic(args.legacy_routing_report or _LEGACY_ROUTE_REPORT_PATH)
