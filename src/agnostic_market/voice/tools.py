@@ -22,6 +22,10 @@ from __future__ import annotations
 from langchain_core.tools import BaseTool, tool
 
 from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION
+from agnostic_market.agents.legacy_observation import (
+    LEGACY_READ_TOOL_CAPABILITIES,
+    observe_legacy_capabilities,
+)
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -83,6 +87,7 @@ def build_voice_tools(
         """Look up the current status of an order by its order id (e.g. 'ORD-1001').
         account_contact: the email or phone number the caller says is on the account -
         include it when the previous result asked for verification."""
+        observe_legacy_capabilities(LEGACY_READ_TOOL_CAPABILITIES[order_status.name], source="tool")
         if order_read_allowed(order_id, store=store, identity=identity):
             summary = store.order_summary(order_id)
             if summary is None:
@@ -137,6 +142,7 @@ def build_voice_tools(
     def list_orders() -> str:
         """List the orders on the caller's account. Requires the caller to be verified -
         call this FIRST for any 'what orders do I have' ask; the result says what to do."""
+        observe_legacy_capabilities(LEGACY_READ_TOOL_CAPABILITIES[list_orders.name], source="tool")
         bound = identity.current()
         if bound is None:
             return _UNVERIFIED_LIST
@@ -150,6 +156,9 @@ def build_voice_tools(
     @tool
     def catalog_search(query: str) -> str:
         """Search the product catalog for items matching a text query."""
+        observe_legacy_capabilities(
+            LEGACY_READ_TOOL_CAPABILITIES[catalog_search.name], source="tool"
+        )
         result = lookup_catalog(store.fixture, query)
         matches = [f"{p.name} (sku {p.sku}, ${p.price_usd:.2f})" for p in result.matches]
         if not matches:
@@ -162,6 +171,7 @@ def build_voice_tools(
     @tool
     def view_cart() -> str:
         """Show what's currently in the caller's cart (a READ — does not change anything)."""
+        observe_legacy_capabilities(LEGACY_READ_TOOL_CAPABILITIES[view_cart.name], source="tool")
         if cart.is_empty():
             return "The cart is empty."
         return f"The cart has {speak_lines(cart.view())} - ${cart.cart_total():.2f} total."

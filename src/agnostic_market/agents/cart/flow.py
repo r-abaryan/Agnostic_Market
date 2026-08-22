@@ -47,6 +47,10 @@ from agnostic_market.agents.clarification import (
     advance_clarification,
     with_clarification_lifecycle,
 )
+from agnostic_market.agents.legacy_observation import (
+    observe_legacy_capabilities,
+    observe_legacy_model_tool_calls,
+)
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
@@ -485,6 +489,7 @@ def build_cart_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, ModifyCart | PlaceOrder):
             raise TypeError("cart capability entry requires a typed Cart invocation")
+        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         if isinstance(invocation.request, PlaceOrder):
             if cart_store.is_empty():
                 return {
@@ -725,6 +730,7 @@ def build_cart_nodes(
             response = model.invoke(messages)
             if not response.tool_calls:
                 return _clarification_result(state, new_messages, "action")
+            observe_legacy_model_tool_calls(response.tool_calls)
             new_messages.append(response)
 
             if response.tool_calls[0]["name"] in _MUTATION_TOOLS:

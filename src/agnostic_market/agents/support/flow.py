@@ -57,6 +57,10 @@ from agnostic_market.agents.clarification import (
     advance_clarification,
     with_clarification_lifecycle,
 )
+from agnostic_market.agents.legacy_observation import (
+    observe_legacy_capabilities,
+    observe_legacy_model_tool_calls,
+)
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.support.prompt import (
     compose_support_capability_prompt,
@@ -639,6 +643,7 @@ def build_support_nodes(
         if invocation is None:
             raise TypeError("support capability entry requires an active invocation")
         request = invocation.request
+        observe_legacy_capabilities((request.kind,), source="typed_owner")
         if isinstance(request, ListOrders):
             if request.scope == "account" and identity_store.current() is None:
                 return _enter_identity_for_action(state, [], request, invocation=invocation)
@@ -1299,6 +1304,7 @@ def build_support_nodes(
             response = model.invoke(messages)
             if not response.tool_calls:
                 return _clarification_result(state, new_messages, "action")
+            observe_legacy_model_tool_calls(response.tool_calls)
             new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]

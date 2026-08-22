@@ -34,7 +34,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -45,6 +45,10 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
 from pydantic import ValidationError
 
+from agnostic_market.agents.legacy_observation import (
+    LegacyRouteObservation,
+    legacy_route_observation_scope,
+)
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
@@ -54,6 +58,7 @@ from agnostic_market.agents.recovery import (
     NodeRecoveryPolicy,
     clear_automation_state,
 )
+from agnostic_market.agents.routing import ShadowRoutingSession
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.dtos.events import (
     CommittedTurn,
@@ -401,6 +406,7 @@ class ReasoningEngine:
         thread_id: str,
         cancellation_quiescence_timeout_seconds: float,
         lifecycle: PrincipalTransitionLifecycle | None = None,
+        shadow_routing: ShadowRoutingSession | None = None,
     ) -> None:
         if graph.checkpointer is None:
             raise ValueError(
@@ -416,6 +422,7 @@ class ReasoningEngine:
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
         self._lifecycle = lifecycle
+        self._shadow_routing = shadow_routing
         if cancellation_quiescence_timeout_seconds <= 0:
             raise ValueError("cancellation quiescence timeout must be positive")
         self._cancellation_quiescence_timeout_seconds = cancellation_quiescence_timeout_seconds
@@ -467,6 +474,57 @@ class ReasoningEngine:
         if not self._node_execution_tracker.turn_admission_open or self._terminal_latched:
             return False
         return bool(self._graph.get_state(self._config).interrupts)
+
+    def _start_shadow_routing(
+        self,
+        turn: CommittedTurn,
+        state: ReasoningState,
+    ) -> asyncio.Task[None] | None:
+        shadow = self._shadow_routing
+        if shadow is None:
+            return None
+        projection = shadow.prepare(turn, state)
+        if projection is None:
+            return None
+        turn_id = turn.message_id
+        if turn_id is None:
+            raise RuntimeError("ordinary admitted shadow turn requires a committed id")
+        return asyncio.create_task(
+            shadow.observe(turn_id, projection),
+            name="semantic-route-shadow",
+        )
+
+    async def _finish_shadow_routing(
+        self,
+        task: asyncio.Task[None] | None,
+        *,
+        turn_id: str,
+        turn_cancelled: bool,
+    ) -> None:
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            async with asyncio.timeout(self._cancellation_quiescence_timeout_seconds):
+                await task
+        except asyncio.CancelledError:
+            shadow = self._shadow_routing
+            if shadow is not None:
+                shadow.record_cancellation(
+                    turn_id,
+                    reason="turn_cancelled" if turn_cancelled else "turn_complete",
+                )
+        except TimeoutError:
+            shadow = self._shadow_routing
+            if shadow is not None:
+                shadow.record_failure(turn_id, reason="cleanup_timeout")
+            logger.critical("shadow recognizer did not honor cancellation within the bound")
+        except Exception:
+            shadow = self._shadow_routing
+            if shadow is not None:
+                shadow.record_failure(turn_id, reason="observer_error")
+            logger.error("shadow routing observation failed")
 
     def _rotate_pending_transition(
         self,
@@ -873,6 +931,9 @@ class ReasoningEngine:
         arrived_interrupt_ids = frozenset(interrupt.id for interrupt in arrived.interrupts)
         async with self._turn_lock:
             cancelled_stream = False
+            shadow_task: asyncio.Task[None] | None = None
+            legacy_observation: LegacyRouteObservation | None = None
+            observation_stack = ExitStack()
             owned_stream_thread_id: str | None = None
             owned_resumed_interrupt_node: str | None = None
             try:
@@ -982,6 +1043,11 @@ class ReasoningEngine:
                     yield self._enter_last_resort()
                     return
                 else:
+                    shadow_task = self._start_shadow_routing(turn, snapshot_state)
+                    if shadow_task is not None:
+                        legacy_observation = observation_stack.enter_context(
+                            legacy_route_observation_scope(message_id)
+                        )
                     payload = {
                         "messages": [HumanMessage(content=turn.text, id=message_id)],
                         "consumed_turn_ids": (message_id,),
@@ -1036,6 +1102,14 @@ class ReasoningEngine:
                 yield self._enter_last_resort()
                 return
             finally:
+                observation_stack.close()
+                if legacy_observation is not None:
+                    write_event(legacy_observation.as_event())
+                await self._finish_shadow_routing(
+                    shadow_task,
+                    turn_id=message_id,
+                    turn_cancelled=cancelled_stream,
+                )
                 if not cancelled_stream and not self._terminal_latched:
                     try:
                         self._rotate_pending_transition(message_id)

@@ -19,6 +19,7 @@ from agnostic_market.agents.frontline.prompt import (
     compose_answer_response_prompt,
     compose_catalog_response_prompt,
 )
+from agnostic_market.agents.legacy_observation import observe_legacy_capabilities
 from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.telemetry import write_capability_answered, write_event
 from agnostic_market.commerce.identity import (
@@ -146,6 +147,7 @@ def build_read_flow_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
             raise TypeError("order-status entry requires a verify-order-status invocation")
+        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         if invocation.request.target is not None:
             return Command(goto=ORDER_STATUS_FULFILL_NODE)
         return Command(goto=ORDER_STATUS_TARGET_PROPOSE_NODE)
@@ -372,6 +374,7 @@ def build_read_flow_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, SearchCatalog):
             raise TypeError("catalog entry requires a search-catalog invocation")
+        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         request = invocation.request
         if request.query is not None:
             return Command(goto=CATALOG_RESPONSE_NODE)
@@ -440,6 +443,7 @@ def build_read_flow_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, AnswerQuestion):
             raise TypeError("answer response requires an answer-question invocation")
+        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         current = state.current_committed_user_message()
         if current is None:
             raise ValueError("answer response requires the current committed caller message")

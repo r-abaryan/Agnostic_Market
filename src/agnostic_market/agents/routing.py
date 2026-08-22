@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, Protocol
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -21,6 +21,7 @@ from langchain_core.runnables import Runnable
 from pydantic import ValidationError
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
+from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import CallerIdentityStore
 from agnostic_market.commerce.orders import RecentOrderContext
@@ -374,6 +375,152 @@ class RoutingAttempt:
     timeout_seconds: float
     provider_call_outcome: ProviderCallOutcome
     projector_version: str = CONTEXT_PROJECTOR_VERSION
+
+
+class RoutingRecognizer(Protocol):
+    """One authority-free asynchronous route recognizer.
+
+    Implementations return closed failures inside RoutingAttempt and propagate task
+    cancellation. They cannot dispatch, speak, mutate state, or execute a capability.
+    """
+
+    async def route(self, context: RoutingContext) -> RoutingAttempt: ...
+
+
+class ShadowRoutingSession:
+    """Session-scoped projection, deduplication, and value-free shadow telemetry."""
+
+    def __init__(
+        self,
+        recognizer: RoutingRecognizer,
+        *,
+        identity_store: CallerIdentityStore,
+        cart_store: CartStore,
+        recent_orders: RecentOrderContext,
+        registry: CapabilityRegistry,
+    ) -> None:
+        self._recognizer = recognizer
+        self._identity_store = identity_store
+        self._cart_store = cart_store
+        self._recent_orders = recent_orders
+        self._registry = registry
+        self._observed_turn_ids: set[str] = set()
+
+    def prepare(
+        self,
+        turn: CommittedTurn,
+        state: ReasoningState,
+    ) -> RoutingContext | RoutingFailure | None:
+        """Claim one admitted turn and project it synchronously before graph execution."""
+
+        turn_id = turn.message_id
+        if turn_id is None or turn_id in self._observed_turn_ids:
+            return None
+        self._observed_turn_ids.add(turn_id)
+        return project_routing_context(
+            turn,
+            state,
+            identity_store=self._identity_store,
+            cart_store=self._cart_store,
+            recent_orders=self._recent_orders,
+            registry=self._registry,
+        )
+
+    async def observe(
+        self,
+        turn_id: str,
+        projection: RoutingContext | RoutingFailure,
+    ) -> None:
+        if isinstance(projection, RoutingFailure):
+            write_event(_shadow_resolution_event(turn_id, projection))
+            return
+        attempt = await self._recognizer.route(projection)
+        write_event(_shadow_attempt_event(turn_id, projection, attempt))
+
+    def record_cancellation(
+        self,
+        turn_id: str,
+        *,
+        reason: Literal["turn_complete", "turn_cancelled"],
+    ) -> None:
+        write_event(
+            {
+                "event": "semantic_route_shadow_cancelled",
+                "turn_id": turn_id,
+                "decision_source": "shadow",
+                "reason": reason,
+            }
+        )
+
+    def record_failure(
+        self,
+        turn_id: str,
+        *,
+        reason: Literal["observer_error", "cleanup_timeout"],
+    ) -> None:
+        write_event(
+            {
+                "event": "semantic_route_shadow_failed",
+                "turn_id": turn_id,
+                "decision_source": "shadow",
+                "reason": reason,
+            }
+        )
+
+
+def _shadow_resolution_event(
+    turn_id: str,
+    resolution: RouteResolution,
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "event": "semantic_route_shadow",
+        "turn_id": turn_id,
+        "decision_source": "shadow",
+        "decision": "routing_failure",
+        "capability": None,
+        "clarification_reason": None,
+        "failure_reason": None,
+    }
+    if isinstance(resolution, RoutingFailure):
+        event["failure_reason"] = resolution.reason
+        return event
+    event["decision"] = resolution.decision
+    if resolution.decision == "direct" and resolution.request is not None:
+        event["capability"] = resolution.request.kind.value
+    elif resolution.decision == "clarify":
+        event["clarification_reason"] = resolution.clarification_reason
+    return event
+
+
+def _shadow_attempt_event(
+    turn_id: str,
+    context: RoutingContext,
+    attempt: RoutingAttempt,
+) -> dict[str, object]:
+    event = _shadow_resolution_event(turn_id, attempt.resolution)
+    if (
+        isinstance(attempt.resolution, RouteDecision)
+        and attempt.resolution.decision == "continue"
+        and context.active_capability is not None
+    ):
+        event["capability"] = context.active_capability.value
+    event.update(
+        {
+            "provider": attempt.provider,
+            "model": attempt.model,
+            "structured_output_method": attempt.structured_output_method,
+            "latency_ms": attempt.elapsed_ms,
+            "input_tokens": attempt.input_tokens,
+            "cache_read_tokens": attempt.cache_read_tokens,
+            "output_tokens": attempt.output_tokens,
+            "route_schema_fingerprint": attempt.route_schema_fingerprint,
+            "router_prompt_fingerprint": attempt.prompt_fingerprint,
+            "registry_fingerprint": attempt.registry_fingerprint,
+            "context_projector_version": attempt.projector_version,
+            "provider_call_outcome": attempt.provider_call_outcome,
+        }
+    )
+    return event
 
 
 class SemanticRouter:

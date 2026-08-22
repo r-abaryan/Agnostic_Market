@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from llm_fakes import TEST_STRUCTURED_OUTPUT_METHOD, FakeChatModel
 
+from agnostic_market.agents import routing as routing_module
 from agnostic_market.agents.capabilities import (
     CapabilityEntry,
     CapabilityRegistry,
@@ -18,7 +20,9 @@ from agnostic_market.agents.routing import (
     ROUTER_PROMPT_FINGERPRINT,
     ROUTER_SYSTEM_PROMPT,
     RoutingAttempt,
+    RoutingRecognizer,
     SemanticRouter,
+    ShadowRoutingSession,
     materialize_route,
     project_routing_context,
     registry_fingerprint,
@@ -59,6 +63,35 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.state import ReasoningState
 
 _SELECTION = ProviderModel(provider="fake", model="router")
+
+
+class _RecordingRecognizer:
+    def __init__(self, attempt: RoutingAttempt) -> None:
+        self._attempt = attempt
+        self.contexts: list[RoutingContext] = []
+
+    async def route(self, context: RoutingContext) -> RoutingAttempt:
+        self.contexts.append(context)
+        return self._attempt
+
+
+def _attempt(resolution: RouteDecision | RoutingFailure) -> RoutingAttempt:
+    return RoutingAttempt(
+        resolution=resolution,
+        provider="fake",
+        model="recognizer",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        elapsed_ms=12.5,
+        input_tokens=21,
+        cache_read_tokens=3,
+        output_tokens=4,
+        route_schema_fingerprint="route-schema",
+        prompt_fingerprint="recognizer-fingerprint",
+        registry_fingerprint="registry-fingerprint",
+        input_max_chars=2048,
+        timeout_seconds=1.0,
+        provider_call_outcome="completed",
+    )
 
 
 def _registry(*request_types: type[IntentRequestModel]) -> CapabilityRegistry:
@@ -195,6 +228,84 @@ def test_projector_rejects_terminal_state_before_reading_live_stores(
     )
 
     assert result == RoutingFailure(reason="context_invalid")
+
+
+async def test_shadow_session_deduplicates_and_emits_only_closed_route_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(routing_module, "write_event", records.append)
+    registry = _registry(SearchCatalog)
+    recognizer: RoutingRecognizer = _RecordingRecognizer(
+        _attempt(RouteDecision.direct(SearchCatalog(query="private product wording")))
+    )
+    shadow = ShadowRoutingSession(
+        recognizer,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=1),
+        registry=registry,
+    )
+    turn = CommittedTurn(
+        text="find private product wording and call me on +44 7700 900123",
+        message_id="shadow-turn-1",
+    )
+
+    projection = shadow.prepare(turn, ReasoningState())
+    assert isinstance(projection, RoutingContext)
+    assert shadow.prepare(turn, ReasoningState()) is None
+    await shadow.observe("shadow-turn-1", projection)
+
+    assert isinstance(recognizer, _RecordingRecognizer)
+    assert recognizer.contexts == [projection]
+    assert records == [
+        {
+            "event": "semantic_route_shadow",
+            "turn_id": "shadow-turn-1",
+            "decision_source": "shadow",
+            "decision": "direct",
+            "capability": "search_catalog",
+            "clarification_reason": None,
+            "failure_reason": None,
+            "provider": "fake",
+            "model": "recognizer",
+            "structured_output_method": TEST_STRUCTURED_OUTPUT_METHOD,
+            "latency_ms": 12.5,
+            "input_tokens": 21,
+            "cache_read_tokens": 3,
+            "output_tokens": 4,
+            "route_schema_fingerprint": "route-schema",
+            "router_prompt_fingerprint": "recognizer-fingerprint",
+            "registry_fingerprint": "registry-fingerprint",
+            "context_projector_version": CONTEXT_PROJECTOR_VERSION,
+            "provider_call_outcome": "completed",
+        }
+    ]
+    serialized = json.dumps(records)
+    assert "private product wording" not in serialized
+    assert "7700" not in serialized
+    assert "utterance" not in records[0]
+    assert "request" not in records[0]
+
+
+async def test_shadow_projection_failure_calls_no_recognizer() -> None:
+    recognizer = _RecordingRecognizer(_attempt(RouteDecision.direct(ViewCart())))
+    shadow = ShadowRoutingSession(
+        recognizer,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=1),
+        registry=_registry(ViewCart),
+    )
+
+    projection = shadow.prepare(
+        CommittedTurn(text="show my cart", message_id="terminal-shadow-turn"),
+        ReasoningState(automation_terminal=True),
+    )
+
+    assert projection == RoutingFailure(reason="context_invalid")
+    await shadow.observe("terminal-shadow-turn", projection)
+    assert recognizer.contexts == []
 
 
 def test_route_resolver_clarifies_unavailable_direct_and_rejects_ownerless_continue() -> None:

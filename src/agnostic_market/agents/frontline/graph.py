@@ -82,6 +82,11 @@ from agnostic_market.agents.frontline.read_flow import (
 )
 from agnostic_market.agents.gate import enumeration_check, gate_check, status_check
 from agnostic_market.agents.identity import build_identity_nodes
+from agnostic_market.agents.legacy_observation import (
+    LEGACY_HANDOVER_CAPABILITIES,
+    observe_legacy_answer,
+    observe_legacy_capabilities,
+)
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.recovery import (
@@ -537,6 +542,8 @@ def build_frontline_graph(
         assert scope is not None
         order_ids = _status_order_ids(state, scope)
         assert order_ids
+        observe_legacy_capabilities((CapabilityId.VERIFY_ORDER_STATUS,), source="gate")
+        observe_legacy_answer(source="gate")
         line = " ".join(_order_status_line(order_id) for order_id in order_ids)
         line += f" {warm_close()}"
         write_event(
@@ -552,6 +559,7 @@ def build_frontline_graph(
     def finalize_node(state: ReasoningState) -> dict[str, object]:
         """Telemetry sink for ANSWERED turns — the classifier dataset needs negatives
         (turns that did NOT escalate) just as much as the handover positives."""
+        observe_legacy_answer(source="model")
         write_event({"utterance": state.last_user_text(), "outcome": "answered"})
         return {}
 
@@ -655,6 +663,7 @@ def build_frontline_graph(
                 )
             else:
                 line = _order_status_line(order_id) + close
+        observe_legacy_answer(source="tool")
         # Same answered-turn telemetry as finalize_node (this path ENDs here, bypassing it),
         # tagged so the code-render count is measurable against the model-narration path.
         write_event(
@@ -677,6 +686,7 @@ def build_frontline_graph(
             state.active_invocation.request, ViewCart
         ):
             raise TypeError("cart view render requires a view-cart invocation")
+        observe_legacy_capabilities((CapabilityId.VIEW_CART,), source="typed_owner")
         line = _cart_view_line(f" {warm_close()}")
         write_capability_answered(
             state.last_user_text(),
@@ -695,6 +705,7 @@ def build_frontline_graph(
             state.active_invocation.request, ViewIdentityStatus
         ):
             raise TypeError("identity status render requires a view-identity-status invocation")
+        observe_legacy_capabilities((CapabilityId.VIEW_IDENTITY_STATUS,), source="typed_owner")
         # Only the verified line takes a close; the unverified one already ends in an invitation.
         verified = identity_store.current() is not None
         line = identity_status_line(verified=verified)
@@ -710,6 +721,10 @@ def build_frontline_graph(
     def handover_node(state: ReasoningState) -> dict[str, object]:
         assert state.handover is not None  # only reached with a handover set
         handover = state.handover
+        observe_legacy_capabilities(
+            LEGACY_HANDOVER_CAPABILITIES.get(handover.reason_code, ()),
+            source=handover.source,
+        )
         # A clear enumeration ask is code-routed before the frontline model. Two READ scopes
         # answer here without re-entering Identity; a third case (unbound with nothing placed)
         # falls through to Identity below:
@@ -730,6 +745,7 @@ def build_frontline_graph(
                 candidates = store.session_placed_orders()
                 order_scope = "session"
             if candidates is not None:
+                observe_legacy_answer(source=handover.source)
                 write_event(
                     {
                         "utterance": state.last_user_text(),
