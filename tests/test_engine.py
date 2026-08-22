@@ -44,7 +44,11 @@ from agnostic_market.agents.engine import (
     build_checkpointer,
 )
 from agnostic_market.agents.frontline import MODEL_SPEECH_NODES, build_frontline_graph
-from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE, TURN_FALLBACK_LINE
+from agnostic_market.agents.recovery import (
+    AUTOMATION_TERMINAL_LINE,
+    TURN_FALLBACK_LINE,
+    clear_automation_state,
+)
 from agnostic_market.agents.routing import (
     ProviderCallOutcome,
     RoutingAttempt,
@@ -79,6 +83,7 @@ from agnostic_market.dtos.orchestration import (
     CapabilityDispatchEnvelope,
     CartItemChoices,
     CartItemQuery,
+    DiscloseAiIdentity,
     ExplicitOrderSet,
     ListOrders,
     ModifyCart,
@@ -121,6 +126,9 @@ _PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
 _TEST_OTP = "482913"
 _WAIT_TIMEOUT_SECONDS = 5.0
+_DISPATCH_REJECTION_LINE = (
+    "I couldn't complete that request. Please try again, or ask to speak to a person."
+)
 
 
 def _shadow_attempt(
@@ -810,6 +818,42 @@ async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_rout
     assert state.active_invocation is None
     assert recognizer.contexts == []
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+
+
+async def test_restored_unregistered_invocation_speaks_once_and_releases_the_next_turn(
+    config_root: Path,
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False, text_response="Ready for the next request.")
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="unregistered-invocation",
+    )
+    origin_id = "removed-capability-origin"
+    engine._graph.update_state(
+        engine._config,
+        {
+            "consumed_turn_ids": (origin_id,),
+            "active_invocation": ActiveInvocation(
+                request=DiscloseAiIdentity(),
+                opened_turn_id=origin_id,
+            ),
+        },
+        as_node=engine._graph.principal_seed_complete_node,
+    )
+    adapter = GraphVoiceAdapter(engine)
+
+    rejected = await _adapter_turn(adapter, "continue", "removed-capability-continuation")
+    after_rejection = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    next_turn = await _adapter_turn(adapter, "hello", "after-rejected-capability")
+
+    assert rejected == [_DISPATCH_REJECTION_LINE]
+    for field, expected in clear_automation_state().items():
+        assert getattr(after_rejection, field) == expected
+    assert next_turn == ["Ready for the next request."]
+    assert frontline.invoke_count == 1 and reasoning.invoke_count == 0
 
 
 async def test_duplicate_list_turn_cannot_open_an_invocation(config_root: Path) -> None:

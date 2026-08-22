@@ -156,6 +156,9 @@ logger = logging.getLogger("agnostic_market.agents.frontline")
 
 _HANDOVER_TOOL_NAME = "request_handover"
 _CAPABILITY_DISPATCH_NODE = "capability_dispatch"
+_CAPABILITY_DISPATCH_REJECTED_LINE = (
+    "I couldn't complete that request. Please try again, or ask to speak to a person."
+)
 _SUPPORT_CAPABILITY_ENTRY_NODE = "support_capability_entry"
 _SUPPORT_CAPABILITY_RENDER_NODE = "support_capability_render"
 _IDENTITY_CAPABILITY_ENTRY_NODE = "identity_capability_entry"
@@ -239,6 +242,7 @@ FRONTLINE_SPEAKABLE_NODES = frozenset(
         "automation_terminal_response",
         "principal_warning",
         "read_render",
+        _CAPABILITY_DISPATCH_NODE,
         _CART_VIEW_RENDER_NODE,
         _IDENTITY_STATUS_RENDER_NODE,
         "forced_status",
@@ -1176,7 +1180,13 @@ def build_frontline_graph(
                     "disposition": "closed",
                 }
             )
-            return Command(update={"pending_capability_dispatch": None}, goto=END)
+            return Command(
+                update={
+                    **clear_automation_state(),
+                    "messages": [AIMessage(_CAPABILITY_DISPATCH_REJECTED_LINE)],
+                },
+                goto=END,
+            )
 
         envelope_value = state.pending_capability_dispatch
         if envelope_value is None:

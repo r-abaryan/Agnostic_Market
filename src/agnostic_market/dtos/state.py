@@ -135,7 +135,11 @@ class CartLine(BaseModel):
 
 
 class PendingCartMutation(BaseModel):
-    """One code-resolved cart change awaiting explicit caller confirmation."""
+    """One code-resolved cart change awaiting explicit caller confirmation.
+
+    `pre_confirm_quantity` records proposal-time state for receipt identity. The store uses
+    live quantity when applying the confirmed change.
+    """
 
     model_config = _FROZEN
 

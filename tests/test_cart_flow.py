@@ -851,6 +851,15 @@ def test_cart_mutation_receipts_reject_key_conflicts_and_report_absence() -> Non
         quantity=3,
         pre_confirm_quantity=0,
     )
+    proposal_state_conflict = cart.mutation_receipt(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=2,
+        pre_confirm_quantity=1,
+    )
     absent = cart.mutation_receipt(
         "cart-mutation-absent",
         operation="remove",
@@ -862,6 +871,7 @@ def test_cart_mutation_receipts_reject_key_conflicts_and_report_absence() -> Non
     )
 
     assert conflict == IndeterminateReceipt(reason="key_conflict")
+    assert proposal_state_conflict == IndeterminateReceipt(reason="key_conflict")
     assert isinstance(absent, NotCommittedReceipt)
     with pytest.raises(CartMutationError, match="different parameters"):
         cart.apply_confirmed_mutation(

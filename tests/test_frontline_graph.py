@@ -101,6 +101,9 @@ from agnostic_market.voice.tools import build_voice_tools
 _HANDOVER_ARGS = {"request_handover": {"destination": "planner", "reason_code": "multi_step"}}
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
 _TEST_OTP = "482913"
+_DISPATCH_REJECTION_LINE = (
+    "I couldn't complete that request. Please try again, or ask to speak to a person."
+)
 
 
 def _granted(*order_ids: str) -> CallerIdentityStore:
@@ -491,7 +494,10 @@ def test_invalid_dispatch_envelope_closes_without_executing_an_owner(
 
     assert isinstance(command, Command)
     assert command.goto == END
-    assert command.update == {"pending_capability_dispatch": None}
+    assert command.update == {
+        **clear_automation_state(),
+        "messages": [AIMessage(_DISPATCH_REJECTION_LINE)],
+    }
     assert records == [
         {
             "event": "capability_dispatch_rejected",
