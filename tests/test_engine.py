@@ -44,7 +44,17 @@ from agnostic_market.agents.engine import (
     build_checkpointer,
 )
 from agnostic_market.agents.frontline import MODEL_SPEECH_NODES, build_frontline_graph
-from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE, TURN_FALLBACK_LINE
+from agnostic_market.agents.recovery import (
+    AUTOMATION_TERMINAL_LINE,
+    TURN_FALLBACK_LINE,
+    clear_automation_state,
+)
+from agnostic_market.agents.routing import (
+    ProviderCallOutcome,
+    RoutingAttempt,
+    RoutingRecognizer,
+    ShadowRoutingSession,
+)
 from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
@@ -69,13 +79,19 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
+    CancelOrders,
+    CapabilityDispatchEnvelope,
     CartItemChoices,
     CartItemQuery,
+    DiscloseAiIdentity,
     ExplicitOrderSet,
     ListOrders,
     ModifyCart,
     PlaceOrder,
     ResolvedCartItemRef,
+    RouteDecision,
+    RoutingContext,
+    RoutingFailure,
     VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
@@ -90,6 +106,7 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     IdentityClarification,
     PendingCancelBatch,
+    PendingCartMutation,
     PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
@@ -109,6 +126,58 @@ _PROPOSE = {"buy_now": {"candidate_key": "2", "quantity": 2}}
 _FACTS = TurnFacts()
 _TEST_OTP = "482913"
 _WAIT_TIMEOUT_SECONDS = 5.0
+_DISPATCH_REJECTION_LINE = (
+    "I couldn't complete that request. Please try again, or ask to speak to a person."
+)
+
+
+def _shadow_attempt(
+    resolution: RouteDecision | RoutingFailure | None = None,
+    *,
+    provider_call_outcome: ProviderCallOutcome = "completed",
+) -> RoutingAttempt:
+    return RoutingAttempt(
+        resolution=(RouteDecision.direct(CancelOrders()) if resolution is None else resolution),
+        provider="fake",
+        model="shadow-recognizer",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        elapsed_ms=1.0,
+        input_tokens=None,
+        cache_read_tokens=None,
+        output_tokens=None,
+        route_schema_fingerprint="route-schema",
+        prompt_fingerprint="recognizer-fingerprint",
+        registry_fingerprint="registry-fingerprint",
+        input_max_chars=2048,
+        timeout_seconds=1.0,
+        provider_call_outcome=provider_call_outcome,
+    )
+
+
+class _DeterministicRoutingRecognizer:
+    def __init__(self, attempt: RoutingAttempt | None = None) -> None:
+        self.contexts: list[RoutingContext] = []
+        self._attempt = _shadow_attempt() if attempt is None else attempt
+
+    async def route(self, context: RoutingContext) -> RoutingAttempt:
+        self.contexts.append(context)
+        return self._attempt
+
+
+class _BlockingRoutingRecognizer(_DeterministicRoutingRecognizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def route(self, context: RoutingContext) -> RoutingAttempt:
+        self.contexts.append(context)
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+        raise AssertionError("cancelled shadow recognizer resumed unexpectedly")
 
 
 class _BlockingFirstResponseModel(FakeChatModel):
@@ -157,6 +226,7 @@ def _engine(
     cart: CartStore | None = None,
     identity: CallerIdentityStore | None = None,
     thread_id: str = "session-1",
+    shadow_recognizer: RoutingRecognizer | None = None,
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     policy = make_policy(refund_returnless_under_usd=50.0)
@@ -201,11 +271,23 @@ def _engine(
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         checkpointer=build_checkpointer(),
     )
+    shadow_routing = (
+        ShadowRoutingSession(
+            shadow_recognizer,
+            identity_store=identity,
+            cart_store=cart,
+            recent_orders=recent_orders,
+            registry=assembly.capability_registry,
+        )
+        if shadow_recognizer is not None
+        else None
+    )
     engine = ReasoningEngine(
         assembly.graph,
         thread_id=thread_id,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         lifecycle=caller_context,
+        shadow_routing=shadow_routing,
     )
     caller_context.attach_engine(engine)
     return engine, store
@@ -342,6 +424,345 @@ async def test_plain_answer_is_spoken_exactly_once(config_root: Path) -> None:
     assert tokens[0].text  # the fake's canned answer
 
 
+async def test_default_engine_allocates_no_shadow_owner_or_task(config_root: Path) -> None:
+    engine, _ = _engine(config_root)
+
+    await _events(engine, "hi there")
+
+    assert engine._shadow_routing is None
+    assert not any(
+        task.get_name() == "semantic-route-shadow" and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
+async def test_shadow_nomination_has_zero_speech_state_tool_or_effect_authority(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    frontline = FakeChatModel(emit_tool_calls=False)
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(
+        config_root,
+        frontline=frontline,
+        thread_id="shadow-zero-authority",
+        shadow_recognizer=recognizer,
+    )
+
+    output = await _adapter_turn(
+        GraphVoiceAdapter(engine),
+        "tell me about your shoes",
+        "shadow-ordinary-turn",
+    )
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    shadow_records = [
+        record for record in records if record.get("event") == "semantic_route_shadow"
+    ]
+    legacy_records = [
+        record for record in records if record.get("event") == "semantic_route_legacy_observation"
+    ]
+
+    assert len(output) == 1
+    assert frontline.invoke_count == 1
+    assert [context.utterance for context in recognizer.contexts] == ["tell me about your shoes"]
+    assert shadow_records == [
+        {
+            "event": "semantic_route_shadow",
+            "turn_id": "shadow-ordinary-turn",
+            "decision_source": "shadow",
+            "decision": "direct",
+            "capability": "cancel_orders",
+            "clarification_reason": None,
+            "failure_reason": None,
+            "provider": "fake",
+            "model": "shadow-recognizer",
+            "structured_output_method": TEST_STRUCTURED_OUTPUT_METHOD,
+            "latency_ms": 1.0,
+            "input_tokens": None,
+            "cache_read_tokens": None,
+            "output_tokens": None,
+            "route_schema_fingerprint": "route-schema",
+            "router_prompt_fingerprint": "recognizer-fingerprint",
+            "registry_fingerprint": "registry-fingerprint",
+            "context_projector_version": "2",
+            "provider_call_outcome": "completed",
+        }
+    ]
+    assert legacy_records == [
+        {
+            "event": "semantic_route_legacy_observation",
+            "turn_id": "shadow-ordinary-turn",
+            "decision_source": "legacy",
+            "capability_candidates": [],
+            "owner_sources": [],
+            "answer_sources": ["model"],
+            "answered": True,
+            "non_tool_ai_text_without_owner": True,
+        }
+    ]
+    assert state.active_invocation is None
+    assert store.placed_count == 0
+    assert store.cancel_count == 0
+    assert store.refund_count == 0
+    assert store.return_count == 0
+
+
+async def test_shadow_legacy_observation_uses_executed_read_tool_and_answer_seams(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    engine, _ = _engine(
+        config_root,
+        frontline=FakeChatModel(force_tool="view_cart", tool_call_limit=1),
+        thread_id="shadow-legacy-read",
+        shadow_recognizer=_DeterministicRoutingRecognizer(),
+    )
+
+    await _adapter_turn(GraphVoiceAdapter(engine), "what is in my cart", "legacy-read-turn")
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert [
+        record for record in records if record.get("event") == "semantic_route_legacy_observation"
+    ] == [
+        {
+            "event": "semantic_route_legacy_observation",
+            "turn_id": "legacy-read-turn",
+            "decision_source": "legacy",
+            "capability_candidates": ["view_cart"],
+            "owner_sources": ["tool"],
+            "answer_sources": ["tool"],
+            "answered": True,
+            "non_tool_ai_text_without_owner": False,
+        }
+    ]
+
+
+async def test_closed_shadow_failure_does_not_enter_graph_recovery_or_change_live_answer(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    recognizer = _DeterministicRoutingRecognizer(
+        _shadow_attempt(
+            RoutingFailure(reason="routing_unavailable"),
+            provider_call_outcome="provider_error",
+        )
+    )
+    engine, store = _engine(
+        config_root,
+        frontline=FakeChatModel(emit_tool_calls=False),
+        thread_id="shadow-closed-failure",
+        shadow_recognizer=recognizer,
+    )
+
+    output = await _adapter_turn(
+        GraphVoiceAdapter(engine),
+        "tell me about your shoes",
+        "shadow-failure-turn",
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert output
+    assert len(recognizer.contexts) == 1
+    assert not any(record.get("event") == "turn_failed" for record in records)
+    assert [
+        (
+            record.get("decision"),
+            record.get("failure_reason"),
+            record.get("provider_call_outcome"),
+        )
+        for record in records
+        if record.get("event") == "semantic_route_shadow"
+    ] == [("routing_failure", "routing_unavailable", "provider_error")]
+    assert store.placed_count == 0
+    assert store.cancel_count == 0
+    assert store.refund_count == 0
+    assert store.return_count == 0
+
+
+async def test_shadow_is_not_recalled_for_duplicate_or_interrupt_resume(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    recognizer = _DeterministicRoutingRecognizer()
+    cart = _cart_with_fixture_product(config_root)
+    engine, store = _engine(
+        config_root,
+        cart=cart,
+        thread_id="shadow-lifecycle-precedence",
+        shadow_recognizer=recognizer,
+    )
+    adapter = GraphVoiceAdapter(engine)
+
+    await _adapter_turn(adapter, "tell me about your shoes", "ordinary-once")
+    await _adapter_turn(adapter, "tell me about your shoes", "ordinary-once")
+    await _adapter_turn(adapter, "checkout now please", "checkout-turn")
+    assert engine.pending_interrupt()
+    await _adapter_turn(adapter, "yes", "consent-turn")
+
+    assert [context.utterance for context in recognizer.contexts] == [
+        "tell me about your shoes",
+        "checkout now please",
+    ]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [
+        record["turn_id"]
+        for record in records
+        if record.get("event") == "semantic_route_legacy_observation"
+    ] == ["ordinary-once", "checkout-turn"]
+    assert store.placed_count == 1
+
+
+async def test_shadow_is_not_started_for_recovery_terminal_or_principal_continuation(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    recovery_recognizer = _DeterministicRoutingRecognizer()
+    recovery_engine, _ = _engine(
+        config_root,
+        thread_id="shadow-recovery-precedence",
+        shadow_recognizer=recovery_recognizer,
+    )
+    abandoned_id = "shadow-abandoned-turn"
+    recovery_engine._graph.update_state(
+        recovery_engine._config,
+        {
+            "messages": [HumanMessage(content="tell me about shoes", id=abandoned_id)],
+            "consumed_turn_ids": (abandoned_id,),
+            "pending_recovery": PendingRecovery(
+                origin_node="model",
+                action=ExceptionAction.SAFE_ABORT,
+                trigger="stream_cancelled",
+                abandoned_message_id=abandoned_id,
+            ),
+        },
+        as_node="__start__",
+    )
+    await _adapter_turn(
+        GraphVoiceAdapter(recovery_engine),
+        "tell me about shoes",
+        abandoned_id,
+    )
+
+    terminal_recognizer = _DeterministicRoutingRecognizer()
+    terminal_engine, _ = _engine(
+        config_root,
+        thread_id="shadow-terminal-precedence",
+        shadow_recognizer=terminal_recognizer,
+    )
+    terminal_engine._terminal_latched = True
+    await _adapter_turn(
+        GraphVoiceAdapter(terminal_engine),
+        "tell me about shoes",
+        "terminal-turn",
+    )
+
+    continuation_recognizer = _DeterministicRoutingRecognizer()
+    continuation_engine, _ = _engine(
+        config_root,
+        thread_id="shadow-continuation-precedence",
+        shadow_recognizer=continuation_recognizer,
+    )
+    origin_id = "principal-continuation-origin"
+    continuation_engine._graph.update_state(
+        continuation_engine._config,
+        {
+            "consumed_turn_ids": (origin_id,),
+            "active_invocation": ActiveInvocation(
+                request=ViewCart(),
+                opened_turn_id=origin_id,
+            ),
+        },
+        as_node="__start__",
+    )
+    await _adapter_turn(
+        GraphVoiceAdapter(continuation_engine),
+        "show it",
+        "principal-continuation-turn",
+    )
+
+    assert recovery_recognizer.contexts == []
+    assert terminal_recognizer.contexts == []
+    assert continuation_recognizer.contexts == []
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(record.get("event") == "semantic_route_legacy_observation" for record in records)
+
+
+async def test_unfinished_shadow_task_is_cancelled_before_turn_cleanup(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    recognizer = _BlockingRoutingRecognizer()
+    engine, _ = _engine(
+        config_root,
+        thread_id="shadow-task-cleanup",
+        shadow_recognizer=recognizer,
+    )
+
+    output = await asyncio.wait_for(
+        _adapter_turn(
+            GraphVoiceAdapter(engine),
+            "tell me about your shoes",
+            "shadow-cancelled-turn",
+        ),
+        timeout=_WAIT_TIMEOUT_SECONDS,
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert output
+    assert recognizer.started.is_set()
+    assert recognizer.cancelled.is_set()
+    assert [
+        record for record in records if record.get("event") == "semantic_route_shadow_cancelled"
+    ] == [
+        {
+            "event": "semantic_route_shadow_cancelled",
+            "turn_id": "shadow-cancelled-turn",
+            "decision_source": "shadow",
+            "reason": "turn_complete",
+        }
+    ]
+    assert [
+        record["turn_id"]
+        for record in records
+        if record.get("event") == "semantic_route_legacy_observation"
+    ] == ["shadow-cancelled-turn"]
+    assert not any(
+        task.get_name() == "semantic-route-shadow" and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+
 async def test_duplicate_normal_turn_id_is_admitted_only_once(config_root: Path) -> None:
     frontline = FakeChatModel(emit_tool_calls=False)
     engine, _ = _engine(
@@ -356,6 +777,164 @@ async def test_duplicate_normal_turn_id_is_admitted_only_once(config_root: Path)
 
     assert frontline.invoke_count == 1
     assert engine._graph.get_state(engine._config).values.get("active_invocation") is None
+
+
+async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_router_recall(
+    config_root: Path,
+) -> None:
+    frontline = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="checkpointed-dispatch-redelivery",
+        shadow_recognizer=recognizer,
+    )
+    adapter = GraphVoiceAdapter(engine)
+    turn_id = "checkpointed-dispatch-turn"
+    engine._graph.update_state(
+        engine._config,
+        {
+            "messages": [HumanMessage(content="what is in my cart?", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                turn_id=turn_id,
+                mode="direct",
+                request=ViewCart(),
+            ),
+        },
+        as_node="__start__",
+    )
+
+    first = await _adapter_turn(adapter, "what is in my cart?", turn_id)
+    second = await _adapter_turn(adapter, "what is in my cart?", turn_id)
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert first == ["Your cart's empty at the moment."]
+    assert second == []
+    assert state.pending_capability_dispatch is None
+    assert state.active_invocation is None
+    assert recognizer.contexts == []
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+
+
+async def test_duplicate_typed_cart_dispatch_cannot_resume_mutation_confirmation(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    product = load_orders_fixture(config_root, "acme_store").products[0]
+    cart = CartStore()
+    frontline = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="duplicate-typed-cart-dispatch",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    dispatch_id = "typed-cart-dispatch"
+    request = ModifyCart(
+        operation="add",
+        item=CartItemQuery(query=product.name),
+        quantity=1,
+    )
+    engine._graph.update_state(
+        engine._config,
+        {
+            "messages": [HumanMessage(content=f"add one {product.name}", id=dispatch_id)],
+            "consumed_turn_ids": (dispatch_id,),
+            "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                turn_id=dispatch_id,
+                mode="direct",
+                request=request,
+            ),
+        },
+        as_node="__start__",
+    )
+
+    await _adapter_turn(adapter, f"add one {product.name}", dispatch_id)
+    first = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    pending = first.pending_cart_mutation
+
+    assert pending is not None
+    assert engine.pending_interrupt()
+    assert cart.is_empty()
+
+    duplicate_output = await _adapter_turn(adapter, f"add one {product.name}", dispatch_id)
+    duplicate = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert duplicate_output == []
+    assert duplicate.pending_cart_mutation == pending
+    assert engine.pending_interrupt()
+    assert cart.is_empty()
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+
+    consent_output = await _adapter_turn(adapter, "yes", "typed-cart-consent")
+    completed = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    receipt = cart.mutation_receipt(
+        pending.idempotency_key,
+        operation=pending.operation,
+        sku=pending.sku,
+        name=pending.name,
+        price_usd=pending.price_usd,
+        quantity=pending.quantity,
+        pre_confirm_quantity=pending.pre_confirm_quantity,
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert cart.view()[0].quantity == 1
+    assert receipt.kind == "committed"
+    assert completed.pending_cart_mutation is None
+    assert not engine.pending_interrupt()
+    assert len(consent_output) == 1 and product.name in consent_output[0]
+    assert [record for record in records if record.get("event") == "cart_item_added"] == [
+        {"event": "cart_item_added", "sku": product.sku}
+    ]
+
+
+async def test_restored_unregistered_invocation_speaks_once_and_releases_the_next_turn(
+    config_root: Path,
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False, text_response="Ready for the next request.")
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="unregistered-invocation",
+    )
+    origin_id = "removed-capability-origin"
+    engine._graph.update_state(
+        engine._config,
+        {
+            "consumed_turn_ids": (origin_id,),
+            "active_invocation": ActiveInvocation(
+                request=DiscloseAiIdentity(),
+                opened_turn_id=origin_id,
+            ),
+        },
+        as_node=engine._graph.principal_seed_complete_node,
+    )
+    adapter = GraphVoiceAdapter(engine)
+
+    rejected = await _adapter_turn(adapter, "continue", "removed-capability-continuation")
+    after_rejection = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    next_turn = await _adapter_turn(adapter, "hello", "after-rejected-capability")
+
+    assert rejected == [_DISPATCH_REJECTION_LINE]
+    for field, expected in clear_automation_state().items():
+        assert getattr(after_rejection, field) == expected
+    assert next_turn == ["Ready for the next request."]
+    assert frontline.invoke_count == 1 and reasoning.invoke_count == 0
 
 
 async def test_duplicate_list_turn_cannot_open_an_invocation(config_root: Path) -> None:
@@ -1717,6 +2296,21 @@ def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> No
 
 _CHECKPOINT_CHANNEL_VALUES = (
     ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1"),
+    CapabilityDispatchEnvelope(
+        turn_id="turn-1",
+        mode="direct",
+        request=ViewCart(),
+    ),
+    PendingCartMutation(
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=2,
+        pre_confirm_quantity=0,
+        idempotency_key="cart-mutation-1",
+        created_at=1.0,
+    ),
     PendingPlacement(
         lines=(CartLine(sku="SKU-1", name="trail shoes", price_usd=79.0, quantity=1),),
         total_usd=79.0,

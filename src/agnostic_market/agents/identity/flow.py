@@ -58,6 +58,10 @@ from agnostic_market.agents.clarification import (
     with_clarification_lifecycle,
 )
 from agnostic_market.agents.identity.prompt import compose_identity_prompt
+from agnostic_market.agents.legacy_observation import (
+    observe_legacy_capabilities,
+    observe_legacy_model_tool_calls,
+)
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore, CustomerDirectory
@@ -178,6 +182,7 @@ def build_identity_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyIdentity | SwitchAccount):
             raise TypeError("identity capability entry requires an identity invocation")
+        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         return {"active_flow": "identity"}
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
@@ -236,6 +241,7 @@ def build_identity_nodes(
             response = model.invoke(messages)
             if not response.tool_calls:
                 return _clarification_result(state, new_messages)
+            observe_legacy_model_tool_calls(response.tool_calls)
             new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]

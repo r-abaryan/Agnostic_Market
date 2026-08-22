@@ -442,6 +442,34 @@ class ActiveInvocation(BaseModel):
         return replacement
 
 
+class CapabilityDispatchEnvelope(BaseModel):
+    """One admitted direct or continuation decision awaiting registry dispatch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    turn_id: NonEmptyText
+    mode: Literal["direct", "continue"]
+    request: IntentRequest | None = None
+    observed_invocation_id: NonEmptyText | None = None
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def request_is_fully_validated(cls, value: object) -> IntentRequest | None:
+        if value is None:
+            return None
+        return _revalidate_intent_request(value)
+
+    @model_validator(mode="after")
+    def payload_matches_mode(self) -> CapabilityDispatchEnvelope:
+        if self.mode == "direct":
+            if self.request is None or self.observed_invocation_id is not None:
+                raise ValueError("direct dispatch requires only one request")
+            RouteDecision.direct(self.request)
+        elif self.request is not None or self.observed_invocation_id is None:
+            raise ValueError("continuation dispatch requires only the observed invocation ID")
+        return self
+
+
 ClarificationReason = Literal[
     "ambiguous_intent",
     "missing_target",

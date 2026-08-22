@@ -18,7 +18,12 @@ import logging
 from pathlib import Path
 from typing import Literal
 
+from agnostic_market.agents.legacy_observation import (
+    observe_legacy_answer,
+    observe_legacy_capabilities,
+)
 from agnostic_market.commerce.spoken import redact_contact
+from agnostic_market.dtos.orchestration import CapabilityId
 
 logger = logging.getLogger("agnostic_market.agents.telemetry")
 
@@ -66,6 +71,8 @@ def write_capability_answered(
     """
     if not utterance.strip():
         return
+    observe_legacy_capabilities((CapabilityId(capability),), source="typed_owner")
+    observe_legacy_answer(source="typed_owner")
     write_event(
         {
             "utterance": utterance,

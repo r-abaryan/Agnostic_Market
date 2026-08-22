@@ -19,6 +19,8 @@ from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
+    CapabilityDispatchEnvelope,
+    CartOperation,
     IntentRequest,
     VerifyOrderStatus,
 )
@@ -130,6 +132,42 @@ class CartLine(BaseModel):
     @property
     def line_total(self) -> float:
         return round(self.price_usd * self.quantity, 2)
+
+
+class PendingCartMutation(BaseModel):
+    """One code-resolved cart change awaiting explicit caller confirmation.
+
+    `pre_confirm_quantity` records proposal-time state for receipt identity. The store uses
+    live quantity when applying the confirmed change.
+    """
+
+    model_config = _FROZEN
+
+    operation: CartOperation
+    sku: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    price_usd: float = Field(ge=0)
+    quantity: int | None = Field(default=None, strict=True, ge=0)
+    pre_confirm_quantity: int = Field(strict=True, ge=0)
+    idempotency_key: str = Field(min_length=1)
+    created_at: float
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def idempotency_key_is_nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("cart mutation idempotency key must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def quantity_matches_operation(self) -> PendingCartMutation:
+        if self.operation == "remove" and self.quantity is not None:
+            raise ValueError("remove cart mutation must not carry a quantity")
+        if self.operation == "add" and (self.quantity is None or self.quantity < 1):
+            raise ValueError("add cart mutation requires a positive quantity")
+        if self.operation == "set_quantity" and self.quantity is None:
+            raise ValueError("set-quantity cart mutation requires a final quantity")
+        return self
 
 
 class PendingPlacement(BaseModel):
@@ -442,8 +480,8 @@ class ReasoningState(BaseModel):
     """The reasoning graph's state (Phase 3a/3b slice of AGENTS.md §A1).
 
     `messages` uses the append reducer. `handover`, when set, routes the turn to the
-    handover sink. `pending_placement` + `active_flow` carry an in-flight placement across
-    the HITL interrupt and across turns (the thread is checkpointed from 3b on).
+    handover sink. Pending Cart proposals and `active_flow` carry in-flight confirmation
+    work across interrupts and turns (the thread is checkpointed from 3b on).
     Every non-`messages` field MUST default: the engine feeds turns as
     `{"messages": [<new user message>]}` deltas.
     """
@@ -457,6 +495,8 @@ class ReasoningState(BaseModel):
     # Session-terminal automation state. Set only by the shared human handover and retained
     # until the caller lifecycle deletes the checkpoint; it is never an identity/account block.
     automation_terminal: bool = False
+    pending_capability_dispatch: CapabilityDispatchEnvelope | None = None
+    pending_cart_mutation: PendingCartMutation | None = None
     pending_placement: PendingPlacement | None = None
     pending_refund: PendingRefund | None = None
     pending_cancel: PendingCancel | None = None

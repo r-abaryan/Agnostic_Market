@@ -18,7 +18,7 @@ from langgraph.types import Command
 
 from agnostic_market.agents._copy import principal_completion_line
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.orders import (
     CancelRecord,
     OrderStore,
@@ -37,6 +37,7 @@ from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction, Pend
 from agnostic_market.dtos.state import (
     BatchCancelOutcome,
     PendingCancelBatch,
+    PendingCartMutation,
     PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
@@ -145,6 +146,7 @@ class CommerceEffectFinishers:
     """The complete flow-owned post-commit projection boundary used by normal and recovery."""
 
     placement: Callable[[PlacedOrder], dict[str, object]]
+    cart_mutation: Callable[[CartMutationRecord], dict[str, object]]
     refund: Callable[[RefundRecord], dict[str, object]]
     cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
     return_: Callable[[ReturnRecord], dict[str, object]]
@@ -714,6 +716,24 @@ def build_recovery_node(
                     return Command(update=update, goto=safe_abort_continue_node)
             line = TURN_FALLBACK_LINE
         elif marker.action == ExceptionAction.CART_REVIEW:
+            pending_mutation = state.pending_cart_mutation
+            if isinstance(pending_mutation, PendingCartMutation):
+                receipt = cart_store.mutation_receipt(
+                    pending_mutation.idempotency_key,
+                    operation=pending_mutation.operation,
+                    sku=pending_mutation.sku,
+                    name=pending_mutation.name,
+                    price_usd=pending_mutation.price_usd,
+                    quantity=pending_mutation.quantity,
+                    pre_confirm_quantity=pending_mutation.pre_confirm_quantity,
+                )
+                if isinstance(receipt, CommittedReceipt) and isinstance(
+                    receipt.record, CartMutationRecord
+                ):
+                    write_event(node_failure_event(marker))
+                    return complete(finishers.cart_mutation(receipt.record))
+                if not isinstance(receipt, NotCommittedReceipt):
+                    return terminal_result(node_failure_event(marker))
             lines = cart_store.view()
             cart_line = (
                 render_cart_line(lines, cart_store.cart_total()) if lines else "Your cart is empty."
@@ -742,6 +762,8 @@ _PROTECTED_STATE_FIELDS = frozenset({"messages", "automation_terminal"})
 _AUTOMATION_STATE_RESET: Mapping[str, object] = MappingProxyType(
     {
         "handover": None,
+        "pending_capability_dispatch": None,
+        "pending_cart_mutation": None,
         "pending_placement": None,
         "pending_refund": None,
         "pending_cancel": None,

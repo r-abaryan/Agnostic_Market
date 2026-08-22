@@ -1,27 +1,8 @@
-"""The cart gated flow (Tier 3, AGENTS §A10/§A10a) — Group B.
+"""Cart mutation, review, and whole-cart placement behavior.
 
-ONE flow owns the whole purchase journey, with the cart/placement distinction kept legible:
-
-  MUTATION (reversible)          PLACEMENT (irreversible — the hardened tail from checkout 3b)
-  assemble ─add/remove/qty──▶ ack        assemble ─buy_now/checkout──▶ guardrail
-     │  review_cart ──────────▶ ack           │                            │
-     │  empty checkout ────────▶ ack           ▼                            ▼
-     └─ leave_cart                        confirm[HITL interrupt] ──yes──▶ place (place_cart)
-
-Cart mutations are reversible → a lightweight spoken ack (`cart_ack`), NO HITL. The single
-irreversible effect (placing the whole cart as one order) keeps every checkout-3b invariant:
-the `idempotency_key`+`created_at` are minted into `PendingPlacement` (a FROZEN whole-cart
-snapshot) BEFORE the interrupt (A10a rule 2); `confirm` holds the interrupt(s) and NO side
-effects; the §4a barged-readback re-confirm; the Clock-A TTL checked first; `place` is the
-sole post-interrupt effect, idempotent by the OrderStore key dedup.
-
-`cart_assemble` and `cart_capability_entry` never speak. Dynamic mutation/review/empty-cart results
-travel through the turn-scoped `pending_ack` channel to `cart_ack`; closed clarification selectors
-travel through `pending_clarification` to `cart_clarify`. Each code-owned node speaks and clears its
-own channel.
-
-SKU discipline (unchanged from checkout): the model NEVER emits a SKU — it picks a candidate
-KEY; code resolves key → sku → name → price and does all arithmetic.
+Typed writes freeze code-resolved proposals before separate confirmation and idempotent effect
+nodes. Models may select bounded candidates but never author catalog identity, consent, effect
+keys, arithmetic, or caller-visible outcomes.
 """
 
 from __future__ import annotations
@@ -47,8 +28,12 @@ from agnostic_market.agents.clarification import (
     advance_clarification,
     with_clarification_lifecycle,
 )
+from agnostic_market.agents.legacy_observation import (
+    observe_legacy_capabilities,
+    observe_legacy_model_tool_calls,
+)
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.orders import (
     Candidate,
     OrderStore,
@@ -75,6 +60,7 @@ from agnostic_market.dtos.state import (
     CartClarificationDetail,
     CartLine,
     HandoffRequest,
+    PendingCartMutation,
     PendingPlacement,
     PolicyContext,
     ReasoningState,
@@ -265,6 +251,9 @@ class CartNodes:
     capability_entry: Callable[[ReasoningState], dict[str, object]]
     ack: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
+    mutation_confirm: Callable[[ReasoningState], dict[str, object]]
+    mutation_apply: Callable[[ReasoningState], dict[str, object]]
+    reconcile_mutation: Callable[[CartMutationRecord], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
@@ -390,6 +379,23 @@ def build_cart_nodes(
             )
         }
 
+    def _mint_mutation(
+        operation: _MutationOperation,
+        item: Candidate | CartLine,
+        quantity: int | None,
+    ) -> PendingCartMutation:
+        current = next((line for line in cart_store.view() if line.sku == item.sku), None)
+        return PendingCartMutation(
+            operation=operation,
+            sku=item.sku,
+            name=item.name,
+            price_usd=item.price_usd,
+            quantity=quantity,
+            pre_confirm_quantity=current.quantity if current is not None else 0,
+            idempotency_key=uuid.uuid4().hex,
+            created_at=time.time(),
+        )
+
     def _apply_candidate_key_mutation(
         call: dict,
         candidates: list[Candidate],
@@ -476,6 +482,7 @@ def build_cart_nodes(
             "messages": new_messages,
             "active_flow": "left_cart",
             "active_invocation": None,
+            "pending_cart_mutation": None,
             "pending_placement": None,
             "pending_clarification": None,
         }
@@ -485,6 +492,7 @@ def build_cart_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, ModifyCart | PlaceOrder):
             raise TypeError("cart capability entry requires a typed Cart invocation")
+        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         if isinstance(invocation.request, PlaceOrder):
             if cart_store.is_empty():
                 return {
@@ -684,27 +692,15 @@ def build_cart_nodes(
                 return empty_cart()
             retain(ModifyCart(operation=request.operation, quantity=request.quantity))
             return clarify("item")
-        if request.operation == "add":
-            outcome = _apply_resolved_mutation(
-                cart_store,
-                "add",
-                number_candidates([live_item])[0],
-                request.quantity,
-            )
-            ack = _mutation_ack([outcome.line], [])
-        else:
-            outcome = _apply_resolved_mutation(
-                cart_store,
-                request.operation,
-                live_item,
-                request.quantity,
-            )
-            ack = _mutation_ack([], [outcome.fragment])
         return {
             "messages": new_messages,
             "active_invocation": None,
-            "active_flow": None,
-            "pending_ack": ack,
+            "active_flow": "cart",
+            "pending_cart_mutation": _mint_mutation(
+                request.operation,
+                live_item,
+                request.quantity,
+            ),
         }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
@@ -725,6 +721,7 @@ def build_cart_nodes(
             response = model.invoke(messages)
             if not response.tool_calls:
                 return _clarification_result(state, new_messages, "action")
+            observe_legacy_model_tool_calls(response.tool_calls)
             new_messages.append(response)
 
             if response.tool_calls[0]["name"] in _MUTATION_TOOLS:
@@ -842,6 +839,132 @@ def build_cart_nodes(
         same update as the spoken message."""
         ack = state.pending_ack or warm_close()
         return {"pending_ack": None, "messages": [AIMessage(ack)]}
+
+    def _mutation_action(pending: PendingCartMutation) -> str:
+        if pending.operation == "add":
+            return f"add {pending.quantity} of {pending.name} to your cart"
+        if pending.operation == "remove":
+            return f"remove {pending.name} from your cart"
+        return f"set {pending.name} to {pending.quantity} in your cart"
+
+    def mutation_confirm_node(state: ReasoningState) -> dict[str, object]:
+        """Obtain explicit consent for one frozen cart mutation."""
+        pending = state.pending_cart_mutation
+        if not isinstance(pending, PendingCartMutation):
+            raise TypeError("cart mutation confirmation requires a pending mutation")
+        if time.time() - pending.created_at > policy.pending_ttl_seconds:
+            write_event({"event": "cart_mutation_expired", "reason": "pending_ttl"})
+            return {
+                "pending_cart_mutation": None,
+                "active_flow": None,
+                "messages": [
+                    AIMessage("That confirmation expired, so I haven't changed your cart.")
+                ],
+            }
+        action = _mutation_action(pending)
+        answer = interrupt(f"Just to confirm: {action}?")
+        verdict = classify_consent(str(answer.get("text", "")))
+        if answer.get("readback_interrupted") or verdict == "unclear":
+            retry = interrupt(f"Sorry - just to be clear: {action}. Please say yes or no.")
+            verdict = classify_consent(str(retry.get("text", "")))
+            if verdict != "yes":
+                verdict = "human" if verdict == "human" else "no"
+        if verdict == "human":
+            write_event({"event": "cart_mutation_cancelled", "reason": "human_requested"})
+            return {
+                "pending_cart_mutation": None,
+                "active_flow": None,
+                "handover": HandoffRequest(
+                    destination="human", reason_code="other", source="model"
+                ),
+            }
+        if verdict == "no":
+            write_event({"event": "cart_mutation_cancelled", "reason": "declined"})
+            return {
+                "pending_cart_mutation": None,
+                "active_flow": None,
+                "messages": [AIMessage("Okay, I won't change your cart.")],
+            }
+        return {}
+
+    def _mutation_result_ack(record: CartMutationRecord) -> str:
+        if record.operation == "add":
+            if record.quantity is None:
+                raise ValueError("authoritative add result is missing its applied delta")
+            line = CartLine(
+                sku=record.sku,
+                name=record.name,
+                price_usd=record.price_usd,
+                quantity=record.quantity,
+            )
+            return _mutation_ack([line], [])
+        if record.operation == "remove":
+            fragment = (
+                f"removed the {record.name} from your cart"
+                if record.outcome == "applied"
+                else f"the {record.name} wasn't in your cart"
+            )
+            return _mutation_ack([], [fragment])
+        if record.final_quantity == 0:
+            fragment = (
+                f"removed the {record.name} from your cart"
+                if record.outcome == "applied"
+                else f"the {record.name} wasn't in your cart"
+            )
+        else:
+            line = CartLine(
+                sku=record.sku,
+                name=record.name,
+                price_usd=record.price_usd,
+                quantity=record.final_quantity,
+            )
+            fragment = f"updated to {speak_lines([line])}"
+        return _mutation_ack([], [fragment])
+
+    def finish_mutation(
+        record: CartMutationRecord,
+        *,
+        reconciled: bool = False,
+        speak_now: bool = False,
+    ) -> dict[str, object]:
+        """Project one authoritative mutation result into state and speech."""
+        ack = _mutation_result_ack(record)
+        update: dict[str, object] = {
+            "pending_cart_mutation": None,
+            "active_flow": None,
+        }
+        if speak_now:
+            update["messages"] = [AIMessage(ack)]
+        else:
+            update["pending_ack"] = ack
+        if not reconciled and record.outcome == "applied":
+            event = {
+                "add": "cart_item_added",
+                "remove": "cart_item_removed",
+                "set_quantity": "cart_quantity_set",
+            }[record.operation]
+            write_event({"event": event, "sku": record.sku})
+        return update
+
+    def mutation_apply_node(state: ReasoningState) -> dict[str, object]:
+        """Apply the confirmed mutation once through the authoritative store."""
+        pending = state.pending_cart_mutation
+        if not isinstance(pending, PendingCartMutation):
+            raise TypeError("cart mutation apply requires a pending mutation")
+        record = cart_store.apply_confirmed_mutation(
+            pending.idempotency_key,
+            operation=pending.operation,
+            sku=pending.sku,
+            name=pending.name,
+            price_usd=pending.price_usd,
+            quantity=pending.quantity,
+            pre_confirm_quantity=pending.pre_confirm_quantity,
+        )
+        return finish_mutation(record)
+
+    def reconcile_mutation(record: CartMutationRecord) -> dict[str, object]:
+        """Project a committed receipt without replaying effect telemetry."""
+        return finish_mutation(record, reconciled=True, speak_now=True)
 
     def clarify_node(state: ReasoningState) -> dict[str, object]:
         clarification = state.pending_clarification
@@ -989,6 +1112,7 @@ def build_cart_nodes(
         write_event({"event": "checkout_cancelled", "reason": "aborted"})
         kept = "" if cart_store.is_empty() else " Your cart's still saved."
         return {
+            "pending_cart_mutation": None,
             "pending_placement": None,
             "pending_clarification": None,
             "clarification_progress": None,
@@ -1001,6 +1125,7 @@ def build_cart_nodes(
         """Entry-router escape: the caller asked for a person mid-flow (§A9 no-trap)."""
         write_event({"event": "checkout_cancelled", "reason": "human_requested"})
         return {
+            "pending_cart_mutation": None,
             "pending_placement": None,
             "pending_clarification": None,
             "clarification_progress": None,
@@ -1012,6 +1137,8 @@ def build_cart_nodes(
     def route_after_assemble(state: ReasoningState) -> str:
         if state.active_flow == "left_cart":
             return "leave"  # explicit leave -> normal pipeline answers
+        if state.pending_cart_mutation is not None:
+            return "mutation_confirm"
         if state.pending_placement is not None:
             return "place"  # buy_now / go_to_checkout minted a placement
         if state.pending_ack is not None:
@@ -1027,6 +1154,9 @@ def build_cart_nodes(
         capability_entry=with_clarification_lifecycle(capability_entry_node),
         ack=ack_node,
         clarify=clarify_node,
+        mutation_confirm=mutation_confirm_node,
+        mutation_apply=mutation_apply_node,
+        reconcile_mutation=reconcile_mutation,
         guardrail=guardrail_node,
         confirm=confirm_node,
         place=place_node,
@@ -1038,6 +1168,7 @@ def build_cart_nodes(
             {
                 "cart_ack",
                 "cart_clarify",
+                "cart_mutation_confirm",
                 "cart_guardrail",
                 "cart_confirm",
                 "cart_place",

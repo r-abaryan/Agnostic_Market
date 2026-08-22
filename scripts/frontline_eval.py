@@ -76,6 +76,18 @@ from agnostic_market.agents.frontline.read_flow import (
     ORDER_STATUS_TARGET_PROPOSE_NODE,
 )
 from agnostic_market.agents.gate import gate_check
+from agnostic_market.agents.legacy_observation import (
+    LEGACY_FLOW_CAPABILITIES as _LEGACY_FLOW_CAPABILITIES,
+)
+from agnostic_market.agents.legacy_observation import (
+    LEGACY_FLOW_TOOL_CAPABILITIES as _LEGACY_FLOW_TOOL_CAPABILITIES,
+)
+from agnostic_market.agents.legacy_observation import (
+    LEGACY_HANDOVER_CAPABILITIES as _LEGACY_HANDOVER_CAPABILITIES,
+)
+from agnostic_market.agents.legacy_observation import (
+    LEGACY_READ_TOOL_CAPABILITIES as _LEGACY_READ_TOOL_CAPABILITIES,
+)
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.routing import (
     CONTEXT_PROJECTOR_VERSION,
@@ -214,6 +226,8 @@ _TRANSPORT_UPSTREAM_TIMEOUT_SECONDS = 60.0
 _TRANSPORT_SCENARIO_TIMEOUT_SECONDS = 90.0
 
 _AUTOMATION_CHANNELS = (
+    "pending_capability_dispatch",
+    "pending_cart_mutation",
     "pending_placement",
     "pending_refund",
     "pending_cancel",
@@ -1775,49 +1789,6 @@ async def _run_semantic_route_cases(
 
 
 _LEGACY_HANDOVER_TOOL_NAME = "request_handover"
-_LEGACY_READ_TOOL_CAPABILITIES = {
-    "order_status": (CapabilityId.VERIFY_ORDER_STATUS,),
-    "list_orders": (CapabilityId.LIST_ORDERS,),
-    "catalog_search": (CapabilityId.SEARCH_CATALOG,),
-    "view_cart": (CapabilityId.VIEW_CART,),
-}
-_LEGACY_FLOW_TOOL_CAPABILITIES = {
-    "propose_refund": (CapabilityId.REFUND_ORDER,),
-    "propose_cancel": (CapabilityId.CANCEL_ORDERS,),
-    "propose_return": (CapabilityId.RETURN_ORDER,),
-    "propose_profile_change": (CapabilityId.CHANGE_PROFILE,),
-    "add_to_cart": (CapabilityId.MODIFY_CART,),
-    "remove_from_cart": (CapabilityId.MODIFY_CART,),
-    "set_quantity": (CapabilityId.MODIFY_CART,),
-    "review_cart": (CapabilityId.VIEW_CART,),
-    "buy_now": (CapabilityId.MODIFY_CART, CapabilityId.PLACE_ORDER),
-    "go_to_checkout": (CapabilityId.PLACE_ORDER,),
-    "propose_identity": (CapabilityId.VERIFY_IDENTITY, CapabilityId.SWITCH_ACCOUNT),
-}
-_LEGACY_HANDOVER_CAPABILITIES = {
-    "address_change": (CapabilityId.CHANGE_PROFILE,),
-    "contact_change": (CapabilityId.CHANGE_PROFILE,),
-    "cancel_order": (CapabilityId.CANCEL_ORDERS,),
-    "refund": (CapabilityId.REFUND_ORDER, CapabilityId.RETURN_ORDER),
-    "cart_write": (CapabilityId.MODIFY_CART, CapabilityId.PLACE_ORDER),
-    "list_orders": (CapabilityId.LIST_ORDERS,),
-    "verification_required": (CapabilityId.VERIFY_IDENTITY,),
-    "switch_account": (CapabilityId.SWITCH_ACCOUNT,),
-}
-_LEGACY_FLOW_CAPABILITIES = {
-    "support": (
-        CapabilityId.CANCEL_ORDERS,
-        CapabilityId.REFUND_ORDER,
-        CapabilityId.RETURN_ORDER,
-        CapabilityId.CHANGE_PROFILE,
-    ),
-    "cart": (CapabilityId.MODIFY_CART, CapabilityId.PLACE_ORDER),
-    "identity": (
-        CapabilityId.VERIFY_IDENTITY,
-        CapabilityId.SWITCH_ACCOUNT,
-        CapabilityId.LIST_ORDERS,
-    ),
-}
 _LEGACY_ROUTE_REPLAY_CONTRACT = (
     "fresh unbound session, empty cart, no active invocation or recent orders"
 )
