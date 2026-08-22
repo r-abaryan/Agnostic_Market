@@ -52,6 +52,7 @@ known-first-party = ["agnostic_market"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+cache_dir = ".test-tmp/pytest-cache"
 # "." so tests importing scripts/ (the evaluator and fault proxy) resolve without a src install.
 pythonpath = ["src", "."]
 asyncio_mode = "auto"

@@ -820,6 +820,87 @@ async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_rout
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
 
 
+async def test_duplicate_typed_cart_dispatch_cannot_resume_mutation_confirmation(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    import json
+
+    product = load_orders_fixture(config_root, "acme_store").products[0]
+    cart = CartStore()
+    frontline = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        cart=cart,
+        thread_id="duplicate-typed-cart-dispatch",
+    )
+    adapter = GraphVoiceAdapter(engine)
+    dispatch_id = "typed-cart-dispatch"
+    request = ModifyCart(
+        operation="add",
+        item=CartItemQuery(query=product.name),
+        quantity=1,
+    )
+    engine._graph.update_state(
+        engine._config,
+        {
+            "messages": [HumanMessage(content=f"add one {product.name}", id=dispatch_id)],
+            "consumed_turn_ids": (dispatch_id,),
+            "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                turn_id=dispatch_id,
+                mode="direct",
+                request=request,
+            ),
+        },
+        as_node="__start__",
+    )
+
+    await _adapter_turn(adapter, f"add one {product.name}", dispatch_id)
+    first = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    pending = first.pending_cart_mutation
+
+    assert pending is not None
+    assert engine.pending_interrupt()
+    assert cart.is_empty()
+
+    duplicate_output = await _adapter_turn(adapter, f"add one {product.name}", dispatch_id)
+    duplicate = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert duplicate_output == []
+    assert duplicate.pending_cart_mutation == pending
+    assert engine.pending_interrupt()
+    assert cart.is_empty()
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+
+    consent_output = await _adapter_turn(adapter, "yes", "typed-cart-consent")
+    completed = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    receipt = cart.mutation_receipt(
+        pending.idempotency_key,
+        operation=pending.operation,
+        sku=pending.sku,
+        name=pending.name,
+        price_usd=pending.price_usd,
+        quantity=pending.quantity,
+        pre_confirm_quantity=pending.pre_confirm_quantity,
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert cart.view()[0].quantity == 1
+    assert receipt.kind == "committed"
+    assert completed.pending_cart_mutation is None
+    assert not engine.pending_interrupt()
+    assert len(consent_output) == 1 and product.name in consent_output[0]
+    assert [record for record in records if record.get("event") == "cart_item_added"] == [
+        {"event": "cart_item_added", "sku": product.sku}
+    ]
+
+
 async def test_restored_unregistered_invocation_speaks_once_and_releases_the_next_turn(
     config_root: Path,
 ) -> None:
