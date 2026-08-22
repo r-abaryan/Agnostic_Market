@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.graph import END
 from langgraph.types import Command
 from llm_fakes import (
     TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
@@ -33,7 +34,7 @@ from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.tooling import wrap_readonly_tool
-from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.cart import CartMutationError, CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
@@ -51,9 +52,11 @@ from agnostic_market.commerce.payment_instruments import (
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
+from agnostic_market.commerce.receipts import IndeterminateReceipt, NotCommittedReceipt
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
-from agnostic_market.dtos.state import SupportClarification
+from agnostic_market.dtos.orchestration import ActiveInvocation, CartItemQuery, ModifyCart
+from agnostic_market.dtos.state import PendingCartMutation, SupportClarification
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.tools import build_voice_tools
 
@@ -746,6 +749,527 @@ async def test_review_cart_lists_contents(config_root: Path) -> None:
 # --- whole-cart placement ----------------------------------------------------------------
 
 
+async def test_typed_cart_mutation_requires_confirmation_before_effect(
+    config_root: Path,
+) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-confirmation"
+
+    await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=f"add two {product.name}",
+                    id=turn_id,
+                )
+            ],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=2,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    paused = graph.get_state(_CFG)
+    assert cart.is_empty()
+    assert paused.interrupts
+    assert paused.interrupts[0].value == (f"Just to confirm: add 2 of {product.name} to your cart?")
+    assert paused.values["active_invocation"] is None
+    assert paused.values["active_flow"] == "cart"
+    assert paused.values["pending_cart_mutation"].sku == product.sku
+
+    out = await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+
+    assert cart.view()[0].quantity == 2
+    assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
+    assert any(product.name in line for line in _ai_texts(out))
+
+
+def test_confirmed_cart_mutation_is_store_idempotent() -> None:
+    cart = CartStore()
+
+    first = cart.apply_confirmed_mutation(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=2,
+        pre_confirm_quantity=0,
+    )
+    replay = cart.apply_confirmed_mutation(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=2,
+        pre_confirm_quantity=0,
+    )
+
+    assert replay == first
+    assert cart.view()[0].quantity == 2
+    assert (
+        cart.mutation_receipt(
+            "cart-mutation-1",
+            operation="add",
+            sku="SKU-1",
+            name="trail shoes",
+            price_usd=79.0,
+            quantity=2,
+            pre_confirm_quantity=0,
+        ).record
+        == first
+    )
+
+
+def test_cart_mutation_receipts_reject_key_conflicts_and_report_absence() -> None:
+    cart = CartStore()
+    cart.apply_confirmed_mutation(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=2,
+        pre_confirm_quantity=0,
+    )
+
+    conflict = cart.mutation_receipt(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=3,
+        pre_confirm_quantity=0,
+    )
+    absent = cart.mutation_receipt(
+        "cart-mutation-absent",
+        operation="remove",
+        sku="SKU-2",
+        name="hiking socks",
+        price_usd=14.5,
+        quantity=None,
+        pre_confirm_quantity=0,
+    )
+
+    assert conflict == IndeterminateReceipt(reason="key_conflict")
+    assert isinstance(absent, NotCommittedReceipt)
+    with pytest.raises(CartMutationError, match="different parameters"):
+        cart.apply_confirmed_mutation(
+            "cart-mutation-1",
+            operation="add",
+            sku="SKU-1",
+            name="trail shoes",
+            price_usd=79.0,
+            quantity=3,
+            pre_confirm_quantity=0,
+        )
+    assert cart.view()[0].quantity == 2
+    with pytest.raises(CartMutationError, match="must not be blank"):
+        cart.mutation_receipt(
+            " ",
+            operation="add",
+            sku="SKU-1",
+            name="trail shoes",
+            price_usd=79.0,
+            quantity=2,
+            pre_confirm_quantity=0,
+        )
+
+
+def test_confirmed_remove_of_absent_line_is_a_truthful_noop() -> None:
+    cart = CartStore()
+
+    record = cart.apply_confirmed_mutation(
+        "cart-remove-absent",
+        operation="remove",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=None,
+        pre_confirm_quantity=1,
+    )
+
+    assert record.outcome == "unchanged"
+    assert record.previous_quantity == 0
+    assert record.final_quantity == 0
+    assert cart.is_empty()
+
+
+def test_invalid_confirmed_mutation_fails_before_changing_cart() -> None:
+    cart = CartStore()
+
+    with pytest.raises(ValidationError):
+        cart.apply_confirmed_mutation(
+            "cart-invalid",
+            operation="add",
+            sku="SKU-1",
+            name="trail shoes",
+            price_usd=79.0,
+            quantity=1,
+            pre_confirm_quantity=-1,
+        )
+
+    assert cart.is_empty()
+    assert isinstance(
+        cart.mutation_receipt(
+            "cart-invalid",
+            operation="add",
+            sku="SKU-1",
+            name="trail shoes",
+            price_usd=79.0,
+            quantity=1,
+            pre_confirm_quantity=0,
+        ),
+        NotCommittedReceipt,
+    )
+
+
+def test_cart_clear_discards_confirmed_mutation_receipts() -> None:
+    cart = CartStore()
+    cart.apply_confirmed_mutation(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=1,
+        pre_confirm_quantity=0,
+    )
+
+    cart.clear()
+
+    receipt = cart.mutation_receipt(
+        "cart-mutation-1",
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=1,
+        pre_confirm_quantity=0,
+    )
+    assert isinstance(receipt, NotCommittedReceipt)
+
+
+@pytest.mark.parametrize(
+    "invalid_shape",
+    (
+        {"operation": "add", "quantity": None},
+        {"operation": "add", "quantity": 0},
+        {"operation": "remove", "quantity": 1},
+        {"operation": "set_quantity", "quantity": None},
+    ),
+)
+def test_pending_cart_mutation_rejects_incoherent_quantity_shapes(
+    invalid_shape: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        PendingCartMutation(
+            sku="SKU-1",
+            name="trail shoes",
+            price_usd=79.0,
+            pre_confirm_quantity=0,
+            idempotency_key="cart-mutation-1",
+            created_at=1.0,
+            **invalid_shape,
+        )
+
+
+def test_pending_cart_mutation_is_frozen_and_extra_forbidden() -> None:
+    pending = PendingCartMutation(
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=1,
+        pre_confirm_quantity=0,
+        idempotency_key="cart-mutation-1",
+        created_at=1.0,
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        pending.quantity = 2
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PendingCartMutation.model_validate({**pending.model_dump(), "caller_text": "add it"})
+    with pytest.raises(ValidationError, match="must not be blank"):
+        PendingCartMutation.model_validate({**pending.model_dump(), "idempotency_key": " "})
+
+
+@pytest.mark.parametrize(
+    ("operation", "quantity", "starting_quantity", "final_quantity", "event", "action"),
+    (
+        ("add", 2, 0, 2, "cart_item_added", "add 2 of {name} to your cart"),
+        ("remove", None, 2, 0, "cart_item_removed", "remove {name} from your cart"),
+        ("set_quantity", 3, 2, 3, "cart_quantity_set", "set {name} to 3 in your cart"),
+        ("set_quantity", 0, 2, 0, "cart_quantity_set", "set {name} to 0 in your cart"),
+    ),
+)
+async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    quantity: int | None,
+    starting_quantity: int,
+    final_quantity: int,
+    event: str,
+    action: str,
+) -> None:
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(cart_flow, "write_event", records.append)
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    if starting_quantity:
+        cart.add_item(
+            sku=product.sku,
+            name=product.name,
+            price_usd=product.price_usd,
+            quantity=starting_quantity,
+        )
+    turn_id = f"typed-{operation}-{quantity}"
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(f"{operation} {product.name}", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation=operation,
+                    item=CartItemQuery(query=product.name),
+                    quantity=quantity,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    paused = graph.get_state(_CFG)
+    pending = paused.values["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.pre_confirm_quantity == starting_quantity
+    assert paused.interrupts[0].value == (f"Just to confirm: {action.format(name=product.name)}?")
+    if starting_quantity:
+        assert cart.view()[0].quantity == starting_quantity
+    else:
+        assert cart.is_empty()
+    assert records == []
+
+    out = await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+
+    lines = cart.view()
+    assert (lines[0].quantity if lines else 0) == final_quantity
+    assert records == [{"event": event, "sku": product.sku}]
+    assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
+    assert graph.get_state(_CFG).values.get("active_flow") is None
+    assert len(_ai_texts(out)) == 1
+    assert product.name in _ai_texts(out)[0]
+
+
+async def test_cart_mutation_decline_is_exact_and_has_no_effect(config_root: Path) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-decline"
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage("add it", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    out = await graph.ainvoke(Command(resume={"text": "no"}), _CFG)
+
+    assert cart.is_empty()
+    assert _ai_texts(out) == ["Okay, I won't change your cart."]
+    assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
+
+
+async def test_cart_mutation_unclear_twice_uses_one_fixed_retry_then_declines(
+    config_root: Path,
+) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-unclear"
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage("add it", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    await graph.ainvoke(Command(resume={"text": "maybe"}), _CFG)
+    retry = graph.get_state(_CFG).interrupts
+    assert len(retry) == 1
+    assert retry[0].value == (
+        f"Sorry - just to be clear: add 1 of {product.name} to your cart. Please say yes or no."
+    )
+    assert cart.is_empty()
+
+    out = await graph.ainvoke(Command(resume={"text": "still maybe"}), _CFG)
+
+    assert _ai_texts(out) == ["Okay, I won't change your cart."]
+    assert cart.is_empty()
+    assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
+
+
+async def test_cart_mutation_human_reply_uses_the_existing_terminal_path(
+    config_root: Path,
+) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-human"
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage("add it", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    out = await graph.ainvoke(Command(resume={"text": "I want a person"}), _CFG)
+
+    assert cart.is_empty()
+    assert out["automation_terminal"] is True
+    assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
+
+
+async def test_cart_mutation_expiry_is_exact_and_does_not_consume_yes(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-expiry"
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage("add it", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+    pending = graph.get_state(_CFG).values["pending_cart_mutation"]
+    monkeypatch.setattr(
+        cart_flow.time,
+        "time",
+        lambda: pending.created_at + _POLICY.pending_ttl_seconds + 1,
+    )
+
+    out = await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+
+    assert _ai_texts(out) == ["That confirmation expired, so I haven't changed your cart."]
+    assert cart.is_empty()
+    assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
+
+
+async def test_barged_cart_mutation_readback_reconfirms_before_effect(
+    config_root: Path,
+) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-barged"
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage("add it", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    await graph.ainvoke(
+        Command(resume={"text": "yes", "readback_interrupted": True}),
+        _CFG,
+    )
+
+    retry = graph.get_state(_CFG).interrupts
+    assert len(retry) == 1
+    assert "Please say yes or no." in retry[0].value
+    assert cart.is_empty()
+
+    await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+    assert cart.view()[0].quantity == 1
+
+
+async def test_wrong_negative_family_nomination_cannot_mutate_without_consent(
+    config_root: Path,
+) -> None:
+    graph, store, cart = _build(config_root)
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-wrong-negative-nomination"
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage("Do not add anything to my cart", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    assert cart.is_empty()
+    assert graph.get_state(_CFG).interrupts
+    assert isinstance(
+        graph.get_state(_CFG).values.get("pending_cart_mutation"),
+        PendingCartMutation,
+    )
+
+
 async def test_buy_now_places_one_order_after_readback(config_root: Path) -> None:
     # candidate_key "2" of the full catalog for "buy it now" = waterproof rain jacket $129.
     reasoning = _tool_fake("buy_now", {"candidate_key": "2", "quantity": 2})
@@ -936,11 +1460,13 @@ async def test_speakable_nodes_and_read_only_tools(config_root: Path) -> None:
         "handover",
         "cart_ack",
         "cart_clarify",
+        "cart_mutation_confirm",
         "cart_guardrail",
         "cart_confirm",
         "cart_place",
         "cart_abort",
     } <= graph.speakable_nodes
+    assert "cart_mutation_apply" not in graph.speakable_nodes
     assert graph.frontline_read_only_tools == {
         "order_status",
         "list_orders",
@@ -948,6 +1474,27 @@ async def test_speakable_nodes_and_read_only_tools(config_root: Path) -> None:
         "view_cart",
     }
     assert "cart_capability_entry" not in graph.speakable_nodes
+
+
+async def test_cart_mutation_effect_has_one_ack_route_and_no_back_edge(
+    config_root: Path,
+) -> None:
+    graph, _, _ = _build(config_root)
+
+    assert {
+        target for source, target in graph.builder.edges if source == "cart_mutation_apply"
+    } == {"cart_ack"}
+    assert "cart_mutation_apply" not in graph.builder.branches
+    assert not any(source == "cart_mutation_confirm" for source, _target in graph.builder.edges)
+    mutation_targets = {
+        edge.target
+        for edge in graph.get_graph().edges
+        if edge.source in {"cart_mutation_confirm", "cart_mutation_apply"}
+    }
+    assert mutation_targets == {"handover", "cart_mutation_apply", "cart_ack", END}
+    assert mutation_targets.isdisjoint(
+        {"cart_assemble", "cart_capability_entry", "cart_mutation_confirm"}
+    )
 
 
 @pytest.mark.parametrize(

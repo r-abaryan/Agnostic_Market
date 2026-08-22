@@ -76,6 +76,7 @@ from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
     CancelOrders,
+    CapabilityDispatchEnvelope,
     CartItemChoices,
     CartItemQuery,
     ExplicitOrderSet,
@@ -100,6 +101,7 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     IdentityClarification,
     PendingCancelBatch,
+    PendingCartMutation,
     PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
@@ -767,6 +769,47 @@ async def test_duplicate_normal_turn_id_is_admitted_only_once(config_root: Path)
 
     assert frontline.invoke_count == 1
     assert engine._graph.get_state(engine._config).values.get("active_invocation") is None
+
+
+async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_router_recall(
+    config_root: Path,
+) -> None:
+    frontline = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, _ = _engine(
+        config_root,
+        frontline=frontline,
+        reasoning=reasoning,
+        thread_id="checkpointed-dispatch-redelivery",
+        shadow_recognizer=recognizer,
+    )
+    adapter = GraphVoiceAdapter(engine)
+    turn_id = "checkpointed-dispatch-turn"
+    engine._graph.update_state(
+        engine._config,
+        {
+            "messages": [HumanMessage(content="what is in my cart?", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                turn_id=turn_id,
+                mode="direct",
+                request=ViewCart(),
+            ),
+        },
+        as_node="__start__",
+    )
+
+    first = await _adapter_turn(adapter, "what is in my cart?", turn_id)
+    second = await _adapter_turn(adapter, "what is in my cart?", turn_id)
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+    assert first == ["Your cart's empty at the moment."]
+    assert second == []
+    assert state.pending_capability_dispatch is None
+    assert state.active_invocation is None
+    assert recognizer.contexts == []
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
 
 
 async def test_duplicate_list_turn_cannot_open_an_invocation(config_root: Path) -> None:
@@ -2128,6 +2171,21 @@ def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> No
 
 _CHECKPOINT_CHANNEL_VALUES = (
     ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1"),
+    CapabilityDispatchEnvelope(
+        turn_id="turn-1",
+        mode="direct",
+        request=ViewCart(),
+    ),
+    PendingCartMutation(
+        operation="add",
+        sku="SKU-1",
+        name="trail shoes",
+        price_usd=79.0,
+        quantity=2,
+        pre_confirm_quantity=0,
+        idempotency_key="cart-mutation-1",
+        created_at=1.0,
+    ),
     PendingPlacement(
         lines=(CartLine(sku="SKU-1", name="trail shoes", price_usd=79.0, quantity=1),),
         total_usd=79.0,

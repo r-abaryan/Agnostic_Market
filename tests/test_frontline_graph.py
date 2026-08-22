@@ -25,6 +25,7 @@ from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.frontline import build_frontline_graph, read_flow
 from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
+    AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
     RECOVERY_TERMINALIZER_NODE_NAME,
     clear_automation_state,
@@ -50,15 +51,18 @@ from agnostic_market.commerce.payment_instruments import (
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
+from agnostic_market.commerce.receipts import CommittedReceipt
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     AnswerQuestion,
     CancelOrders,
+    CapabilityDispatchEnvelope,
     CapabilityId,
     CartItemChoices,
     CartItemQuery,
+    DiscloseAiIdentity,
     ExplicitOrderSet,
     ExplicitOrderTarget,
     FocusedOrderSet,
@@ -78,10 +82,12 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
+    CartClarification,
     ClarificationProgress,
     HandoffDestination,
     HandoffReasonCode,
     HandoffRequest,
+    PendingCartMutation,
     PolicyContext,
     ReasoningState,
 )
@@ -313,6 +319,188 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         assert command_node not in graph.builder.branches
 
 
+def test_direct_dispatch_envelope_opens_invocation_and_routes_atomically(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    envelope = CapabilityDispatchEnvelope(
+        turn_id="dispatch-direct",
+        mode="direct",
+        request=ViewCart(),
+    )
+
+    command = graph.nodes["capability_dispatch"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("what is in my cart?", id="dispatch-direct")],
+            consumed_turn_ids=("dispatch-direct",),
+            pending_capability_dispatch=envelope,
+        )
+    )
+
+    assert isinstance(command, Command)
+    assert command.goto == "cart_view_render"
+    assert command.update["pending_capability_dispatch"] is None
+    invocation = command.update["active_invocation"]
+    assert isinstance(invocation, ActiveInvocation)
+    assert invocation.request == ViewCart()
+    assert invocation.opened_turn_id == "dispatch-direct"
+
+
+def test_compiled_entry_consumes_direct_dispatch_without_legacy_routing(
+    config_root: Path,
+) -> None:
+    frontline = FakeChatModel(emit_tool_calls=False, text_response="legacy route ran")
+    reasoning = FakeChatModel(emit_tool_calls=False)
+    graph = _graph(config_root, frontline, reasoning_model=reasoning)
+    turn_id = "dispatch-compiled"
+
+    result = graph.invoke(
+        _admitted_turn(
+            "what is in my cart?",
+            turn_id=turn_id,
+            pending_capability_dispatch=CapabilityDispatchEnvelope(
+                turn_id=turn_id,
+                mode="direct",
+                request=ViewCart(),
+            ),
+        )
+    )
+
+    assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+    assert result["pending_capability_dispatch"] is None
+    assert result["active_invocation"] is None
+    assert _only_spoken(result) == "Your cart's empty at the moment."
+
+
+def test_continue_dispatch_envelope_requires_and_preserves_the_observed_invocation(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    invocation = ActiveInvocation(request=ModifyCart(operation="add"), opened_turn_id="turn-1")
+    envelope = CapabilityDispatchEnvelope(
+        turn_id="turn-2",
+        mode="continue",
+        observed_invocation_id=invocation.invocation_id,
+    )
+
+    command = graph.nodes["capability_dispatch"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("the shoes", id="turn-2")],
+            consumed_turn_ids=("turn-1", "turn-2"),
+            active_invocation=invocation,
+            active_flow="cart",
+            clarification_progress=ClarificationProgress(flow="cart", reasks=1),
+            pending_capability_dispatch=envelope,
+        )
+    )
+
+    assert isinstance(command, Command)
+    assert command.goto == "cart_capability_entry"
+    assert command.update == {"pending_capability_dispatch": None}
+
+
+def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    old = ActiveInvocation(request=ModifyCart(operation="add"), opened_turn_id="turn-1")
+    envelope = CapabilityDispatchEnvelope(
+        turn_id="turn-2",
+        mode="direct",
+        request=ViewCart(),
+    )
+
+    command = graph.nodes["capability_dispatch"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("show my cart", id="turn-2")],
+            consumed_turn_ids=("turn-1", "turn-2"),
+            active_invocation=old,
+            active_flow="cart",
+            identity_claim_misses=1,
+            pending_ack="old response",
+            pending_clarification=CartClarification(detail="item"),
+            clarification_progress=ClarificationProgress(flow="cart", reasks=1),
+            pending_capability_dispatch=envelope,
+        )
+    )
+
+    assert isinstance(command, Command)
+    assert command.goto == "cart_view_render"
+    replacement = command.update["active_invocation"]
+    assert isinstance(replacement, ActiveInvocation)
+    assert replacement.invocation_id != old.invocation_id
+    assert replacement.request == ViewCart()
+    assert {
+        "active_flow": command.update["active_flow"],
+        "identity_claim_misses": command.update["identity_claim_misses"],
+        "pending_ack": command.update["pending_ack"],
+        "pending_clarification": command.update["pending_clarification"],
+        "clarification_progress": command.update["clarification_progress"],
+    } == {
+        "active_flow": None,
+        "identity_claim_misses": 0,
+        "pending_ack": None,
+        "pending_clarification": None,
+        "clarification_progress": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("stale_turn", "stale_invocation", "unregistered", "malformed_envelope"),
+)
+def test_invalid_dispatch_envelope_closes_without_executing_an_owner(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(frontline_graph, "write_event", records.append)
+    graph = _graph(config_root, FakeChatModel())
+    invocation = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
+    envelope: object = (
+        CapabilityDispatchEnvelope(
+            turn_id="stale-turn",
+            mode="direct",
+            request=ViewCart(),
+        )
+        if failure == "stale_turn"
+        else CapabilityDispatchEnvelope(
+            turn_id="turn-2",
+            mode="continue",
+            observed_invocation_id="stale-invocation",
+        )
+        if failure == "stale_invocation"
+        else CapabilityDispatchEnvelope(
+            turn_id="turn-2",
+            mode="direct",
+            request=DiscloseAiIdentity(),
+        )
+        if failure == "unregistered"
+        else object()
+    )
+
+    command = graph.nodes["capability_dispatch"].invoke(
+        ReasoningState.model_construct(
+            messages=[HumanMessage("current", id="turn-2")],
+            consumed_turn_ids=("turn-1", "turn-2"),
+            active_invocation=invocation,
+            pending_capability_dispatch=envelope,
+        )
+    )
+
+    assert isinstance(command, Command)
+    assert command.goto == END
+    assert command.update == {"pending_capability_dispatch": None}
+    assert records == [
+        {
+            "event": "capability_dispatch_rejected",
+            "reason": failure,
+            "disposition": "closed",
+        }
+    ]
+
+
 def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -348,12 +536,17 @@ def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
     )
 
     assert reasoning.invoke_count == 0
-    assert cart.view()[0].sku == product.sku
-    assert cart.view()[0].price_usd == product.price_usd
+    assert cart.is_empty()
     assert result["active_invocation"] is None
-    assert result["active_flow"] is None
-    assert product.name in _only_spoken(result)
-    assert records == [{"event": "cart_item_added", "sku": product.sku}]
+    assert result["active_flow"] == "cart"
+    pending = result["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.sku == product.sku
+    assert pending.price_usd == product.price_usd
+    assert result["__interrupt__"][0].value == (
+        f"Just to confirm: add 1 of {product.name} to your cart?"
+    )
+    assert records == []
 
 
 def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
@@ -380,8 +573,11 @@ def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
         )
     )
 
-    assert cart.view()[0].sku == product.sku
+    assert cart.is_empty()
     assert result["active_invocation"] is None
+    pending = result["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.sku == product.sku
 
 
 def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> None:
@@ -435,18 +631,21 @@ def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> No
     second = graph.nodes["cart_capability_entry"].invoke(second_state)
 
     assert second["active_invocation"] is None
-    assert second["active_flow"] is None
-    assert second["pending_ack"]
-    assert cart.view()[0].quantity == 2
+    assert second["active_flow"] == "cart"
+    pending = second["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.quantity == 2
+    assert pending.pre_confirm_quantity == 0
+    assert cart.is_empty()
     assert reasoning.invoke_count == 2
 
 
 @pytest.mark.parametrize(
-    ("operation", "quantity", "expected_quantity", "expected_event"),
+    ("operation", "quantity"),
     (
-        ("set_quantity", 3, 3, "cart_quantity_set"),
-        ("set_quantity", 0, None, "cart_quantity_set"),
-        ("remove", None, None, "cart_item_removed"),
+        ("set_quantity", 3),
+        ("set_quantity", 0),
+        ("remove", None),
     ),
 )
 def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
@@ -454,8 +653,6 @@ def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
     quantity: int | None,
-    expected_quantity: int | None,
-    expected_event: str,
 ) -> None:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     product = store.fixture.products[0]
@@ -493,12 +690,13 @@ def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
 
     assert reasoning.invoke_count == 0
     assert result["active_invocation"] is None
-    lines = cart.view()
-    if expected_quantity is None:
-        assert lines == ()
-    else:
-        assert lines[0].quantity == expected_quantity
-    assert records == [{"event": expected_event, "sku": product.sku}]
+    assert cart.view()[0].quantity == 1
+    pending = result["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.operation == operation
+    assert pending.quantity == quantity
+    assert pending.pre_confirm_quantity == 1
+    assert records == []
 
 
 def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path) -> None:
@@ -627,8 +825,11 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     )
 
     assert third["active_invocation"] is None
-    assert cart.view()[0].sku == "SKU-DUPLICATE"
-    assert cart.view()[0].quantity == 2
+    assert cart.is_empty()
+    pending = third["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.sku == "SKU-DUPLICATE"
+    assert pending.quantity == 2
     assert reasoning.invoke_count == 2
 
 
@@ -793,7 +994,10 @@ def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing_slot(
     )
 
     assert update["active_invocation"] is None
-    assert cart.view()[0].quantity == 2
+    assert cart.is_empty()
+    pending = update["pending_cart_mutation"]
+    assert isinstance(pending, PendingCartMutation)
+    assert pending.quantity == 2
     assert reasoning.invoke_count == 2
     assert any(
         isinstance(message, ToolMessage) and "Unavailable action" in str(message.content)
@@ -1142,33 +1346,39 @@ def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
 
 
 @pytest.mark.parametrize("fails_after_mutation", (False, True))
-def test_typed_cart_recovery_reads_live_cart_without_replaying_mutation(
+def test_typed_cart_recovery_reconciles_without_replaying_mutation(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     fails_after_mutation: bool,
 ) -> None:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     cart = CartStore()
-    graph = _graph(config_root, FakeChatModel(), store=store, cart_store=cart)
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        checkpointer=InMemorySaver(),
+    )
     product = store.fixture.products[0]
+    real_apply = cart.apply_confirmed_mutation
     if fails_after_mutation:
-        real_write = cart_flow.write_event
 
-        def fail_after_write(record: dict[str, object]) -> None:
-            if record.get("event") == "cart_item_added":
-                raise RuntimeError("injected post-mutation telemetry failure")
-            real_write(record)
+        def fail_after_mutation(*args, **kwargs):
+            real_apply(*args, **kwargs)
+            raise RuntimeError("injected post-mutation failure")
 
-        monkeypatch.setattr(cart_flow, "write_event", fail_after_write)
+        monkeypatch.setattr(cart, "apply_confirmed_mutation", fail_after_mutation)
     else:
 
         def fail_before_mutation(*_args, **_kwargs):
             raise RuntimeError("injected pre-mutation failure")
 
-        monkeypatch.setattr(cart_flow, "_apply_resolved_mutation", fail_before_mutation)
+        monkeypatch.setattr(cart, "apply_confirmed_mutation", fail_before_mutation)
     turn_id = f"typed-cart-recovery-{fails_after_mutation}"
+    config = {"configurable": {"thread_id": turn_id}}
 
-    result = graph.invoke(
+    first = graph.invoke(
         _admitted_turn(
             f"add one {product.name}",
             turn_id=turn_id,
@@ -1180,17 +1390,77 @@ def test_typed_cart_recovery_reads_live_cart_without_replaying_mutation(
                 ),
                 opened_turn_id=turn_id,
             ),
-        )
+        ),
+        config,
     )
+
+    assert cart.is_empty()
+    assert first["__interrupt__"][0].value == (
+        f"Just to confirm: add 1 of {product.name} to your cart?"
+    )
+
+    result = graph.invoke(Command(resume={"text": "yes"}), config)
 
     assert cart.line_count == int(fails_after_mutation)
     assert result["active_invocation"] is None
+    assert result["pending_cart_mutation"] is None
     line = _only_spoken(result)
-    assert "Please review your cart before trying again." in line
     if fails_after_mutation:
         assert product.name in line
+        assert "added" in line.lower()
     else:
         assert "Your cart is empty." in line
+        assert "Please review your cart before trying again." in line
+
+
+def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    cart = CartStore()
+    graph = _graph(
+        config_root,
+        FakeChatModel(),
+        store=store,
+        cart_store=cart,
+        checkpointer=InMemorySaver(),
+    )
+    product = store.fixture.products[0]
+    turn_id = "typed-cart-malformed-receipt"
+    config = {"configurable": {"thread_id": turn_id}}
+    graph.invoke(
+        _admitted_turn(
+            f"add one {product.name}",
+            turn_id=turn_id,
+            active_invocation=ActiveInvocation(
+                request=ModifyCart(
+                    operation="add",
+                    item=CartItemQuery(query=product.name),
+                    quantity=1,
+                ),
+                opened_turn_id=turn_id,
+            ),
+        ),
+        config,
+    )
+
+    def fail_before_mutation(*_args, **_kwargs):
+        raise RuntimeError("injected effect failure")
+
+    monkeypatch.setattr(cart, "apply_confirmed_mutation", fail_before_mutation)
+    monkeypatch.setattr(
+        cart,
+        "mutation_receipt",
+        lambda *_args, **_kwargs: CommittedReceipt(record="malformed"),
+    )
+
+    result = graph.invoke(Command(resume={"text": "yes"}), config)
+
+    assert cart.is_empty()
+    assert result["automation_terminal"] is True
+    assert result["pending_cart_mutation"] is None
+    assert _only_spoken(result) == AUTOMATION_TERMINAL_LINE
 
 
 def _only_spoken(result: dict[str, object]) -> str:
@@ -2618,6 +2888,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "cart_ack",
         },
         AbandonmentKind.AUTHORITATIVE_RECONCILE: {
+            "cart_mutation_apply",
             "cart_place",
             "support_place",
             "support_cancel_void",
@@ -2628,6 +2899,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "tools",
             "principal_warning",
             "order_status_target_confirm",
+            "cart_mutation_confirm",
             "cart_confirm",
             "support_dispatch",
             "support_collect",
@@ -2659,6 +2931,8 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "cart_assemble",
             "cart_capability_entry",
             "cart_ack",
+            "cart_mutation_confirm",
+            "cart_mutation_apply",
         },
         ExceptionAction.RECONCILE_PLACEMENT: {"cart_place"},
         ExceptionAction.RECONCILE_REFUND: {"support_place"},
@@ -2687,7 +2961,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 72
+    assert len(policies) == 74
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -2699,7 +2973,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 71
+    assert len(graph.recovery_handled_nodes) == 73
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}

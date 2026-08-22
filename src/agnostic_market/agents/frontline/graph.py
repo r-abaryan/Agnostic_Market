@@ -60,6 +60,7 @@ from agnostic_market.agents._copy import guest_list_close, identity_status_line,
 from agnostic_market.agents.capabilities import (
     CapabilityEntry,
     CapabilityRegistry,
+    CapabilityRegistryError,
     CapabilitySpec,
 )
 from agnostic_market.agents.cart import build_cart_nodes
@@ -122,8 +123,10 @@ from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
+    ActiveInvocation,
     AnswerQuestion,
     CancelOrders,
+    CapabilityDispatchEnvelope,
     CapabilityId,
     ChangeProfile,
     ListOrders,
@@ -873,9 +876,8 @@ def build_frontline_graph(
         # turn-scoped "left_*" marker, pending_ack, and pending_clarification persist in
         # thread state and must not affect THIS turn. `clarification_progress` spans turns
         # only while the matching sticky flow owns the engagement; an owner mismatch clears
-        # it below. (pending_placement needs no such reset:
-        # while one exists the graph is paused at confirm and turns arrive as resumes,
-        # never through here.)
+        # it below. Pending Cart confirmations need no such reset because their turns arrive
+        # as resumes and never pass through entry.
         update: dict[str, object] = {
             "handover": None,
             "pending_ack": None,
@@ -960,6 +962,8 @@ def build_frontline_graph(
             return "automation_terminal_response"
         if state.pending_recovery is not None:
             return RECOVERY_NODE_NAME
+        if state.pending_capability_dispatch is not None:
+            return _CAPABILITY_DISPATCH_NODE
         if state.active_invocation is not None and state.active_flow is None:
             return _CAPABILITY_DISPATCH_NODE
         text = state.last_user_text()
@@ -1094,15 +1098,22 @@ def build_frontline_graph(
         return END
 
     def route_after_cart_assemble(state: ReasoningState) -> str:
-        # "place" | "ack" | "leave" | "clarify" — the flow decides (route_after_assemble is
-        # closed over the stores; graph maps its decision to a node).
+        # The flow decides; graph construction maps its closed result to one node.
         decision = cart.route_after_assemble(state)
         return {
             "place": "cart_guardrail",
+            "mutation_confirm": "cart_mutation_confirm",
             "ack": "cart_ack",
             "leave": "gate",  # model left; normal pipeline answers this same turn
             "clarify": "cart_clarify",
         }[decision]
+
+    def route_after_cart_mutation_confirm(state: ReasoningState) -> str:
+        if state.handover is not None:
+            return "handover"
+        if state.pending_cart_mutation is not None:
+            return "cart_mutation_apply"
+        return END
 
     def route_after_cart_guardrail(state: ReasoningState) -> str:
         return "cart_confirm" if state.pending_placement is not None else END
@@ -1155,17 +1166,75 @@ def build_frontline_graph(
     capability_registry = _build_frontline_capability_registry()
 
     def capability_dispatch(state: ReasoningState) -> Command:
-        """Route the active request to its owning node. Nothing else.
+        """Consume one admitted dispatch or resume one already-open invocation."""
 
-        No state update, live read, model call, render, or mutation: the owner keeps every
-        effect and speech authority. `Command` is the sole executable route (this node has no
-        outgoing edge), so an unregistered id raises here and ends the turn under this node's
-        own recovery policy rather than falling through to a broad model.
-        """
-        invocation = state.active_invocation
-        if invocation is None:
-            raise TypeError("capability dispatch requires an active invocation")
-        return Command(goto=capability_registry.resolve(invocation.request).node_name)
+        def reject(reason: str) -> Command:
+            write_event(
+                {
+                    "event": "capability_dispatch_rejected",
+                    "reason": reason,
+                    "disposition": "closed",
+                }
+            )
+            return Command(update={"pending_capability_dispatch": None}, goto=END)
+
+        envelope_value = state.pending_capability_dispatch
+        if envelope_value is None:
+            invocation = state.active_invocation
+            if invocation is None:
+                return reject("missing_invocation")
+            try:
+                destination = capability_registry.resolve(invocation.request).node_name
+            except CapabilityRegistryError:
+                return reject("unregistered")
+            return Command(goto=destination)
+
+        if not isinstance(envelope_value, CapabilityDispatchEnvelope):
+            return reject("malformed_envelope")
+        try:
+            envelope = CapabilityDispatchEnvelope.model_validate(envelope_value)
+        except (TypeError, ValueError):
+            return reject("malformed_envelope")
+
+        if not state.consumed_turn_ids or envelope.turn_id != state.consumed_turn_ids[-1]:
+            return reject("stale_turn")
+
+        if envelope.mode == "continue":
+            invocation = state.active_invocation
+            if invocation is None or envelope.observed_invocation_id != invocation.invocation_id:
+                return reject("stale_invocation")
+            try:
+                destination = capability_registry.resolve(invocation.request).node_name
+            except CapabilityRegistryError:
+                return reject("unregistered")
+            return Command(
+                update={"pending_capability_dispatch": None},
+                goto=destination,
+            )
+
+        request = envelope.request
+        if request is None:
+            return reject("malformed_envelope")
+        try:
+            destination = capability_registry.resolve(request).node_name
+        except CapabilityRegistryError:
+            return reject("unregistered")
+        replacement = ActiveInvocation(
+            request=request,
+            opened_turn_id=envelope.turn_id,
+        )
+        return Command(
+            update={
+                "pending_capability_dispatch": None,
+                "active_invocation": replacement,
+                "identity_claim_misses": 0,
+                "active_flow": None,
+                "pending_ack": None,
+                "pending_clarification": None,
+                "clarification_progress": None,
+            },
+            goto=destination,
+        )
 
     def route_after_identity_capability_entry(state: ReasoningState) -> str:
         invocation = state.active_invocation
@@ -1443,6 +1512,18 @@ def build_frontline_graph(
     )
     node_registry.register(
         "cart_clarify", cart.clarify, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
+    )
+    node_registry.register(
+        "cart_mutation_confirm",
+        cart.mutation_confirm,
+        ExceptionAction.CART_REVIEW,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+    )
+    node_registry.register(
+        "cart_mutation_apply",
+        cart.mutation_apply,
+        ExceptionAction.CART_REVIEW,
+        AbandonmentKind.AUTHORITATIVE_RECONCILE,
     )
     node_registry.register(
         "cart_guardrail", cart.guardrail, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
@@ -1806,6 +1887,7 @@ def build_frontline_graph(
             profile_store,
             CommerceEffectFinishers(
                 placement=cart.finish_placement,
+                cart_mutation=cart.reconcile_mutation,
                 refund=support.finish_refund,
                 cancel=support.finish_cancel,
                 return_=support.finish_return,
@@ -1916,6 +1998,7 @@ def build_frontline_graph(
         "gate": "gate",
         "cart_ack": "cart_ack",
         "cart_clarify": "cart_clarify",
+        "cart_mutation_confirm": "cart_mutation_confirm",
         "cart_guardrail": "cart_guardrail",
     }
     graph.add_conditional_edges(
@@ -1930,6 +2013,12 @@ def build_frontline_graph(
     )
     graph.add_edge("cart_ack", END)
     graph.add_edge("cart_clarify", END)
+    graph.add_conditional_edges(
+        "cart_mutation_confirm",
+        route_after_cart_mutation_confirm,
+        {"handover": "handover", "cart_mutation_apply": "cart_mutation_apply", END: END},
+    )
+    graph.add_edge("cart_mutation_apply", "cart_ack")
     graph.add_conditional_edges(
         "cart_guardrail",
         route_after_cart_guardrail,

@@ -607,7 +607,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         runtime.caller_context.close_session()
 
 
-async def test_evaluator_executes_a_seeded_typed_cart_request_without_semantic_routing(
+async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
     config_root: Path,
 ) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
@@ -650,26 +650,22 @@ async def test_evaluator_executes_a_seeded_typed_cart_request_without_semantic_r
             identity_store=runtime.identity_store,
             model_call_count=lambda: _model_calls(routing, reasoning),
         )
-        line = runtime.cart_store.view()[0]
-
-        assert line.sku == product.sku
-        assert line.quantity == 1
-        assert line.price_usd == product.price_usd
+        assert runtime.cart_store.is_empty()
         assert len(observation.final.audible) == 1
         audible = observation.final.audible[0]
-        assert audible.node == "cart_ack"
-        assert product.name in audible.text
+        assert audible.node == "__interrupt__"
+        assert audible.text == f"Just to confirm: add 1 of {product.name} to your cart?"
         assert observation.final.model_calls == 0
         assert (
             _score_safety_observation(
                 observation,
                 expected_effects=observation.before,
                 expected_state=GraphObservation(
-                    active_flow=None,
-                    automation_channels=(),
+                    active_flow="cart",
+                    automation_channels=("pending_cart_mutation",),
                     handover_destination=None,
-                    interrupted=False,
-                    unfinished=False,
+                    interrupted=True,
+                    unfinished=True,
                     automation_terminal=False,
                 ),
                 expected_admitted_user_messages=(),

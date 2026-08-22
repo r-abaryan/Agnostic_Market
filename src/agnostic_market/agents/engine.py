@@ -71,6 +71,7 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
+    CapabilityDispatchEnvelope,
     CapabilityId,
     PrincipalTransition,
 )
@@ -81,6 +82,7 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     IdentityClarification,
     PendingCancelBatch,
+    PendingCartMutation,
     PendingIdentity,
     PendingPlacement,
     PendingProfileChange,
@@ -114,6 +116,8 @@ def _write_ingress_rejection(
 # grant. LangChain messages remain covered by the serializer's built-in safe types.
 _CHECKPOINT_CHANNEL_DTOS = (
     ActiveInvocation,
+    CapabilityDispatchEnvelope,
+    PendingCartMutation,
     PendingPlacement,
     PendingRefund,
     CancellableOrderScope,
@@ -772,6 +776,30 @@ class ReasoningEngine:
             if field != "active_invocation"
         )
 
+    def _is_checkpointed_dispatch_redelivery(
+        self,
+        snapshot: StateSnapshot,
+        state: ReasoningState,
+        message_id: str,
+    ) -> bool:
+        envelope = state.pending_capability_dispatch
+        if not isinstance(envelope, CapabilityDispatchEnvelope):
+            return False
+        try:
+            envelope = CapabilityDispatchEnvelope.model_validate(envelope)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            envelope.turn_id == message_id
+            and state.consumed_turn_ids
+            and state.consumed_turn_ids[-1] == message_id
+            and state.committed_user_message(message_id) is not None
+            and state.pending_recovery is None
+            and not snapshot.interrupts
+            and snapshot.next == (self._recovery_entry_node,)
+            and _task_matches(snapshot, self._recovery_entry_node, interrupted=False)
+        )
+
     def _seed_stream_recovery(
         self,
         marker: PendingRecovery,
@@ -1009,8 +1037,20 @@ class ReasoningEngine:
                             update={"consumed_turn_ids": () if already_consumed else (message_id,)}
                         )
                 elif message_id in snapshot_state.consumed_turn_ids:
-                    write_event({"event": "duplicate_turn_ignored", "reason": "consumed_turn_id"})
-                    return
+                    if self._is_checkpointed_dispatch_redelivery(
+                        snapshot,
+                        snapshot_state,
+                        message_id,
+                    ):
+                        payload = Command(update={"consumed_turn_ids": ()})
+                    else:
+                        write_event(
+                            {
+                                "event": "duplicate_turn_ignored",
+                                "reason": "consumed_turn_id",
+                            }
+                        )
+                        return
                 elif snapshot.interrupts:
                     if not self._checkpoint_has_valid_interrupt(snapshot):
                         yield self._enter_last_resort()

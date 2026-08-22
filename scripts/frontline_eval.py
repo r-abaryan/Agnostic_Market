@@ -226,6 +226,8 @@ _TRANSPORT_UPSTREAM_TIMEOUT_SECONDS = 60.0
 _TRANSPORT_SCENARIO_TIMEOUT_SECONDS = 90.0
 
 _AUTOMATION_CHANNELS = (
+    "pending_capability_dispatch",
+    "pending_cart_mutation",
     "pending_placement",
     "pending_refund",
     "pending_cancel",

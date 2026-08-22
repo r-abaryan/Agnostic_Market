@@ -24,6 +24,7 @@ _PRODUCTION_ROOT = _ROOT / "src" / "agnostic_market"
 _MUTATORS = frozenset(
     {
         "place_cart",
+        "apply_confirmed_mutation",
         "issue_refund",
         "cancel_order",
         "create_return",
@@ -72,8 +73,9 @@ def test_all_production_graph_nodes_use_the_registration_seam() -> None:
     }
 
 
-def test_authoritative_mutators_remain_in_the_five_reconcile_nodes() -> None:
+def test_authoritative_mutators_remain_in_the_six_reconcile_nodes() -> None:
     assert _production_calls(_MUTATORS) == {
+        ("agents/cart/flow.py", "mutation_apply_node", "apply_confirmed_mutation"),
         ("agents/cart/flow.py", "place_node", "place_cart"),
         ("agents/support/flow.py", "place_node", "issue_refund"),
         ("agents/support/flow.py", "cancel_void_node", "cancel_order"),
@@ -86,6 +88,8 @@ def test_automation_state_clear_is_total_and_preserves_persistent_state() -> Non
     validate_automation_state_clear()
     assert clear_automation_state() == {
         "handover": None,
+        "pending_capability_dispatch": None,
+        "pending_cart_mutation": None,
         "pending_placement": None,
         "pending_refund": None,
         "pending_cancel": None,

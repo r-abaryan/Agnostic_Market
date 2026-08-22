@@ -20,6 +20,7 @@ from agnostic_market.dtos.orchestration import (
     AnswerResponse,
     CancellableOrderScope,
     CancelOrders,
+    CapabilityDispatchEnvelope,
     CapabilityId,
     CartItemChoices,
     CartItemQuery,
@@ -228,6 +229,63 @@ def test_active_invocation_replaces_only_the_same_capability_request() -> None:
                 "opened_turn_id": "turn-1",
                 "unexpected": True,
             }
+        )
+
+
+def test_capability_dispatch_envelope_has_closed_direct_and_continue_shapes() -> None:
+    direct = CapabilityDispatchEnvelope(
+        turn_id="turn-1",
+        mode="direct",
+        request=ViewCart(),
+    )
+    continuing = CapabilityDispatchEnvelope(
+        turn_id="turn-2",
+        mode="continue",
+        observed_invocation_id="invocation-1",
+    )
+
+    assert direct.request == ViewCart()
+    assert direct.observed_invocation_id is None
+    assert continuing.request is None
+    assert continuing.observed_invocation_id == "invocation-1"
+
+    malformed = (
+        {"turn_id": "turn-1", "mode": "direct"},
+        {
+            "turn_id": "turn-1",
+            "mode": "direct",
+            "request": ViewCart(),
+            "observed_invocation_id": "invocation-1",
+        },
+        {"turn_id": "turn-1", "mode": "continue"},
+        {
+            "turn_id": "turn-1",
+            "mode": "continue",
+            "request": ViewCart(),
+            "observed_invocation_id": "invocation-1",
+        },
+        {
+            "turn_id": "turn-1",
+            "mode": "direct",
+            "request": ViewCart(),
+            "unexpected": True,
+        },
+    )
+    for payload in malformed:
+        with pytest.raises(ValidationError):
+            CapabilityDispatchEnvelope.model_validate(payload)
+
+
+def test_direct_dispatch_envelope_rejects_code_owned_request_evidence() -> None:
+    with pytest.raises(ValidationError, match="owning capability"):
+        CapabilityDispatchEnvelope(
+            turn_id="turn-1",
+            mode="direct",
+            request=ModifyCart(
+                operation="add",
+                item=ResolvedCartItemRef(sku="SKU-SHM-01"),
+                quantity=1,
+            ),
         )
 
 
