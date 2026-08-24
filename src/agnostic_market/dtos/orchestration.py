@@ -69,6 +69,7 @@ class CapabilityId(StrEnum):
     VERIFY_IDENTITY = "verify_identity"
     SWITCH_ACCOUNT = "switch_account"
     VIEW_IDENTITY_STATUS = "view_identity_status"
+    ABORT_CURRENT = "abort_current"
     DISCLOSE_AI_IDENTITY = "disclose_ai_identity"
     REQUEST_PERSON = "request_person"
 
@@ -367,6 +368,12 @@ class ViewIdentityStatus(_CompleteIntentRequest):
     kind: Literal[CapabilityId.VIEW_IDENTITY_STATUS] = CapabilityId.VIEW_IDENTITY_STATUS
 
 
+class AbortCurrent(_CompleteIntentRequest):
+    model_config = _FROZEN
+
+    kind: Literal[CapabilityId.ABORT_CURRENT] = CapabilityId.ABORT_CURRENT
+
+
 class DiscloseAiIdentity(_CompleteIntentRequest):
     model_config = _FROZEN
 
@@ -394,6 +401,7 @@ IntentRequest = Annotated[
     | VerifyIdentity
     | SwitchAccount
     | ViewIdentityStatus
+    | AbortCurrent
     | DiscloseAiIdentity
     | RequestPerson,
     Field(discriminator="kind"),
@@ -440,6 +448,30 @@ class ActiveInvocation(BaseModel):
         if replacement.capability != self.capability:
             raise ValueError("active invocation request cannot change capability")
         return replacement
+
+
+class InvocationClarificationOwner(BaseModel):
+    """Clarification budget owned by one retained capability invocation."""
+
+    model_config = _FROZEN
+
+    kind: Literal["invocation"] = "invocation"
+    invocation_id: NonEmptyText
+
+
+class RouterClarificationOwner(BaseModel):
+    """Clarification budget owned by consecutive ordinary router no-action turns."""
+
+    model_config = _FROZEN
+
+    kind: Literal["router"] = "router"
+    clarification_id: NonEmptyText = Field(default_factory=lambda: uuid.uuid4().hex)
+
+
+ClarificationOwner = Annotated[
+    InvocationClarificationOwner | RouterClarificationOwner,
+    Field(discriminator="kind"),
+]
 
 
 class CapabilityDispatchEnvelope(BaseModel):
@@ -563,6 +595,19 @@ class RoutingFailure(BaseModel):
     reason: RoutingFailureReason
 
 
+RouterNoActionReason = ClarificationReason | RoutingFailureReason
+
+
+class RouterNoActionEnvelope(BaseModel):
+    """One admitted non-executable route awaiting code-authored speech."""
+
+    model_config = _FROZEN
+
+    turn_id: NonEmptyText
+    owner: ClarificationOwner
+    reason: RouterNoActionReason
+
+
 RouteResolution = RouteDecision | RoutingFailure
 
 
@@ -580,6 +625,7 @@ class RoutingContext(BaseModel):
 
     model_config = _FROZEN
 
+    routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary"
     utterance: NonEmptyText
     bound_customer: StrictBool
     active_capability: CapabilityId | None = None

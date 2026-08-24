@@ -25,6 +25,9 @@ _MUTATORS = frozenset(
     {
         "place_cart",
         "apply_confirmed_mutation",
+        "add_item",
+        "set_quantity",
+        "remove_item",
         "issue_refund",
         "cancel_order",
         "create_return",
@@ -73,7 +76,7 @@ def test_all_production_graph_nodes_use_the_registration_seam() -> None:
     }
 
 
-def test_authoritative_mutators_remain_in_the_six_reconcile_nodes() -> None:
+def test_production_mutators_remain_in_the_six_reconcile_nodes() -> None:
     assert _production_calls(_MUTATORS) == {
         ("agents/cart/flow.py", "mutation_apply_node", "apply_confirmed_mutation"),
         ("agents/cart/flow.py", "place_node", "place_cart"),
@@ -89,6 +92,7 @@ def test_automation_state_clear_is_total_and_preserves_persistent_state() -> Non
     assert clear_automation_state() == {
         "handover": None,
         "pending_capability_dispatch": None,
+        "pending_router_no_action": None,
         "pending_cart_mutation": None,
         "pending_placement": None,
         "pending_refund": None,
@@ -102,7 +106,7 @@ def test_automation_state_clear_is_total_and_preserves_persistent_state() -> Non
         "active_flow": None,
         "pending_ack": None,
         "pending_clarification": None,
-        "clarification_progress": None,
+        "clarification_liveness": None,
     }
     assert {"messages", "automation_terminal"}.isdisjoint(clear_automation_state())
 
@@ -156,6 +160,38 @@ def test_validated_policy_mapping_is_immutable() -> None:
             lambda _state: {},
             ExceptionAction.SAFE_ABORT,
             AbandonmentKind.PURE_ABORT,
+        )
+
+
+def test_consent_interrupt_metadata_is_closed_and_immutable() -> None:
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+    registry.register(
+        "confirm",
+        lambda _state: {},
+        ExceptionAction.ABORT_PLACEMENT_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+        consent_interrupt_kind="standard",
+    )
+
+    kinds = registry.validated_consent_interrupt_kinds()
+
+    assert kinds == {"confirm": "standard"}
+    with pytest.raises(TypeError):
+        kinds["confirm"] = "cancel"  # type: ignore[index]
+
+
+def test_consent_interrupt_requires_lifecycle_special_abandonment() -> None:
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+
+    with pytest.raises(ValueError, match="consent interrupt"):
+        registry.register(
+            "confirm",
+            lambda _state: {},
+            ExceptionAction.SAFE_ABORT,
+            AbandonmentKind.PURE_ABORT,
+            consent_interrupt_kind="standard",
         )
 
 

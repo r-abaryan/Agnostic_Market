@@ -42,19 +42,19 @@ src/agnostic_market/
   tenancy/    merchant resolution and immutable per-session context
   secrets/    pluggable SecretResolver; config holds env:// refs, never values
   llm/        provider-agnostic gateway and the conformance gate
-  voice/      STT/TTS factories, read-only tools, LiveKit adapter, call-start disclosure
+  voice/      STT/TTS factories, LiveKit adapter, call-start disclosure
   commerce/   fixture-backed catalog, orders, cart, profile, verification
   agents/     the tiered reasoning graph and its engine
 scripts/      worker entrypoint, evaluator, conformance, transport-fault and smoke runners
 tests/        38 test modules, zero network
 ```
 
-Inside `agents/`, each gated flow is a package pairing graph logic with its model-facing prompt:
-`frontline/` routes, while `cart/`, `support/`, and `identity/` own their effects. `gate.py` is a
-deterministic pre-generation safety floor, `engine.py` the thread and resume seam, `recovery.py`
-the per-node failure policy, and `capabilities.py` the per-session capability registry the graph
-dispatcher resolves against. `routing.py` holds a semantic router that is scored offline and
-carries no live authority.
+Inside `agents/`, each gated flow is a package pairing graph logic with its model-facing prompt.
+`engine.py` owns ordinary-turn semantic recognition plus thread and resume lifecycle,
+`frontline/graph.py` dispatches typed requests, `recovery.py` owns per-node failure policy, and
+`capabilities.py` provides the immutable per-session registry. `cart/`, `support/`, `identity/`,
+and `frontline/read_flow.py` own execution. `routing.py` understands intent but carries no live
+authority.
 
 ## Run
 
@@ -78,19 +78,27 @@ uv run python scripts/voice_agent.py console   # terminal, no LiveKit room
 uv run python scripts/voice_agent.py dev       # connect to a LiveKit room
 ```
 
+Voice startup is fail-closed. In addition to provider conformance, the configured routing model
+must have a current passing cutover report at
+`config/telemetry/semantic_routing_report.json`. The report must match the active model, structured
+output method, route schema, prompt, registry, context projector, runtime limits, and frozen corpus.
+The preserved rejected report does not satisfy that contract.
+
 Secrets are never committed. Config files hold `env://NAME` references and the resolver reads the
 value at use time.
 
 ## Status
 
 Phases 0 through 3 are built: config and tenancy, the LLM gateway and conformance gate, the voice
-loop, and the gated commerce graph. Routing is migrating from keyword gates to typed capability
-requests resolved through an immutable per-session registry. Several read owners already resolve
-that way and answer from code with no model call.
+loop, and the gated commerce graph. The current feature branch has completed the source-level
+migration from keyword gates to typed capability requests resolved through one immutable
+per-session registry. Ordinary human and abort requests are semantic capabilities; deterministic
+code still owns consent, authorization, effects, and speech from authoritative outcomes.
 
-A semantic router for the remaining keyword gates is built but not adopted. It is scored offline
-against the live route on a fixed corpus, and the current candidate did not clear the thresholds
-fixed before the run, so the keyword route still owns every live turn.
+This architecture is not production-qualified. The prior generative candidate remains rejected,
+and voice startup now rejects it before constructing the recognizer. Activation still requires an
+approved recognizer, per-domain acceptance, latency and outage evidence, live shadow review, and
+the separate disclosure owner.
 
 Deliberately not built yet:
 

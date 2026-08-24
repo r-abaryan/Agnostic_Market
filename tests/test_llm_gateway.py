@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from llm_fakes import RecordingResolver
+from pydantic import ValidationError
 
 from agnostic_market.dtos.config import ProviderModel
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
@@ -56,6 +58,45 @@ def test_model_kwargs_pass_through() -> None:
         ProviderModel(provider="anthropic", model="claude-haiku-4-5"), max_retries=5
     )
     assert model.max_retries == 5
+
+
+def test_selection_reasoning_effort_is_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: dict[str, Any] = {}
+
+    def build(model: str, **kwargs: Any) -> object:
+        received.update(model=model, **kwargs)
+        return object()
+
+    monkeypatch.setattr("agnostic_market.llm.gateway.init_chat_model", build)
+    gateway = LLMGateway(_credentials(), RecordingResolver())
+
+    gateway.chat_model(
+        ProviderModel(provider="openai", model="gpt-5.6-luna", reasoning_effort="none")
+    )
+
+    assert received["model"] == "openai:gpt-5.6-luna"
+    assert received["reasoning_effort"] == "none"
+
+
+def test_reasoning_effort_cannot_be_hidden_in_gateway_kwargs() -> None:
+    gateway = LLMGateway(_credentials(), RecordingResolver())
+
+    with pytest.raises(GatewayError, match="ProviderModel"):
+        gateway.chat_model(
+            ProviderModel(provider="openai", model="gpt-5.6-luna"),
+            reasoning_effort="none",
+        )
+
+
+def test_unknown_reasoning_effort_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="reasoning_effort"):
+        ProviderModel(
+            provider="openai",
+            model="gpt-5.6-luna",
+            reasoning_effort="fast",  # type: ignore[arg-type]
+        )
 
 
 def test_structured_output_method_comes_from_provider_config() -> None:

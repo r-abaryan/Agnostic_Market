@@ -1,4 +1,8 @@
-# T1 eval — frontline under-escalation (AGENTS.md T1, seam #1).
+# Historical T1 language corpus from the removed gate/model escalation architecture.
+#
+# Preserve these reviewed utterances as controlled source data. Do not execute their old
+# binary labels as a current routing rubric. Reusable rows require explicit relabelling to
+# typed RouteDecision ground truth before joining the semantic-routing corpus.
 #
 # Stance (2026-07-07): the MODEL is the primary escalation decider; the slim gate is a
 # high-certainty irreversible-only floor. So the pre-registered bar is on the MODEL's

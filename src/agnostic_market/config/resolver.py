@@ -163,14 +163,14 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
 
     clarification = policies.get("clarification_reask_max", {})
     clarification_ceiling = limits.get("clarification_reask_ceiling", {})
-    for flow in ("identity", "support", "cart"):
-        value = clarification.get(flow)
-        limit = clarification_ceiling.get(flow)
+    for owner in ("identity", "support", "cart", "router"):
+        value = clarification.get(owner)
+        limit = clarification_ceiling.get(owner)
         if value is not None and limit is not None and value > limit:
             raise PolicyBoundsViolationError(
-                f"policies.clarification_reask_max.{flow}={value} exceeds the "
+                f"policies.clarification_reask_max.{owner}={value} exceeds the "
                 f"platform ceiling {limit} - a merchant may tighten a clarification budget, "
-                "never make a sticky flow unbounded"
+                "never make a clarification owner unbounded"
             )
 
 

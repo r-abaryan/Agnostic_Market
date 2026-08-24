@@ -26,6 +26,7 @@ from livekit.agents.voice.audio_recognition import _EndOfTurnInfo, _EndOfTurnMet
 from livekit.agents.voice.room_io import RoomIO
 from livekit.plugins.langchain import LLMAdapter
 from llm_fakes import RecordingResolver
+from routing_helpers import ArchitectureRoutingRecognizer
 
 from agnostic_market.agents.engine import build_checkpointer
 from agnostic_market.config.registry import ConfigRegistry
@@ -63,6 +64,7 @@ class _ContractState(TypedDict, total=False):
     effect_count: int
     normal_count: int
     consumed_turn_ids: Annotated[tuple[str, ...], merge_consumed_turn_ids]
+    pending_route: str | None
     visited: Annotated[list[str], _append]
 
 
@@ -490,6 +492,7 @@ async def _recorder_loop(config_root: Path) -> VoiceLoop:
         credentials,
         RecordingResolver(),
         config_root=config_root,
+        routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
     )
 
 
@@ -1123,6 +1126,50 @@ def test_destinations_render_an_edge_without_executing_it() -> None:
 
     assert result["visited"] == ["source"]
     assert ("source", "rendered") in rendered_edges
+
+
+async def test_pending_route_survives_cancellation_before_its_consumer_commits() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def no_action(_state: _ContractState) -> dict:
+        started.set()
+        await release.wait()
+        return {"pending_route": None, "visited": ["no_action"]}
+
+    builder = StateGraph(_ContractState)
+    builder.add_node("entry", lambda _state: {})
+    builder.add_node("no_action", no_action)
+    builder.add_edge(START, "entry")
+    builder.add_conditional_edges(
+        "entry",
+        lambda state: "no_action" if state.get("pending_route") else END,
+        {"no_action": "no_action", END: END},
+    )
+    graph = builder.compile(checkpointer=build_checkpointer())
+    config = _config("pending-route-cancellation")
+    graph.update_state(config, {"pending_route": "clarify"}, as_node="__start__")
+
+    async def drain() -> None:
+        async for _ in graph.astream(None, config):
+            pass
+
+    first = asyncio.create_task(drain())
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    cancelled = graph.get_state(config)
+    assert cancelled.values["pending_route"] == "clarify"
+    assert cancelled.next == ("no_action",)
+
+    release.set()
+    await graph.ainvoke(None, config)
+    finished = graph.get_state(config)
+    assert finished.values.get("pending_route") is None
+    assert finished.values["visited"] == ["no_action"]
+    assert finished.next == ()
 
 
 def _recovery_contract_graph(

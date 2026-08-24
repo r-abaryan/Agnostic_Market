@@ -2,8 +2,8 @@
 
 - graph.py  : builds the graph and its capability registry, returned together as one
               `FrontlineGraphAssembly` so runtime and evaluator share one registry instance.
-              Also owns the handover tool, deferral copy, and speakable-node declaration. CODE.
-- prompt.py : the frontline model-facing instructions + contrastive few-shot. PROMPT.
+              Also owns typed dispatch, terminal handover, and speech declarations. CODE.
+- typed_prompt.py : typed owner prompts for bounded model proposals. PROMPT.
 """
 
 from agnostic_market.agents.frontline.graph import (

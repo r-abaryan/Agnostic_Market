@@ -1,16 +1,15 @@
-"""Phase-2 voice worker — serve one merchant's minimal voice loop (BUILD_PLAN Phase 2).
+"""Serve one configured merchant through the qualified voice pipeline.
 
 Run:
     uv run python scripts/voice_agent.py console   # local mic/speaker dev loop
     uv run python scripts/voice_agent.py dev       # LiveKit Cloud -> Playground (the live call)
 
-Needs in .env: DEEPGRAM_API_KEY, CARTESIA_API_KEY, ANTHROPIC_API_KEY (routing LLM),
-LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET (dev mode; read by the LiveKit SDK).
+Needs in .env: the provider keys referenced by merchant config plus
+LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET for dev mode.
 Merchant served: env VOICE_AGENT_MERCHANT_ID (default "acme_store").
 
-Exit check (Phase 2): the call opens with the disclosure (played first, uninterruptible,
-COMPLIANCE 2), answers "what's the status of order ORD-1001" from the fixture, and logs
-per-turn latency (see voice/pipeline.py). ASCII-only output.
+Startup requires current LLM conformance and semantic-routing qualification reports. A qualified
+session opens with the configured disclosure and logs per-turn latency through the voice pipeline.
 """
 
 from __future__ import annotations
@@ -22,12 +21,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from livekit import agents
 
+from agnostic_market.agents.routing_activation import QualifiedSemanticRouterFactory
+from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.llm.gateway import load_provider_credentials
+from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.llm.providers import (
     ConformanceRegistry,
-    check_llm_certification,
     load_conformance_targets,
+    require_llm_certification,
 )
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.voice.pipeline import build_voice_loop
@@ -61,16 +62,39 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     registry = ConfigRegistry(_CONFIG_ROOT).load()
     resolved = registry.get(_MERCHANT_ID)
 
-    # Config-time certification check (warn-only in Phase 1/2; Phase 4 gate makes it blocking).
     targets = load_conformance_targets(_CONFIG_ROOT / "conformance" / "targets.yaml")
     conformance = ConformanceRegistry(
         _CONFIG_ROOT / "conformance" / "reports.json",
         max_report_age_days=targets.max_report_age_days,
     )
-    for warning in check_llm_certification(resolved.config, conformance):
-        logger.warning("certification: %s", warning)
+    require_llm_certification(resolved.config, conformance)
 
-    loop = build_voice_loop(resolved, credentials, secrets, config_root=_CONFIG_ROOT)
+    gateway = LLMGateway(credentials, secrets)
+    routing_contract = load_yaml_layer(
+        _CONFIG_ROOT / "eval" / "frontline_semantic_route_structural.yaml"
+    )
+    expected_corpus_fingerprint = routing_contract.get("frozen_corpus_fingerprint")
+    if not isinstance(expected_corpus_fingerprint, str) or not expected_corpus_fingerprint.strip():
+        raise RuntimeError("semantic routing corpus contract has no frozen fingerprint")
+    routing_factory = QualifiedSemanticRouterFactory(
+        qualification_path=_CONFIG_ROOT / "telemetry" / "semantic_routing_report.json",
+        selection=resolved.config.llm.routing,
+        credentials=credentials,
+        secrets=secrets,
+        structured_output_method=gateway.structured_output_method(resolved.config.llm.routing),
+        timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
+        input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
+        max_report_age_days=targets.max_report_age_days,
+        expected_corpus_fingerprint=expected_corpus_fingerprint,
+    )
+
+    loop = build_voice_loop(
+        resolved,
+        credentials,
+        secrets,
+        config_root=_CONFIG_ROOT,
+        routing_recognizer_factory=routing_factory,
+    )
     logger.info(
         "serving merchant %s (config_version %s)", _MERCHANT_ID, resolved.config_version[:12]
     )

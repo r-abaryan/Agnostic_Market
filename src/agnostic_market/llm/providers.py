@@ -52,7 +52,7 @@ from agnostic_market.dtos.orchestration import (
 # After the first report for this suite version is accepted, bump when checks or
 # transmitted schemas change so accepted reports fail closed. Before that, the version
 # is unreleased and its checks may still be completed without a meaningless bump.
-SUITE_VERSION = "4"
+SUITE_VERSION = "5"
 
 # Prompts name the required tool explicitly: the check verifies protocol conformance
 # (parse/emit/select), not semantic routing quality (that is Phase 6's behavioral eval).
@@ -307,8 +307,7 @@ async def _check_streaming(chat_model: BaseChatModel) -> ConformanceCheck:
 async def run_conformance(
     chat_model: BaseChatModel,
     *,
-    provider: str,
-    model: str,
+    selection: ProviderModel,
     structured_output_method: StructuredOutputMethod,
 ) -> ConformanceReport:
     """Run all three checks; verdict is commerce-ready iff ALL pass.
@@ -328,13 +327,15 @@ async def run_conformance(
         # handled inside the checks, so anything reaching here is infrastructure — it is
         # re-raised with cause, never swallowed and never turned into a verdict.
         raise ConformanceRunError(
-            f"conformance run for {provider}:{model} hit a transport/auth error "
+            f"conformance run for {selection.provider}:{selection.model} hit a "
+            f"transport/auth error "
             f"({type(exc).__name__}) - no verdict recorded; fix and re-run"
         ) from exc
     verdict = "commerce-ready" if all(check.passed for check in checks) else "chat-only"
     return ConformanceReport(
-        provider=provider,
-        model=model,
+        provider=selection.provider,
+        model=selection.model,
+        reasoning_effort=selection.reasoning_effort,
         suite_version=SUITE_VERSION,
         run_at=datetime.now(tz=UTC),
         checks=checks,
@@ -382,10 +383,17 @@ class ConformanceRegistry:
             json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
-    def is_commerce_ready(self, provider: str, model: str, *, now: datetime | None = None) -> bool:
+    def is_commerce_ready(
+        self,
+        selection: ProviderModel,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
         """FAIL-CLOSED: True only for a current-suite, unexpired, commerce-ready report."""
-        report = self._reports.get(self._key(provider, model))
+        report = self._reports.get(self._key(selection.provider, selection.model))
         if report is None or report.suite_version != SUITE_VERSION:
+            return False
+        if report.reasoning_effort != selection.reasoning_effort:
             return False
         if report.verdict != "commerce-ready":
             return False
@@ -393,11 +401,12 @@ class ConformanceRegistry:
 
     def require_commerce_ready(self, selection: ProviderModel) -> None:
         """The gate the Phase-3 router calls before routing a commerce turn."""
-        if not self.is_commerce_ready(selection.provider, selection.model):
+        if not self.is_commerce_ready(selection):
             raise ChatOnlyModelError(
                 f"model '{selection.provider}:{selection.model}' is not certified "
                 f"commerce-ready (fail-closed: report missing, expired, from an older "
-                f"suite, or chat-only) - it may not serve a commerce turn (AGENTS A11)"
+                f"suite, for a different runtime recipe, or chat-only) - it may not "
+                f"serve a commerce turn (AGENTS A11)"
             )
 
 
@@ -412,9 +421,17 @@ def check_llm_certification(config: MerchantConfig, registry: ConformanceRegistr
     # Iterate the DTO's own fields so a future LLMConfig node is checked automatically.
     for node in LLMConfig.model_fields:
         selection: ProviderModel = getattr(config.llm, node)
-        if not registry.is_commerce_ready(selection.provider, selection.model):
+        if not registry.is_commerce_ready(selection):
             warnings.append(
                 f"merchant {config.merchant_id!r}: llm.{node} = "
                 f"'{selection.provider}:{selection.model}' is not certified commerce-ready"
             )
     return warnings
+
+
+def require_llm_certification(config: MerchantConfig, registry: ConformanceRegistry) -> None:
+    """Reject startup when any configured LLM role lacks current conformance evidence."""
+
+    failures = check_llm_certification(config, registry)
+    if failures:
+        raise ChatOnlyModelError("; ".join(failures))

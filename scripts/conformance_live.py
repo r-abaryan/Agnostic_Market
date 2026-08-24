@@ -47,8 +47,7 @@ async def _run() -> int:
         try:
             report = await run_conformance(
                 chat_model,
-                provider=target.provider,
-                model=target.model,
+                selection=target,
                 structured_output_method=gateway.structured_output_method(target),
             )
         except ConformanceRunError as exc:

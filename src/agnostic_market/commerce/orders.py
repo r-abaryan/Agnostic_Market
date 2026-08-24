@@ -611,7 +611,7 @@ class CatalogLookup:
 
 
 def lookup_catalog(fixture: OrdersFixture, query: str) -> CatalogLookup:
-    """Preserve the legacy read tool's one-way, case-insensitive name containment."""
+    """Apply one-way, case-insensitive product-name containment."""
 
     needle = query.strip().lower()
     products = tuple(fixture.products)

@@ -1,4 +1,4 @@
-"""Frontline graph: structural safety + routing (gate / read-only / model-handover). Zero net."""
+"""Frontline graph structural safety, typed routing, and owner contracts. Zero network."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ import json
 from collections import Counter
 from pathlib import Path
 from types import MappingProxyType
-from typing import NoReturn
+from typing import NoReturn, get_args
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END
@@ -31,7 +31,6 @@ from agnostic_market.agents.recovery import (
     clear_automation_state,
 )
 from agnostic_market.agents.support import flow as support_flow
-from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     BoundIdentity,
@@ -45,6 +44,7 @@ from agnostic_market.commerce.orders import (
     OrderStore,
     RecentOrderContext,
     load_orders_fixture,
+    render_cart_line,
 )
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentDirectory,
@@ -55,6 +55,7 @@ from agnostic_market.commerce.receipts import CommittedReceipt
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
+    AbortCurrent,
     ActiveInvocation,
     AnswerQuestion,
     CancelOrders,
@@ -62,17 +63,19 @@ from agnostic_market.dtos.orchestration import (
     CapabilityId,
     CartItemChoices,
     CartItemQuery,
+    ClarificationReason,
     DiscloseAiIdentity,
     ExplicitOrderSet,
-    ExplicitOrderTarget,
     FocusedOrderSet,
     IntentRequest,
+    InvocationClarificationOwner,
     ListOrders,
     ModifyCart,
     PlaceOrder,
     RecentOrderSet,
-    RefundOrder,
+    RequestPerson,
     ResolvedCartItemRef,
+    RoutingFailureReason,
     SearchCatalog,
     SwitchAccount,
     VerifyIdentity,
@@ -83,27 +86,22 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
     CartClarification,
-    ClarificationProgress,
-    HandoffDestination,
-    HandoffReasonCode,
-    HandoffRequest,
+    ClarificationLiveness,
+    HandoffSource,
     PendingCartMutation,
-    PolicyContext,
     ReasoningState,
 )
 from agnostic_market.voice.context import CallerContext
-from agnostic_market.voice.tools import build_voice_tools
 
 # A DEFERRING destination (planner) — these tests exercise the destination-agnostic handover
-# CONTROL mechanism (routing through Command, deferral speak, history hygiene), NOT a specific
-# flow. checkout/support destinations ENTER their flows (3b/3c) instead of deferring, so a
-# mechanism test must use a destination that still ends at the spoken deferral.
-_HANDOVER_ARGS = {"request_handover": {"destination": "planner", "reason_code": "multi_step"}}
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
 _TEST_OTP = "482913"
-_DISPATCH_REJECTION_LINE = (
-    "I couldn't complete that request. Please try again, or ask to speak to a person."
-)
+_DISPATCH_REJECTION_LINE = "I couldn't complete that request. Please try again."
+
+
+def test_router_no_action_copy_exactly_covers_closed_reasons() -> None:
+    expected = set(get_args(ClarificationReason)) | set(get_args(RoutingFailureReason))
+    assert set(frontline_graph._ROUTER_NO_ACTION_LINES) == expected
 
 
 def _granted(*order_ids: str) -> CallerIdentityStore:
@@ -114,25 +112,9 @@ def _granted(*order_ids: str) -> CallerIdentityStore:
     return identity
 
 
-def _tools(
-    config_root: Path,
-    store: OrderStore,
-    cart: CartStore,
-    recent_orders: RecentOrderContext,
-    identity: CallerIdentityStore,
-) -> list:
-    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
-    return [
-        wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, recent_orders, identity, customers)
-    ]
-
-
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     store = kwargs.pop("store", None) or OrderStore(load_orders_fixture(config_root, "acme_store"))
-    # The SAME cart instance must reach build_voice_tools AND the graph, or view_cart reads a
-    # different cart than the render node (split-brain, graph docstring). Same for the
-    # identity store (P7): the tool grants into it, the render router reads it.
+    # Routing projection and graph owners share these session stores.
     cart = kwargs.pop("cart_store", None) or CartStore()
     policy = kwargs.pop("policy", None) or make_policy(refund_returnless_under_usd=50.0)
     recent_orders = kwargs.pop("recent_orders", None) or RecentOrderContext(
@@ -150,7 +132,6 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     )
     return build_frontline_graph(
         fake,
-        _tools(config_root, store, cart, recent_orders, identity),
         display_name="Acme Store",
         tenant_id="acme_store",
         cart_store=cart,
@@ -190,16 +171,18 @@ def _admitted_turn(text: str, *, turn_id: str, **state: object) -> dict[str, obj
 # --- the structural safety invariant (T1's structural half) --------------------------
 
 
-def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
+def test_frontline_has_no_broad_model_or_tool_routing_surface(config_root: Path) -> None:
     graph = _graph(config_root, FakeChatModel())
-    # The only tools the frontline can call are the read-only ones + request_handover
-    # (a control signal, not a mutation). NO cart-write / place-order / refund / profile.
-    assert graph.frontline_read_only_tools == {
-        "order_status",
-        "list_orders",
-        "catalog_search",
-        "view_cart",
-    }
+    assert not hasattr(graph, "frontline_read_only_tools")
+    assert {
+        "gate",
+        "model",
+        "tools",
+        "cross_switch",
+        "read_render",
+        "forced_status",
+        "enumeration_gate",
+    }.isdisjoint(graph.nodes)
 
 
 @pytest.mark.parametrize(
@@ -209,7 +192,7 @@ def test_frontline_holds_no_sensitive_tool(config_root: Path) -> None:
         ("x" * 41, 40),
     ),
 )
-def test_ordinary_frontline_model_rejects_invalid_caller_audible_text(
+def test_typed_answer_owner_rejects_invalid_caller_audible_text(
     config_root: Path,
     tmp_path: Path,
     model_text: str,
@@ -221,9 +204,14 @@ def test_ordinary_frontline_model_rejects_invalid_caller_audible_text(
         caller_audible_model_text_max_chars=max_chars,
     )
 
-    result = graph.invoke(_admitted_turn("Tell me a joke about shoes.", turn_id="bounded-model"))
+    result = _typed_read(
+        graph,
+        AnswerQuestion(topic="general"),
+        turn_id="bounded-model",
+        text="Tell me a joke about shoes.",
+    )
 
-    assert _failed_nodes(tmp_path) == ["model"]
+    assert _failed_nodes(tmp_path) == ["answer_response"]
     assert "hit a snag" in _only_spoken(result)
     assert model_text not in _only_spoken(result)
     assert _answered_rows(tmp_path) == []
@@ -250,6 +238,8 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.SEARCH_CATALOG,
         CapabilityId.ANSWER_QUESTION,
         CapabilityId.VERIFY_ORDER_STATUS,
+        CapabilityId.ABORT_CURRENT,
+        CapabilityId.REQUEST_PERSON,
     )
     assert registry.entry_nodes == (
         "support_capability_entry",
@@ -260,6 +250,8 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "catalog_entry",
         "answer_response",
         "order_status_entry",
+        "abort_current",
+        "request_person",
     )
     # Rendering hint only, and DERIVED: it must equal the registry's own entry nodes, and the
     # dispatcher must still own no executable outgoing route.
@@ -271,7 +263,6 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     # while another is added, and it names nothing when it breaks.
     assert set(CapabilityId) - set(registry.capability_ids) == {
         CapabilityId.DISCLOSE_AI_IDENTITY,
-        CapabilityId.REQUEST_PERSON,
     }
     assert registry.resolve(SearchCatalog(query="shoes")).node_name == "catalog_entry"
     assert graph.builder.nodes["catalog_entry"].ends == (
@@ -291,6 +282,8 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     assert not any(source == "answer_response" for source, _target in graph.builder.edges)
     assert "answer_response" not in graph.builder.branches
     assert registry.resolve(VerifyOrderStatus()).node_name == "order_status_entry"
+    assert registry.resolve(AbortCurrent()).node_name == "abort_current"
+    assert registry.resolve(RequestPerson()).node_name == "request_person"
     assert graph.builder.nodes["order_status_entry"].ends == (
         "order_status_target_ask",
         "order_status_target_propose",
@@ -349,10 +342,10 @@ def test_direct_dispatch_envelope_opens_invocation_and_routes_atomically(
     assert invocation.opened_turn_id == "dispatch-direct"
 
 
-def test_compiled_entry_consumes_direct_dispatch_without_legacy_routing(
+def test_compiled_entry_consumes_direct_dispatch_without_ordinary_routing(
     config_root: Path,
 ) -> None:
-    frontline = FakeChatModel(emit_tool_calls=False, text_response="legacy route ran")
+    frontline = FakeChatModel(emit_tool_calls=False, text_response="ordinary route ran")
     reasoning = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, frontline, reasoning_model=reasoning)
     turn_id = "dispatch-compiled"
@@ -392,13 +385,41 @@ def test_continue_dispatch_envelope_requires_and_preserves_the_observed_invocati
             consumed_turn_ids=("turn-1", "turn-2"),
             active_invocation=invocation,
             active_flow="cart",
-            clarification_progress=ClarificationProgress(flow="cart", reasks=1),
+            clarification_liveness=ClarificationLiveness(
+                owner=InvocationClarificationOwner(invocation_id=invocation.invocation_id),
+                reasks=1,
+            ),
             pending_capability_dispatch=envelope,
         )
     )
 
     assert isinstance(command, Command)
     assert command.goto == "cart_capability_entry"
+    assert command.update == {"pending_capability_dispatch": None}
+
+
+def test_continue_dispatch_retains_identity_detour_execution_ownership(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    invocation = ActiveInvocation(request=CancelOrders(), opened_turn_id="turn-1")
+
+    command = graph.nodes["capability_dispatch"].invoke(
+        ReasoningState(
+            messages=[HumanMessage("casey@example.com", id="turn-2")],
+            consumed_turn_ids=("turn-1", "turn-2"),
+            active_invocation=invocation,
+            active_flow="identity",
+            pending_capability_dispatch=CapabilityDispatchEnvelope(
+                turn_id="turn-2",
+                mode="continue",
+                observed_invocation_id=invocation.invocation_id,
+            ),
+        )
+    )
+
+    assert isinstance(command, Command)
+    assert command.goto == "identity_assemble"
     assert command.update == {"pending_capability_dispatch": None}
 
 
@@ -422,7 +443,10 @@ def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
             identity_claim_misses=1,
             pending_ack="old response",
             pending_clarification=CartClarification(detail="item"),
-            clarification_progress=ClarificationProgress(flow="cart", reasks=1),
+            clarification_liveness=ClarificationLiveness(
+                owner=InvocationClarificationOwner(invocation_id=old.invocation_id),
+                reasks=1,
+            ),
             pending_capability_dispatch=envelope,
         )
     )
@@ -438,13 +462,13 @@ def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
         "identity_claim_misses": command.update["identity_claim_misses"],
         "pending_ack": command.update["pending_ack"],
         "pending_clarification": command.update["pending_clarification"],
-        "clarification_progress": command.update["clarification_progress"],
+        "clarification_liveness": command.update["clarification_liveness"],
     } == {
         "active_flow": None,
         "identity_claim_misses": 0,
         "pending_ack": None,
         "pending_clarification": None,
-        "clarification_progress": None,
+        "clarification_liveness": None,
     }
 
 
@@ -632,7 +656,7 @@ def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> No
         consumed_turn_ids=("typed-cart-item", "typed-cart-quantity"),
         active_invocation=retained,
         active_flow="cart",
-        clarification_progress=first["clarification_progress"],
+        clarification_liveness=first["clarification_liveness"],
     )
     second = graph.nodes["cart_capability_entry"].invoke(second_state)
 
@@ -801,7 +825,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
             consumed_turn_ids=("typed-cart-duplicate", "typed-cart-selection"),
             active_invocation=retained,
             active_flow="cart",
-            clarification_progress=first["clarification_progress"],
+            clarification_liveness=first["clarification_liveness"],
         )
     )
 
@@ -826,7 +850,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
             ),
             active_invocation=selected,
             active_flow="cart",
-            clarification_progress=second["clarification_progress"],
+            clarification_liveness=second["clarification_liveness"],
         )
     )
 
@@ -1086,25 +1110,30 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
             consumed_turn_ids=("typed-cart-exit",),
             active_invocation=invocation,
             active_flow="cart",
-            clarification_progress=ClarificationProgress(flow="cart", reasks=2),
+            clarification_liveness=ClarificationLiveness(
+                owner=InvocationClarificationOwner(invocation_id=invocation.invocation_id),
+                reasks=2,
+            ),
         )
     )
     assert exhausted["active_invocation"] is None
-    assert exhausted["active_flow"] == "left_cart"
+    assert exhausted["active_flow"] is None
 
-    for node_name in ("cart_abort", "cart_escape_human"):
-        graph = _graph(config_root, FakeChatModel())
-        update = graph.nodes[node_name].invoke(
-            ReasoningState(
-                consumed_turn_ids=("typed-cart-exit",),
-                active_invocation=invocation,
-                active_flow="cart",
-            )
+    graph = _graph(config_root, FakeChatModel())
+    update = graph.nodes["abort_current"].invoke(
+        ReasoningState(
+            consumed_turn_ids=("typed-cart-exit",),
+            active_invocation=ActiveInvocation(
+                request=AbortCurrent(),
+                opened_turn_id="typed-cart-exit",
+            ),
+            active_flow="cart",
         )
-        assert update["active_invocation"] is None
+    )
+    assert update["active_invocation"] is None
 
 
-@pytest.mark.parametrize("exit_kind", ("leave", "exhaustion", "abort", "human"))
+@pytest.mark.parametrize("exit_kind", ("leave", "exhaustion"))
 def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
     config_root: Path,
     exit_kind: str,
@@ -1122,8 +1151,6 @@ def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
     text = {
         "leave": "let's discuss something unrelated",
         "exhaustion": "I still cannot choose",
-        "abort": "never mind",
-        "human": "get me a person",
     }[exit_kind]
     state: dict[str, object] = {
         "active_flow": "cart",
@@ -1133,172 +1160,16 @@ def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
         ),
     }
     if exit_kind == "exhaustion":
-        state["clarification_progress"] = ClarificationProgress(flow="cart", reasks=2)
+        invocation = state["active_invocation"]
+        assert isinstance(invocation, ActiveInvocation)
+        state["clarification_liveness"] = ClarificationLiveness(
+            owner=InvocationClarificationOwner(invocation_id=invocation.invocation_id),
+            reasks=2,
+        )
 
     result = graph.invoke(_admitted_turn(text, turn_id=f"typed-cart-{exit_kind}", **state))
 
     assert result["active_invocation"] is None
-    if exit_kind == "human":
-        assert result["automation_terminal"] is True
-
-
-def test_cross_flow_switch_clears_a_typed_cart_invocation(config_root: Path) -> None:
-    reasoning = FakeChatModel(emit_tool_calls=False)
-    cart = CartStore()
-    graph = _graph(
-        config_root,
-        FakeChatModel(emit_tool_calls=False),
-        cart_store=cart,
-        reasoning_model=reasoning,
-    )
-    turn_id = "typed-cart-cross-flow"
-
-    result = graph.invoke(
-        _admitted_turn(
-            "actually I want a refund",
-            turn_id=turn_id,
-            active_flow="cart",
-            active_invocation=ActiveInvocation(
-                request=ModifyCart(operation="add"),
-                opened_turn_id=turn_id,
-            ),
-        )
-    )
-
-    assert result["active_invocation"] is None
-    assert result["active_flow"] == "support"
-    assert cart.is_empty()
-
-
-def test_mid_slot_checkout_replaces_typed_cart_without_a_model_call(
-    config_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    product = store.fixture.products[0]
-    cart = CartStore()
-    cart.add_item(
-        sku=product.sku,
-        name=product.name,
-        price_usd=product.price_usd,
-        quantity=1,
-    )
-    reasoning = FakeChatModel(emit_tool_calls=False)
-    records: list[dict[str, object]] = []
-    monkeypatch.setattr(frontline_graph, "write_event", records.append)
-    graph = _graph(
-        config_root,
-        FakeChatModel(),
-        store=store,
-        cart_store=cart,
-        reasoning_model=reasoning,
-    )
-    turn_id = "typed-cart-to-checkout"
-
-    result = graph.invoke(
-        _admitted_turn(
-            "just check out",
-            turn_id=turn_id,
-            active_flow="cart",
-            active_invocation=ActiveInvocation(
-                request=ModifyCart(operation="add"),
-                opened_turn_id=turn_id,
-            ),
-        )
-    )
-
-    assert result["active_invocation"] is None
-    assert result["pending_placement"] is not None
-    assert len(result["__interrupt__"]) == 1
-    assert cart.line_count == 1
-    assert reasoning.invoke_count == 0
-    assert [record for record in records if record.get("event") == "capability_replaced"] == [
-        {
-            "event": "capability_replaced",
-            "from": "modify_cart",
-            "destination": "checkout",
-            "reason_code": "cart_write",
-            "source": "gate",
-        }
-    ]
-    assert not any(record.get("event") == "flow_cross_switch" for record in records)
-
-
-def test_mid_slot_checkout_opens_a_fresh_place_order_invocation(
-    config_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    records: list[dict[str, object]] = []
-    monkeypatch.setattr(frontline_graph, "write_event", records.append)
-    graph = _graph(config_root, FakeChatModel())
-    turn_id = "typed-cart-replacement"
-    original = ActiveInvocation(
-        request=ModifyCart(operation="add"),
-        opened_turn_id=turn_id,
-    )
-
-    update = graph.nodes["cross_switch"].invoke(
-        ReasoningState(
-            messages=[HumanMessage("just check out", id=turn_id)],
-            consumed_turn_ids=(turn_id,),
-            active_flow="cart",
-            active_invocation=original,
-        )
-    )
-
-    replacement = update["active_invocation"]
-    assert isinstance(replacement, ActiveInvocation)
-    assert type(replacement.request) is PlaceOrder
-    assert replacement.invocation_id != original.invocation_id
-    assert replacement.opened_turn_id == turn_id
-    assert update["handover"] == HandoffRequest(
-        destination="checkout",
-        reason_code="cart_write",
-        source="gate",
-    )
-    assert records == [
-        {
-            "event": "capability_replaced",
-            "from": "modify_cart",
-            "destination": "checkout",
-            "reason_code": "cart_write",
-            "source": "gate",
-        }
-    ]
-
-
-def test_mid_slot_checkout_with_an_empty_cart_uses_the_checkout_line_without_a_model(
-    config_root: Path,
-) -> None:
-    cart = CartStore()
-    reasoning = FakeChatModel(emit_tool_calls=False)
-    graph = _graph(
-        config_root,
-        FakeChatModel(),
-        cart_store=cart,
-        reasoning_model=reasoning,
-    )
-    turn_id = "typed-empty-cart-to-checkout"
-
-    result = graph.invoke(
-        _admitted_turn(
-            "just check out",
-            turn_id=turn_id,
-            active_flow="cart",
-            active_invocation=ActiveInvocation(
-                request=ModifyCart(operation="add"),
-                opened_turn_id=turn_id,
-            ),
-        )
-    )
-
-    assert _only_spoken(result) == "Your cart's empty - what would you like to add?"
-    assert reasoning.invoke_count == 0
-    assert result["active_invocation"] is None
-    assert result["active_flow"] is None
-    assert result["pending_placement"] is None
-    assert result["pending_clarification"] is None
-    assert "__interrupt__" not in result
 
 
 def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
@@ -1875,13 +1746,15 @@ def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_provenanc
     assert _only_spoken(result) == answer
     prompt = response_model._seen_prompts[-1]
     assert utterance in prompt
+    assert "does not apply to this terminal owner" in prompt
+    assert "Never promise to check, handle, transfer, or follow up" in prompt
     if topic == "policy":
         assert "answer only from the approved merchant policy facts" in prompt
         assert "may give a low-risk explanation" not in prompt
     else:
         assert "may give a low-risk explanation" in prompt
         assert "answer only from the approved merchant policy facts" not in prompt
-        assert "unsupported takes precedence over clarify" in prompt
+        assert "unsupported takes precedence" in prompt
     assert _answered_rows(tmp_path) == [
         {
             "utterance": utterance,
@@ -2365,7 +2238,10 @@ def test_order_status_target_confirmation_human_escape_uses_terminal_handover(
 
     result = graph.invoke(
         Command(
-            resume={"text": "I want a person"},
+            resume={
+                "text": "I want a person",
+                "handoff_source": HandoffSource.SEMANTIC_ROUTER.value,
+            },
             update={"consumed_turn_ids": ("status-confirm-human-answer",)},
         ),
         config,
@@ -2386,10 +2262,10 @@ def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
         thread_id="status-confirm-failure",
     )
 
-    def _fail_consent(_text: str) -> NoReturn:
+    def _fail_consent(_answer: object, **_kwargs: object) -> NoReturn:
         raise RuntimeError("injected confirmation failure")
 
-    monkeypatch.setattr(read_flow, "classify_consent", _fail_consent)
+    monkeypatch.setattr(read_flow, "classify_confirmation", _fail_consent)
     result = graph.invoke(
         Command(
             resume={"text": "yes"},
@@ -2613,37 +2489,19 @@ def test_cart_view_owner_speaks_the_empty_line_with_no_close(config_root: Path) 
     assert not any(line.endswith(close) for close in all_closes())
 
 
-def test_both_cart_read_paths_speak_the_same_line(config_root: Path) -> None:
-    # The tool-driven render and the typed owner must not drift: one helper authors both.
-    def build(model: FakeChatModel):
-        cart = CartStore()
-        cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
-        return _graph(config_root, model, cart_store=cart)
+def test_typed_cart_read_uses_the_shared_live_renderer(config_root: Path) -> None:
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
+    graph = _graph(config_root, FakeChatModel(), cart_store=cart)
 
-    typed_line = _only_spoken(
-        _typed_read(build(FakeChatModel()), ViewCart(), turn_id="same-typed", text="my cart?")
-    )
-    tool_result = build(FakeChatModel(scripted_calls=[[("view_cart", {})]])).invoke(
-        _admitted_turn("what's in my cart?", turn_id="same-tool")
-    )
-    tool_line = str(
-        [m for m in tool_result["messages"] if isinstance(m, AIMessage) and not m.tool_calls][
-            -1
-        ].content
-    )
+    typed_line = _only_spoken(_typed_read(graph, ViewCart(), turn_id="same-typed", text="my cart?"))
 
-    # Both must really be the rendered cart, not an empty line or model prose.
-    assert "waterproof rain jacket" in typed_line and "waterproof rain jacket" in tool_line
-    # Closes rotate, so compare the sentence before the close.
-    assert typed_line.split(" in total.")[0] == tool_line.split(" in total.")[0]
+    assert typed_line.startswith(render_cart_line(cart.view(), cart.cart_total()))
 
 
-def test_each_cart_read_path_takes_exactly_one_close(
+def test_typed_cart_read_takes_exactly_one_close(
     config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The close is computed ONCE per turn in read_render_node, before its branch. A helper that
-    # called warm_close() itself would advance the module-level rotation twice on a cart read,
-    # which no membership assertion would catch.
     calls: list[int] = []
 
     def counting_close() -> str:
@@ -2660,14 +2518,6 @@ def test_each_cart_read_path_takes_exactly_one_close(
         turn_id="close-typed",
         text="my cart?",
     )
-    assert len(calls) == 1
-
-    calls.clear()
-    _graph(
-        config_root,
-        FakeChatModel(scripted_calls=[[("view_cart", {})]]),
-        cart_store=cart,
-    ).invoke(_admitted_turn("what's in my cart?", turn_id="close-tool"))
     assert len(calls) == 1
 
 
@@ -2841,20 +2691,21 @@ def test_a_failed_order_list_render_records_no_answered_turn(
 def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) -> None:
     graph = _graph(config_root, FakeChatModel())
     policies = graph.node_recovery_policies
+    assert {
+        "ordinary_abort",
+        "cart_abort",
+        "support_abort",
+        "identity_abort",
+    }.isdisjoint(graph.get_graph().nodes)
     expected_abandonment = {
         AbandonmentKind.PURE_ABORT: {
             "entry",
-            "cross_switch",
-            "gate",
-            "model",
-            "finalize",
-            "read_render",
-            "forced_status",
-            "enumeration_gate",
+            "request_person",
+            "abort_current",
+            "owner_declined",
+            "router_no_action",
             "cart_clarify",
             "cart_guardrail",
-            "cart_abort",
-            "support_assemble",
             "capability_dispatch",
             "support_capability_entry",
             "identity_capability_entry",
@@ -2880,16 +2731,13 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "support_return_guardrail",
             "support_profile_guardrail",
             "support_profile_risk_check",
-            "support_abort",
             "identity_assemble",
             "identity_ask_contact",
             "identity_reask",
             "identity_guardrail",
             "identity_risk_check",
-            "identity_abort",
         },
         AbandonmentKind.CART_REVIEW: {
-            "cart_assemble",
             "cart_capability_entry",
             "cart_ack",
         },
@@ -2902,7 +2750,6 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "support_profile_place",
         },
         AbandonmentKind.LIFECYCLE_SPECIAL: {
-            "tools",
             "principal_warning",
             "order_status_target_confirm",
             "cart_mutation_confirm",
@@ -2922,19 +2769,14 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         AbandonmentKind.TERMINAL: {
             "handover",
             "automation_terminal_response",
-            "cart_escape_human",
-            "support_escape_human",
-            "identity_escape_human",
         },
     }
     expected_exception = {
         ExceptionAction.SAFE_ABORT: {
             *expected_abandonment[AbandonmentKind.PURE_ABORT],
             "order_status_target_confirm",
-            "tools",
         },
         ExceptionAction.CART_REVIEW: {
-            "cart_assemble",
             "cart_capability_entry",
             "cart_ack",
             "cart_mutation_confirm",
@@ -2967,7 +2809,6 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
 
     assert isinstance(policies, MappingProxyType)
-    assert len(policies) == 74
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
     assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
@@ -2979,12 +2820,21 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             graph.principal_seed_complete_node,
         }
     )
-    assert len(graph.recovery_handled_nodes) == 73
     assert set(policies) == set().union(*expected_exception.values())
     assert graph.recovery_handled_nodes == frozenset(
         set(policies) - {"automation_terminal_response"}
     )
     assert graph.recovery_handled_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
+    assert graph.consent_interrupt_kinds == {
+        "principal_warning": "standard",
+        "order_status_target_confirm": "standard",
+        "cart_mutation_confirm": "standard",
+        "cart_confirm": "standard",
+        "support_confirm": "standard",
+        "support_cancel_confirm": "cancel",
+        "support_return_confirm": "standard",
+        "support_profile_confirm": "standard",
+    }
     assert graph.node_execution_tracker.tracked_node_names == frozenset(
         set(policies) - expected_abandonment[AbandonmentKind.PURE_ABORT]
     )
@@ -3002,1003 +2852,3 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             else policy.on_exception
         )
         assert policy.on_cancellation == expected_cancellation, name
-
-
-def _handover_update(
-    graph,
-    destination: HandoffDestination,
-    reason_code: HandoffReasonCode,
-) -> dict[str, object]:
-    state = ReasoningState(
-        consumed_turn_ids=("handover-turn",),
-        handover=HandoffRequest(
-            destination=destination,
-            reason_code=reason_code,
-            source="gate",
-        ),
-    )
-    return graph.nodes["handover"].invoke(state)
-
-
-def test_total_clear_is_used_only_for_terminal_handover_and_cross_switch(
-    config_root: Path,
-) -> None:
-    graph = _graph(config_root, FakeChatModel())
-    assert _handover_update(graph, "human", "other") == {
-        **clear_automation_state(),
-        "automation_terminal": True,
-    }
-
-    cross_switch = graph.nodes["cross_switch"].invoke(
-        ReasoningState(
-            messages=[HumanMessage("refund my order")],
-            active_flow="cart",
-        )
-    )
-    assert cross_switch == {
-        **clear_automation_state(),
-        "handover": HandoffRequest(
-            destination="support",
-            reason_code="refund",
-            source="gate",
-        ),
-    }
-
-
-def test_non_human_handover_entries_remain_partial_updates(config_root: Path) -> None:
-    graph = _graph(config_root, FakeChatModel())
-
-    assert _handover_update(graph, "checkout", "cart_write") == {
-        "active_flow": "cart",
-        "handover": None,
-        "clarification_progress": None,
-    }
-    switch = _handover_update(graph, "support", "switch_account")
-    switch_invocation = switch.pop("active_invocation")
-    assert switch == {
-        "active_flow": "identity",
-        "handover": None,
-        "identity_claim_misses": 0,
-        "clarification_progress": None,
-    }
-    assert isinstance(switch_invocation, ActiveInvocation)
-    assert switch_invocation.request == SwitchAccount()
-    assert switch_invocation.opened_turn_id == "handover-turn"
-
-    list_orders = _handover_update(graph, "support", "list_orders")
-    list_invocation = list_orders.pop("active_invocation")
-    assert list_orders == {
-        "active_flow": "identity",
-        "handover": None,
-        "identity_claim_misses": 0,
-        "clarification_progress": None,
-    }
-    assert isinstance(list_invocation, ActiveInvocation)
-    assert list_invocation.request == ListOrders(scope="account")
-    assert list_invocation.opened_turn_id == "handover-turn"
-    for reason_code in ("refund", "cancel_order", "address_change", "contact_change"):
-        assert _handover_update(graph, "support", reason_code) == {
-            "active_flow": "support",
-            "handover": None,
-            "clarification_progress": None,
-        }
-
-
-def test_bound_and_session_list_readbacks_remain_partial_updates(config_root: Path) -> None:
-    identity = CallerIdentityStore()
-    identity.bind(
-        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
-    )
-    bound_graph = _graph(config_root, FakeChatModel(), identity=identity)
-    bound = _handover_update(bound_graph, "support", "list_orders")
-
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    _place_two_session_orders(store)
-    session_graph = _graph(config_root, FakeChatModel(), store=store)
-    session = _handover_update(session_graph, "support", "list_orders")
-
-    expected_keys = {"messages", "active_flow", "handover", "identity_claim_misses"}
-    assert set(bound) == expected_keys
-    assert set(session) == expected_keys
-    for update in (bound, session):
-        assert update["active_flow"] is None
-        assert update["handover"] is None
-        assert update["identity_claim_misses"] == 0
-
-
-# --- routing paths -------------------------------------------------------------------
-
-
-async def test_gate_trip_skips_model_and_hands_over(config_root: Path) -> None:
-    # The slim gate trips on high-certainty IRREVERSIBLE requests (here: cancel) BEFORE any
-    # generation: the frontline model is never invoked, and the turn enters the support
-    # flow directly (cancel is a BUILT capability — it no longer defers; and if support's
-    # model bounces and leaves, the gate-skip hands the answer to the frontline model
-    # rather than a canned deferral — see checkout's gate-skip test).
-    fake = FakeChatModel(tool_call_limit=1)
-    reasoning = FakeChatModel(emit_tool_calls=False)  # support clarifies; stays in flow
-    graph = _graph(config_root, fake, reasoning_model=reasoning)
-    out = await graph.ainvoke({"messages": [HumanMessage("cancel my order please")]})
-    assert out["active_flow"] == "support"  # entered by the gate, pre-generation
-    assert fake._tool_calls_made == 0  # the frontline model never ran
-
-
-def test_ambiguous_pronoun_cancel_does_not_force_an_order_handover(config_root: Path) -> None:
-    graph = _graph(config_root, FakeChatModel())
-
-    update = graph.nodes["gate"].invoke(
-        ReasoningState(messages=[HumanMessage("Actually, you know what? Let's cancel it.")])
-    )
-
-    assert update == {}
-
-
-async def test_cancel_order_enters_the_support_flow(config_root: Path) -> None:
-    # Group A: cancel_order is now a BUILT support capability, so a cancel_order handover
-    # ENTERS the support flow (it no longer defers — that was the 3c-only behavior). The
-    # support assemble model runs and proposes the cancel. (Group C: address/contact change
-    # enter too; only payment_change defers.) Fix 2: ORD-1002 is CUST-002's and this session is
-    # UNBOUND, so the mutation cannot authorize on a rung-1 pair — it DETOURS into the identity
-    # OTP flow (no pending minted, "no pending before auth"); it resumes + mints after the bind.
-    reasoning = FakeChatModel(
-        force_tool="propose_cancel",
-        canned_args={"propose_cancel": {"order_keys": ["ORD-1002"]}},
-        tool_call_limit=1,
-    )
-    graph = _graph(config_root, FakeChatModel(tool_call_limit=1), reasoning_model=reasoning)
-    out = await graph.ainvoke(
-        {
-            "messages": [HumanMessage("actually cancel order ORD-1002", id="cancel-detour-turn")],
-            "consumed_turn_ids": ("cancel-detour-turn",),
-        }
-    )
-    assert reasoning._tool_calls_made == 1  # the support model ran and proposed a cancel
-    assert out.get("active_flow") == "identity"  # detoured to verify (rung-2 required)
-    assert out.get("pending_cancel") is None  # nothing staged before the caller is bound
-    invocation = out.get("active_invocation")
-    assert isinstance(invocation, ActiveInvocation)
-    assert invocation.opened_turn_id == "cancel-detour-turn"
-    request = invocation.request
-    assert isinstance(request, CancelOrders)
-    assert request.target.order_refs == ("ORD-1002",)
-
-
-async def test_address_change_enters_the_support_flow(config_root: Path) -> None:
-    # Group C: address_change flipped from defer -> enter (the profile flow is built).
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={
-            "request_handover": {"destination": "support", "reason_code": "address_change"}
-        },
-        tool_call_limit=1,
-    )
-    reasoning = FakeChatModel(emit_tool_calls=False)  # support clarifies; stays in flow
-    graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke({"messages": [HumanMessage("I need to update my address")]})
-    assert out.get("active_flow") == "support"  # ENTERED (no deferral line)
-    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
-    assert not any("support team" in t for t in texts)  # the old deferral is gone
-
-
-async def test_payment_change_still_defers(config_root: Path) -> None:
-    # Phase 5 boundary pin: payment_change must NOT enter (its flow doesn't exist — entering
-    # would bounce off the assemble and double-speak). The honest deferral speaks once.
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={
-            "request_handover": {"destination": "support", "reason_code": "payment_change"}
-        },
-        tool_call_limit=1,
-    )
-    graph = _graph(config_root, frontline)
-    out = await graph.ainvoke({"messages": [HumanMessage("put my new card on the account")]})
-    assert out.get("active_flow") is None
-    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
-    assert sum("support team" in t for t in texts) == 1  # exactly one deferral line
-
-
-async def test_read_only_turn_answers_without_handover(config_root: Path) -> None:
-    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
-    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
-    assert out.get("handover") is None
-    assert [type(m).__name__ for m in out["messages"]] == [
-        "HumanMessage",
-        "AIMessage",
-        "ToolMessage",
-        "AIMessage",
-    ]
-
-
-async def test_model_handover_routes_through_command(config_root: Path) -> None:
-    # Trigger-free phrasing the gate can't pattern -> the model calls request_handover.
-    # This fake emits an EMPTY-content tool call (no narration), so the node's canned
-    # deferral fires as the fallback — the caller is never left silent.
-    fake = FakeChatModel(
-        force_tool="request_handover", tool_call_limit=1, canned_args=_HANDOVER_ARGS
-    )
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke(
-        {"messages": [HumanMessage("I moved recently, make sure it goes to the right place")]}
-    )
-    assert out["handover"].source == "model"
-    # Proper tool_use/tool_result pairing (G1): the executed handover tool left a ToolMessage.
-    assert any(isinstance(m, ToolMessage) for m in out["messages"])
-    assert "picked up" in out["messages"][-1].content  # the planner deferral line
-
-
-async def test_model_narration_is_not_double_spoken(config_root: Path) -> None:
-    # Live 2026-07-08 bug: when the model narrates its handover AND the node appends the
-    # canned deferral, the caller hears two deferrals. If the model already spoke, the
-    # node must stay silent (its deferral is a fallback only).
-    class NarratingFake(FakeChatModel):
-        def _respond(self, messages, **kwargs):  # type: ignore[override]
-            msg = super()._respond(messages, **kwargs)
-            if msg.tool_calls:  # attach spoken narration alongside the handover tool call
-                msg.content = "I'll connect you with our support team for that."
-            return msg
-
-    fake = NarratingFake(
-        force_tool="request_handover", tool_call_limit=1, canned_args=_HANDOVER_ARGS
-    )
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("plan a whole trip outfit for me")]})
-    assert out["handover"].source == "model"
-    # The node did NOT append its canned deferral (the model's narration is the deferral).
-    canned = "I'll make sure it's picked up"  # the planner deferral line
-    assert not any(
-        isinstance(m, AIMessage) and canned in (m.content or "") for m in out["messages"]
-    )
-
-
-async def test_two_turn_history_stays_clean(config_root: Path) -> None:
-    # F2 regression: after a model-handover turn, the next turn runs without a dangling
-    # tool_use breaking the model call.
-    fake = FakeChatModel(
-        force_tool="request_handover", tool_call_limit=1, canned_args=_HANDOVER_ARGS
-    )
-    graph = _graph(config_root, fake)
-    first = await graph.ainvoke({"messages": [HumanMessage("send it to my work address")]})
-    second = await graph.ainvoke(
-        {"messages": [*first["messages"], HumanMessage("what's the status of order ORD-1001")]}
-    )
-    assert second["messages"]  # completed without error
-
-
-async def test_model_node_prepends_platform_system_prompt(config_root: Path) -> None:
-    # F1: the prompt lives inside the graph, so eval and production share one prompt path.
-    seen: dict[str, object] = {}
-
-    class RecordingFake(FakeChatModel):
-        def _respond(self, messages, **kwargs):  # type: ignore[override]
-            seen["first"] = messages[0]
-            return super()._respond(messages, **kwargs)
-
-    fake = RecordingFake(tool_call_limit=0, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)
-    await graph.ainvoke({"messages": [HumanMessage("hello")]})
-    assert isinstance(seen["first"], SystemMessage)
-    assert "Acme Store" in seen["first"].content
-
-
-async def test_plain_answer_ends_without_tools(config_root: Path) -> None:
-    fake = FakeChatModel(emit_tool_calls=False)
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("hi there")]})
-    assert out.get("handover") is None
-    assert isinstance(out["messages"][-1], AIMessage)
-    assert out["messages"][-1].content
-
-
-async def test_runaway_tool_loop_is_bounded(config_root: Path) -> None:
-    # A model that never stops calling read tools must not spin forever: the hop guard ends
-    # the turn after policy.max_tool_hops round-trips (no framework loop protection here).
-    # Forces catalog_search (NON-renderable — stays on the model->tools->model loop; a
-    # single renderable read like order_status would divert to read_render and END after one
-    # hop, which is a STRONGER bound, not the loop this guard protects).
-    default_hops = make_policy().max_tool_hops
-    fake = FakeChatModel(force_tool="catalog_search", canned_args=_READ_ARGS)  # no limit set
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
-    hops = sum(1 for m in out["messages"] if isinstance(m, AIMessage) and m.tool_calls)
-    assert hops == default_hops
-    assert isinstance(out["messages"][-1], AIMessage)
-    assert out["messages"][-1].content  # limit produces a final answer, not a dangling call
-    for index, message in enumerate(out["messages"]):
-        if isinstance(message, AIMessage) and message.tool_calls:
-            assert isinstance(out["messages"][index + 1], ToolMessage)
-
-
-async def test_tool_hop_bound_tracks_the_policy_knob(config_root: Path) -> None:
-    # The bound is config-driven (policies.security.max_tool_hops), not a hardcoded constant:
-    # a tightened knob ends the turn sooner. Pins that the value actually THREADS to the guard.
-    fake = FakeChatModel(force_tool="catalog_search", canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake, policy=make_policy(max_tool_hops=2))
-    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
-    hops = sum(1 for m in out["messages"] if isinstance(m, AIMessage) and m.tool_calls)
-    assert hops == 2
-
-
-async def test_tool_hop_bound_strips_a_provider_tool_call_from_the_final_pass(
-    config_root: Path,
-) -> None:
-    class ToolCallingWithoutToolsFake(FakeChatModel):
-        def _respond(self, messages, **kwargs):  # type: ignore[override]
-            if not kwargs.get("tools"):
-                return AIMessage(
-                    content="",
-                    tool_calls=[
-                        {
-                            "name": "catalog_search",
-                            "args": {"query": "shoes"},
-                            "id": "invalid_final_call",
-                            "type": "tool_call",
-                        }
-                    ],
-                )
-            return super()._respond(messages, **kwargs)
-
-    fake = ToolCallingWithoutToolsFake(
-        force_tool="catalog_search", canned_args=_READ_ARGS, tool_call_limit=None
-    )
-    graph = _graph(config_root, fake, policy=make_policy(max_tool_hops=1))
-    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
-    tool_messages = [message for message in out["messages"] if isinstance(message, ToolMessage)]
-    assert len(tool_messages) == 1
-    final = out["messages"][-1]
-    assert isinstance(final, AIMessage) and not final.tool_calls and final.content
-
-
-async def test_state_followup_reads_recent_context_without_calling_the_model(
-    config_root: Path,
-) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    store.cancel_order("cancel-1", order_id="ORD-1002")
-    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
-    recent_orders.record(["ORD-1002"], operation="read")
-    identity = _granted("ORD-1002")
-    graph = _graph(
-        config_root,
-        FakeChatModel(raise_transport=True),
-        store=store,
-        recent_orders=recent_orders,
-        identity=identity,
-    )
-    out = await graph.ainvoke({"messages": [HumanMessage("is it cancelled?")]})
-    assert "ORD-1002" in out["messages"][-1].content
-    assert "cancelled" in out["messages"][-1].content
-
-
-async def test_plural_state_followup_corrects_a_memory_claim_from_live_store(
-    config_root: Path,
-) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    store.cancel_order("cancel-1", order_id="ORD-1002")
-    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
-    recent_orders.record(["ORD-1001", "ORD-1002"], operation="list")
-    graph = _graph(
-        config_root,
-        FakeChatModel(raise_transport=True),
-        store=store,
-        recent_orders=recent_orders,
-        identity=_granted("ORD-1001", "ORD-1002"),
-    )
-    out = await graph.ainvoke(
-        {
-            "messages": [
-                AIMessage("ORD-1001 and ORD-1002 are both cancelled."),
-                HumanMessage("so both are cancelled?"),
-            ]
-        }
-    )
-    line = out["messages"][-1].content
-    assert "ORD-1001" in line and "ORD-1002" in line
-    assert "ORD-1001" in line and "was expected" in line
-    assert "ORD-1002" in line and "cancelled" in line
-
-
-@pytest.mark.parametrize(
-    ("recorded_refs", "has_focus"),
-    (
-        (("ORD-1001",), True),
-        (("ORD-1001", "ORD-1003"), False),
-    ),
-)
-def test_recent_order_focus_is_consistent_across_frontline_and_support_prompts(
-    config_root: Path,
-    recorded_refs: tuple[str, ...],
-    has_focus: bool,
-) -> None:
-    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
-    recent_orders.record(recorded_refs, operation="read")
-    identity = CallerIdentityStore()
-    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    frontline = FakeChatModel(emit_tool_calls=False, record_prompts=True)
-    reasoning = FakeChatModel(emit_tool_calls=False, record_prompts=True)
-    graph = _graph(
-        config_root,
-        frontline,
-        recent_orders=recent_orders,
-        identity=identity,
-        reasoning_model=reasoning,
-    )
-    state = ReasoningState(
-        messages=[HumanMessage("Please continue.", id="focus-prompt")],
-        consumed_turn_ids=("focus-prompt",),
-    )
-
-    graph.nodes["model"].invoke(state)
-    frontline_prompt = frontline._seen_prompts[-1]
-    graph.nodes["support_assemble"].invoke(
-        ReasoningState(
-            messages=state.messages,
-            consumed_turn_ids=state.consumed_turn_ids,
-            active_flow="support",
-        )
-    )
-    broad_support_prompt = reasoning._seen_prompts[-1]
-    typed_state = ReasoningState(
-        messages=state.messages,
-        consumed_turn_ids=state.consumed_turn_ids,
-        active_flow="support",
-        active_invocation=ActiveInvocation(
-            request=RefundOrder(
-                target=ExplicitOrderTarget(order_ref="ORD-1001"),
-                destination="original",
-            ),
-            opened_turn_id="focus-prompt",
-        ),
-    )
-    graph.nodes["support_capability_entry"].invoke(typed_state)
-    typed_support_prompt = reasoning._seen_prompts[-1]
-
-    assert ("The order most recently discussed on this call is ORD-1001" in frontline_prompt) is (
-        has_focus
-    )
-    for prompt in (broad_support_prompt, typed_support_prompt):
-        assert ("the order most recently discussed" in prompt) is has_focus
-
-
-async def test_unverified_all_orders_state_check_enters_identity_flow(
-    config_root: Path,
-) -> None:
-    graph = _graph(
-        config_root,
-        FakeChatModel(raise_transport=True),
-        reasoning_model=FakeChatModel(emit_tool_calls=False),
-    )
-    out = await graph.ainvoke(
-        _admitted_turn(
-            "are all my orders cancelled?",
-            turn_id="all-orders-state-check",
-        )
-    )
-    assert out.get("active_flow") == "identity"
-
-
-async def test_unverified_explicit_state_check_does_not_bypass_order_authorization(
-    config_root: Path,
-) -> None:
-    graph = _graph(config_root, FakeChatModel(emit_tool_calls=False))
-    out = await graph.ainvoke({"messages": [HumanMessage("is ORD-1002 cancelled?")]})
-    final = out["messages"][-1]
-    assert final.content == _TEXT_RESPONSE
-    assert "waterproof rain jacket" not in final.content
-
-
-async def test_bound_status_followup_ignores_a_residual_foreign_guest_grant(
-    config_root: Path,
-) -> None:
-    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
-    recent_orders.record(["ORD-1002"], operation="read")
-    identity = CallerIdentityStore()
-    identity.grant_orders("ORD-1002")
-    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    graph = _graph(
-        config_root,
-        FakeChatModel(emit_tool_calls=False),
-        recent_orders=recent_orders,
-        identity=identity,
-    )
-
-    out = await graph.ainvoke({"messages": [HumanMessage("is it cancelled?")]})
-
-    assert out["messages"][-1].content == _TEXT_RESPONSE
-    assert "waterproof rain jacket" not in out["messages"][-1].content
-
-
-async def test_answered_turn_writes_telemetry_negative(config_root: Path, tmp_path) -> None:
-    # The classifier dataset needs NEGATIVES: an answered (non-escalated) turn must leave
-    # a telemetry line too, not only handovers. (Telemetry is redirected to tmp by conftest.)
-    import json
-
-    from agnostic_market.agents import telemetry
-
-    fake = FakeChatModel(emit_tool_calls=False)
-    graph = _graph(config_root, fake)
-    await graph.ainvoke({"messages": [HumanMessage("hi there")]})
-    lines = [
-        json.loads(line)
-        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(rec["outcome"] == "answered" and rec["utterance"] == "hi there" for rec in lines)
-
-
-# --- policy grounding: DERIVED from enforced values (no drift), + free-text extras --------
-
-
-def _policy(**over) -> PolicyContext:
-    # The policy-grounding suite's default carries a spoken_policy_extra; everything else
-    # (incl. the security knobs) comes from the shared factory. Any field overridable —
-    # `over` wins over these defaults (a test may set spoken_policy_extra=None).
-    return make_policy(
-        **{
-            "refund_returnless_under_usd": 50.0,
-            "spoken_policy_extra": "Refunds take 5 to 7 business days.",
-            **over,
-        }
-    )
-
-
-def test_prompt_grounds_policy_from_enforced_values() -> None:
-    from agnostic_market.agents.frontline.prompt import compose_system_prompt
-
-    prompt = compose_system_prompt("Acme Store", _policy())
-    assert "Refunds take 5 to 7 business days." in prompt  # the free-text extra
-    assert "$50" in prompt  # the returnless threshold, DERIVED from the enforced value
-    assert "$200" in prompt  # the human-review line, DERIVED
-    assert "ONLY policy statements" in prompt
-
-
-def test_spoken_policy_tracks_the_enforced_value_no_drift() -> None:
-    # The whole point: change the ENFORCED number, the spoken sentence changes with it —
-    # they are one source, so a merchant can't state a threshold the guardrail won't honor.
-    from agnostic_market.agents.spoken_policy import compose_spoken_policy
-
-    assert "$50" in compose_spoken_policy(_policy(refund_returnless_under_usd=50.0))
-    assert "$120" in compose_spoken_policy(_policy(refund_returnless_under_usd=120.0))
-    # returnless 0 => return-first for every shipped refund (no dollar threshold spoken).
-    zero = compose_spoken_policy(_policy(refund_returnless_under_usd=0.0))
-    assert "issued once the return is arranged" in zero
-    # The return window (Group C: enforced by the returns guardrail) is derived the same way.
-    assert "within 30 days of delivery" in compose_spoken_policy(_policy(return_window_days=30))
-    assert "within 60 days of delivery" in compose_spoken_policy(_policy(return_window_days=60))
-
-
-def test_prompt_speaks_derived_policy_even_without_free_text() -> None:
-    from agnostic_market.agents.frontline.prompt import compose_system_prompt
-
-    prompt = compose_system_prompt("Acme Store", _policy(spoken_policy_extra=None))
-    assert "$50" in prompt  # derived sentences exist for every merchant
-    assert "NEVER invent" in prompt
-
-
-def test_prompt_forbids_order_status_from_confirming_account_ownership() -> None:
-    # Fix 4 (live 2026-07-18): a guest read ORD-1002 via order#+email, then asked "is it on
-    # this account, under that email?" and the model answered "Yes, it's on the account for
-    # casey@example.com" - an ownership ORACLE (anyone with an order number could learn whose
-    # account it is) + a PII echo. The frontline prompt must forbid confirming the account link
-    # and repeating the caller's contact; an order_status read speaks order STATE only.
-    from agnostic_market.agents.frontline.prompt import compose_system_prompt
-
-    prompt = compose_system_prompt("Acme Store", _policy())
-    assert "STATE ONLY" in prompt
-    assert "NEVER confirms, denies, or discusses WHOSE account" in prompt
-    assert "Never repeat the caller's email or phone number" in prompt
-    # the contrastive few-shot for the ownership probe is present
-    assert "that order is on this account" in prompt
-
-
-def test_shared_context_carries_todays_date_and_past_eta_rule() -> None:
-    # Live call #9 P6: with no "today" in any prompt, a stored ETA of July 9 was spoken as
-    # a FUTURE arrival on July 13. The date is read at compose time (per turn).
-    from datetime import datetime
-
-    from agnostic_market.agents._shared_prompt import compose_shared_context
-
-    context = compose_shared_context("Acme Store", _policy())
-    assert f"Today's date: {datetime.now():%A %d %B %Y}" in context
-    assert "BEFORE today is in the PAST" in context
-
-
-def test_shared_context_reaches_every_agent_prompt() -> None:
-    # Knowledge must not be tier-local (live 2026-07-10: policy facts lived only in the
-    # frontline prompt, so a policy question that gate-routed into support met a model
-    # with zero policy knowledge). All three composers carry the SAME shared block:
-    # persona continuity + the DERIVED policy summary.
-    from agnostic_market.agents.cart.prompt import compose_cart_prompt
-    from agnostic_market.agents.frontline.prompt import compose_system_prompt
-    from agnostic_market.agents.support.prompt import compose_support_prompt
-    from agnostic_market.commerce.cart import CartStore
-    from agnostic_market.commerce.orders import Candidate, OrderCandidate
-
-    policy = _policy()
-    prompts = [
-        compose_system_prompt("Acme Store", policy),
-        compose_cart_prompt(
-            "Acme Store",
-            [Candidate(key="1", sku="SKU-1", name="thing", price_usd=1.0)],
-            CartStore(),
-            policy,
-        ),
-        compose_support_prompt(
-            "Acme Store",
-            [
-                OrderCandidate(
-                    key="1",
-                    order_id="ORD-1",
-                    summary="a thing",
-                    total_usd=1.0,
-                    status="processing",
-                )
-            ],
-            policy,
-        ),
-    ]
-    for prompt in prompts:
-        assert "ONE continuous assistant" in prompt
-        assert "Refunds take 5 to 7 business days." in prompt
-        assert "$50" in prompt  # the derived enforced sentence reaches every tier
-
-
-def test_support_prompt_teaches_batch_cancel_tool() -> None:
-    # F-16.2 batch: the support model is told to cancel MULTIPLE orders in ONE propose_cancel
-    # call (not one-at-a-time across turns), and to never report an order done from memory. A
-    # content pin — the structural fix is code; this guards the wording against regression to
-    # the retired (and non-functional) one-at-a-time continuation promise.
-    from agnostic_market.agents.support.prompt import compose_support_prompt
-    from agnostic_market.commerce.orders import OrderCandidate
-
-    orders = [
-        OrderCandidate(key="1", order_id="ORD-1", summary="x", total_usd=1.0, status="processing")
-    ]
-    prompt = compose_support_prompt("Acme Store", orders, _policy())
-    assert "propose_cancel ONCE with ALL their option numbers" in prompt
-    assert "NEVER report an order as done from memory" in prompt
-    # The retired false promise must not creep back in.
-    assert "on the NEXT turn propose the next one" not in prompt
-
-
-# --- L3 deterministic read renderers: a single order_status/view_cart read is rendered in
-#     CODE and ENDs, skipping the second model pass (latency + grounding win). -------------
-
-from llm_fakes import _TEXT_RESPONSE  # noqa: E402  the fake's narration text (single source)
-
-
-async def test_single_order_status_renders_in_code_and_skips_second_model_pass(
-    config_root: Path,
-) -> None:
-    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    # An AUTHORIZED read (P7): render tests exercise the L3 path, not the object-binding
-    # gate — the gate's own pins live below and in test_voice_tools.py.
-    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
-    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
-    final = out["messages"][-1]
-    # The final line is the CODE render (contains the order id + a store-derived status),
-    # NOT the model's narration text — proving the second model pass was skipped.
-    assert isinstance(final, AIMessage) and "ORD-1001" in final.content
-    assert _TEXT_RESPONSE not in final.content
-    # The model was invoked exactly ONCE (the tool-call turn); no narration invoke followed.
-    assert fake._tool_calls_made == 1
-
-
-async def test_render_node_is_speakable(config_root: Path) -> None:
-    graph = _graph(config_root, FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS))
-    assert "read_render" in graph.speakable_nodes
-
-
-async def test_render_appends_a_factual_close_no_product_opinion(config_root: Path) -> None:
-    # A status read ends with a warm FACTUAL close — never a product opinion ("nice
-    # choice"/"good pick"), which reads as scripted and is nonsensical after a read (live
-    # 2026-07-15: appreciative closes dropped).
-    from agnostic_market.agents._copy import all_closes
-
-    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
-    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
-    line = out["messages"][-1].content
-    assert any(line.endswith(c) for c in all_closes())
-    assert "pick" not in line.lower() and "choice" not in line.lower()  # no product opinion
-
-
-async def test_multi_intent_read_still_goes_to_the_model(config_root: Path) -> None:
-    # "status of my order AND do you have socks?" -> the model emits TWO tool calls in one
-    # response; the ==1 guard fails, so the turn does NOT divert to read_render after the
-    # tools run — it returns to the model, which composes both (its narration text). The
-    # tool_call_limit makes that post-tools model invoke return text (not loop).
-    fake = FakeChatModel(
-        scripted_calls=[
-            [("order_status", {"order_id": "ORD-1001"}), ("catalog_search", {"query": "socks"})]
-        ],
-        tool_call_limit=0,  # after the scripted multi-call, the next invoke narrates
-    )
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke(
-        {"messages": [HumanMessage("status of ORD-1001 and do you have socks")]}
-    )
-    # The model composed the answer (its narration text), NOT a code render.
-    assert out["messages"][-1].content == _TEXT_RESPONSE
-
-
-async def test_single_catalog_search_stays_model_narrated(config_root: Path) -> None:
-    # catalog_search is NOT renderable (fuzzy discovery needs framing) — even a single call
-    # routes back to the model.
-    fake = FakeChatModel(tool_call_limit=1, force_tool="catalog_search", canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("do you have shoes")]})
-    assert out["messages"][-1].content == _TEXT_RESPONSE
-
-
-async def test_single_view_cart_renders_in_code(config_root: Path) -> None:
-    cart = CartStore()
-    cart.add_item(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)
-    fake = FakeChatModel(tool_call_limit=1, force_tool="view_cart", canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake, cart_store=cart)
-    out = await graph.ainvoke({"messages": [HumanMessage("what's in my cart")]})
-    final = out["messages"][-1]
-    assert "2 rain jackets" in final.content and "$258.00" in final.content
-    assert _TEXT_RESPONSE not in final.content
-
-
-async def test_render_cannot_invent_forward_state(config_root: Path) -> None:
-    # A processing order must render "being prepared", never "on the way" — the phrase is
-    # derived from the store field, so the embellishment class is structurally impossible.
-    fake = FakeChatModel(
-        tool_call_limit=1,
-        canned_args={"order_status": {"order_id": "ORD-1002"}},
-    )
-    graph = _graph(config_root, fake, identity=_granted("ORD-1002"))
-    out = await graph.ainvoke({"messages": [HumanMessage("status of ORD-1002")]})
-    line = out["messages"][-1].content
-    assert "being prepared" in line and "on its way" not in line
-
-
-async def test_handover_turn_never_renders(config_root: Path) -> None:
-    # A request_handover turn sets `handover`; the shared predicate excludes it, so the divert
-    # never steals a handover turn — it routes to the handover sink (spoken deferral).
-    fake = FakeChatModel(
-        tool_call_limit=1, force_tool="request_handover", canned_args=_HANDOVER_ARGS
-    )
-    graph = _graph(config_root, fake)
-    out = await graph.ainvoke({"messages": [HumanMessage("I need a human")]})
-    # Deferral spoken (planner destination), NOT a code render.
-    assert "picked up" in out["messages"][-1].content.lower()
-
-
-async def test_unauthorized_order_read_never_renders(config_root: Path) -> None:
-    # THE P7 render-gate pin: read_render re-derives the line from the STORE, so a declined
-    # order_status followed by the render divert would LEAK the order around the tool's
-    # object-binding gate. `_render_ready` requires authorization — an unverified single
-    # order_status falls back to the model, which narrates the tool's ask-for-contact
-    # instruction (the fake's text), and NO store-derived order line is ever spoken.
-    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake)  # identity store fresh: unverified session
-    out = await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
-    final = out["messages"][-1]
-    assert final.content == _TEXT_RESPONSE  # model narration, NOT a code render
-    spoken = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
-    assert not any("trail running shoes" in t for t in spoken)  # no order data leaked
-
-
-async def test_list_orders_handover_enters_the_identity_flow(config_root: Path) -> None:
-    # P7 rung 2: a list_orders handover ENTERS the identity flow (no deferral); the identity
-    # model runs and asks for the contact on the account (clarify -> stays sticky).
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={"request_handover": {"destination": "support", "reason_code": "list_orders"}},
-        tool_call_limit=1,
-    )
-    reasoning = FakeChatModel(emit_tool_calls=False)  # identity model asks its ONE question
-    graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke(
-        _admitted_turn("what orders do I have", turn_id="list-orders-handover")
-    )
-    assert out.get("active_flow") == "identity"  # ENTERED (sticky, awaiting the claim)
-    texts = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
-    assert not any("support team" in t for t in texts)  # no stale deferral
-
-
-async def test_identity_apply_is_speakable(config_root: Path) -> None:
-    graph = _graph(config_root, FakeChatModel())
-    assert "identity_apply" in graph.speakable_nodes
-    assert "identity_reask" in graph.speakable_nodes
-    assert "identity_assemble" not in graph.speakable_nodes  # double-speak (cart_ack lesson)
-
-
-async def test_unverified_enumeration_diverts_without_a_relay_pass(config_root: Path) -> None:
-    # THE deterministic enumeration divert (call #13 latency + F-12.3 closed structurally):
-    # a single unverified list_orders probe routes STRAIGHT to the identity flow in code.
-    # The high-confidence detector avoids the frontline model entirely, so it cannot relay
-    # the tool's instruction, ask for the email itself, or narrate.
-    frontline = FakeChatModel(force_tool="list_orders", tool_call_limit=1)
-    reasoning = FakeChatModel(emit_tool_calls=False)  # identity model asks its ONE question
-    graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke(_admitted_turn("what orders do I have", turn_id="enumeration-divert"))
-    assert out.get("active_flow") == "identity"  # entered via the code-set handover
-    assert frontline._tool_calls_made == 0
-    spoken = [str(m.content) for m in out["messages"] if isinstance(m, AIMessage) and m.content]
-    assert not any("email or phone" in t and "verification" in t for t in spoken)
-
-
-async def test_explicit_enumeration_phrase_skips_frontline_model(config_root: Path) -> None:
-    # Live call #17: this exact intent was answered "I can't list orders" because only a
-    # model-emitted list_orders tool call triggered the deterministic identity divert.
-    frontline = FakeChatModel(raise_transport=True)
-    reasoning = FakeChatModel(emit_tool_calls=False)
-    graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke(
-        _admitted_turn(
-            "tell me what order numbers are available",
-            turn_id="explicit-enumeration",
-        )
-    )
-    assert out.get("active_flow") == "identity"
-
-
-async def test_enumeration_cross_switches_out_of_sticky_support(config_root: Path) -> None:
-    # The live failure occurred after a cancel authorization denial left support sticky.
-    # Enumeration belongs to identity even though both use the "support" handover destination.
-    frontline = FakeChatModel(raise_transport=True)
-    reasoning = FakeChatModel(emit_tool_calls=False)
-    graph = _graph(config_root, frontline, reasoning_model=reasoning)
-    out = await graph.ainvoke(
-        _admitted_turn(
-            "tell me what orders are available",
-            turn_id="enumeration-cross-switch",
-            active_flow="support",
-        )
-    )
-    assert out.get("active_flow") == "identity"
-    assert out.get("pending_cancel") is None
-
-
-async def test_bound_enumeration_renders_the_list_in_code(config_root: Path) -> None:
-    # A BOUND session's clear enumeration ask is code-authored from the scoped store view
-    # and the turn ENDs without re-entering Identity or invoking the frontline model.
-    from agnostic_market.commerce.identity import BoundIdentity
-
-    identity = CallerIdentityStore()
-    identity.bind(
-        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
-    )
-    fake = FakeChatModel(force_tool="list_orders", tool_call_limit=1)
-    graph = _graph(config_root, fake, identity=identity)
-    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
-    final = out["messages"][-1]
-    assert "ORD-1002" in final.content and "ORD-1001" not in final.content  # scoped
-    assert _TEXT_RESPONSE not in final.content  # code render, not model narration
-    assert fake._tool_calls_made == 0
-
-
-async def test_bound_enumeration_escapes_sticky_support_without_otp(config_root: Path) -> None:
-    from agnostic_market.commerce.identity import BoundIdentity
-
-    identity = CallerIdentityStore()
-    identity.bind(
-        BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
-    )
-    graph = _graph(config_root, FakeChatModel(raise_transport=True), identity=identity)
-    out = await graph.ainvoke(
-        {
-            "messages": [HumanMessage("tell me what orders are available")],
-            "active_flow": "support",
-        }
-    )
-    final = out["messages"][-1]
-    assert "ORD-1002" in final.content and "ORD-1001" not in final.content
-    assert out.get("active_flow") is None
-    assert out.get("pending_identity") is None
-
-
-# --- Fix 3: a GUEST lists the orders they placed THIS session (no verification) ------------
-
-
-def _place_two_session_orders(store: OrderStore) -> tuple[str, str]:
-    from agnostic_market.dtos.state import CartLine
-
-    a = store.place_cart(
-        "s1",
-        lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=2)],
-        total_usd=258.0,
-    )
-    b = store.place_cart(
-        "s2",
-        lines=[CartLine(sku="SKU-RED-42", name="trail shoes", price_usd=89.99, quantity=1)],
-        total_usd=89.99,
-    )
-    return a.order_id, b.order_id
-
-
-async def test_guest_lists_session_placed_orders_without_verification(
-    config_root: Path, tmp_path: Path
-) -> None:
-    # THE Fix-3 pin (live trace 2026-07-18): an UNBOUND caller who placed orders this call asks
-    # to list them and hears them read back from CODE — no identity handover, no OTP. The spoken
-    # line DISCLOSES this-call scope (not "you've got N orders", which implies full history) and
-    # carries exactly ONE closing invitation (the verify-for-more line, NOT also warm_close).
-    import json
-
-    from agnostic_market.agents._copy import GUEST_LIST_CLOSE, all_closes
-
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    a, b = _place_two_session_orders(store)
-    graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)
-    out = await graph.ainvoke({"messages": [HumanMessage("tell me what orders are there")]})
-    final = out["messages"][-1]
-    assert a in final.content and b in final.content  # both session orders read back
-    assert out.get("active_flow") is None  # NO identity detour
-    assert out.get("pending_identity") is None
-    assert "on this call" in final.content  # scope disclosed (not full-history phrasing)
-    assert GUEST_LIST_CLOSE in final.content  # the verify-for-more invite
-    assert not any(c in final.content for c in all_closes())  # and NOT also a warm_close
-    scope = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-        if '"order_scope"' in line
-    ]
-    assert scope and scope[-1]["order_scope"] == "session"
-
-
-async def test_guest_enumeration_never_lists_fixture_orders(config_root: Path) -> None:
-    # SECURITY: a guest's session list is drawn ONLY from what they placed — never an account's
-    # fixture orders (a different code path). Place ONE order; the spoken list must not name any
-    # fixture order id.
-    from agnostic_market.dtos.state import CartLine
-
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    placed = store.place_cart(
-        "one",
-        lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=129.0, quantity=1)],
-        total_usd=129.0,
-    )
-    graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)
-    out = await graph.ainvoke({"messages": [HumanMessage("what orders do I have")]})
-    final = out["messages"][-1]
-    assert placed.order_id in final.content
-    assert not any(x in final.content for x in ("ORD-1001", "ORD-1002", "ORD-1003"))
-
-
-async def test_guest_with_no_placed_orders_still_enters_identity(config_root: Path) -> None:
-    # An unbound caller who placed NOTHING has no session orders to read — so enumeration still
-    # enters the identity flow (today's behavior; nothing to list without an account).
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={"request_handover": {"destination": "support", "reason_code": "list_orders"}},
-        tool_call_limit=1,
-    )
-    graph = _graph(config_root, frontline, reasoning_model=FakeChatModel(emit_tool_calls=False))
-    out = await graph.ainvoke(
-        _admitted_turn("what orders do I have", turn_id="guest-empty-enumeration")
-    )
-    assert out.get("active_flow") == "identity"
-
-
-async def test_guest_status_list_reads_session_placed(config_root: Path) -> None:
-    # Symmetry with the state-verification path: an unbound guest asking "are they both shipped?"
-    # reads the session-placed orders (forced-status), not nothing.
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    a, b = _place_two_session_orders(store)
-    graph = _graph(config_root, FakeChatModel(raise_transport=True), store=store)
-    out = await graph.ainvoke({"messages": [HumanMessage("are both of my orders shipped?")]})
-    final = out["messages"][-1]
-    assert a in final.content and b in final.content
-    assert out.get("active_flow") is None  # answered in code, no identity
-
-
-async def test_render_emits_exactly_one_answered_event(config_root: Path, tmp_path: Path) -> None:
-    # The render path ENDs at read_render (bypassing finalize_node); it must emit exactly ONE
-    # answered-telemetry event, not zero and not a duplicate. (Telemetry is redirected to
-    # tmp_path by the autouse conftest fixture.)
-    import json
-
-    fake = FakeChatModel(tool_call_limit=1, canned_args=_READ_ARGS)
-    graph = _graph(config_root, fake, identity=_granted("ORD-1001"))
-    await graph.ainvoke({"messages": [HumanMessage("status of order ORD-1001")]})
-    sink = tmp_path / "telemetry.jsonl"
-    answered = [
-        json.loads(line)
-        for line in sink.read_text(encoding="utf-8").splitlines()
-        if '"outcome": "answered"' in line
-    ]
-    assert len(answered) == 1
-    assert answered[0]["outcome_detail"] == "code_render"

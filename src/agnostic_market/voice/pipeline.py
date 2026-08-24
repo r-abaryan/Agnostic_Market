@@ -1,16 +1,8 @@
-"""AgentSession assembly — the Phase-2 minimal voice loop (BUILD_PLAN Phase 2).
+"""Assemble one configured voice session around the reasoning engine.
 
-Per-merchant, all from config: STT/TTS via the engine factories, the LLM via the
-Phase-1 gateway (`config.llm.response`), tools from the orders fixture. VAD and audio
-turn detection are livekit-agents 1.6 session DEFAULTS — deliberately not configured
-here (adopt built, VOICE_PIPELINE §1b); the built-in audio turn detector replaced the
-deprecated text turn-detector plugin (VOICE_PIPELINE §2 pending an update pass).
-
-The call-start disclosure (COMPLIANCE §2, EU AI Act Art. 50(1)) is played by the agent's
-own `on_enter` hook — STRUCTURAL ordering (it fires the moment the agent enters the
-session, before any user turn can be answered), not reliant on the worker calling say()
-in time. Wording comes from merchant config; that it plays, plays first, and cannot be
-barged over is enforced here in code.
+STT, TTS, response and reasoning models, merchant stores, and the qualified routing recognizer
+are explicit session dependencies. LiveKit owns VAD and audio turn-detection defaults. The
+agent's `on_enter` hook owns disclosure ordering before any caller turn can be answered.
 """
 
 from __future__ import annotations
@@ -27,8 +19,9 @@ from livekit.plugins import langchain as lk_langchain
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.routing import RoutingSession
+from agnostic_market.agents.routing_activation import RoutingRecognizerFactory
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -60,7 +53,6 @@ from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.voice.context import CallerContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.stt_engine import build_stt
-from agnostic_market.voice.tools import build_voice_tools
 from agnostic_market.voice.tts_engine import build_tts
 
 logger = logging.getLogger(__name__)
@@ -133,6 +125,7 @@ def build_voice_loop(
     secrets: SecretResolver,
     *,
     config_root: Path,
+    routing_recognizer_factory: RoutingRecognizerFactory,
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
@@ -176,15 +169,9 @@ def build_voice_loop(
         order_store=store,
     )
     gateway = LLMGateway(credentials, secrets)
-    # Read-only tools pass through the audit/tenant wrapper; the graph owns its own
-    # system prompts + few-shot (F1), so the Agent below carries NO instructions.
-    tools = [
-        wrap_readonly_tool(t, config.merchant_id)
-        for t in build_voice_tools(store, cart_store, recent_orders, identity_store, customers)
-    ]
+    response_structured_output_method = gateway.structured_output_method(config.llm.response)
     assembly = build_frontline_graph(
         chat_model=gateway.chat_model(config.llm.response),
-        read_only_tools=tools,
         display_name=config.display_name,
         tenant_id=config.merchant_id,
         # Checkout runs on the reasoning tier (AGENTS §A11: big model for gated flows).
@@ -206,12 +193,19 @@ def build_voice_loop(
         customers=customers,
         payment_instruments=payment_instruments,
         lifecycle=caller_context,
-        structured_output_method=gateway.structured_output_method(config.llm.response),
+        structured_output_method=response_structured_output_method,
         caller_audible_model_text_max_chars=(config.runtime.caller_audible_model_text_max_chars),
         # The checkout/support HITL interrupts need a durable thread (in-memory for the build
         # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
         # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
         checkpointer=build_checkpointer(),
+    )
+    routing = RoutingSession(
+        routing_recognizer_factory(assembly.capability_registry),
+        identity_store=identity_store,
+        cart_store=cart_store,
+        recent_orders=recent_orders,
+        registry=assembly.capability_registry,
     )
     engine = ReasoningEngine(
         assembly.graph,
@@ -219,6 +213,7 @@ def build_voice_loop(
         cancellation_quiescence_timeout_seconds=(
             config.runtime.cancellation_quiescence_timeout_seconds
         ),
+        routing=routing,
         lifecycle=caller_context,
     )
     caller_context.attach_engine(engine)

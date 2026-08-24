@@ -12,14 +12,13 @@ from langchain_core.messages import AIMessage, SystemMessage
 from langgraph.graph import END
 from langgraph.types import Command, interrupt
 
-from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._consent import classify_confirmation
 from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION, ORDER_NUMBER_QUESTION, warm_close
-from agnostic_market.agents.frontline.prompt import (
+from agnostic_market.agents.frontline.typed_prompt import (
     ORDER_TARGET_PROPOSAL_PROMPT,
     compose_answer_response_prompt,
     compose_catalog_response_prompt,
 )
-from agnostic_market.agents.legacy_observation import observe_legacy_capabilities
 from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.telemetry import write_capability_answered, write_event
 from agnostic_market.commerce.identity import (
@@ -37,7 +36,7 @@ from agnostic_market.commerce.orders import (
     lookup_catalog,
     render_order_status_line,
 )
-from agnostic_market.commerce.spoken import caller_stated_order_id
+from agnostic_market.commerce.spoken import caller_stated_order_ids
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AnswerQuestion,
@@ -147,7 +146,6 @@ def build_read_flow_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
             raise TypeError("order-status entry requires a verify-order-status invocation")
-        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         if invocation.request.target is not None:
             return Command(goto=ORDER_STATUS_FULFILL_NODE)
         return Command(goto=ORDER_STATUS_TARGET_PROPOSE_NODE)
@@ -212,17 +210,18 @@ def build_read_flow_nodes(
         )
         subject = "that order" if len(order_ids) == 1 else "those orders"
         answer = interrupt(f"I heard {listed}. Did you mean {subject}?")
-        verdict = classify_consent(str(answer.get("text", "")))
-        if answer.get("readback_interrupted") or verdict == "unclear":
+        decision = classify_confirmation(answer)
+        if answer.get("readback_interrupted") or decision.verdict == "unclear":
             answer = interrupt(f"To confirm, should I check {listed}? Please say yes or no.")
-            verdict = classify_consent(str(answer.get("text", "")))
-        if verdict == "yes":
+            decision = classify_confirmation(answer)
+        if decision.verdict == "yes":
             confirmed = request.with_confirmed_explicit_target()
             return Command(
                 goto=ORDER_STATUS_FULFILL_NODE,
                 update={"active_invocation": invocation.with_request(confirmed)},
             )
-        if verdict == "human":
+        if decision.verdict == "human":
+            assert decision.handoff_source is not None
             return Command(
                 goto="handover",
                 update={
@@ -230,7 +229,7 @@ def build_read_flow_nodes(
                     "handover": HandoffRequest(
                         destination="human",
                         reason_code="other",
-                        source="gate",
+                        source=decision.handoff_source,
                     ),
                 },
             )
@@ -280,10 +279,8 @@ def build_read_flow_nodes(
             if authorization_message is None:
                 authorization_message = target_message
             if not request.explicit_target_confirmed:
-                if all(
-                    caller_stated_order_id(target_message.content, order_id) == order_id
-                    for order_id in order_ids
-                ):
+                stated_order_ids = caller_stated_order_ids(target_message.content)
+                if stated_order_ids and set(stated_order_ids) == set(order_ids):
                     confirmed = request.with_confirmed_explicit_target()
                     return Command(
                         goto=ORDER_STATUS_FULFILL_NODE,
@@ -374,7 +371,6 @@ def build_read_flow_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, SearchCatalog):
             raise TypeError("catalog entry requires a search-catalog invocation")
-        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         request = invocation.request
         if request.query is not None:
             return Command(goto=CATALOG_RESPONSE_NODE)
@@ -443,7 +439,6 @@ def build_read_flow_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, AnswerQuestion):
             raise TypeError("answer response requires an answer-question invocation")
-        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         current = state.current_committed_user_message()
         if current is None:
             raise ValueError("answer response requires the current committed caller message")

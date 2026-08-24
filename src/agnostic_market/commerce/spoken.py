@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Literal
 
 # Digit words as STT emits them. "oh" is the common spoken zero in phone numbers/codes
@@ -32,9 +33,11 @@ _DIGIT_WORDS = {
     "eight": "8",
     "nine": "9",
 }
-_ORDER_ID = re.compile(r"^ORD-(\d+)$", re.IGNORECASE)
-_ORDER_VALUE_PREFIXES = frozenset({"ord", "order"})
+_ORDER_FUSED_LABEL = re.compile(r"ord(\d+)$")
+_ORDER_LABEL_TOKENS = frozenset({"ord", "order"})
 _ORDER_VALUE_FILLERS = frozenset({"ord", "number", "id", "is"})
+_ORDER_SET_CONNECTORS = frozenset({"and", "also", "plus"})
+_ORDER_SET_BLOCKERS = frozenset({"dont", "never", "no", "not", "rather", "instead"})
 # Seven digits is the shortest dialable local number accepted by the voice boundary.
 _MIN_PHONE_DIGITS = 7
 
@@ -75,37 +78,123 @@ def caller_stated_phone(utterance: str, proposed: str) -> bool:
     return proposed_digits in runs
 
 
-def caller_stated_order_id(utterance: str, proposed: str) -> str | None:
-    """Return a normalized explicit order id only when the caller stated that id.
+@dataclass(frozen=True)
+class _OrderReferenceSpan:
+    reference: str
+    token_start: int
+    token_end: int
+    char_start: int
+    char_end: int
+    collapsed_or_label: bool = False
 
-    This binds an unverified model proposal to committed caller input before it may cross an
-    identity transition. Numbered option keys are intentionally rejected: no authorized option
-    list exists for an unbound caller, and a key must never become meaningful only after login.
-    """
-    match = _ORDER_ID.fullmatch(proposed.strip())
-    if match is None:
-        return None
-    stated: set[str] = set()
-    tokens = re.findall(r"[a-z0-9]+", utterance.casefold())
-    for index, token in enumerate(tokens):
-        if token not in _ORDER_VALUE_PREFIXES:
-            continue
+
+def _order_reference_at(
+    tokens: tuple[re.Match[str], ...], index: int
+) -> _OrderReferenceSpan | None:
+    value = tokens[index].group()
+    fused = _ORDER_FUSED_LABEL.fullmatch(value)
+    collapsed_or_label = False
+    if fused is not None:
+        return _OrderReferenceSpan(
+            reference=f"ORD-{fused.group(1)}",
+            token_start=index,
+            token_end=index + 1,
+            char_start=tokens[index].start(),
+            char_end=tokens[index].end(),
+        )
+    if value in _ORDER_LABEL_TOKENS:
         cursor = index + 1
-        while cursor < len(tokens) and tokens[cursor] in _ORDER_VALUE_FILLERS:
-            cursor += 1
-        digits: list[str] = []
-        while cursor < len(tokens):
-            value = spoken_digits(tokens[cursor])
-            if not value:
-                break
-            digits.append(value)
-            cursor += 1
-        if digits:
-            stated.add("".join(digits))
-    number = match.group(1)
-    if number not in stated:
+    elif index + 2 < len(tokens) and tuple(
+        token.group() for token in tokens[index : index + 3]
+    ) == ("o", "r", "d"):
+        cursor = index + 3
+    elif index + 1 < len(tokens) and (value, tokens[index + 1].group()) == ("or", "d"):
+        cursor = index + 2
+        collapsed_or_label = True
+    else:
         return None
-    return f"ORD-{number}"
+
+    while cursor < len(tokens) and tokens[cursor].group() in _ORDER_VALUE_FILLERS:
+        cursor += 1
+    if cursor < len(tokens) and tokens[cursor].group() == "dash":
+        cursor += 1
+    if cursor >= len(tokens):
+        return None
+
+    payload = tokens[cursor].group()
+    if payload.isdigit():
+        digits = payload
+        cursor += 1
+    elif payload in _DIGIT_WORDS:
+        parts: list[str] = []
+        while cursor < len(tokens) and tokens[cursor].group() in _DIGIT_WORDS:
+            parts.append(_DIGIT_WORDS[tokens[cursor].group()])
+            cursor += 1
+        digits = "".join(parts)
+    else:
+        nested_fused = _ORDER_FUSED_LABEL.fullmatch(payload)
+        if nested_fused is None:
+            return None
+        digits = nested_fused.group(1)
+        cursor += 1
+
+    return _OrderReferenceSpan(
+        reference=f"ORD-{digits}",
+        token_start=index,
+        token_end=cursor,
+        char_start=tokens[index].start(),
+        char_end=tokens[cursor - 1].end(),
+        collapsed_or_label=collapsed_or_label,
+    )
+
+
+def _is_additive_order_join(text: str) -> bool:
+    words = re.findall(r"[a-z0-9]+", text)
+    if words:
+        return all(word in _ORDER_SET_CONNECTORS for word in words)
+    return any(mark in text for mark in (",", ";", "&", "+"))
+
+
+def caller_stated_order_ids(utterance: str) -> tuple[str, ...]:
+    """Extract one unambiguous, strong-labelled order-reference set from one utterance."""
+    normalized = utterance.casefold().replace("don't", "dont")
+    tokens = tuple(re.finditer(r"[a-z0-9]+", normalized))
+    spans: list[_OrderReferenceSpan] = []
+    index = 0
+    while index < len(tokens):
+        span = _order_reference_at(tokens, index)
+        if span is not None:
+            if span.collapsed_or_label and spans:
+                return ()
+            spans.append(span)
+            index = span.token_end
+            continue
+        index += 1
+
+    if not spans:
+        return ()
+
+    consumed = {
+        token_index for span in spans for token_index in range(span.token_start, span.token_end)
+    }
+    if any(
+        token.group() in _ORDER_SET_BLOCKERS
+        for token_index, token in enumerate(tokens)
+        if token_index not in consumed
+    ):
+        return ()
+    if any(
+        not _is_additive_order_join(normalized[left.char_end : right.char_start])
+        for left, right in pairwise(spans)
+    ):
+        return ()
+
+    tail = normalized[spans[-1].char_end :]
+    tail_words = re.findall(r"[a-z0-9]+", tail)
+    if tail_words and (tail_words[0] in _ORDER_SET_CONNECTORS or tail_words[0] == "or"):
+        return ()
+
+    return tuple(dict.fromkeys(span.reference for span in spans))
 
 
 def spoken_email(text: str) -> str | None:
@@ -221,7 +310,7 @@ def scan_contact_candidates(text: str) -> tuple[ContactCandidate, ...]:
             preceding_order_label = False
             continue
         flush()
-        preceding_order_label = bare in _ORDER_VALUE_PREFIXES
+        preceding_order_label = bare in _ORDER_LABEL_TOKENS
     flush()
     return tuple(candidates)
 

@@ -14,6 +14,7 @@ from livekit.agents import Agent
 from livekit.plugins import cartesia, deepgram
 from livekit.plugins import langchain as lk_langchain
 from llm_fakes import FakeChatModel, RecordingResolver
+from routing_helpers import ArchitectureRoutingRecognizer
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
@@ -32,7 +33,13 @@ from agnostic_market.voice.pipeline import DisclosureFirstAgent, VoiceLoop, buil
 async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
     resolved = ConfigRegistry(config_root).load().get("acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
-    return build_voice_loop(resolved, credentials, resolver, config_root=config_root)
+    return build_voice_loop(
+        resolved,
+        credentials,
+        resolver,
+        config_root=config_root,
+        routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+    )
 
 
 async def test_disclosure_is_formatted_and_bound_to_on_enter(config_root: Path) -> None:
@@ -73,7 +80,7 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
     assert loop.session.options.endpointing["min_delay"] == 0.3  # streaming default kept
 
 
-async def test_voice_graph_uses_response_and_reasoning_roles_only(
+async def test_voice_graph_uses_only_response_and_reasoning_model_roles(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -108,7 +115,6 @@ async def test_voice_graph_uses_response_and_reasoning_roles_only(
 
     assert chat_selections == [config.llm.response, config.llm.reasoning]
     assert method_selections == [config.llm.response]
-    assert config.llm.routing not in chat_selections
 
 
 async def test_background_audio_has_a_thinking_sound_and_no_ambient(config_root: Path) -> None:
@@ -164,7 +170,13 @@ async def test_session_build_rejects_profile_for_unknown_customer(
     resolved = ConfigRegistry(config_root).load().get("acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_voice_loop(resolved, credentials, RecordingResolver(), config_root=config_root)
+        build_voice_loop(
+            resolved,
+            credentials,
+            RecordingResolver(),
+            config_root=config_root,
+            routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+        )
 
 
 async def test_session_build_rejects_payment_instrument_for_unknown_customer(
@@ -184,7 +196,13 @@ async def test_session_build_rejects_payment_instrument_for_unknown_customer(
     resolved = ConfigRegistry(config_root).load().get("acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_voice_loop(resolved, credentials, RecordingResolver(), config_root=config_root)
+        build_voice_loop(
+            resolved,
+            credentials,
+            RecordingResolver(),
+            config_root=config_root,
+            routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+        )
 
 
 class _FakeEngine:

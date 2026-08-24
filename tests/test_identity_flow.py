@@ -19,6 +19,7 @@ from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
+    CancelOrders,
     ChangeProfile,
     ListOrders,
     VerifyIdentity,
@@ -39,7 +40,6 @@ _VERIFY_CONTEXT_WARNING = (
     "Orders already placed will remain placed, but they won't stay available in this "
     "conversation. Would you like to continue?"
 )
-# Enumeration has NO gate patterns by design — entry is the MODEL's request_handover.
 _REQUEST = "what orders do I have on my account?"
 
 
@@ -65,13 +65,6 @@ def _identity_harness(
     return build_support_engine(
         config_root,
         policy=policy,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {"destination": "support", "reason_code": "list_orders"}
-            },
-            tool_call_limit=99,
-        ),
         reasoning=(
             reasoning
             if reasoning is not None
@@ -96,16 +89,6 @@ def _switch_harness(
     return build_support_engine(
         config_root,
         policy=_POLICY.model_copy(update={"otp_max_attempts": otp_max_attempts}),
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {
-                    "destination": "support",
-                    "reason_code": "switch_account",
-                }
-            },
-            tool_call_limit=99,
-        ),
         reasoning=FakeChatModel(
             force_tool="propose_identity",
             canned_args={"propose_identity": {"contact_claim": claim}},
@@ -289,7 +272,7 @@ async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover
     assert state.get("automation_terminal") is True
     assert state.get("active_flow") is None
     assert state.get("active_invocation") is None
-    assert state.get("clarification_progress") is None
+    assert state.get("clarification_liveness") is None
     assert h.identity.current() is None
     assert h.otp.dispatch_count == 0
     assert h.store.cancel_count == h.store.refund_count == h.store.return_count == 0
@@ -299,11 +282,12 @@ async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover
         if '"event": "clarification_exhausted"' in line
     ]
     assert exhausted_events == [
-        '{"event": "clarification_exhausted", "flow": "identity", "consumed_reasks": 1, "limit": 1}'
+        '{"event": "clarification_exhausted", "owner_kind": "invocation", '
+        '"consumed_reasks": 1, "limit": 1}'
     ]
 
 
-async def test_valid_identity_claim_clears_prior_clarification_progress(
+async def test_valid_identity_claim_clears_prior_clarification_liveness(
     config_root: Path,
 ) -> None:
     thread_id = "ident-clarify-progress"
@@ -317,12 +301,12 @@ async def test_valid_identity_claim_clears_prior_clarification_progress(
 
     await _events(h.engine, _REQUEST)
     before = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
-    assert before["clarification_progress"].flow == "identity"
+    assert before["clarification_liveness"].reasks == 0
     events = await _events(h.engine, _CUST1_PHONE)
 
     assert any(isinstance(event, InterruptEvent) for event in events)
     after = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
-    assert after.get("clarification_progress") is None
+    assert after.get("clarification_liveness") is None
     assert h.otp.dispatch_count == 1
 
 
@@ -353,7 +337,7 @@ async def test_malformed_identity_tools_preserve_miss_budget_and_continuation(
     _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=1)
     assert reasoning.invoke_count == 3
     state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
-    assert state["clarification_progress"].reasks == 0
+    assert state["clarification_liveness"].reasks == 0
 
 
 # --- the happy path: claim -> OTP -> bind -> the SCOPED list -------------------------------
@@ -798,7 +782,7 @@ async def test_session_placed_order_appears_in_the_identified_list(config_root: 
     )
     # Bound -> the enumeration ask code-renders the account list directly (handover node), no OTP.
     events = await _events(h.engine, _REQUEST)
-    line = next(e for e in _spoken(events) if e.node == "handover")
+    line = next(e for e in _spoken(events) if e.node == "support_capability_render")
     assert "ORD-9001" in line.text  # placed THIS call, listed alongside the account's own orders
     assert "ORD-1001" in line.text  # CUST-001's fixture order too
 
@@ -811,7 +795,7 @@ async def test_already_bound_reask_lists_without_a_second_otp(config_root: Path)
     # A SECOND enumeration request re-lists directly from the existing binding — no Identity
     # re-entry, no re-claim, and no second OTP.
     events = await _events(h.engine, "tell me my orders again please")
-    line = next(e for e in _spoken(events) if e.node == "handover")
+    line = next(e for e in _spoken(events) if e.node == "support_capability_render")
     assert "ORD-1001" in line.text
     assert h.otp.dispatch_count == 1  # unchanged
 
@@ -963,24 +947,17 @@ async def test_abort_mid_identity_leaves_nothing_bound(config_root: Path) -> Non
     h = build_support_engine(
         config_root,
         policy=_POLICY,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {"destination": "support", "reason_code": "list_orders"}
-            },
-            tool_call_limit=99,
-        ),
         reasoning=FakeChatModel(emit_tool_calls=False),  # clarifies; stays sticky
         thread_id="ident-abort-1",
     )
     await _events(h.engine, _REQUEST)
     events = await _events(h.engine, "never mind, forget it")
     texts = [e.text for e in _spoken(events)]
-    assert any("dropped" in t for t in texts)
+    assert texts == ["Okay. I've stopped that request."]
     assert h.identity.current() is None
 
 
-async def test_cross_switch_out_of_identity_on_a_gate_certain_intent(
+async def test_direct_semantic_route_replaces_an_identity_invocation(
     config_root: Path,
 ) -> None:
     # While sticky in identity, "cancel my order please" is NOT an abort phrasing — it falls
@@ -988,13 +965,6 @@ async def test_cross_switch_out_of_identity_on_a_gate_certain_intent(
     h = build_support_engine(
         config_root,
         policy=_POLICY,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {"destination": "support", "reason_code": "list_orders"}
-            },
-            tool_call_limit=99,
-        ),
         reasoning=FakeChatModel(emit_tool_calls=False),  # clarifies in BOTH flows
         thread_id="ident-cross-1",
     )
@@ -1002,13 +972,21 @@ async def test_cross_switch_out_of_identity_on_a_gate_certain_intent(
     before_switch = h.engine._graph.get_state(
         {"configurable": {"thread_id": "ident-cross-1"}}
     ).values
-    assert before_switch["clarification_progress"].flow == "identity"
+    old_invocation = before_switch["active_invocation"]
+    assert before_switch["clarification_liveness"].owner.invocation_id == (
+        old_invocation.invocation_id
+    )
     await _events(h.engine, "cancel my order please")
     state = h.engine._graph.get_state({"configurable": {"thread_id": "ident-cross-1"}})
-    assert state.values.get("active_flow") == "support"  # switched, not trapped
+    assert state.values.get("active_flow") == "support"
     assert state.values.get("pending_identity") is None
-    assert state.values["clarification_progress"].flow == "support"
-    assert state.values["clarification_progress"].reasks == 0
+    new_invocation = state.values["active_invocation"]
+    assert new_invocation.invocation_id != old_invocation.invocation_id
+    assert isinstance(new_invocation.request, CancelOrders)
+    assert state.values["clarification_liveness"].owner.invocation_id == (
+        new_invocation.invocation_id
+    )
+    assert state.values["clarification_liveness"].reasks == 0
 
 
 async def test_identity_stepup_never_touches_refund_or_profile_state(

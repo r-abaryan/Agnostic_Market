@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
@@ -20,17 +20,18 @@ from langchain_core.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field
 
-from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._consent import classify_confirmation
 from agnostic_market.agents._copy import warm_close
-from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
-from agnostic_market.agents.cart.prompt import compose_cart_capability_prompt, compose_cart_prompt
+from agnostic_market.agents._toolcalls import (
+    ack_extra_tool_calls,
+    current_turn_called,
+    unknown_tool_result,
+)
+from agnostic_market.agents.cart.prompt import compose_cart_capability_prompt
 from agnostic_market.agents.clarification import (
     advance_clarification,
+    invocation_clarification_owner,
     with_clarification_lifecycle,
-)
-from agnostic_market.agents.legacy_observation import (
-    observe_legacy_capabilities,
-    observe_legacy_model_tool_calls,
 )
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
@@ -41,7 +42,6 @@ from agnostic_market.commerce.orders import (
     RecentOrderContext,
     match_named_items,
     number_candidates,
-    resolve_candidates,
     speak_lines,
 )
 from agnostic_market.dtos.confirmation import (
@@ -113,13 +113,6 @@ def _placement_confirmation_phrase(
     return validate_confirmation_rendering(policy, rendered, phrase)
 
 
-class _ProposeItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    candidate_key: str
-    quantity: int = Field(strict=True)
-
-
 class _ProposeKey(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -132,110 +125,7 @@ class _ProposeQuantity(BaseModel):
     quantity: int = Field(strict=True, ge=0)
 
 
-class _RequestCartClarification(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    detail: CartClarificationDetail
-
-
-# Reversible cart mutations BATCH within one model response (live call #9 P3: "one from
-# each" emitted N calls and N-1 were silently dropped). Control/terminal tools (review,
-# checkout, buy_now, leave) stay one-per-turn and must LEAD the response to act.
 _MutationOperation = Literal["add", "remove", "set_quantity"]
-_MUTATION_OPERATIONS: dict[str, _MutationOperation] = {
-    "add_to_cart": "add",
-    "remove_from_cart": "remove",
-    "set_quantity": "set_quantity",
-}
-_MUTATION_TOOLS = frozenset(_MUTATION_OPERATIONS)
-
-
-@dataclass(frozen=True)
-class _AddedMutationOutcome:
-    line: CartLine
-
-
-@dataclass(frozen=True)
-class _DescribedMutationOutcome:
-    fragment: str
-
-
-@overload
-def _apply_resolved_mutation(
-    cart_store: CartStore,
-    operation: Literal["add"],
-    item: Candidate,
-    quantity: int,
-) -> _AddedMutationOutcome: ...
-
-
-@overload
-def _apply_resolved_mutation(
-    cart_store: CartStore,
-    operation: Literal["remove", "set_quantity"],
-    item: Candidate | CartLine,
-    quantity: int | None,
-) -> _DescribedMutationOutcome: ...
-
-
-def _apply_resolved_mutation(
-    cart_store: CartStore,
-    operation: _MutationOperation,
-    item: Candidate | CartLine,
-    quantity: int | None,
-) -> _AddedMutationOutcome | _DescribedMutationOutcome:
-    """Apply one already-resolved reversible mutation and record its factual outcome."""
-    if operation == "add":
-        if not isinstance(item, Candidate):
-            raise TypeError("resolved add requires a catalog candidate")
-        if quantity is None or quantity < 1:
-            raise ValueError("resolved add requires a positive quantity")
-        line = cart_store.add_item(
-            sku=item.sku,
-            name=item.name,
-            price_usd=item.price_usd,
-            quantity=quantity,
-        )
-        write_event({"event": "cart_item_added", "sku": item.sku})
-        return _AddedMutationOutcome(line=line)
-    if operation == "remove":
-        if quantity is not None:
-            raise ValueError("resolved remove forbids a quantity")
-        removed = cart_store.remove_item(item.sku)
-        if removed:
-            write_event({"event": "cart_item_removed", "sku": item.sku})
-        return _DescribedMutationOutcome(
-            fragment=(
-                f"removed the {item.name} from your cart"
-                if removed
-                else f"the {item.name} wasn't in your cart"
-            )
-        )
-    if operation == "set_quantity":
-        if quantity is None or quantity < 0:
-            raise ValueError("resolved set-quantity requires a non-negative quantity")
-        if quantity == 0:
-            removed = cart_store.remove_item(item.sku)
-            if removed:
-                write_event({"event": "cart_quantity_set", "sku": item.sku})
-            return _DescribedMutationOutcome(
-                fragment=(
-                    f"removed the {item.name} from your cart"
-                    if removed
-                    else f"the {item.name} wasn't in your cart"
-                )
-            )
-        line = cart_store.set_quantity(item.sku, quantity)
-        if line is not None:
-            write_event({"event": "cart_quantity_set", "sku": item.sku})
-        return _DescribedMutationOutcome(
-            fragment=(
-                f"updated to {speak_lines([line])}"
-                if line is not None
-                else f"the {item.name} wasn't in your cart"
-            )
-        )
-    raise ValueError(f"unsupported resolved mutation operation: {operation!r}")
 
 
 @dataclass(frozen=True)
@@ -243,11 +133,9 @@ class CartNodes:
     """The flow's node callables + its caller-facing (speakable) node names.
 
     Wiring (add_node/add_edge) is the graph builder's job (frontline/graph.py); this module
-    owns only behavior. Routers that branch purely on state live in graph.py (like checkout);
-    `route_after_assemble` is exposed here because it maps the assemble outcome to a node.
+    owns only behavior. Routers that branch on store-owned outcomes stay with this bundle.
     """
 
-    assemble: Callable[[ReasoningState], dict[str, object]]
     capability_entry: Callable[[ReasoningState], dict[str, object]]
     ack: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
@@ -258,10 +146,7 @@ class CartNodes:
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
     finish_placement: Callable[[PlacedOrder], dict[str, object]]
-    abort: Callable[[ReasoningState], dict[str, object]]
-    escape_human: Callable[[ReasoningState], dict[str, object]]
-    # After assemble: "place" (guardrail) | "ack" | "leave" (gate) | "clarify".
-    route_after_assemble: Callable[[ReasoningState], str]
+    route_after_capability_entry: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
 
@@ -278,44 +163,14 @@ def build_cart_nodes(
     tenant/policy bound in code at build time, never carried in conversation state)."""
 
     @tool
-    def add_to_cart(candidate_key: str, quantity: int) -> str:
-        """Add an item to the cart: the option number the caller chose and how many."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
-    def remove_from_cart(candidate_key: str) -> str:
-        """Remove an item from the cart (the option number of a line already in it)."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
-    def set_quantity(candidate_key: str, quantity: int) -> str:
-        """Set an item's quantity outright (0 removes it)."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
-    def review_cart() -> str:
-        """Read the cart contents back to the caller."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
-    def buy_now(candidate_key: str, quantity: int) -> str:
-        """Add one item and go straight to placing the order (an explicit immediate buy)."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
-    def go_to_checkout() -> str:
-        """Place the whole cart as an order (the caller is done shopping)."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
-
-    @tool
     def request_cart_clarification(detail: CartClarificationDetail) -> str:
         """Ask one platform-authored Cart question for the selected missing detail."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
+        raise NotImplementedError("intercepted by the capability entry; never executed")
 
     @tool
     def leave_cart() -> str:
         """Leave the cart flow (caller changed their mind or asked something else)."""
-        raise NotImplementedError("intercepted by the assemble node; never executed")
+        raise NotImplementedError("intercepted by the capability entry; never executed")
 
     @tool
     def provide_cart_item(candidate_key: str) -> str:
@@ -326,26 +181,6 @@ def build_cart_nodes(
     def provide_cart_quantity(quantity: int) -> str:
         """Supply only the missing whole-number quantity for the active cart request."""
         raise NotImplementedError("intercepted by the capability entry; never executed")
-
-    cart_tools = (
-        add_to_cart,
-        remove_from_cart,
-        set_quantity,
-        review_cart,
-        buy_now,
-        go_to_checkout,
-        request_cart_clarification,
-        leave_cart,
-    )
-    bound_tool_names = frozenset(tool.name for tool in cart_tools)
-    model = reasoning_model.bind_tools(cart_tools)
-
-    def _resolve(candidate_key: str, candidates: list[Candidate]) -> Candidate | None:
-        by_key = {c.key: c for c in candidates}
-        return by_key.get(candidate_key)
-
-    def _valid_keys(candidates: list[Candidate]) -> str:
-        return ", ".join(sorted(c.key for c in candidates))
 
     def _mutation_ack(added: list[CartLine], fragments: list[str], *, invalid: int = 0) -> str:
         parts = [f"added {speak_lines(added)} to your cart"] if added else []
@@ -396,61 +231,6 @@ def build_cart_nodes(
             created_at=time.time(),
         )
 
-    def _apply_candidate_key_mutation(
-        call: dict,
-        candidates: list[Candidate],
-        new_messages: list,
-        added: list[CartLine],
-        fragments: list[str],
-    ) -> bool:
-        """Apply ONE reversible cart mutation and append its ToolMessage. Records its ack
-        piece: adds collect into `added` (merged into one spoken phrase), remove/set into
-        `fragments`. False = invalid proposal (corrective feedback appended instead)."""
-        name = call["name"]
-        if name == "remove_from_cart":
-            try:
-                proposal_key = _ProposeKey.model_validate(call["args"])
-            except ValueError:
-                proposal_key = None
-            chosen = _resolve(proposal_key.candidate_key, candidates) if proposal_key else None
-            if chosen is None:
-                fb = f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}."
-                new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
-                return False
-            outcome = _apply_resolved_mutation(cart_store, "remove", chosen, None)
-            new_messages.append(ToolMessage(outcome.fragment, tool_call_id=call["id"]))
-            fragments.append(outcome.fragment)
-            return True
-        # add_to_cart / set_quantity
-        try:
-            proposal = _ProposeItem.model_validate(call["args"])
-        except ValueError:
-            proposal = None
-        chosen = _resolve(proposal.candidate_key, candidates) if proposal else None
-        if (
-            chosen is None
-            or proposal.quantity < 0
-            or (name == "add_to_cart" and proposal.quantity < 1)
-        ):
-            fb = (
-                f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}; "
-                "quantity must be a whole number "
-                f"{'>= 0' if name == 'set_quantity' else '>= 1'}."
-            )
-            new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
-            return False
-        operation = _MUTATION_OPERATIONS[name]
-        outcome = _apply_resolved_mutation(cart_store, operation, chosen, proposal.quantity)
-        if operation == "add":
-            new_messages.append(
-                ToolMessage(f"added {proposal.quantity} of {chosen.key}", tool_call_id=call["id"])
-            )
-            added.append(outcome.line)
-            return True
-        new_messages.append(ToolMessage(outcome.fragment, tool_call_id=call["id"]))
-        fragments.append(outcome.fragment)
-        return True
-
     def _clarification_result(
         state: ReasoningState,
         new_messages: list,
@@ -458,13 +238,13 @@ def build_cart_nodes(
     ) -> dict[str, object]:
         step = advance_clarification(
             state,
-            flow="cart",
+            owner=invocation_clarification_owner(state),
             max_reasks=policy.cart_clarification_reask_max,
         )
         if step.exhausted:
             return {
                 "messages": new_messages,
-                "active_flow": "left_cart",
+                "active_flow": None,
                 "active_invocation": None,
                 "pending_clarification": None,
             }
@@ -472,7 +252,7 @@ def build_cart_nodes(
             "messages": new_messages,
             "active_flow": "cart",
             "pending_clarification": CartClarification(detail=detail),
-            "clarification_progress": step.progress,
+            "clarification_liveness": step.liveness,
         }
 
     def _leave_result(new_messages: list, call_id: str) -> dict[str, object]:
@@ -480,7 +260,7 @@ def build_cart_nodes(
         write_event({"event": "cart_left", "reason": "left_flow"})
         return {
             "messages": new_messages,
-            "active_flow": "left_cart",
+            "active_flow": None,
             "active_invocation": None,
             "pending_cart_mutation": None,
             "pending_placement": None,
@@ -492,7 +272,6 @@ def build_cart_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, ModifyCart | PlaceOrder):
             raise TypeError("cart capability entry requires a typed Cart invocation")
-        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         if isinstance(invocation.request, PlaceOrder):
             if cart_store.is_empty():
                 return {
@@ -703,140 +482,10 @@ def build_cart_nodes(
             ),
         }
 
-    def assemble_node(state: ReasoningState) -> dict[str, object]:
-        """Model turn INSIDE the cart flow: mutate, review, place, clarify, or leave.
-        It is not caller-speakable. Code-authored acks use `pending_ack`; clarification uses
-        the typed selector rendered by `cart_clarify`.
-
-        Reversible mutations BATCH (live call #9 P3: "one from each" emitted N adds and
-        N-1 were silently dropped): when the response LEADS with a mutation, every mutation
-        call in it applies in order under ONE combined ack; control calls mixed in behind
-        mutations are answered but not acted on (control intent must lead its own turn).
-        Control/terminal tools stay one-per-turn as before."""
-        candidates = resolve_candidates(order_store.fixture, state.last_user_text())
-        prompt = SystemMessage(compose_cart_prompt(display_name, candidates, cart_store, policy))
-        messages: list = [prompt, *state.messages]
-        new_messages: list = []
-        for _attempt in range(2):  # one invalid proposal/batch gets ONE corrective re-prompt
-            response = model.invoke(messages)
-            if not response.tool_calls:
-                return _clarification_result(state, new_messages, "action")
-            observe_legacy_model_tool_calls(response.tool_calls)
-            new_messages.append(response)
-
-            if response.tool_calls[0]["name"] in _MUTATION_TOOLS:
-                added: list[CartLine] = []
-                fragments: list[str] = []
-                invalid = 0
-                for call in response.tool_calls:
-                    if call["name"] not in _MUTATION_TOOLS:
-                        # F-4 invariant: every tool_use gets a tool_result, acted on or not.
-                        new_messages.append(
-                            ToolMessage(
-                                "ignored - call this leading its own turn",
-                                tool_call_id=call["id"],
-                            )
-                        )
-                    elif not _apply_candidate_key_mutation(
-                        call, candidates, new_messages, added, fragments
-                    ):
-                        invalid += 1
-                if not added and not fragments:  # whole batch invalid -> corrective re-prompt
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
-                return {
-                    "messages": new_messages,
-                    "pending_ack": _mutation_ack(added, fragments, invalid=invalid),
-                }
-
-            ack_extra_tool_calls(response, new_messages)
-            call = response.tool_calls[0]
-            name = call["name"]
-
-            if name == "request_cart_clarification":
-                try:
-                    clarification = _RequestCartClarification.model_validate(call["args"])
-                except ValueError:
-                    clarification = None
-                if clarification is None:
-                    new_messages.append(
-                        ToolMessage("Invalid clarification request.", tool_call_id=call["id"])
-                    )
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
-                new_messages.append(
-                    ToolMessage("cart clarification requested", tool_call_id=call["id"])
-                )
-                return _clarification_result(state, new_messages, clarification.detail)
-
-            if name == "leave_cart":
-                return _leave_result(new_messages, call["id"])
-
-            if name == "review_cart":
-                new_messages.append(ToolMessage("reviewed cart", tool_call_id=call["id"]))
-                if cart_store.is_empty():
-                    ack = _EMPTY_CART_REVIEW_LINE
-                else:
-                    ack = (
-                        f"You've got {speak_lines(cart_store.view())} - "
-                        f"that's ${cart_store.cart_total():.2f}. {warm_close()}"
-                    )
-                return {"messages": new_messages, "pending_ack": ack}
-
-            if name == "go_to_checkout":
-                new_messages.append(ToolMessage("go to checkout", tool_call_id=call["id"]))
-                if cart_store.is_empty():
-                    return {
-                        "messages": new_messages,
-                        "pending_ack": _EMPTY_CART_CHECKOUT_LINE,
-                    }
-                return {"messages": new_messages, **_mint_placement()}
-
-            # buy_now: direct-buy resolves a candidate key, then goes straight to the
-            # placement tail (add_to_cart/set_quantity/remove_from_cart batch above).
-            if name == "buy_now":
-                try:
-                    proposal = _ProposeItem.model_validate(call["args"])
-                except ValueError:
-                    proposal = None
-                chosen = _resolve(proposal.candidate_key, candidates) if proposal else None
-                if chosen is None or proposal.quantity < 1:
-                    fb = (
-                        f"Invalid proposal. Valid option numbers: {_valid_keys(candidates)}; "
-                        "quantity must be a whole number >= 1."
-                    )
-                    new_messages.append(ToolMessage(fb, tool_call_id=call["id"]))
-                    messages = [prompt, *state.messages, *new_messages]
-                    continue
-                cart_store.add_item(
-                    sku=chosen.sku,
-                    name=chosen.name,
-                    price_usd=chosen.price_usd,
-                    quantity=proposal.quantity,
-                )
-                new_messages.append(
-                    ToolMessage(
-                        f"buy now {proposal.quantity} of {chosen.key}", tool_call_id=call["id"]
-                    )
-                )
-                write_event({"event": "cart_item_added", "sku": chosen.sku, "reason": "buy_now"})
-                return {"messages": new_messages, **_mint_placement()}
-
-            if name not in bound_tool_names:
-                new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_cart.name))
-                messages = [prompt, *state.messages, *new_messages]
-                continue
-            # A bound name reaching here is code drift: preserve the loud developer failure.
-            raise ValueError(f"cart assemble: bound tool has no handler: {name!r}")
-
-        logger.warning("cart assemble: two invalid tool calls; asking for action in code")
-        return _clarification_result(state, new_messages, "action")
-
     def ack_node(state: ReasoningState) -> dict[str, object]:
         """Speak the code-authored in-flow line (mutation ack / review listing / empty-cart)
-        and clear it. This node preserves `active_flow`: broad Cart stays sticky, while a completed
-        typed mutation has already cleared it. Clear-before-speak: `pending_ack` goes None in the
-        same update as the spoken message."""
+        and clear it. A completed typed mutation has already cleared its execution phase.
+        Clear-before-speak keeps the acknowledgement from replaying."""
         ack = state.pending_ack or warm_close()
         return {"pending_ack": None, "messages": [AIMessage(ack)]}
 
@@ -863,19 +512,21 @@ def build_cart_nodes(
             }
         action = _mutation_action(pending)
         answer = interrupt(f"Just to confirm: {action}?")
-        verdict = classify_consent(str(answer.get("text", "")))
-        if answer.get("readback_interrupted") or verdict == "unclear":
+        decision = classify_confirmation(answer)
+        if answer.get("readback_interrupted") or decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {action}. Please say yes or no.")
-            verdict = classify_consent(str(retry.get("text", "")))
-            if verdict != "yes":
-                verdict = "human" if verdict == "human" else "no"
+            decision = classify_confirmation(retry)
+        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
+            assert decision.handoff_source is not None
             write_event({"event": "cart_mutation_cancelled", "reason": "human_requested"})
             return {
                 "pending_cart_mutation": None,
                 "active_flow": None,
                 "handover": HandoffRequest(
-                    destination="human", reason_code="other", source="model"
+                    destination="human",
+                    reason_code="other",
+                    source=decision.handoff_source,
                 ),
             }
         if verdict == "no":
@@ -1048,19 +699,21 @@ def build_cart_nodes(
             }
         phrase = _placement_confirmation_phrase(pending, PLACE_ORDER_POLICY)
         answer = interrupt(f"Just to confirm: shall I place {phrase}?")
-        verdict = classify_consent(str(answer.get("text", "")))
-        if answer.get("readback_interrupted") or verdict == "unclear":
+        decision = classify_confirmation(answer)
+        if answer.get("readback_interrupted") or decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: shall I place {phrase}? Yes or no?")
-            verdict = classify_consent(str(retry.get("text", "")))
-            if verdict != "yes":
-                verdict = "human" if verdict == "human" else "no"
+            decision = classify_confirmation(retry)
+        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
+            assert decision.handoff_source is not None
             write_event({"event": "checkout_cancelled", "reason": "human_requested"})
             return {
                 "pending_placement": None,
                 "active_flow": None,
                 "handover": HandoffRequest(
-                    destination="human", reason_code="other", source="model"
+                    destination="human",
+                    reason_code="other",
+                    source=decision.handoff_source,
                 ),
             }
         if verdict == "no":
@@ -1106,36 +759,8 @@ def build_cart_nodes(
         )
         return finish_placement(placed)
 
-    def abort_node(state: ReasoningState) -> dict[str, object]:
-        """Entry-router escape: explicit abort mid-flow. Drops the pending PLACEMENT but
-        KEEPS the cart (D6: abandoning checkout doesn't empty the basket)."""
-        write_event({"event": "checkout_cancelled", "reason": "aborted"})
-        kept = "" if cart_store.is_empty() else " Your cart's still saved."
-        return {
-            "pending_cart_mutation": None,
-            "pending_placement": None,
-            "pending_clarification": None,
-            "clarification_progress": None,
-            "active_invocation": None,
-            "active_flow": None,
-            "messages": [AIMessage(f"No problem - I've dropped that.{kept}")],
-        }
-
-    def escape_human_node(state: ReasoningState) -> dict[str, object]:
-        """Entry-router escape: the caller asked for a person mid-flow (§A9 no-trap)."""
-        write_event({"event": "checkout_cancelled", "reason": "human_requested"})
-        return {
-            "pending_cart_mutation": None,
-            "pending_placement": None,
-            "pending_clarification": None,
-            "clarification_progress": None,
-            "active_invocation": None,
-            "active_flow": None,
-            "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
-        }
-
-    def route_after_assemble(state: ReasoningState) -> str:
-        if state.active_flow == "left_cart":
+    def route_after_capability_entry(state: ReasoningState) -> str:
+        if current_turn_called(state.messages, "leave_cart"):
             return "leave"  # explicit leave -> normal pipeline answers
         if state.pending_cart_mutation is not None:
             return "mutation_confirm"
@@ -1150,7 +775,6 @@ def build_cart_nodes(
         raise RuntimeError("cart assemble produced no outcome")
 
     return CartNodes(
-        assemble=with_clarification_lifecycle(assemble_node),
         capability_entry=with_clarification_lifecycle(capability_entry_node),
         ack=ack_node,
         clarify=clarify_node,
@@ -1161,9 +785,7 @@ def build_cart_nodes(
         confirm=confirm_node,
         place=place_node,
         finish_placement=finish_placement,
-        abort=abort_node,
-        escape_human=escape_human_node,
-        route_after_assemble=route_after_assemble,
+        route_after_capability_entry=route_after_capability_entry,
         speakable_nodes=frozenset(
             {
                 "cart_ack",
@@ -1172,7 +794,6 @@ def build_cart_nodes(
                 "cart_guardrail",
                 "cart_confirm",
                 "cart_place",
-                "cart_abort",
             }
         ),
     )

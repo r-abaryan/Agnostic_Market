@@ -28,6 +28,7 @@ _DEFAULTS: dict[str, object] = {
     "identity_clarification_reask_max": 1,
     "support_clarification_reask_max": 2,
     "cart_clarification_reask_max": 2,
+    "router_clarification_reask_max": 2,
     "cancel_batch_max": 10,
 }
 

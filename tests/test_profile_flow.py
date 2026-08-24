@@ -16,12 +16,12 @@ from turn_helpers import engine_events
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileError, ProfileStore, load_profile_fixture
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.orchestration import ChangeProfile, RouteDecision, RouteResolution
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
 _NEW_ADDRESS = "7 Elm Street, Dover"
-# Profile changes have NO gate patterns by design — entry is the MODEL's request_handover.
 _REQUEST = f"Please update my delivery address to {_NEW_ADDRESS}"
 
 
@@ -33,21 +33,14 @@ def _profile_harness(
     field: str = "address",
     new_value: str = _NEW_ADDRESS,
     *,
-    reason_code: str = "address_change",
     risk_flagged: bool = False,
     thread_id: str = "prof-1",
     bound: bool = True,
+    routing_resolution: RouteResolution | None = None,
 ) -> SupportHarness:
     h = build_support_engine(
         config_root,
         policy=_POLICY,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {"destination": "support", "reason_code": reason_code}
-            },
-            tool_call_limit=99,
-        ),
         reasoning=FakeChatModel(
             force_tool="propose_profile_change",
             canned_args={"propose_profile_change": {"field": field, "new_value": new_value}},
@@ -55,6 +48,11 @@ def _profile_harness(
         ),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
+        routing_resolution=(
+            routing_resolution
+            if routing_resolution is not None
+            else RouteDecision.direct(ChangeProfile(field=field))
+        ),
     )
     if bound:
         # A profile change is account-scoped: it requires an OTP-bound identity (Fix 5 M-B). The
@@ -112,7 +110,6 @@ async def test_contact_change_updates_the_factor_reference(config_root: Path) ->
         config_root,
         field="contact",
         new_value="555-0187",
-        reason_code="contact_change",
         thread_id="prof-contact-1",
     )
     old_factor = h.profile.contact_on_file(_OWNER)
@@ -220,10 +217,19 @@ async def test_barged_profile_readback_repeats_the_new_value_before_changing(
 
 async def test_payment_change_still_defers_honestly(config_root: Path) -> None:
     # Phase 5: payment_change must NOT enter the flow — the honest deferral speaks once.
-    h = _profile_harness(config_root, reason_code="payment_change", thread_id="prof-pay-1")
+    h = _profile_harness(
+        config_root,
+        thread_id="prof-pay-1",
+        routing_resolution=RouteDecision.clarify("unsupported_capability"),
+    )
     events = await _events(h.engine, "put my new card on the account")
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
-    assert any(e.node == "handover" and "support team" in e.text for e in spoken)
+    assert [(e.node, e.text) for e in spoken] == [
+        (
+            "router_no_action",
+            "I couldn't complete that request. Please try again.",
+        )
+    ]
     assert h.profile.change_count == 0
     assert not h.engine.pending_interrupt()
 
