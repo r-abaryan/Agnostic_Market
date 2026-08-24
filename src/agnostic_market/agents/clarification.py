@@ -1,4 +1,4 @@
-"""Shared clarification-liveness accounting for sticky transactional flows."""
+"""Shared clarification-liveness accounting for explicit routing owners."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from functools import wraps
 
 from agnostic_market.agents.telemetry import write_event
+from agnostic_market.dtos.orchestration import InvocationClarificationOwner
 from agnostic_market.dtos.state import (
+    ClarificationLiveness,
     ClarificationOwner,
-    ClarificationProgress,
     ReasoningState,
 )
 
@@ -20,36 +21,45 @@ StateNode = Callable[[ReasoningState], NodeUpdate]
 @dataclass(frozen=True)
 class ClarificationStep:
     exhausted: bool
-    progress: ClarificationProgress | None
+    liveness: ClarificationLiveness | None
+
+
+def invocation_clarification_owner(state: ReasoningState) -> InvocationClarificationOwner:
+    """Return the only valid owner for capability-level clarification."""
+
+    invocation = state.active_invocation
+    if invocation is None:
+        raise ValueError("capability clarification requires an active invocation")
+    return InvocationClarificationOwner(invocation_id=invocation.invocation_id)
 
 
 def advance_clarification(
     state: ReasoningState,
     *,
-    flow: ClarificationOwner,
+    owner: ClarificationOwner,
     max_reasks: int,
 ) -> ClarificationStep:
     """Admit the initial question/re-ask or report that the next one exceeds policy."""
 
-    current = state.clarification_progress
-    if current is None or current.flow != flow:
+    current = state.clarification_liveness
+    if current is None or current.owner != owner:
         return ClarificationStep(
             exhausted=False,
-            progress=ClarificationProgress(flow=flow, reasks=0),
+            liveness=ClarificationLiveness(owner=owner, reasks=0),
         )
     if current.reasks >= max_reasks:
         write_event(
             {
                 "event": "clarification_exhausted",
-                "flow": flow,
+                "owner_kind": owner.kind,
                 "consumed_reasks": current.reasks,
                 "limit": max_reasks,
             }
         )
-        return ClarificationStep(exhausted=True, progress=None)
+        return ClarificationStep(exhausted=True, liveness=None)
     return ClarificationStep(
         exhausted=False,
-        progress=current.model_copy(update={"reasks": current.reasks + 1}),
+        liveness=current.model_copy(update={"reasks": current.reasks + 1}),
     )
 
 
@@ -60,7 +70,7 @@ def with_clarification_lifecycle(node: StateNode) -> StateNode:
     def wrapped(state: ReasoningState) -> NodeUpdate:
         update = node(state)
         if update.get("pending_clarification") is None:
-            return {**update, "clarification_progress": None}
+            return {**update, "clarification_liveness": None}
         return update
 
     return wrapped

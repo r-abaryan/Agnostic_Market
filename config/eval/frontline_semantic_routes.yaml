@@ -1,4 +1,4 @@
-schema_version: "3"
+schema_version: "5"
 cases:
   - case_id: catalog_search
     scenario_class: direct
@@ -24,6 +24,8 @@ cases:
         - search_catalog
         - answer_question
         - verify_order_status
+        - abort_current
+        - request_person
     expected:
       decision: direct
       request: { kind: search_catalog, query: null }
@@ -550,6 +552,521 @@ cases:
     expected:
       decision: direct
       request: { kind: answer_question, topic: general }
+
+  - case_id: request_person_human_support
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I need human support"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_connect_representative
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Please connect me to a representative"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_speak_human
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Can I speak to a human?"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_real_person
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Just get me a real person please"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_agent
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Agent please"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_preference
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I'd rather deal with a real person here"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_put_through
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Can you put me through to someone?"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_customer_service
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I want to speak with someone in customer service"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_supervisor
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Get me your supervisor"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_manager
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Can I speak to a manager?"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: request_person_anyone_else
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Is there anyone else I can talk to?"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: human_mention_cancel_order
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I need someone to cancel my order"
+    expected: { decision: direct, request: { kind: cancel_orders, target: null } }
+
+  - case_id: human_mention_refund_order
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I want someone to look into my refund"
+    expected:
+      decision: direct
+      request: { kind: refund_order, target: null, amount_usd: null, destination: null }
+
+  - case_id: human_mention_order_status
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I need someone to check my order status"
+    expected: { decision: direct, request: { kind: verify_order_status, target: null } }
+
+  - case_id: human_mention_update_address
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: account_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I want someone to update my address"
+    expected:
+      decision: direct
+      request: { kind: change_profile, field: address, new_value: null }
+
+  - case_id: human_mention_confirm_price
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I need a rep to confirm the price"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_process_return
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I want anyone available to process this return"
+    expected: { decision: direct, request: { kind: return_order, target: null } }
+
+  - case_id: human_mention_explain_charges
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "I'd like someone to explain these charges"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_supervisor_statement
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "The supervisor said my order shipped"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_sales_rep_statement
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "A sales rep recommended this jacket"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_manager_statement
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "My manager approved the refund"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_return_policy
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Can anyone explain the return policy?"
+    expected: { decision: direct, request: { kind: answer_question, topic: policy } }
+
+  - case_id: human_mention_account_question
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Is there anyone else listed on the account?"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_transfer_question
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Have I been transferred to a person?"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: human_mention_identity_question
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Did an agent already verify my account?"
+    expected: { decision: direct, request: { kind: view_identity_status } }
+
+  - case_id: human_mention_review_question
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What does human review mean?"
+    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: acceptance_abort_current
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Please stop this request"
+      active_capability: modify_cart
+    expected: { decision: direct, request: { kind: abort_current } }
+
+  - case_id: acceptance_request_person
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: compliance_control
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Could you transfer me to customer support?"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: acceptance_change_profile
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Update the delivery address on my profile"
+      bound_customer: true
+    expected:
+      decision: direct
+      request: { kind: change_profile, field: address, new_value: null }
+
+  - case_id: acceptance_modify_cart
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Put trail shoes in my basket"
+    expected:
+      decision: direct
+      request: { kind: modify_cart, operation: add, item: null, quantity: null }
+
+  - case_id: acceptance_switch_account
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_control
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "I need to use a different account"
+      bound_customer: true
+    expected: { decision: direct, request: { kind: switch_account } }
+
+  - case_id: acceptance_verify_identity
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_control
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Help me verify my account"
+    expected: { decision: direct, request: { kind: verify_identity } }
+
+  - case_id: acceptance_view_cart
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Tell me what is in my basket"
+      cart_state: nonempty
+    expected: { decision: direct, request: { kind: view_cart } }
+
+  - case_id: acceptance_view_identity_status
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Am I signed in to an account right now?"
+      bound_customer: true
+    expected: { decision: direct, request: { kind: view_identity_status } }
+
+  - case_id: stop_word_catalog_negation
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Please do not stop looking for the jacket"
+    expected: { decision: direct, request: { kind: search_catalog, query: null } }
+
+  - case_id: stop_word_order_status
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Why did my order stop moving?"
+    expected: { decision: direct, request: { kind: verify_order_status, target: null } }
+
+  - case_id: stop_word_catalog_noun
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Find me a door stop"
+    expected: { decision: direct, request: { kind: search_catalog, query: null } }
+
+  - case_id: confirmation_escape_person_before_deciding
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: compliance_control
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "Please get me a person before I decide"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: confirmation_escape_transfer_instead
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: compliance_control
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "I want to speak to someone instead"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: confirmation_escape_take_over
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "Can a human take over from here?"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: confirmation_escape_support_transfer
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: compliance_control
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "Transfer me to customer support"
+    expected: { decision: direct, request: { kind: request_person } }
+
+  - case_id: confirmation_no_escape_natural_affirmation
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "sure"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_receipt_request
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "yes please, and I need someone to email me a receipt"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_address_check
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "I want someone to double check the address"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_manager_reference
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "that's correct, my manager approved it"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_negated_person
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "no, I don't need a person"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_human_question
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "did a human set this price?"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_hesitation
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "I am not sure"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: confirmation_no_escape_explanation_request
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      routing_scope: confirmation_escape
+      utterance: "can someone explain these charges?"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
 
 projected_case:
   case_id: fixture_projected_view_cart

@@ -40,7 +40,7 @@ _BASE_BODY = (
     'compliance: { call_start_disclosure: "Hi, this is an AI assistant." }\n'
     "policies:\n"
     "  cancel_batch_max: 10\n"
-    "  clarification_reask_max: { identity: 1, support: 2, cart: 2 }\n"
+    "  clarification_reask_max: { identity: 1, support: 2, cart: 2, router: 2 }\n"
 )
 
 _TEMPLATE_BODY = """\

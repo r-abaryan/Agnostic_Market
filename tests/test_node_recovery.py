@@ -30,13 +30,21 @@ from agnostic_market.agents.recovery import (
 from agnostic_market.agents.support import _stepup as support_stepup
 from agnostic_market.commerce.orders import render_cart_line
 from agnostic_market.dtos.events import SpokenMessageEvent
-from agnostic_market.dtos.orchestration import CancelOrders, ExplicitOrderSet, ListOrders
+from agnostic_market.dtos.orchestration import (
+    CancelOrders,
+    CartItemQuery,
+    ExplicitOrderSet,
+    ListOrders,
+    ModifyCart,
+    PlaceOrder,
+    RouteDecision,
+)
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import PendingRefund, ReasoningState, open_active_invocation
 
 _ACTION_CASES = (
-    ("model", ExceptionAction.SAFE_ABORT, TURN_FALLBACK_LINE),
-    ("cart_assemble", ExceptionAction.CART_REVIEW, None),
+    ("answer_response", ExceptionAction.SAFE_ABORT, TURN_FALLBACK_LINE),
+    ("cart_capability_entry", ExceptionAction.CART_REVIEW, None),
     (
         "principal_warning",
         ExceptionAction.ABORT_PRINCIPAL_WARNING,
@@ -342,7 +350,7 @@ async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(
         harness.engine._config,
         {
             "pending_recovery": PendingRecovery(
-                origin_node="model",
+                origin_node="answer_response",
                 action=ExceptionAction.SAFE_ABORT,
                 trigger="node_exception",
             ),
@@ -422,31 +430,34 @@ async def test_capability_entry_exception_is_owned_by_the_destination_not_the_di
     assert snapshot.next == ()
 
 
-async def test_cart_mutation_then_exception_preserves_live_cart_and_requires_review(
+async def test_cart_mutation_then_exception_reconciles_the_committed_effect(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    reasoning = FakeChatModel(
-        force_tool="add_to_cart",
-        canned_args={"add_to_cart": {"candidate_key": "2", "quantity": 1}},
-        tool_call_limit=1,
-    )
     harness = build_support_engine(
         config_root,
         policy=make_policy(),
-        reasoning=reasoning,
+        reasoning=FakeChatModel(),
         thread_id="cart-review-after-write",
+        routing_resolution=RouteDecision.direct(
+            ModifyCart(
+                operation="add",
+                item=CartItemQuery(query="waterproof rain jacket"),
+                quantity=1,
+            )
+        ),
     )
     cart = harness.caller_context.cart_store
-    original_add = cart.add_item
+    original_apply = cart.apply_confirmed_mutation
 
-    def write_then_fail(**kwargs):
-        original_add(**kwargs)
+    def write_then_fail(*args, **kwargs):
+        original_apply(*args, **kwargs)
         raise RuntimeError("simulated failure after reversible cart write")
 
-    monkeypatch.setattr(cart, "add_item", write_then_fail)
+    monkeypatch.setattr(cart, "apply_confirmed_mutation", write_then_fail)
 
-    events = await _events(harness.engine, "checkout now please")
+    await _events(harness.engine, "add one waterproof rain jacket to my cart")
+    events = await _events(harness.engine, "yes")
     spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
     snapshot = harness.engine._graph.get_state(harness.engine._config)
 
@@ -454,7 +465,7 @@ async def test_cart_mutation_then_exception_preserves_live_cart_and_requires_rev
     assert harness.store.placed_count == 0
     assert len(spoken) == 1 and spoken[0].node == RECOVERY_NODE_NAME
     assert "waterproof rain jacket" in spoken[0].text
-    assert "review your cart" in spoken[0].text.lower()
+    assert spoken[0].text.startswith("Added 1 waterproof rain jacket to your cart.")
     assert snapshot.values.get("active_flow") is None
     assert snapshot.values.get("pending_recovery") is None
     assert snapshot.next == ()
@@ -464,16 +475,18 @@ async def test_confirmation_exception_aborts_placement_but_preserves_cart(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    reasoning = FakeChatModel(
-        force_tool="buy_now",
-        canned_args={"buy_now": {"candidate_key": "2", "quantity": 1}},
-        tool_call_limit=1,
-    )
     harness = build_support_engine(
         config_root,
         policy=make_policy(),
-        reasoning=reasoning,
+        reasoning=FakeChatModel(),
         thread_id="placement-confirm-failure",
+        routing_resolution=RouteDecision.direct(PlaceOrder()),
+    )
+    harness.caller_context.cart_store.add_item(
+        sku="SKU-BLU-07",
+        name="waterproof rain jacket",
+        price_usd=129.0,
+        quantity=1,
     )
 
     def fail_confirmation(_prompt: str):
@@ -578,16 +591,6 @@ def _identity_verification_harness(config_root: Path, *, thread_id: str):
     return build_support_engine(
         config_root,
         policy=make_policy(),
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {
-                    "destination": "support",
-                    "reason_code": "list_orders",
-                }
-            },
-            tool_call_limit=99,
-        ),
         reasoning=FakeChatModel(
             force_tool="propose_identity",
             canned_args={"propose_identity": {"contact_claim": "+1 555 010 0119"}},

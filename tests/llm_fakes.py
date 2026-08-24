@@ -105,8 +105,7 @@ class FakeChatModel(BaseChatModel):
     # None = tool-call on every tools-bound invoke (conformance-suite behavior). An int
     # bounds it so an agent LOOP (model -> tool -> model) terminates with a text answer.
     tool_call_limit: int | None = None
-    # Deterministically emit a specific tool by name (bypasses _pick_tool) — for tests that
-    # must exercise a tool the prompt wouldn't naturally name (e.g. request_handover).
+    # Deterministically emit a specific bound tool by name when a test must bypass selection.
     force_tool: str | None = None
     # Emit a SECOND identical tool call alongside the first (a misbehaving model) — drives
     # the assemble nodes' extra-call ack (a dangling tool_use poisons the thread history).

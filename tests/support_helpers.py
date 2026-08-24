@@ -11,11 +11,11 @@ from llm_fakes import (
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
 )
+from routing_helpers import make_routing_session
 from turn_helpers import TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS
 
 from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
 from agnostic_market.agents.frontline import build_frontline_graph
-from agnostic_market.agents.tooling import wrap_readonly_tool
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -30,6 +30,7 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.dtos.orchestration import RouteResolution
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.voice.context import CallerContext
 
@@ -77,6 +78,7 @@ def build_support_engine(
     risk_flagged: bool = False,
     thread_id: str = "support-1",
     payment_instruments_fixture: PaymentInstrumentsFixture | None = None,
+    routing_resolution: RouteResolution | None = None,
 ) -> SupportHarness:
     """The production graph shape behind a ReasoningEngine, with fakes + per-test stores.
 
@@ -84,8 +86,6 @@ def build_support_engine(
     (the split-brain rule); the neutral reasoning default clarifies — suites pass their
     own force_tool/scripted fakes.
     """
-    from agnostic_market.voice.tools import build_voice_tools
-
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
     cart = CartStore()
@@ -97,10 +97,6 @@ def build_support_engine(
         else load_payment_instruments_fixture(config_root, "acme_store")
     )
     payment_instruments = PaymentInstrumentDirectory(instrument_fixture)
-    tools = [
-        wrap_readonly_tool(t, "acme_store")
-        for t in build_voice_tools(store, cart, recent_orders, identity, customers)
-    ]
     otp = OtpProvider(valid_code=TEST_OTP)
     verification = VerificationStore(otp)
     profile = ProfileStore(load_profile_fixture(config_root, "acme_store"))
@@ -113,7 +109,6 @@ def build_support_engine(
     )
     assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
-        tools,
         display_name="Acme Store",
         tenant_id="acme_store",
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
@@ -137,6 +132,14 @@ def build_support_engine(
         assembly.graph,
         thread_id=thread_id,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
+        routing=make_routing_session(
+            assembly.capability_registry,
+            identity_store=identity,
+            cart_store=cart,
+            recent_orders=recent_orders,
+            resolution=routing_resolution,
+            continue_active=routing_resolution is not None,
+        ),
         lifecycle=caller_context,
     )
     caller_context.attach_engine(engine)

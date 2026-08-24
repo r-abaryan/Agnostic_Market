@@ -13,6 +13,7 @@ from agnostic_market.llm.providers import (
     ConformanceRunError,
     check_llm_certification,
     load_conformance_targets,
+    require_llm_certification,
     run_conformance,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "check_llm_certification",
     "load_conformance_targets",
     "load_provider_credentials",
+    "require_llm_certification",
     "run_conformance",
 ]

@@ -10,9 +10,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
-from agnostic_market.dtos.config import ProviderModel
+from agnostic_market.dtos.config import ProviderModel, ReasoningEffort
 
 # Same strict base as dtos/config.py: forbid unknown keys, validate on assignment.
 _STRICT = ConfigDict(extra="forbid", validate_assignment=True)
@@ -59,12 +59,13 @@ class ConformanceCheck(BaseModel):
 
 
 class ConformanceReport(BaseModel):
-    """Suite verdict for one provider:model (persisted in config/conformance/reports.json)."""
+    """Suite verdict for one provider:model runtime recipe."""
 
     model_config = _STRICT
 
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    reasoning_effort: ReasoningEffort | None = None
     suite_version: str = Field(min_length=1)
     run_at: datetime
     checks: list[ConformanceCheck]
@@ -80,3 +81,10 @@ class ConformanceTargetsConfig(BaseModel):
     max_retries: int = Field(ge=0)
     # Never empty: a live run that certifies nothing must fail at load, not print PASS.
     targets: list[ProviderModel] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _targets_are_unique(self) -> ConformanceTargetsConfig:
+        identities = [(target.provider, target.model) for target in self.targets]
+        if len(set(identities)) != len(identities):
+            raise ValueError("conformance targets must have unique provider:model identities")
+        return self

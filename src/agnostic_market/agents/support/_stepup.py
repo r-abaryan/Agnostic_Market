@@ -27,7 +27,7 @@ from langgraph.types import interrupt
 
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
-from agnostic_market.dtos.state import HandoffRequest, ReasoningState
+from agnostic_market.dtos.state import HandoffRequest, HandoffSource, ReasoningState
 
 
 class _SteppablePending(Protocol):
@@ -82,7 +82,9 @@ def build_stepup_nodes(
                 pending_field: None,
                 "active_flow": None,
                 "handover": HandoffRequest(
-                    destination="human", reason_code="verification_required", source="gate"
+                    destination="human",
+                    reason_code="verification_required",
+                    source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
         return {}
@@ -118,7 +120,9 @@ def build_stepup_nodes(
                 pending_field: None,
                 "active_flow": None,
                 "handover": HandoffRequest(
-                    destination="human", reason_code="verification_required", source="gate"
+                    destination="human",
+                    reason_code="verification_required",
+                    source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
         # Re-collect: bump tries + a NEW attempt key so the re-dispatch is a legitimate send.

@@ -48,6 +48,8 @@ from agnostic_market.dtos.orchestration import (
     IntentRequest,
     RefundOrder,
     ReturnOrder,
+    RouteDecision,
+    RouteResolution,
 )
 from agnostic_market.dtos.state import (
     CartLine,
@@ -65,12 +67,6 @@ _CONTACT_1001 = "+1 555 010 0119"
 _CONTACT_1002 = "casey@example.com"  # CUST-002's on-file contact (the OTP recipient after bind)
 # The three fixture orders' model-facing details — none may enter an unverified prompt.
 _FIXTURE_DETAILS = ("ORD-100", "trail running", "waterproof rain jacket", "merino", "$129", "$179")
-
-# The frontline hands over the production way (request_handover -> support); the deterministic
-# gate deliberately does not own every phrasing. Reused by the guest-detour drives below.
-_HANDOVER_TO_SUPPORT = {
-    "request_handover": {"destination": "support", "reason_code": "cancel_order"}
-}
 
 
 def test_incomplete_refund_owner_reprompts_invalid_model_output(config_root: Path) -> None:
@@ -132,7 +128,7 @@ def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
             "consumed_turn_ids": ("turn-1", "turn-2"),
             "active_invocation": retained,
             "pending_clarification": None,
-            "clarification_progress": first["clarification_progress"],
+            "clarification_liveness": first["clarification_liveness"],
         }
     )
 
@@ -144,19 +140,16 @@ def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
     assert second["pending_refund"].destination == "new_instrument"
 
 
-def test_profile_owner_carries_incomplete_request_then_gathers_value_after_binding(
+def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value(
     config_root: Path,
 ) -> None:
-    reasoning = FakeChatModel(
-        scripted_calls=[
-            [
-                (
-                    "propose_profile_change",
-                    {"field": "address", "new_value": "42 New Road"},
-                )
-            ]
-        ]
-    )
+    proposal = [
+        (
+            "propose_profile_change",
+            {"field": "address", "new_value": "42 New Road"},
+        )
+    ]
+    reasoning = FakeChatModel(scripted_calls=[proposal, proposal, proposal])
     h = _harness(config_root, reasoning, thread_id="profile-owner-slots")
     first_turn_ids = ("turn-1",)
     request = ChangeProfile(field="address")
@@ -170,11 +163,12 @@ def test_profile_owner_carries_incomplete_request_then_gathers_value_after_bindi
         ),
     )
 
-    identity_entry = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    first = h.engine._graph.nodes["support_capability_entry"].invoke(state)
 
-    assert reasoning.invoke_count == 0
-    assert identity_entry["active_flow"] == "identity"
-    assert identity_entry["active_invocation"].request == request
+    assert reasoning.invoke_count == 2
+    assert first["active_flow"] == "support"
+    assert first["active_invocation"].request == request
+    assert first["pending_clarification"] == SupportClarification(detail="profile_value")
     h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
     second_turn_ids = ("turn-1", "turn-2")
     bound_state = ReasoningState(
@@ -189,6 +183,7 @@ def test_profile_owner_carries_incomplete_request_then_gathers_value_after_bindi
 
     completed = h.engine._graph.nodes["support_capability_entry"].invoke(bound_state)
 
+    assert reasoning.invoke_count == 3
     assert completed["active_invocation"] is None
     assert completed["pending_profile_change"].field == "address"
     assert completed["pending_profile_change"].new_value == "42 New Road"
@@ -289,7 +284,7 @@ def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
         consumed_turn_ids=("turn-1", "turn-2"),
         active_flow="support",
         active_invocation=retained,
-        clarification_progress=first["clarification_progress"],
+        clarification_liveness=first["clarification_liveness"],
     )
     second = h.engine._graph.nodes["support_capability_entry"].invoke(second_state)
 
@@ -416,11 +411,42 @@ def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_referen
 
 
 def _harness(
-    config_root: Path, reasoning: FakeChatModel, *, thread_id: str, policy=_POLICY, frontline=None
+    config_root: Path,
+    reasoning: FakeChatModel,
+    *,
+    thread_id: str,
+    policy=_POLICY,
+    frontline=None,
+    routing_resolution: RouteResolution | None = None,
 ) -> SupportHarness:
     return build_support_engine(
-        config_root, policy=policy, reasoning=reasoning, frontline=frontline, thread_id=thread_id
+        config_root,
+        policy=policy,
+        reasoning=reasoning,
+        frontline=frontline,
+        thread_id=thread_id,
+        routing_resolution=routing_resolution,
     )
+
+
+def _typed_mutation_request(
+    tool_name: str,
+    arguments: dict[str, object],
+    *,
+    include_refund_details: bool = True,
+) -> CancelOrders | RefundOrder | ReturnOrder:
+    if tool_name == "propose_cancel":
+        refs = tuple(str(ref) for ref in arguments["order_keys"])
+        return CancelOrders(target=ExplicitOrderSet(order_refs=refs))
+    if tool_name == "propose_return":
+        return ReturnOrder(target=ExplicitOrderTarget(order_ref=str(arguments["order_key"])))
+    if tool_name == "propose_refund":
+        return RefundOrder(
+            target=ExplicitOrderTarget(order_ref=str(arguments["order_key"])),
+            amount_usd=(float(arguments["amount_usd"]) if include_refund_details else None),
+            destination=(str(arguments["destination"]) if include_refund_details else None),
+        )
+    raise ValueError(f"unsupported mutation tool fixture: {tool_name}")
 
 
 async def _events(engine, text: str) -> list:
@@ -569,7 +595,7 @@ async def test_model_only_order_reference_cannot_cross_identity(config_root: Pat
     )
     await _events(h.engine, "cancel my rain jacket order")
     state = _state_values(h, "scope-model-ref")
-    assert _active_request(h, "scope-model-ref") is None
+    assert _active_request(h, "scope-model-ref") == CancelOrders()
     assert state.get("pending_cancel") is None
     assert state.get("active_flow") != "identity"
     assert h.identity.current() is None
@@ -582,10 +608,7 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
     # THE Fix 2 happy path (the live-trace scenario, now SAFE): a guest asks to cancel ORD-1002,
     # detours into identity, verifies via OTP to CUST-002's on-file contact, then resumes from
     # a typed continuation without another model reconstruction call. A guest who cannot
-    # complete the OTP never mutates. The frontline hands over the production way.
-    frontline = FakeChatModel(
-        force_tool="request_handover", canned_args=_HANDOVER_TO_SUPPORT, tool_call_limit=1
-    )
+    # complete the OTP never mutates.
     scripted = [
         [("propose_cancel", {"order_keys": ["ORD-1002"]})],  # support assemble -> detour
         [],  # identity clarify turn 1 (no contact yet)
@@ -595,7 +618,6 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
         config_root,
         FakeChatModel(scripted_calls=scripted),
         thread_id="scope-resume",
-        frontline=frontline,
     )
     await _events(h.engine, "cancel order ORD-1002")  # -> identity (asks for contact)
     assert _active_flow(h, "scope-resume") == "identity"
@@ -621,13 +643,6 @@ async def test_guest_profile_change_verifies_then_resumes_under_the_new_principa
     # change against the newly bound customer. The bind OTP goes to that customer's on-file
     # factor, which IS the profile step-up factor, so one dispatch, not two.
     new_address = "42 New Road"
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={
-            "request_handover": {"destination": "support", "reason_code": "address_change"}
-        },
-        tool_call_limit=1,
-    )
     scripted = [
         [("propose_profile_change", {"field": "address", "new_value": new_address})],
         [],  # identity assemble, same turn: no contact claim yet
@@ -637,7 +652,7 @@ async def test_guest_profile_change_verifies_then_resumes_under_the_new_principa
         config_root,
         FakeChatModel(scripted_calls=scripted),
         thread_id="scope-profile-resume",
-        frontline=frontline,
+        routing_resolution=RouteDecision.direct(ChangeProfile(field="address")),
     )
 
     await _events(h.engine, f"change my address to {new_address}")
@@ -657,10 +672,6 @@ async def test_guest_profile_change_verifies_then_resumes_under_the_new_principa
     assert h.profile.address_on_file("CUST-001") == new_address
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="strong-labelled letter-spelled order IDs do not reach guest mutation detours",
-)
 @pytest.mark.parametrize(
     ("tool_name", "tool_args", "utterance", "request_type"),
     (
@@ -677,8 +688,8 @@ async def test_guest_profile_change_verifies_then_resumes_under_the_new_principa
             ReturnOrder,
         ),
         (
-            "propose_refund",
-            {"order_key": "ORD-1001", "amount_usd": 20.0, "destination": "original"},
+            "provide_refund_order",
+            {"order_key": "ORD-1001"},
             "Refund $20 for order. O r d one zero zero one.",
             RefundOrder,
         ),
@@ -729,7 +740,7 @@ async def test_guest_batch_requires_every_deduplicated_target_in_caller_speech(
     )
     await _events(harness.engine, "Cancel order ORD-1002.")
     state = _state_values(harness, thread_id)
-    assert _active_request(harness, thread_id) is None
+    assert _active_request(harness, thread_id) == CancelOrders()
     assert state.get("pending_cancel") is None
     assert state.get("active_flow") != "identity"
     assert harness.store.cancel_count == 0
@@ -757,25 +768,107 @@ async def test_guest_batch_preserves_all_exact_caller_stated_targets(
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "tool_args", "utterance", "reason_code"),
+    ("proposed_refs", "utterance"),
+    (
+        (("ORD-1002",), "Cancel order ORD-1002 and order ORD-1001."),
+        (("ORD-1002", "ORD-1001"), "Cancel order ORD-1002."),
+        (("ORD-1002",), "Cancel order ORD-1002 or order ORD-1001."),
+        (("ORD-1001",), "Cancel order ORD-1002, actually order ORD-1001 instead."),
+    ),
+)
+async def test_guest_cancel_rejects_inexact_or_ambiguous_caller_target_sets(
+    config_root: Path,
+    proposed_refs: tuple[str, ...],
+    utterance: str,
+) -> None:
+    thread_id = f"scope-cancel-rejected-set-{len(proposed_refs)}-{len(utterance)}"
+    harness = _harness(
+        config_root,
+        FakeChatModel(
+            force_tool="propose_cancel",
+            canned_args={"propose_cancel": {"order_keys": list(proposed_refs)}},
+            tool_call_limit=2,
+        ),
+        thread_id=thread_id,
+    )
+
+    events = await _events(harness.engine, utterance)
+
+    request = _active_request(harness, thread_id)
+    assert isinstance(request, CancelOrders)
+    assert request.target is None
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert harness.identity.current() is None
+    assert harness.otp.dispatch_count == 0
+    assert harness.store.cancel_count == 0
+    assert _no_pendings(harness, thread_id)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_args", "utterance", "request_type"),
+    (
+        (
+            "propose_return",
+            {"order_key": "ORD-1001"},
+            "Return order ORD-1001 and order ORD-1002.",
+            ReturnOrder,
+        ),
+        (
+            "provide_refund_order",
+            {"order_key": "ORD-1001"},
+            "Refund order ORD-1001 or order ORD-1002.",
+            RefundOrder,
+        ),
+    ),
+)
+async def test_guest_scalar_mutations_reject_multiple_or_ambiguous_targets(
+    config_root: Path,
+    tool_name: str,
+    tool_args: dict[str, str],
+    utterance: str,
+    request_type: type,
+) -> None:
+    thread_id = f"scope-scalar-rejected-set-{tool_name}"
+    harness = _harness(
+        config_root,
+        FakeChatModel(
+            force_tool=tool_name,
+            canned_args={tool_name: tool_args},
+            tool_call_limit=2,
+        ),
+        thread_id=thread_id,
+    )
+
+    events = await _events(harness.engine, utterance)
+
+    request = _active_request(harness, thread_id)
+    assert isinstance(request, request_type)
+    assert request.target is None
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert harness.identity.current() is None
+    assert harness.otp.dispatch_count == 0
+    assert harness.store.return_count == 0
+    assert harness.store.refund_count == 0
+    assert _no_pendings(harness, thread_id)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_args", "utterance"),
     (
         (
             "propose_cancel",
             {"order_keys": ["ORD-1002"]},
             "Cancel my rain jacket order.",
-            "cancel_order",
         ),
         (
             "propose_return",
             {"order_key": "ORD-1001"},
             "Return my trail running shoes.",
-            "refund",
         ),
         (
             "propose_refund",
             {"order_key": "ORD-1001", "amount_usd": 20.0, "destination": "original"},
             "Refund $20 for my trail running shoes.",
-            "refund",
         ),
     ),
 )
@@ -784,7 +877,6 @@ async def test_model_only_target_fails_closed_for_every_guest_mutation_consumer(
     tool_name: str,
     tool_args: dict,
     utterance: str,
-    reason_code: str,
 ) -> None:
     thread_id = f"scope-model-target-{tool_name}"
     harness = _harness(
@@ -794,21 +886,13 @@ async def test_model_only_target_fails_closed_for_every_guest_mutation_consumer(
             canned_args={tool_name: tool_args},
             tool_call_limit=2,
         ),
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {
-                    "destination": "support",
-                    "reason_code": reason_code,
-                }
-            },
-            tool_call_limit=1,
-        ),
         thread_id=thread_id,
     )
     await _events(harness.engine, utterance)
     state = _state_values(harness, thread_id)
-    assert _active_request(harness, thread_id) is None
+    request = _active_request(harness, thread_id)
+    assert isinstance(request, CancelOrders | RefundOrder | ReturnOrder)
+    assert request.target is None
     assert state.get("pending_cancel") is None
     assert state.get("pending_return") is None
     assert state.get("pending_refund") is None
@@ -827,22 +911,23 @@ async def _drive_explicit_action_continuation(
     thread_id: str,
     expect_model_free_continuation: bool = True,
 ) -> tuple[SupportHarness, FakeChatModel, list]:
-    reasoning = FakeChatModel(
-        scripted_calls=[
-            [(tool_name, tool_args)],
-            [],
-            [("propose_identity", {"contact_claim": _CONTACT_1001})],
-        ]
+    request = _typed_mutation_request(
+        tool_name,
+        tool_args,
+        include_refund_details=expect_model_free_continuation,
     )
+    scripted_calls = [
+        [],
+        [("propose_identity", {"contact_claim": _CONTACT_1001})],
+    ]
+    if not expect_model_free_continuation:
+        scripted_calls.append([("provide_refund_amount", {"amount_usd": tool_args["amount_usd"]})])
+    reasoning = FakeChatModel(scripted_calls=scripted_calls)
     h = _harness(
         config_root,
         reasoning,
         thread_id=thread_id,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={"request_handover": {"destination": "support", "reason_code": "refund"}},
-            tool_call_limit=1,
-        ),
+        routing_resolution=RouteDecision.direct(request),
     )
     await _events(h.engine, utterance)
     assert _active_request(h, thread_id) is not None
@@ -952,9 +1037,6 @@ async def test_failed_otp_on_action_detour_leaves_zero_resume_intent(
     # SECURITY: a FAILED verification during an explicit-order mutation detour must leave ZERO
     # continuation intent is cleared on the handover so a later turn
     # can never silently resume the cancel. OTP exhausted -> human, nothing voided.
-    frontline = FakeChatModel(
-        force_tool="request_handover", canned_args=_HANDOVER_TO_SUPPORT, tool_call_limit=1
-    )
     scripted = [
         [("propose_cancel", {"order_keys": ["ORD-1002"]})],  # detour
         [],
@@ -964,7 +1046,6 @@ async def test_failed_otp_on_action_detour_leaves_zero_resume_intent(
         config_root,
         FakeChatModel(scripted_calls=scripted),
         thread_id="scope-fail",
-        frontline=frontline,
         policy=make_policy(otp_max_attempts=1),  # one wrong code exhausts
     )
     await _events(h.engine, "cancel order ORD-1002")
@@ -1048,8 +1129,8 @@ async def test_bound_unknown_order_id_is_combined_not_found_and_never_logged(
 
 async def test_bound_second_denial_offers_human(config_root: Path, tmp_path: Path) -> None:
     # The deterministic escalation on-ramp: a BOUND caller's 2nd failed target for the same order
-    # switches the corrective to one that OFFERS a person (the caller accepting rides the
-    # existing entry-router escape_human path). Unbound callers never reach this — they detour.
+    # switches the corrective to one that OFFERS a person (the caller accepting is routed to the
+    # semantic RequestPerson owner). Unbound callers never reach this — they detour.
     cross = {"order_keys": ["ORD-1001"]}  # CUST-001's, not this bound CUST-002 caller's
     scripted = [
         [("propose_cancel", dict(cross))],
@@ -1115,30 +1196,19 @@ async def test_one_caller_turn_consumes_at_most_one_order_denial(
     arguments: dict[str, object],
     utterance: str,
 ) -> None:
-    repeated = [(tool_name, dict(arguments))]
-    reasoning = FakeChatModel(scripted_calls=[repeated, repeated])
+    reasoning = FakeChatModel()
     thread_id = f"one-denial-{tool_name}"
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={
-            "request_handover": {
-                "destination": "support",
-                "reason_code": "cancel_order" if tool_name == "propose_cancel" else "refund",
-            }
-        },
-        tool_call_limit=1,
-    )
     harness = _harness(
         config_root,
         reasoning,
         thread_id=thread_id,
-        frontline=frontline,
+        routing_resolution=RouteDecision.direct(_typed_mutation_request(tool_name, arguments)),
     )
     _bind_cust2(harness)
 
     first = await _events(harness.engine, utterance)
 
-    assert reasoning.invoke_count == 1
+    assert reasoning.invoke_count == 0
     assert [
         event["attempt"]
         for event in _telemetry(tmp_path)
@@ -1154,7 +1224,7 @@ async def test_one_caller_turn_consumes_at_most_one_order_denial(
 
     second = await _events(harness.engine, "Please try that order again")
 
-    assert reasoning.invoke_count == 2
+    assert reasoning.invoke_count == 0
     assert [
         event["attempt"]
         for event in _telemetry(tmp_path)
@@ -1199,33 +1269,24 @@ async def test_unbound_model_only_order_target_asks_for_caller_stated_number(
         tool_call_limit=99,
     )
     thread_id = f"missing-stated-{tool_name}"
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={
-            "request_handover": {
-                "destination": "support",
-                "reason_code": "cancel_order" if tool_name == "propose_cancel" else "refund",
-            }
-        },
-        tool_call_limit=1,
-    )
     harness = _harness(
         config_root,
         reasoning,
         thread_id=thread_id,
-        frontline=frontline,
     )
 
     events = await _events(harness.engine, utterance)
 
-    assert reasoning.invoke_count == 1
+    assert reasoning.invoke_count == 2
     assert _spoken(events) == [
         ("support_clarify", "What is the order number, for example ORD-1234?")
     ]
     assert not any(isinstance(event, (TokenEvent, InterruptEvent)) for event in events)
     state = _state_values(harness, thread_id)
     assert state["active_flow"] == "support"
-    assert _active_request(harness, thread_id) is None
+    request = _active_request(harness, thread_id)
+    assert isinstance(request, CancelOrders | RefundOrder | ReturnOrder)
+    assert request.target is None
     assert state.get("pending_clarification") is None
     assert harness.identity.current() is None
     assert harness.otp.dispatch_count == 0
@@ -1276,11 +1337,17 @@ async def test_session_placed_order_needs_no_verification(
             tool_call_limit=1,
         ),
         thread_id="scope-9",
+        routing_resolution=RouteDecision.direct(CancelOrders(target=FocusedOrderSet())),
     )
     placed = h.store.place_cart(
         "pk-1",
         lines=[CartLine(sku="SKU-SOCK-01", name="wool socks", price_usd=24.0, quantity=1)],
         total_usd=24.0,
+    )
+    h.recent_orders.record(
+        (placed.order_id,),
+        operation="place",
+        focused_order_ref=placed.order_id,
     )
     events = await _events(h.engine, "cancel that order I just placed")
     interrupts = [e for e in events if isinstance(e, InterruptEvent)]
@@ -1302,12 +1369,11 @@ async def test_bound_identity_owned_sails_non_owned_detours_or_denies(
     # its readback with no verification asked (rung-2 bound owner).
     h1 = _harness(
         config_root,
-        FakeChatModel(
-            force_tool="propose_return",
-            canned_args={"propose_return": {"order_key": "1"}},
-            tool_call_limit=1,
-        ),
+        FakeChatModel(),
         thread_id="scope-10a",
+        routing_resolution=RouteDecision.direct(
+            ReturnOrder(target=ExplicitOrderTarget(order_ref="ORD-1001"))
+        ),
     )
     h1.identity.bind(bound)
     e1 = await _events(h1.engine, "I need to return this order")
@@ -1323,12 +1389,11 @@ async def test_rung1_read_grant_does_not_authorize_a_mutation(
     # detours into identity; nothing is voided (Fix 2: rung-1 != mutation authority).
     h = _harness(
         config_root,
-        FakeChatModel(
-            force_tool="propose_cancel",
-            canned_args={"propose_cancel": {"order_keys": ["2"]}},
-            tool_call_limit=1,
-        ),
+        FakeChatModel(),
         thread_id="scope-11",
+        routing_resolution=RouteDecision.direct(
+            CancelOrders(target=ExplicitOrderSet(order_refs=("ORD-1002",)))
+        ),
     )
     h.identity.grant_orders("ORD-1002")  # rung-1 READ grant only
     events = await _events(h.engine, "cancel order ORD-1002")
@@ -1348,13 +1413,17 @@ async def test_unshipped_refund_steer_does_not_leak_for_unauthorized_order(
     # cancel-steer, whose line speaks "the full $129.00 goes back". The gate must hold
     # UPSTREAM: no steer event, no dollar spoken, no pending of either kind — and (Fix 2) an
     # unbound caller detours to identity instead.
-    args = {
-        "propose_refund": {"order_key": "ORD-1002", "amount_usd": 129.0, "destination": "original"}
-    }
     h = _harness(
         config_root,
-        FakeChatModel(force_tool="propose_refund", canned_args=args, tool_call_limit=1),
+        FakeChatModel(),
         thread_id="scope-12",
+        routing_resolution=RouteDecision.direct(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1002"),
+                amount_usd=129.0,
+                destination="original",
+            )
+        ),
     )
     events = await _events(h.engine, "I want my money back for order ORD-1002")
     assert _no_details_spoken(events)
@@ -1429,19 +1498,13 @@ def _profile_harness(
     return build_support_engine(
         config_root,
         policy=_POLICY,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {"destination": "support", "reason_code": "contact_change"}
-            },
-            tool_call_limit=1,
-        ),
         reasoning=FakeChatModel(
             force_tool="propose_profile_change",
             canned_args={"propose_profile_change": {"field": "contact", "new_value": new_value}},
-            tool_call_limit=1,
+            tool_call_limit=2,
         ),
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(ChangeProfile(field="contact")),
     )
 
 
@@ -1473,7 +1536,10 @@ async def test_unbound_profile_change_detours_to_identity(
 
 
 async def test_model_only_profile_value_cannot_cross_identity(config_root: Path) -> None:
-    h = _profile_harness(config_root, thread_id="scope-prof-model-value")
+    h = _profile_harness(
+        config_root,
+        thread_id="scope-prof-model-value",
+    )
     events = await _events(h.engine, "I have a new phone number for my account")
     state = _state_values(h, "scope-prof-model-value")
     assert _spoken(events) == [
@@ -1483,7 +1549,7 @@ async def test_model_only_profile_value_cannot_cross_identity(config_root: Path)
         )
     ]
     assert not any(isinstance(event, TokenEvent) for event in events)
-    assert _active_request(h, "scope-prof-model-value") is None
+    assert _active_request(h, "scope-prof-model-value") == ChangeProfile(field="contact")
     assert state.get("pending_profile_change") is None
     assert state.get("active_flow") == "support"
     assert state.get("pending_clarification") is None
@@ -1501,7 +1567,7 @@ async def test_order_number_cannot_become_a_model_proposed_contact(
     )
     await _events(h.engine, "Change the contact for order 1002")
     state = _state_values(h, "scope-prof-order-number")
-    assert _active_request(h, "scope-prof-order-number") is None
+    assert _active_request(h, "scope-prof-order-number") == ChangeProfile(field="contact")
     assert state.get("pending_profile_change") is None
     assert state.get("active_flow") != "identity"
     assert h.otp.dispatch_count == 0
@@ -1540,9 +1606,6 @@ async def test_needs_identity_detour_never_echoes_a_contact(
     # The honest PII invariant, now trivial by construction: the contact claim is no longer a
     # mutation credential (account_contact is gone from propose_cancel), so a guest cancel that
     # detours to identity never carries a contact into a support ToolMessage or telemetry.
-    frontline = FakeChatModel(
-        force_tool="request_handover", canned_args=_HANDOVER_TO_SUPPORT, tool_call_limit=1
-    )
     scripted = [
         [("propose_cancel", {"order_keys": ["ORD-1002"]})],  # -> detour (no contact anywhere)
         [],
@@ -1551,7 +1614,6 @@ async def test_needs_identity_detour_never_echoes_a_contact(
         config_root,
         FakeChatModel(scripted_calls=scripted),
         thread_id="scope-16",
-        frontline=frontline,
     )
     await _events(h.engine, "cancel order ORD-1002")
     for event in _telemetry(tmp_path):

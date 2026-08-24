@@ -36,7 +36,17 @@ from agnostic_market.dtos.events import (
     TokenEvent,
     TurnFacts,
 )
-from agnostic_market.dtos.orchestration import CancellableOrderScope, CancelOrders
+from agnostic_market.dtos.orchestration import (
+    AnswerQuestion,
+    CancellableOrderScope,
+    CancelOrders,
+    ExplicitOrderSet,
+    ExplicitOrderTarget,
+    IntentRequest,
+    RefundOrder,
+    RouteDecision,
+    RouteResolution,
+)
 from agnostic_market.dtos.state import CartLine, PolicyContext, ReasoningState
 
 # returnless high on purpose (the default): the legacy amount-gate/step-up scenarios run
@@ -50,7 +60,6 @@ _PROPOSE = {
     "propose_refund": {"order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"}
 }
 _REFUND_REQUEST = "I'd like a refund to a different card"
-_REFUND_HANDOVER = {"request_handover": {"destination": "support", "reason_code": "refund"}}
 
 
 def _instrument_ref(config_root: Path, customer_ref: str) -> str:
@@ -68,6 +77,7 @@ def _engine(
     risk_flagged: bool = False,
     policy: PolicyContext = _POLICY,
     thread_id: str = "support-1",
+    routing_resolution: RouteResolution | None = None,
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
     """Thin wrapper over the shared harness (support_helpers) preserving this file's
     4-tuple unpacking + its propose_refund default. Fixture orders are PRE-AUTHORIZED
@@ -81,6 +91,14 @@ def _engine(
             or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
             risk_flagged=risk_flagged,
             thread_id=thread_id,
+            routing_resolution=routing_resolution
+            or RouteDecision.direct(
+                RefundOrder(
+                    target=ExplicitOrderTarget(order_ref="ORD-1002"),
+                    amount_usd=129.0,
+                    destination="new_instrument",
+                )
+            ),
         )
     )
     return harness.engine, harness.store, harness.verification, harness.otp
@@ -131,7 +149,7 @@ def _assert_refund_destination_failed_closed(
     onramps = [event for event in telemetry if event["event"] == "human_onramp"]
     assert len(onramps) == 1
     assert onramps[0]["reason_code"] == "refund"
-    assert onramps[0]["source"] == "gate"
+    assert onramps[0]["source"] == "deterministic_policy"
     assert onramps[0]["active_flow"] is None
     assert [event for event in telemetry if event["event"] == "automation_terminal_response"] == [
         {"event": "automation_terminal_response"}
@@ -256,7 +274,6 @@ async def test_live_read_blocks_a_lapsed_grant_at_place(config_root: Path) -> No
     [
         ("yes", TurnFacts(readback_interrupted=True), "refund-reconfirm-barged"),
         ("I'm not sure", _FACTS, "refund-reconfirm-unclear"),
-        ("sure", _FACTS, "refund-reconfirm-ambiguous-sure"),
     ],
 )
 async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
@@ -278,6 +295,17 @@ async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
     assert _instrument_ref(config_root, "CUST-002") in reconfirms[0].prompt
     await _events(engine, "yes")  # a clean committed yes places it
     assert store.refund_count == 1
+
+
+async def test_refund_accepts_supported_natural_affirmation(config_root: Path) -> None:
+    engine, store, _, _ = _engine(config_root, thread_id="refund-natural-affirmation")
+    await _pause_at_otp(engine)
+    await _events(engine, _VALID_OTP)
+
+    await _events(engine, "sure")
+
+    assert store.refund_count == 1
+    assert not engine.pending_interrupt()
 
 
 async def test_no_at_readback_cancels_without_refunding(config_root: Path) -> None:
@@ -303,11 +331,15 @@ async def test_kill_mid_stepup_leaves_no_ghost_refund_and_no_free_level(config_r
     assert store.refund_count == 0
     assert verification.current_level() == 1
     # A fresh session starts clean.
-    engine2, store2, verification2, _ = _engine(config_root, thread_id="support-2")
+    engine2, store2, verification2, _ = _engine(
+        config_root,
+        thread_id="support-2",
+        routing_resolution=RouteDecision.direct(AnswerQuestion(topic="general")),
+    )
     events = await _events(engine2, "hi there")
     assert store2.refund_count == 0
     assert verification2.current_level() == 1
-    assert any(isinstance(e, TokenEvent) for e in events)
+    assert any(isinstance(e, TokenEvent | SpokenMessageEvent) for e in events)
 
 
 # --- Group A: refund-to-ORIGINAL (L1, no step-up) ----------------------------------------
@@ -318,22 +350,37 @@ _REFUND_ORIGINAL = {
 }
 _CANCEL_PROCESSING = {"propose_cancel": {"order_keys": ["2"]}}  # ORD-1002, processing
 _CANCEL_SHIPPED = {"propose_cancel": {"order_keys": ["1"]}}  # ORD-1001, shipped
+_ORDER_BY_KEY = {
+    "1": "ORD-1001",
+    "2": "ORD-1002",
+    "3": "ORD-1003",
+    "4": "ORD-9001",
+}
 
 
 def _cancel_engine(config_root, args, *, thread_id, risk_flagged=False):
+    keys = args["propose_cancel"]["order_keys"]
     return _engine(
         config_root,
-        reasoning=FakeChatModel(force_tool=next(iter(args)), canned_args=args, tool_call_limit=1),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(
+            CancelOrders(
+                target=ExplicitOrderSet(order_refs=tuple(_ORDER_BY_KEY[key] for key in keys))
+            )
+        ),
     )
 
 
 async def test_refund_to_original_is_l1_no_stepup(config_root: Path) -> None:
     engine, store, verification, otp = _engine(
         config_root,
-        reasoning=FakeChatModel(
-            force_tool="propose_refund", canned_args=_REFUND_ORIGINAL, tool_call_limit=1
+        routing_resolution=RouteDecision.direct(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1002"),
+                amount_usd=50.0,
+                destination="original",
+            )
         ),
         thread_id="ro-1",
     )
@@ -464,20 +511,9 @@ async def test_stale_scalar_cancel_call_cannot_widen_to_account_scope(
 ) -> None:
     from agnostic_market.commerce.identity import BoundIdentity
 
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={
-            "request_handover": {
-                "destination": "support",
-                "reason_code": "cancel_order",
-            }
-        },
-        tool_call_limit=1,
-    )
     harness = build_support_engine(
         config_root,
         policy=_POLICY,
-        frontline=frontline,
         reasoning=FakeChatModel(
             force_tool="propose_cancel",
             canned_args={"propose_cancel": {"order_key": "2"}},
@@ -523,23 +559,15 @@ def _place_second_cancellable_extra(store: OrderStore) -> str:
 
 
 def _batch_engine(config_root, keys, *, thread_id, policy=_POLICY, place_second=False):
-    """Support engine that enters support the PRODUCTION way — the frontline model hands over
-    (request_handover -> cancel_order/support), NOT the deterministic gate (which deliberately
-    does not own plural/collective 'cancel both' phrasings — F-16.2). The reasoning fake then
-    forces ONE propose_cancel(order_keys=keys). Optionally seeds a second cancellable order."""
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={"request_handover": {"destination": "support", "reason_code": "cancel_order"}},
-        tool_call_limit=1,
-    )
-    args = {"propose_cancel": {"order_keys": keys}}
+    """Build a typed cancellation engine and optionally seed another cancellable order."""
     harness = authorize_fixture_orders(
         build_support_engine(
             config_root,
             policy=policy,
-            frontline=frontline,
-            reasoning=FakeChatModel(
-                force_tool="propose_cancel", canned_args=args, tool_call_limit=1
+            routing_resolution=RouteDecision.direct(
+                CancelOrders(
+                    target=ExplicitOrderSet(order_refs=tuple(_ORDER_BY_KEY[key] for key in keys))
+                )
             ),
             thread_id=thread_id,
         )
@@ -596,7 +624,7 @@ async def test_batch_cancel_all_ineligible_declines_without_readback(config_root
 async def test_batch_cancel_dedups_repeated_key(config_root: Path) -> None:
     # "cancel both" that lists the SAME order twice mints ONE target -> ONE void.
     engine, store = _batch_engine(config_root, ["2", "2"], thread_id="batch-4")
-    await _events(engine, "cancel it and also cancel it")
+    await _events(engine, "cancel both duplicate order references")
     await _events(engine, "yes")
     assert store.cancel_count == 1
 
@@ -718,23 +746,19 @@ def _scope_engine(
     the session is pre-verified so the scope resolves WITHOUT an identity detour."""
     from support_helpers import TEST_OTP  # noqa: F401  (the valid code the OtpProvider holds)
 
-    frontline = FakeChatModel(
-        force_tool="request_handover",
-        canned_args={"request_handover": {"destination": "support", "reason_code": "cancel_order"}},
-        tool_call_limit=1,
-    )
     scripted = [
-        [("propose_cancel", {"order_keys": [], "scope": scope})],  # support assemble
         [],  # identity clarify on turn 1 (caller hasn't given a contact yet)
         [("propose_identity", {"contact_claim": "casey@example.com"})],  # identity assemble turn 2
     ]
     harness = build_support_engine(
         config_root,
         policy=make_policy(otp_max_attempts=otp_max, cancel_batch_max=cancel_batch_max),
-        frontline=frontline,
         reasoning=FakeChatModel(scripted_calls=scripted),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(
+            CancelOrders(target=CancellableOrderScope(scope=scope))
+        ),
     )
     _place_second_cancellable(harness.store)  # ORD-9001, session-owned, cancellable
     if bound:
@@ -939,7 +963,6 @@ async def test_risk_after_identity_clears_scope_without_voiding(config_root: Pat
     [
         ("never mind, forget it", "mb-abort"),
         ("I want a person", "mb-human"),
-        ("checkout now please", "mb-cross-switch"),
     ],
 )
 async def test_identity_exit_paths_clear_retained_cancel_scope(
@@ -962,15 +985,15 @@ def _refund_engine(config_root, amount, dest, *, thread_id, policy=_POLICY):
     # ORD-1001 (key "1") is shipped but total 179.98; refunds don't need it cancellable.
     return _engine(
         config_root,
-        reasoning=FakeChatModel(
-            force_tool="propose_refund",
-            canned_args={
-                "propose_refund": {"order_key": "1", "amount_usd": amount, "destination": dest}
-            },
-            tool_call_limit=1,
-        ),
         policy=policy,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1001"),
+                amount_usd=amount,
+                destination=dest,
+            )
+        ),
     )
 
 
@@ -1032,13 +1055,15 @@ async def test_missing_new_instrument_fails_closed(config_root: Path, tmp_path: 
                 },
                 tool_call_limit=1,
             ),
-            frontline=FakeChatModel(
-                force_tool="request_handover",
-                canned_args=_REFUND_HANDOVER,
-                tool_call_limit=1,
-            ),
             thread_id="refund-missing-instrument",
             payment_instruments_fixture=PaymentInstrumentsFixture(payment_instruments={}),
+            routing_resolution=RouteDecision.direct(
+                RefundOrder(
+                    target=ExplicitOrderTarget(order_ref="ORD-1001"),
+                    amount_usd=100.0,
+                    destination="new_instrument",
+                )
+            ),
         )
     )
 
@@ -1070,12 +1095,14 @@ async def test_session_order_without_account_owner_cannot_select_new_instrument(
         config_root,
         policy=_POLICY,
         reasoning=reasoning,
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args=_REFUND_HANDOVER,
-            tool_call_limit=1,
-        ),
         thread_id="refund-session-order-no-owner",
+        routing_resolution=RouteDecision.direct(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-9001"),
+                amount_usd=20.0,
+                destination="new_instrument",
+            )
+        ),
     )
     placed = harness.store.place_cart(
         "session-order",
@@ -1180,11 +1207,18 @@ _FULL_REFUND_ORIGINAL = {
 
 
 def _refund_original_engine(config_root, args, *, thread_id, policy=_POLICY):
+    proposal = args["propose_refund"]
     return _engine(
         config_root,
-        reasoning=FakeChatModel(force_tool="propose_refund", canned_args=args, tool_call_limit=1),
         policy=policy,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref=_ORDER_BY_KEY[proposal["order_key"]]),
+                amount_usd=proposal["amount_usd"],
+                destination=proposal["destination"],
+            )
+        ),
     )
 
 
@@ -1370,15 +1404,15 @@ async def test_delivered_order_is_return_first_too(
     tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 10.0})
     engine, store, _, _ = _engine(
         config_root,
-        reasoning=FakeChatModel(
-            force_tool="propose_refund",
-            canned_args={
-                "propose_refund": {"order_key": "3", "amount_usd": 40.0, "destination": "original"}
-            },
-            tool_call_limit=1,
-        ),
         policy=tight,
         thread_id="ret-4",
+        routing_resolution=RouteDecision.direct(
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1003"),
+                amount_usd=40.0,
+                destination="original",
+            )
+        ),
     )
     events = await _events(engine, "I want a refund for my socks order")  # ORD-1003, delivered
     assert store.refund_count == 0
@@ -1399,7 +1433,6 @@ async def test_delivered_order_is_return_first_too(
         ("don't cancel", "no"),  # negation survives the neutralization
         ("no, leave it", "no"),
         ("cancel it", "unclear"),  # bare command -> the one §4a re-confirm asks yes/no
-        ("get me a person", "human"),
     ],
 )
 def test_classify_cancel_consent_polarity(text: str, expected: str) -> None:
@@ -1408,27 +1441,17 @@ def test_classify_cancel_consent_polarity(text: str, expected: str) -> None:
     assert classify_cancel_consent(text) == expected
 
 
-def test_support_abort_set_excludes_cancel_phrases() -> None:
-    from agnostic_market.agents._consent import is_abort, is_support_abort
-
-    assert is_support_abort("never mind, forget it") is True
-    assert is_support_abort("stop") is True
-    assert is_support_abort("yeah cancel it") is False  # subject matter, not an abort
-    assert is_abort("cancel it") is True  # checkout keeps the abort reading
-
-
-async def test_cancel_phrase_while_sticky_in_support_reaches_the_model(
+async def test_cancel_phrase_during_typed_support_clarification_is_not_an_abort(
     config_root: Path,
 ) -> None:
-    # THE live bug shape: the support model had asked its own question (sticky, nothing
-    # pending) and the caller's "yeah cancel it" must route to ASSEMBLE (the model has the
-    # context), never to the abort escape.
+    # Subject-matter "cancel" must remain with the active Support owner, not trigger abort.
     engine, store, _, _ = _engine(
         config_root,
         reasoning=FakeChatModel(emit_tool_calls=False),  # clarifies every turn -> sticky
         thread_id="pol-1",
+        routing_resolution=RouteDecision.direct(RefundOrder()),
     )
-    await _events(engine, "I want a refund for my order")  # gate -> support, model clarifies
+    await _events(engine, "I want a refund for my order")
     events = await _events(engine, "yeah cancel it")
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert not any("dropped that" in e.text for e in spoken)  # abort did NOT fire
@@ -1436,47 +1459,44 @@ async def test_cancel_phrase_while_sticky_in_support_reaches_the_model(
     assert [(e.node, e.text) for e in spoken] == [
         (
             "support_clarify",
-            "What would you like help with: a cancellation, return, refund, or profile update?",
-        )
+            "What is the order number, for example ORD-1234?",
+        ),
     ]
     assert store.cancel_count == 0  # and nothing was silently voided either
 
 
 @pytest.mark.parametrize(
-    ("detail", "line"),
+    ("typed_request", "detail", "line"),
     [
         (
-            "action",
-            "What would you like help with: a cancellation, return, refund, or profile update?",
+            RefundOrder(),
+            "order",
+            "What is the order number, for example ORD-1234?",
         ),
-        ("order", "What is the order number, for example ORD-1234?"),
-        ("amount", "What amount would you like refunded?"),
         (
+            RefundOrder(target=ExplicitOrderTarget(order_ref="ORD-1001")),
+            "amount",
+            "What amount would you like refunded?",
+        ),
+        (
+            RefundOrder(
+                target=ExplicitOrderTarget(order_ref="ORD-1001"),
+                amount_usd=20.0,
+            ),
             "refund_destination",
             "Should the refund go back to the original payment method?",
         ),
-        (
-            "profile_field",
-            "Would you like to update your delivery address or contact number?",
-        ),
-        (
-            "profile_value",
-            "What new delivery address or contact number would you like to use?",
-        ),
     ],
 )
-async def test_support_clarification_tool_selects_one_code_authored_line(
-    config_root: Path, detail: str, line: str
+async def test_incomplete_typed_support_request_selects_one_code_authored_line(
+    config_root: Path, typed_request: IntentRequest, detail: str, line: str
 ) -> None:
-    reasoning = FakeChatModel(
-        force_tool="request_support_clarification",
-        canned_args={"request_support_clarification": {"detail": detail}},
-        tool_call_limit=1,
-    )
+    reasoning = FakeChatModel(emit_tool_calls=False)
     engine, store, _, _ = _engine(
         config_root,
         reasoning=reasoning,
         thread_id=f"support-clarify-{detail}",
+        routing_resolution=RouteDecision.direct(typed_request),
     )
 
     events = await _events(engine, "I need help with a refund")
@@ -1494,32 +1514,7 @@ async def test_support_clarification_tool_selects_one_code_authored_line(
     assert store.refund_count == store.return_count == store.cancel_count == 0
 
 
-def test_support_clarification_tool_schema_excludes_code_only_outcomes(
-    config_root: Path,
-) -> None:
-    reasoning = FakeChatModel(emit_tool_calls=False)
-    _engine(
-        config_root,
-        reasoning=reasoning,
-        thread_id="support-clarify-schema",
-    )
-
-    detail_schema = reasoning.bound_tools["request_support_clarification"]["function"][
-        "parameters"
-    ]["properties"]["detail"]
-    assert set(detail_schema["enum"]) == {
-        "action",
-        "order",
-        "amount",
-        "refund_destination",
-        "profile_field",
-        "profile_value",
-    }
-    assert "order_match" not in detail_schema["enum"]
-    assert "order_match_human_help" not in detail_schema["enum"]
-
-
-async def test_support_no_tool_prose_falls_back_to_code_authored_action_question(
+async def test_typed_support_model_prose_falls_back_to_the_missing_slot_question(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
@@ -1530,6 +1525,7 @@ async def test_support_no_tool_prose_falls_back_to_code_authored_action_question
         config_root,
         reasoning=reasoning,
         thread_id="support-clarify-no-tool",
+        routing_resolution=RouteDecision.direct(RefundOrder()),
     )
 
     events = await _events(engine, "I need a refund")
@@ -1539,7 +1535,7 @@ async def test_support_no_tool_prose_falls_back_to_code_authored_action_question
     assert [(e.node, e.text) for e in events if isinstance(e, SpokenMessageEvent)] == [
         (
             "support_clarify",
-            "What would you like help with: a cancellation, return, refund, or profile update?",
+            "What is the order number, for example ORD-1234?",
         )
     ]
     state = engine._graph.get_state(
@@ -1575,6 +1571,7 @@ async def test_unknown_support_tool_uses_bounded_correction_without_an_effect(
         config_root,
         reasoning=reasoning,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(RefundOrder()),
     )
 
     events = await _events(engine, "I need a refund")
@@ -1594,7 +1591,7 @@ async def test_unknown_support_tool_uses_bounded_correction_without_an_effect(
     ] == [
         (
             "support_clarify",
-            "What would you like help with: a cancellation, return, refund, or profile update?",
+            "What is the order number, for example ORD-1234?",
         )
     ]
     assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
@@ -1611,6 +1608,7 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
         config_root,
         reasoning=FakeChatModel(emit_tool_calls=False),
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(RefundOrder()),
     )
 
     first = await _events(engine, "I need a refund")
@@ -1636,7 +1634,7 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
     assert state.automation_terminal is True
     assert state.active_flow is None
     assert state.active_invocation is None
-    assert state.clarification_progress is None
+    assert state.clarification_liveness is None
     assert verification.current_level() == 1
     assert otp.dispatch_count == 0
     assert store.refund_count == store.return_count == store.cancel_count == 0
@@ -1646,7 +1644,8 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
         if '"event": "clarification_exhausted"' in line
     ]
     assert exhausted_events == [
-        '{"event": "clarification_exhausted", "flow": "support", "consumed_reasks": 2, "limit": 2}'
+        '{"event": "clarification_exhausted", "owner_kind": "invocation", '
+        '"consumed_reasks": 2, "limit": 2}'
     ]
 
 
@@ -1666,6 +1665,7 @@ async def test_changing_support_clarification_detail_does_not_reset_the_budget(
         config_root,
         reasoning=reasoning,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(RefundOrder()),
     )
 
     await _events(engine, "I need a refund")
@@ -1677,7 +1677,7 @@ async def test_changing_support_clarification_detail_does_not_reset_the_budget(
         "automation_terminal_response"
     ]
     state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
-    assert state.get("clarification_progress") is None
+    assert state.get("clarification_liveness") is None
     assert store.refund_count == store.return_count == store.cancel_count == 0
     telemetry = (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8")
     assert telemetry.count('"event": "clarification_exhausted"') == 1
@@ -1698,16 +1698,24 @@ async def test_support_two_malformed_clarification_calls_are_paired_then_fall_ba
         config_root,
         reasoning=reasoning,
         thread_id=thread_id,
+        routing_resolution=RouteDecision.direct(RefundOrder()),
     )
 
     events = await _events(engine, "I need a refund")
+    second_events = await _events(engine, "I still need help")
 
     assert reasoning.invoke_count == 2
-    assert [(e.node, e.text) for e in events if isinstance(e, SpokenMessageEvent)] == [
+    assert [
+        (e.node, e.text) for e in [*events, *second_events] if isinstance(e, SpokenMessageEvent)
+    ] == [
         (
             "support_clarify",
-            "What would you like help with: a cancellation, return, refund, or profile update?",
-        )
+            "What is the order number, for example ORD-1234?",
+        ),
+        (
+            "support_clarify",
+            "What is the order number, for example ORD-1234?",
+        ),
     ]
     state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
     tool_use_ids = {
@@ -1721,22 +1729,13 @@ async def test_support_two_malformed_clarification_calls_are_paired_then_fall_ba
     }
     assert tool_use_ids == tool_result_ids
     assert state["active_flow"] == "support"
-    assert state["clarification_progress"].reasks == 0
+    assert state["clarification_liveness"].reasks == 1
     assert store.refund_count == store.return_count == store.cancel_count == 0
 
 
 @pytest.mark.parametrize(
     ("proposal_model", "arguments"),
     [
-        (
-            support_flow._ProposeRefund,
-            {
-                "order_key": "1",
-                "amount_usd": 10.0,
-                "destination": "original",
-                "unexpected": True,
-            },
-        ),
         (
             support_flow._ProposeCancel,
             {"order_keys": ["1"], "unexpected": True},
@@ -1791,13 +1790,14 @@ async def test_support_double_tool_call_is_acked_in_thread_history(config_root: 
         config_root,
         reasoning=FakeChatModel(
             force_tool="propose_cancel",
-            canned_args=_CANCEL_PROCESSING,
+            canned_args={"propose_cancel": {"order_keys": ["ORD-1002"]}},
             tool_call_limit=1,
             double_tool_calls=True,
         ),
         thread_id="multi-1",
+        routing_resolution=RouteDecision.direct(CancelOrders()),
     )
-    events = await _events(engine, "cancel my rain jacket order")
+    events = await _events(engine, "cancel order ORD-1002")
     assert any(isinstance(e, InterruptEvent) for e in events)  # flow proceeded to readback
     # Structural: EVERY persisted tool_use has a tool_result (a dangling pair fails
     # provider-side history validation on every later model call in the session). The

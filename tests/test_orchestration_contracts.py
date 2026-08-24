@@ -55,7 +55,12 @@ from agnostic_market.dtos.orchestration import (
     project_principal_transition,
     validate_route_output,
 )
-from agnostic_market.dtos.state import ReasoningState, open_active_invocation
+from agnostic_market.dtos.state import (
+    HandoffRequest,
+    HandoffSource,
+    ReasoningState,
+    open_active_invocation,
+)
 
 
 class _RogueRequest(BaseModel):
@@ -67,6 +72,24 @@ class _RogueRequest(BaseModel):
 
 def _cancel_request() -> CancelOrders:
     return CancelOrders(target=CancellableOrderScope(scope="all_cancellable"))
+
+
+def test_handoff_provenance_uses_current_code_owned_sources_only() -> None:
+    assert (
+        HandoffRequest(
+            destination="human",
+            reason_code="other",
+            source=HandoffSource.SEMANTIC_ROUTER,
+        ).source
+        is HandoffSource.SEMANTIC_ROUTER
+    )
+    for removed_source in ("gate", "model"):
+        with pytest.raises(ValidationError):
+            HandoffRequest(
+                destination="human",
+                reason_code="other",
+                source=removed_source,
+            )
 
 
 def test_answer_response_is_a_closed_three_arm_contract() -> None:
@@ -511,6 +534,7 @@ def test_every_capability_id_has_one_valid_intent_shape() -> None:
         CapabilityId.VERIFY_IDENTITY: {"kind": "verify_identity"},
         CapabilityId.SWITCH_ACCOUNT: {"kind": "switch_account"},
         CapabilityId.VIEW_IDENTITY_STATUS: {"kind": "view_identity_status"},
+        CapabilityId.ABORT_CURRENT: {"kind": "abort_current"},
         CapabilityId.DISCLOSE_AI_IDENTITY: {"kind": "disclose_ai_identity"},
         CapabilityId.REQUEST_PERSON: {"kind": "request_person"},
     }
@@ -794,6 +818,7 @@ def test_routing_context_is_bounded_and_authority_free() -> None:
         "recent_order_count",
         "cart_state",
         "available_capabilities",
+        "routing_scope",
     }
     with pytest.raises(ValidationError):
         RoutingContext(

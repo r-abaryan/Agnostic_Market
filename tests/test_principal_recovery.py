@@ -45,23 +45,12 @@ def _identity_harness(
     config_root: Path,
     *,
     customer_claim: str = "+1 555 010 0119",
-    reason_code: str = "list_orders",
     thread_id: str,
     reasoning: FakeChatModel | None = None,
 ) -> SupportHarness:
     return build_support_engine(
         config_root,
         policy=make_policy(refund_returnless_under_usd=50.0),
-        frontline=FakeChatModel(
-            force_tool="request_handover",
-            canned_args={
-                "request_handover": {
-                    "destination": "support",
-                    "reason_code": reason_code,
-                }
-            },
-            tool_call_limit=99,
-        ),
         reasoning=reasoning
         or FakeChatModel(
             force_tool="propose_identity",
@@ -241,7 +230,6 @@ async def test_identity_apply_failure_before_publication_preserves_original_prin
     harness = _identity_harness(
         config_root,
         customer_claim="casey@example.com",
-        reason_code="switch_account",
         thread_id="transition-before-publish",
     )
     assert harness.verification.verify_otp(_OTP)
@@ -366,7 +354,6 @@ async def test_switch_apply_failure_after_coherent_publish_preserves_acknowledge
     harness = _identity_harness(
         config_root,
         customer_claim="casey@example.com",
-        reason_code="switch_account",
         thread_id="switch-after-publish",
     )
     assert harness.verification.verify_otp(_OTP)
@@ -445,7 +432,6 @@ async def test_cancelled_identity_apply_resolves_principal_publication_fail_clos
     harness = _identity_harness(
         config_root,
         customer_claim="casey@example.com",
-        reason_code="switch_account",
         thread_id=f"cancelled-principal-{publication}",
     )
     assert harness.verification.verify_otp(_OTP)
@@ -540,7 +526,6 @@ async def test_unquiescent_identity_apply_defers_terminal_cleanup_until_worker_e
     harness = _identity_harness(
         config_root,
         customer_claim="casey@example.com",
-        reason_code="switch_account",
         thread_id=f"unquiescent-principal-{wait_outcome}-{publication}",
     )
     assert harness.verification.verify_otp(_OTP)
@@ -646,7 +631,6 @@ async def test_deferred_terminal_cleanup_yields_to_session_close_without_recreat
     harness = _identity_harness(
         config_root,
         customer_claim="casey@example.com",
-        reason_code="switch_account",
         thread_id="unquiescent-principal-close-race",
     )
     assert harness.verification.verify_otp(_OTP)

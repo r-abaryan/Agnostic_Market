@@ -52,16 +52,17 @@ from agnostic_market.agents._copy import (
     identity_status_line,
     principal_completion_line,
 )
-from agnostic_market.agents._toolcalls import ack_extra_tool_calls, unknown_tool_result
+from agnostic_market.agents._toolcalls import (
+    ack_extra_tool_calls,
+    current_turn_called,
+    unknown_tool_result,
+)
 from agnostic_market.agents.clarification import (
     advance_clarification,
+    invocation_clarification_owner,
     with_clarification_lifecycle,
 )
 from agnostic_market.agents.identity.prompt import compose_identity_prompt
-from agnostic_market.agents.legacy_observation import (
-    observe_legacy_capabilities,
-    observe_legacy_model_tool_calls,
-)
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore, CustomerDirectory
@@ -76,6 +77,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.state import (
     HandoffRequest,
+    HandoffSource,
     IdentityClarification,
     PendingIdentity,
     PolicyContext,
@@ -116,8 +118,6 @@ class IdentityNodes:
     dispatch: Callable[[ReasoningState], dict[str, object]]
     collect: Callable[[ReasoningState], dict[str, object]]
     apply: Callable[[ReasoningState], dict[str, object]]
-    abort: Callable[[ReasoningState], dict[str, object]]
-    escape_human: Callable[[ReasoningState], dict[str, object]]
     # "leave" | "handover" | "guardrail" | "reask" | "clarify" — from the assemble outcome.
     route_after_assemble: Callable[[ReasoningState], str]
     # "confirm" (already bound to this customer, level held) | "stepup".
@@ -136,7 +136,7 @@ def _flow_exit(update: dict[str, object]) -> dict[str, object]:
         "pending_cancel": None,
         "active_invocation": None,
         "pending_clarification": None,
-        "clarification_progress": None,
+        "clarification_liveness": None,
         **update,
     }
 
@@ -182,20 +182,21 @@ def build_identity_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyIdentity | SwitchAccount):
             raise TypeError("identity capability entry requires an identity invocation")
-        observe_legacy_capabilities((invocation.request.kind,), source="typed_owner")
         return {"active_flow": "identity"}
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left identity", tool_call_id=call_id))
         write_event({"event": "identity_left", "reason": reason})
-        return _flow_exit({"messages": new_messages, "active_flow": "left_identity"})
+        return _flow_exit({"messages": new_messages, "active_flow": None})
 
     def _human_handover(update: dict[str, object]) -> dict[str, object]:
         return _flow_exit(
             {
                 "active_flow": None,
                 "handover": HandoffRequest(
-                    destination="human", reason_code="verification_required", source="gate"
+                    destination="human",
+                    reason_code="verification_required",
+                    source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
                 **update,
             }
@@ -204,7 +205,7 @@ def build_identity_nodes(
     def _clarification_result(state: ReasoningState, new_messages: list) -> dict[str, object]:
         step = advance_clarification(
             state,
-            flow="identity",
+            owner=invocation_clarification_owner(state),
             max_reasks=policy.identity_clarification_reask_max,
         )
         if step.exhausted:
@@ -212,7 +213,7 @@ def build_identity_nodes(
         return {
             "messages": new_messages,
             "pending_clarification": IdentityClarification(),
-            "clarification_progress": step.progress,
+            "clarification_liveness": step.liveness,
         }
 
     def assemble_node(state: ReasoningState) -> dict[str, object]:
@@ -241,7 +242,6 @@ def build_identity_nodes(
             response = model.invoke(messages)
             if not response.tool_calls:
                 return _clarification_result(state, new_messages)
-            observe_legacy_model_tool_calls(response.tool_calls)
             new_messages.append(response)
             ack_extra_tool_calls(response, new_messages)
             call = response.tool_calls[0]
@@ -465,34 +465,9 @@ def build_identity_nodes(
             "active_flow": "support",
         }
 
-    def abort_node(state: ReasoningState) -> dict[str, object]:
-        """Entry-router escape: explicit abort while identity was in flight. Names what was
-        dropped (the verification) and what wasn't touched (the account)."""
-        write_event({"event": "identity_cancelled", "reason": "aborted"})
-        return _flow_exit(
-            {
-                "active_flow": None,
-                "messages": [
-                    AIMessage(
-                        "No problem - I've dropped that. Nothing on your account has changed."
-                    )
-                ],
-            }
-        )
-
-    def escape_human_node(state: ReasoningState) -> dict[str, object]:
-        """Entry-router escape: the caller asked for a person mid-identity (§A9 no-trap)."""
-        write_event({"event": "identity_cancelled", "reason": "human_requested"})
-        return _flow_exit(
-            {
-                "active_flow": None,
-                "handover": HandoffRequest(destination="human", reason_code="other", source="gate"),
-            }
-        )
-
     def route_after_assemble(state: ReasoningState) -> str:
         # Which outcome did assemble reach? Order matters (terminal states first).
-        if state.active_flow == "left_identity":
+        if current_turn_called(state.messages, "leave_identity"):
             return "leave"  # model explicitly left; normal pipeline answers this turn
         if state.handover is not None:
             return "handover"  # terminal second no-match -> the silent human path
@@ -543,8 +518,6 @@ def build_identity_nodes(
         dispatch=stepup.dispatch,
         collect=_clear_selection_on_handover(stepup.collect),
         apply=apply_node,
-        abort=abort_node,
-        escape_human=escape_human_node,
         route_after_assemble=route_after_assemble,
         route_after_guardrail=route_after_guardrail,
         route_after_collect=route_after_collect,
@@ -555,7 +528,6 @@ def build_identity_nodes(
                 "identity_risk_check",
                 "identity_collect",
                 "identity_apply",  # authors the scoped order list
-                "identity_abort",
             }
         ),
     )

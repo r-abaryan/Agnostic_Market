@@ -6,7 +6,7 @@ ONE coherent job, deliberately narrow:
   - dispatch: a fresh turn is fed as a DELTA (`{"messages": [<new user message>]}` — the
     thread's checkpoint carries history; feeding full transport history would duplicate
     it, verified 2026-07-08), a turn arriving while the graph is paused at an interrupt
-    resumes it with `Command(resume={text, readback_interrupted})`;
+    resumes it with `Command(resume={text, readback_interrupted, handoff_source?})`;
   - interrupt detection (the `__interrupt__` update) → an InterruptEvent wrapping the
     GRAPH-authored payload.
 
@@ -34,7 +34,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -45,9 +45,9 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
 from pydantic import ValidationError
 
-from agnostic_market.agents.legacy_observation import (
-    LegacyRouteObservation,
-    legacy_route_observation_scope,
+from agnostic_market.agents._consent import (
+    classify_cancel_consent,
+    classify_consent,
 )
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
@@ -58,7 +58,7 @@ from agnostic_market.agents.recovery import (
     NodeRecoveryPolicy,
     clear_automation_state,
 )
-from agnostic_market.agents.routing import ShadowRoutingSession
+from agnostic_market.agents.routing import RoutingSession
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.dtos.events import (
     CommittedTurn,
@@ -73,13 +73,20 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     CapabilityDispatchEnvelope,
     CapabilityId,
+    InvocationClarificationOwner,
     PrincipalTransition,
+    RequestPerson,
+    RouteDecision,
+    RouterClarificationOwner,
+    RouterNoActionEnvelope,
+    RoutingFailure,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CartClarification,
-    ClarificationProgress,
+    ClarificationLiveness,
     HandoffRequest,
+    HandoffSource,
     IdentityClarification,
     PendingCancelBatch,
     PendingCartMutation,
@@ -117,6 +124,7 @@ def _write_ingress_rejection(
 _CHECKPOINT_CHANNEL_DTOS = (
     ActiveInvocation,
     CapabilityDispatchEnvelope,
+    RouterNoActionEnvelope,
     PendingCartMutation,
     PendingPlacement,
     PendingRefund,
@@ -129,13 +137,13 @@ _CHECKPOINT_CHANNEL_DTOS = (
     IdentityClarification,
     SupportClarification,
     CartClarification,
-    ClarificationProgress,
+    ClarificationLiveness,
     HandoffRequest,
 )
 # Pydantic's Python-mode model_dump flattens nested models but retains custom enum values.
 # LangGraph therefore sees these two constructors independently while decoding otherwise valid
 # channel DTOs. Keep them separate from the schema-derived channel boundary and exact-pinned.
-_CHECKPOINT_NESTED_ENUMS = (CapabilityId, ExceptionAction)
+_CHECKPOINT_NESTED_ENUMS = (CapabilityId, ExceptionAction, HandoffSource)
 
 
 def build_checkpointer() -> InMemorySaver:
@@ -255,19 +263,16 @@ class _GraphSpans:
       - `ttf_model`: to the completed model update. The historical key is retained for log
         continuity, but update-only streaming cannot observe provider generation-start;
       - `tools`: how many tool calls ran (0 = single pass; >=1 = a read/mutation loop);
-      - `tool_to_next_model`: from the last tool result to the model activity AFTER it — the
-        cost of the second reasoning pass that renders a tool result into speech. STAYS None
-        when a deterministic read renderer (the `read_render` node) authored the post-tool
-        line INSTEAD of a second model pass (L3) — only the `model` node runs the LLM, so a
-        node-authored AIMessage is not counted as model activity;
+      - `tool_to_next_model`: from the last tool result to the next declared model node;
       - `total`: whole in-graph time.
     Passive: it only observes the stream the engine already consumes; it authors nothing and
     speaks nothing (the one-author rule holds). Logged at DEBUG — a telemetry backend is
     Phase 6; this is the diagnostic the renderer-bypass decision (T2 latency pass) needs.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_nodes: frozenset[str]) -> None:
         self._start = time.perf_counter()
+        self._model_nodes = model_nodes
         self._ttf_model: float | None = None
         self._tool_count = 0
         self._last_tool_at: float | None = None
@@ -279,12 +284,9 @@ class _GraphSpans:
             self._tool_count += 1
             self._last_tool_at = now
             return
-        # Only the `model` node runs the LLM; a node-authored AIMessage (a read render, a
-        # guardrail decline, a readback) is NOT a model pass and must not be timed as one —
-        # else L3's rendered turns would show a phantom second-model-pass cost.
         node = meta.get("langgraph_node") if isinstance(meta, dict) else None
         is_model = (
-            node == "model"
+            node in self._model_nodes
             and isinstance(token, AIMessageChunk | AIMessage)
             and (bool(str(token.text)) or bool(getattr(token, "tool_calls", None)))
         )
@@ -409,8 +411,8 @@ class ReasoningEngine:
         *,
         thread_id: str,
         cancellation_quiescence_timeout_seconds: float,
+        routing: RoutingSession,
         lifecycle: PrincipalTransitionLifecycle | None = None,
-        shadow_routing: ShadowRoutingSession | None = None,
     ) -> None:
         if graph.checkpointer is None:
             raise ValueError(
@@ -422,11 +424,19 @@ class ReasoningEngine:
         self._config = {"configurable": {"thread_id": thread_id}}
         self._speakable: frozenset[str] = getattr(graph, "speakable_nodes", frozenset())
         self._model_speech: frozenset[str] = getattr(graph, "model_speech_nodes", frozenset())
+        model_execution_nodes = getattr(graph, "model_execution_nodes", None)
+        if not isinstance(model_execution_nodes, frozenset) or not all(
+            isinstance(name, str) for name in model_execution_nodes
+        ):
+            raise ValueError("ReasoningEngine requires graph-declared model execution nodes")
+        self._model_execution_nodes: frozenset[str] = model_execution_nodes
         # A session is a serial conversation. A waiter re-checks the checkpoint so two
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
         self._lifecycle = lifecycle
-        self._shadow_routing = shadow_routing
+        if not isinstance(routing, RoutingSession):
+            raise ValueError("ReasoningEngine requires an active RoutingSession")
+        self._routing = routing
         if cancellation_quiescence_timeout_seconds <= 0:
             raise ValueError("cancellation quiescence timeout must be positive")
         self._cancellation_quiescence_timeout_seconds = cancellation_quiescence_timeout_seconds
@@ -449,6 +459,15 @@ class ReasoningEngine:
         ):
             raise ValueError("ReasoningEngine requires graph-declared node recovery policies")
         self._node_recovery_policies: Mapping[str, NodeRecoveryPolicy] = recovery_policies
+        consent_interrupt_kinds = getattr(graph, "consent_interrupt_kinds", None)
+        if not isinstance(consent_interrupt_kinds, Mapping) or not all(
+            isinstance(name, str) and bool(name) and kind in ("standard", "cancel")
+            for name, kind in consent_interrupt_kinds.items()
+        ):
+            raise ValueError("ReasoningEngine requires graph-declared consent interrupts")
+        self._consent_interrupt_kinds: Mapping[str, Literal["standard", "cancel"]] = dict(
+            consent_interrupt_kinds
+        )
         infrastructure_nodes = getattr(graph, "recovery_infrastructure_nodes", None)
         if not isinstance(infrastructure_nodes, frozenset) or not all(
             isinstance(name, str) for name in infrastructure_nodes
@@ -478,57 +497,6 @@ class ReasoningEngine:
         if not self._node_execution_tracker.turn_admission_open or self._terminal_latched:
             return False
         return bool(self._graph.get_state(self._config).interrupts)
-
-    def _start_shadow_routing(
-        self,
-        turn: CommittedTurn,
-        state: ReasoningState,
-    ) -> asyncio.Task[None] | None:
-        shadow = self._shadow_routing
-        if shadow is None:
-            return None
-        projection = shadow.prepare(turn, state)
-        if projection is None:
-            return None
-        turn_id = turn.message_id
-        if turn_id is None:
-            raise RuntimeError("ordinary admitted shadow turn requires a committed id")
-        return asyncio.create_task(
-            shadow.observe(turn_id, projection),
-            name="semantic-route-shadow",
-        )
-
-    async def _finish_shadow_routing(
-        self,
-        task: asyncio.Task[None] | None,
-        *,
-        turn_id: str,
-        turn_cancelled: bool,
-    ) -> None:
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
-        try:
-            async with asyncio.timeout(self._cancellation_quiescence_timeout_seconds):
-                await task
-        except asyncio.CancelledError:
-            shadow = self._shadow_routing
-            if shadow is not None:
-                shadow.record_cancellation(
-                    turn_id,
-                    reason="turn_cancelled" if turn_cancelled else "turn_complete",
-                )
-        except TimeoutError:
-            shadow = self._shadow_routing
-            if shadow is not None:
-                shadow.record_failure(turn_id, reason="cleanup_timeout")
-            logger.critical("shadow recognizer did not honor cancellation within the bound")
-        except Exception:
-            shadow = self._shadow_routing
-            if shadow is not None:
-                shadow.record_failure(turn_id, reason="observer_error")
-            logger.error("shadow routing observation failed")
 
     def _rotate_pending_transition(
         self,
@@ -776,17 +744,28 @@ class ReasoningEngine:
             if field != "active_invocation"
         )
 
-    def _is_checkpointed_dispatch_redelivery(
+    def _is_checkpointed_route_redelivery(
         self,
         snapshot: StateSnapshot,
         state: ReasoningState,
         message_id: str,
     ) -> bool:
-        envelope = state.pending_capability_dispatch
-        if not isinstance(envelope, CapabilityDispatchEnvelope):
+        pending_values = tuple(
+            value
+            for value in (
+                state.pending_capability_dispatch,
+                state.pending_router_no_action,
+            )
+            if value is not None
+        )
+        if len(pending_values) != 1:
             return False
+        envelope = pending_values[0]
         try:
-            envelope = CapabilityDispatchEnvelope.model_validate(envelope)
+            if isinstance(envelope, CapabilityDispatchEnvelope):
+                envelope = CapabilityDispatchEnvelope.model_validate(envelope)
+            else:
+                envelope = RouterNoActionEnvelope.model_validate(envelope)
         except (TypeError, ValueError):
             return False
         return bool(
@@ -799,6 +778,108 @@ class ReasoningEngine:
             and snapshot.next == (self._recovery_entry_node,)
             and _task_matches(snapshot, self._recovery_entry_node, interrupted=False)
         )
+
+    def _closed_consent_verdict(self, node: str, text: str) -> str | None:
+        kind = self._consent_interrupt_kinds.get(node)
+        if kind is None:
+            return None
+        return classify_cancel_consent(text) if kind == "cancel" else classify_consent(text)
+
+    async def _confirmation_handoff_source(
+        self,
+        turn: CommittedTurn,
+        state: ReasoningState,
+        node: str,
+    ) -> HandoffSource | None:
+        if self._closed_consent_verdict(node, turn.text) != "unclear":
+            return None
+        resolution = await self._routing.resolve_confirmation_escape(turn, state)
+        if (
+            isinstance(resolution, RouteDecision)
+            and resolution.decision == "direct"
+            and isinstance(resolution.request, RequestPerson)
+        ):
+            return HandoffSource.SEMANTIC_ROUTER
+        if isinstance(resolution, RoutingFailure) and resolution.reason == "routing_unavailable":
+            return HandoffSource.ROUTING_FAILURE_POLICY
+        return None
+
+    @staticmethod
+    def _no_action_owner(state: ReasoningState):
+        invocation = state.active_invocation
+        if invocation is not None:
+            return InvocationClarificationOwner(invocation_id=invocation.invocation_id)
+        liveness = state.clarification_liveness
+        if liveness is not None and isinstance(liveness.owner, RouterClarificationOwner):
+            return liveness.owner
+        return RouterClarificationOwner()
+
+    async def _ordinary_turn_payload(
+        self,
+        turn: CommittedTurn,
+        state: ReasoningState,
+    ) -> dict[str, object]:
+        message_id = turn.message_id
+        if message_id is None:
+            raise ValueError("ordinary routed turn requires a committed id")
+        payload: dict[str, object] = {
+            "messages": [HumanMessage(content=turn.text, id=message_id)],
+            "consumed_turn_ids": (message_id,),
+        }
+        invocation = state.active_invocation
+        if invocation is not None and not self._routing.capability_available(invocation.capability):
+            payload.update(
+                {
+                    "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                        turn_id=message_id,
+                        mode="continue",
+                        observed_invocation_id=invocation.invocation_id,
+                    ),
+                    "clarification_liveness": None,
+                }
+            )
+            return payload
+
+        resolution = await self._routing.resolve(turn, state)
+        if isinstance(resolution, RouteDecision) and resolution.decision == "direct":
+            request = resolution.request
+            if request is not None:
+                payload.update(
+                    {
+                        "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                            turn_id=message_id,
+                            mode="direct",
+                            request=request,
+                        ),
+                        "clarification_liveness": None,
+                    }
+                )
+                return payload
+            resolution = RoutingFailure(reason="decision_rejected")
+        elif isinstance(resolution, RouteDecision) and resolution.decision == "continue":
+            invocation = state.active_invocation
+            if invocation is not None:
+                payload["pending_capability_dispatch"] = CapabilityDispatchEnvelope(
+                    turn_id=message_id,
+                    mode="continue",
+                    observed_invocation_id=invocation.invocation_id,
+                )
+                return payload
+            resolution = RoutingFailure(reason="decision_rejected")
+
+        reason = (
+            resolution.clarification_reason
+            if isinstance(resolution, RouteDecision)
+            else resolution.reason
+        )
+        if reason is None:
+            reason = "decision_rejected"
+        payload["pending_router_no_action"] = RouterNoActionEnvelope(
+            turn_id=message_id,
+            owner=self._no_action_owner(state),
+            reason=reason,
+        )
+        return payload
 
     def _seed_stream_recovery(
         self,
@@ -959,9 +1040,6 @@ class ReasoningEngine:
         arrived_interrupt_ids = frozenset(interrupt.id for interrupt in arrived.interrupts)
         async with self._turn_lock:
             cancelled_stream = False
-            shadow_task: asyncio.Task[None] | None = None
-            legacy_observation: LegacyRouteObservation | None = None
-            observation_stack = ExitStack()
             owned_stream_thread_id: str | None = None
             owned_resumed_interrupt_node: str | None = None
             try:
@@ -978,9 +1056,26 @@ class ReasoningEngine:
                 snapshot = self._graph.get_state(self._config)
                 snapshot_state = ReasoningState.model_validate(snapshot.values)
                 cross_thread = arrived_thread_id != self._thread_id
-                marker = self._validated_pending_recovery(snapshot, snapshot_state)
+                marker = (
+                    None
+                    if snapshot_state.automation_terminal
+                    else self._validated_pending_recovery(snapshot, snapshot_state)
+                )
                 resumed_interrupt_node: str | None = None
-                if cross_thread:
+                if snapshot_state.automation_terminal:
+                    if message_id in snapshot_state.consumed_turn_ids:
+                        write_event(
+                            {
+                                "event": "duplicate_turn_ignored",
+                                "reason": "consumed_turn_id",
+                            }
+                        )
+                        return
+                    payload = {
+                        "messages": [HumanMessage(content=turn.text, id=message_id)],
+                        "consumed_turn_ids": (message_id,),
+                    }
+                elif cross_thread:
                     write_event({"event": "cross_thread_turn_consumed"})
                     if marker is not None:
                         payload: object = Command(
@@ -1037,7 +1132,7 @@ class ReasoningEngine:
                             update={"consumed_turn_ids": () if already_consumed else (message_id,)}
                         )
                 elif message_id in snapshot_state.consumed_turn_ids:
-                    if self._is_checkpointed_dispatch_redelivery(
+                    if self._is_checkpointed_route_redelivery(
                         snapshot,
                         snapshot_state,
                         message_id,
@@ -1065,11 +1160,19 @@ class ReasoningEngine:
                         if resumed_interrupt_node is None:
                             yield self._enter_last_resort()
                             return
+                        resume_payload: dict[str, object] = {
+                            "text": turn.text,
+                            "readback_interrupted": facts.readback_interrupted,
+                        }
+                        handoff_source = await self._confirmation_handoff_source(
+                            turn,
+                            snapshot_state,
+                            resumed_interrupt_node,
+                        )
+                        if handoff_source is not None:
+                            resume_payload["handoff_source"] = handoff_source.value
                         payload = Command(
-                            resume={
-                                "text": turn.text,
-                                "readback_interrupted": facts.readback_interrupted,
-                            },
+                            resume=resume_payload,
                             update={"consumed_turn_ids": (message_id,)},
                         )
                     else:
@@ -1083,17 +1186,9 @@ class ReasoningEngine:
                     yield self._enter_last_resort()
                     return
                 else:
-                    shadow_task = self._start_shadow_routing(turn, snapshot_state)
-                    if shadow_task is not None:
-                        legacy_observation = observation_stack.enter_context(
-                            legacy_route_observation_scope(message_id)
-                        )
-                    payload = {
-                        "messages": [HumanMessage(content=turn.text, id=message_id)],
-                        "consumed_turn_ids": (message_id,),
-                    }
+                    payload = await self._ordinary_turn_payload(turn, snapshot_state)
                 speech = _TurnSpeech(self._speakable, self._model_speech)
-                spans = _GraphSpans()
+                spans = _GraphSpans(self._model_execution_nodes)
                 while True:
                     # LangGraph 1.2.7 re-raises an already-handled node exception when
                     # `messages` participates in an async stream. Its update-only path
@@ -1142,14 +1237,6 @@ class ReasoningEngine:
                 yield self._enter_last_resort()
                 return
             finally:
-                observation_stack.close()
-                if legacy_observation is not None:
-                    write_event(legacy_observation.as_event())
-                await self._finish_shadow_routing(
-                    shadow_task,
-                    turn_id=message_id,
-                    turn_cancelled=cancelled_stream,
-                )
                 if not cancelled_stream and not self._terminal_latched:
                     try:
                         self._rotate_pending_transition(message_id)

@@ -2,27 +2,35 @@
 # These are sanitized phrases observed in live-call #18, not a claim of real-dataset coverage.
 
 order_reference:
-  expected_order_id: "ORD-1002"
   accepted_labelled_stt:
-    - "cancel order ORD-1002"
-    - "cancel order one zero zero two"
-    - "Cancel order. O r d one zero zero two."
-    - "cancel ord1002"
-    - "cancel ORD 1002"
-  rejected_stt:
-    - utterance: "cancel my rain jacket order"
-      proposed_order_id: "ORD-1002"
-    - utterance: "cancel one zero zero two"
-      proposed_order_id: "ORD-1002"
-    - utterance: "cancel option two"
-      proposed_order_id: "ORD-1002"
-    - utterance: "cancel order ORD-100"
-      proposed_order_id: "ORD-1002"
-    - utterance: "cancel order ORD-1002 or ORD-1001"
-      proposed_order_id: "ORD-1002"
     - utterance: "cancel order ORD-1002"
-      proposed_order_id: "2"
-    - utterance: "refund $1002"
-      proposed_order_id: "ORD-1002"
-    - utterance: "refund my order for $1001"
-      proposed_order_id: "ORD-1001"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "cancel order one zero zero two"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "Cancel order. O r d one zero zero two."
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "cancel ord1002"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "cancel ORD 1002"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "cancel order 1002"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "Cancel O R D dash one zero zero two"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "cancel or d one zero zero two"
+      expected_order_refs: ["ORD-1002"]
+    - utterance: "cancel ORD-1002 and order ORD-1001"
+      expected_order_refs: ["ORD-1002", "ORD-1001"]
+    - utterance: "cancel ORD-1002, ORD-1001 plus ORD-1002"
+      expected_order_refs: ["ORD-1002", "ORD-1001"]
+  rejected_stt:
+    - "cancel my rain jacket order"
+    - "cancel one zero zero two"
+    - "cancel option two"
+    - "cancel order ORD-1002 or ORD-1001"
+    - "cancel order ORD-1002 and 1001"
+    - "cancel order ORD-1002 and my other order"
+    - "do not cancel order ORD-1002"
+    - "cancel order ORD-1002, actually order ORD-1001 instead"
+    - "refund $1002"
+    - "refund my order for $1001"

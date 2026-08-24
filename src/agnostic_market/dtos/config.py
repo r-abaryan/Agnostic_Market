@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 # Reusable strict base: forbid unknown keys, validate on assignment.
 _STRICT = ConfigDict(extra="forbid", validate_assignment=True)
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
 
 class ProviderModel(BaseModel):
@@ -33,6 +34,10 @@ class ProviderModel(BaseModel):
 
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class LLMConfig(BaseModel):
@@ -130,7 +135,7 @@ _DEFAULT_PENDING_TTL_SECONDS = 120.0
 
 
 class ClarificationReaskPolicy(BaseModel):
-    """Per-flow conversational-liveness budgets.
+    """Per-owner conversational-liveness budgets.
 
     Values count additional questions after the initial clarification. The fields are required:
     effective values come from layered config, never a second set of source-code defaults.
@@ -141,6 +146,7 @@ class ClarificationReaskPolicy(BaseModel):
     identity: int = Field(ge=0)
     support: int = Field(ge=0)
     cart: int = Field(ge=0)
+    router: int = Field(ge=0)
 
 
 class SecurityPolicy(BaseModel):
@@ -228,6 +234,7 @@ class PolicyConfig(BaseModel):
             identity_clarification_reask_max=self.clarification_reask_max.identity,
             support_clarification_reask_max=self.clarification_reask_max.support,
             cart_clarification_reask_max=self.clarification_reask_max.cart,
+            router_clarification_reask_max=self.clarification_reask_max.router,
             cancel_batch_max=self.cancel_batch_max,
         )
 

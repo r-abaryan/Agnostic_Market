@@ -9,6 +9,7 @@ kept out here so nothing imports a half-defined shape prematurely.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated, Literal
 
 from langchain_core.messages import AnyMessage, HumanMessage
@@ -21,7 +22,9 @@ from agnostic_market.dtos.orchestration import (
     CancellableOrderScope,
     CapabilityDispatchEnvelope,
     CartOperation,
+    ClarificationOwner,
     IntentRequest,
+    RouterNoActionEnvelope,
     VerifyOrderStatus,
 )
 from agnostic_market.dtos.recovery import PendingRecovery
@@ -43,9 +46,14 @@ def merge_consumed_turn_ids(
     return tuple(merged)
 
 
-# Handover destinations (tiers). Only "support"/"human" have a spoken sink in 3a; the rest
-# are declared now so the tool schema is stable, and get real flows in 3b/3c/3d.
-HandoffDestination = Literal["support", "checkout", "planner", "human"]
+HandoffDestination = Literal["human"]
+
+
+class HandoffSource(StrEnum):
+    DETERMINISTIC_POLICY = "deterministic_policy"
+    SEMANTIC_ROUTER = "semantic_router"
+    ROUTING_FAILURE_POLICY = "routing_failure_policy"
+
 
 # Why a handover fired — a CLOSED enum, never free prose: it is logged (HandoffRequested),
 # so prose here would be a PII echo channel (a model-written reason could carry an address).
@@ -102,6 +110,7 @@ class PolicyContext(BaseModel):
     identity_clarification_reask_max: int = Field(ge=0)
     support_clarification_reask_max: int = Field(ge=0)
     cart_clarification_reask_max: int = Field(ge=0)
+    router_clarification_reask_max: int = Field(ge=0)
     # Max orders in one cancel batch — a SAFETY bound (a big batch must fit the LangGraph
     # recursion/step budget), NOT a merchant knob: it is `_safety_locked` in config, so no
     # tenant can touch it. Over-cap asks the caller to narrow, never silently takes the first
@@ -390,14 +399,8 @@ class PendingIdentity(BaseModel):
     grants_at_mint: int = Field(ge=0)
 
 
-# Flows a session can be "inside" across turns (entry router bypasses gate/frontline).
-# "left_*" are TURN-SCOPED markers (reset at entry): the model left the flow this turn, so
-# a same-turn re-entry is blocked — breaks the assemble->gate->handover->assemble cycle
-# structurally instead of relying on the recursion limit. Each gated flow carries its own
-# sticky value + left-twin so the entry router knows which flow's escape/stickiness rules
-# apply. Group B: the "cart" flow owns both cart MUTATION and the whole-cart placement tail
-# (the single-line "checkout" flow it replaces is gone — direct-buy normalizes through it).
-ActiveFlow = Literal["cart", "left_cart", "support", "left_support", "identity", "left_identity"]
+# Graph-local execution phase for transactional capability owners.
+ActiveFlow = Literal["cart", "support", "identity"]
 
 
 class IdentityClarification(BaseModel):
@@ -449,31 +452,23 @@ PendingClarification = Annotated[
 ]
 
 
-ClarificationOwner = Literal["identity", "support", "cart"]
-
-
-class ClarificationProgress(BaseModel):
-    """Consecutive clarification questions for one sticky flow engagement."""
+class ClarificationLiveness(BaseModel):
+    """Consecutive clarification questions for one explicit owner."""
 
     model_config = _FROZEN
 
-    flow: ClarificationOwner
+    owner: ClarificationOwner
     reasks: int = Field(ge=0)
 
 
 class HandoffRequest(BaseModel):
-    """A frontline decision to hand a turn to a higher tier (AGENTS.md handover boundary).
-
-    Set by either the deterministic gate (`source="gate"`, pre-generation) or the model's
-    `request_handover` tool call (`source="model"`). Carries no free text — `reason_code`
-    is a closed enum so the logged handover cannot leak caller PII.
-    """
+    """A capability or control decision to terminate automation for human help."""
 
     model_config = _FROZEN
 
     destination: HandoffDestination
     reason_code: HandoffReasonCode
-    source: Literal["gate", "model"]
+    source: HandoffSource
 
 
 class ReasoningState(BaseModel):
@@ -496,6 +491,7 @@ class ReasoningState(BaseModel):
     # until the caller lifecycle deletes the checkpoint; it is never an identity/account block.
     automation_terminal: bool = False
     pending_capability_dispatch: CapabilityDispatchEnvelope | None = None
+    pending_router_no_action: RouterNoActionEnvelope | None = None
     pending_cart_mutation: PendingCartMutation | None = None
     pending_placement: PendingPlacement | None = None
     pending_refund: PendingRefund | None = None
@@ -510,8 +506,7 @@ class ReasoningState(BaseModel):
     pending_recovery: PendingRecovery | None = None
     # Bounded re-ask counter for the identity flow's contact claim (P7 decision 4: ONE
     # softened re-ask on a no-match — STT mishears emails constantly — then a silent human
-    # handover). Spans turns WITHIN the sticky flow; cleared on every flow exit (apply,
-    # abort, escape, leave, cross-switch, terminal handover).
+    # handover). Spans turns within the identity invocation and clears on every exit.
     identity_claim_misses: int = 0
     active_flow: ActiveFlow | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
@@ -522,12 +517,11 @@ class ReasoningState(BaseModel):
     # Turn-scoped instruction for a flow-owned, code-authored clarification line. Each
     # transactional flow writes its own selector atomically as it yields to its renderer.
     pending_clarification: PendingClarification | None = None
-    # Engagement-scoped liveness tracker. Entry preserves it while the same sticky flow
-    # continues; real progress and every lifecycle exit clear it.
-    clarification_progress: ClarificationProgress | None = None
+    # One liveness tracker owned by an invocation or consecutive router clarification.
+    clarification_liveness: ClarificationLiveness | None = None
 
     def last_user_text(self) -> str:
-        """Return the latest stored caller text, preserving the legacy flow lookup contract."""
+        """Return the latest committed caller text."""
 
         for message in reversed(self.messages):
             if isinstance(message, HumanMessage):

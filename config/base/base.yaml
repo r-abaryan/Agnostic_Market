@@ -58,6 +58,7 @@ _platform:
       identity: 2                               # missing verification contact: exit sooner
       support: 4                                # room for multi-slot support requests
       cart: 4                                   # bounded shopping help, never placement
+      router: 4                                 # ordinary no-action turns must terminate
 
 # Structural default shared by all merchants (override may not change it — locked above).
 schema_version: "0.2"
@@ -86,6 +87,7 @@ policies:
     identity: 1
     support: 2
     cart: 2
+    router: 2
 
 # Call-start AI disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1), applies 2 Aug 2026).
 # WORDING is merchant-overridable (brand/voice/locale); WHETHER it plays is code

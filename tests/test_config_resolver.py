@@ -37,6 +37,7 @@ def _base() -> dict:
                     "identity": 2,
                     "support": 4,
                     "cart": 4,
+                    "router": 4,
                 },
             },
         },
@@ -54,6 +55,7 @@ def _base() -> dict:
                 "identity": 1,
                 "support": 2,
                 "cart": 2,
+                "router": 2,
             },
         },
     }
@@ -329,6 +331,7 @@ def test_security_knobs_at_ceiling_are_allowed() -> None:
         ("identity", 3),
         ("support", 5),
         ("cart", 5),
+        ("router", 5),
     ],
 )
 def test_clarification_reask_over_flow_ceiling_is_rejected(flow: str, over_value: int) -> None:
@@ -352,4 +355,5 @@ def test_security_knobs_default_when_unset() -> None:
         "identity": 1,
         "support": 2,
         "cart": 2,
+        "router": 2,
     }

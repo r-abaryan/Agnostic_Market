@@ -10,7 +10,9 @@ session — one bad turn would poison the whole call.
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, ToolMessage
+from collections.abc import Sequence
+
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
 
 def unknown_tool_result(call_id: str, *, leave_tool: str) -> ToolMessage:
@@ -33,3 +35,14 @@ def ack_extra_tool_calls(response: AIMessage, new_messages: list) -> None:
                 tool_call_id=extra["id"],
             )
         )
+
+
+def current_turn_called(messages: Sequence[AnyMessage], tool_name: str) -> bool:
+    """Return whether the latest model response in this turn called one tool."""
+
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return False
+        if isinstance(message, AIMessage):
+            return any(call["name"] == tool_name for call in message.tool_calls)
+    return False

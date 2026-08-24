@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Literal
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -21,8 +22,8 @@ from agnostic_market.agents.routing import (
     ROUTER_SYSTEM_PROMPT,
     RoutingAttempt,
     RoutingRecognizer,
+    RoutingSession,
     SemanticRouter,
-    ShadowRoutingSession,
     materialize_route,
     project_routing_context,
     registry_fingerprint,
@@ -34,6 +35,7 @@ from agnostic_market.commerce.orders import RecentOrderContext
 from agnostic_market.dtos.config import ProviderModel
 from agnostic_market.dtos.events import CommittedTurn
 from agnostic_market.dtos.orchestration import (
+    AbortCurrent,
     ActiveInvocation,
     AnswerQuestion,
     CancelOrders,
@@ -108,8 +110,10 @@ def _registry(*request_types: type[IntentRequestModel]) -> CapabilityRegistry:
 def _context(
     *capabilities: CapabilityId,
     active: CapabilityId | None = None,
+    routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary",
 ) -> RoutingContext:
     return RoutingContext(
+        routing_scope=routing_scope,
         utterance="cancel all my orders",
         bound_customer=False,
         active_capability=active,
@@ -230,7 +234,7 @@ def test_projector_rejects_terminal_state_before_reading_live_stores(
     assert result == RoutingFailure(reason="context_invalid")
 
 
-async def test_shadow_session_deduplicates_and_emits_only_closed_route_fields(
+async def test_routing_session_resolves_and_emits_only_closed_route_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     records: list[dict[str, object]] = []
@@ -239,7 +243,7 @@ async def test_shadow_session_deduplicates_and_emits_only_closed_route_fields(
     recognizer: RoutingRecognizer = _RecordingRecognizer(
         _attempt(RouteDecision.direct(SearchCatalog(query="private product wording")))
     )
-    shadow = ShadowRoutingSession(
+    routing = RoutingSession(
         recognizer,
         identity_store=CallerIdentityStore(),
         cart_store=CartStore(),
@@ -248,27 +252,28 @@ async def test_shadow_session_deduplicates_and_emits_only_closed_route_fields(
     )
     turn = CommittedTurn(
         text="find private product wording and call me on +44 7700 900123",
-        message_id="shadow-turn-1",
+        message_id="route-turn-1",
     )
 
-    projection = shadow.prepare(turn, ReasoningState())
+    projection = routing.project(turn, ReasoningState())
     assert isinstance(projection, RoutingContext)
-    assert shadow.prepare(turn, ReasoningState()) is None
-    await shadow.observe("shadow-turn-1", projection)
+    resolution = await routing.resolve(turn, ReasoningState())
 
     assert isinstance(recognizer, _RecordingRecognizer)
     assert recognizer.contexts == [projection]
+    assert resolution == RouteDecision.direct(SearchCatalog(query="private product wording"))
     assert records == [
         {
-            "event": "semantic_route_shadow",
-            "turn_id": "shadow-turn-1",
-            "decision_source": "shadow",
+            "event": "semantic_route",
+            "turn_id": "route-turn-1",
+            "decision_source": "active",
             "decision": "direct",
             "capability": "search_catalog",
             "clarification_reason": None,
             "failure_reason": None,
             "provider": "fake",
             "model": "recognizer",
+            "reasoning_effort": None,
             "structured_output_method": TEST_STRUCTURED_OUTPUT_METHOD,
             "latency_ms": 12.5,
             "input_tokens": 21,
@@ -288,9 +293,9 @@ async def test_shadow_session_deduplicates_and_emits_only_closed_route_fields(
     assert "request" not in records[0]
 
 
-async def test_shadow_projection_failure_calls_no_recognizer() -> None:
+async def test_routing_projection_failure_calls_no_recognizer() -> None:
     recognizer = _RecordingRecognizer(_attempt(RouteDecision.direct(ViewCart())))
-    shadow = ShadowRoutingSession(
+    routing = RoutingSession(
         recognizer,
         identity_store=CallerIdentityStore(),
         cart_store=CartStore(),
@@ -298,13 +303,16 @@ async def test_shadow_projection_failure_calls_no_recognizer() -> None:
         registry=_registry(ViewCart),
     )
 
-    projection = shadow.prepare(
-        CommittedTurn(text="show my cart", message_id="terminal-shadow-turn"),
+    turn = CommittedTurn(text="show my cart", message_id="terminal-route-turn")
+    projection = routing.project(
+        turn,
         ReasoningState(automation_terminal=True),
     )
 
     assert projection == RoutingFailure(reason="context_invalid")
-    await shadow.observe("terminal-shadow-turn", projection)
+    assert await routing.resolve(turn, ReasoningState(automation_terminal=True)) == RoutingFailure(
+        reason="context_invalid"
+    )
     assert recognizer.contexts == []
 
 
@@ -334,6 +342,46 @@ def test_route_resolver_preserves_executable_decisions() -> None:
         )
         is continuation
     )
+
+
+@pytest.mark.parametrize(
+    "decision",
+    (
+        RouteDecision.direct(ViewCart()),
+        RouteDecision.continue_current(),
+        RouteDecision.clarify("missing_value"),
+    ),
+)
+def test_confirmation_scope_allows_only_request_person(decision: RouteDecision) -> None:
+    context = _context(
+        CapabilityId.VIEW_CART,
+        CapabilityId.REQUEST_PERSON,
+        active=CapabilityId.VIEW_CART,
+        routing_scope="confirmation_escape",
+    )
+
+    assert resolve_route(context, decision) == RouteDecision.clarify("ambiguous_intent")
+    person = RouteDecision.direct(RequestPerson())
+    assert resolve_route(context, person) is person
+
+
+async def test_confirmation_escape_projects_its_scope_for_the_one_recognizer() -> None:
+    recognizer = _RecordingRecognizer(_attempt(RouteDecision.direct(ViewCart())))
+    routing = RoutingSession(
+        recognizer,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=1),
+        registry=_registry(ViewCart, RequestPerson),
+    )
+
+    result = await routing.resolve_confirmation_escape(
+        CommittedTurn(text="sure", message_id="confirmation-turn"),
+        ReasoningState(),
+    )
+
+    assert result == RouteDecision.clarify("ambiguous_intent")
+    assert recognizer.contexts[0].routing_scope == "confirmation_escape"
 
 
 def test_route_materializer_covers_every_capability_from_one_coarse_contract() -> None:
@@ -426,6 +474,10 @@ def test_route_materializer_covers_every_capability_from_one_coarse_contract() -
             ViewIdentityStatus(),
         ),
         (
+            RouteProposal(decision="direct", capability=CapabilityId.ABORT_CURRENT),
+            AbortCurrent(),
+        ),
+        (
             RouteProposal(decision="direct", capability=CapabilityId.DISCLOSE_AI_IDENTITY),
             DiscloseAiIdentity(),
         ),
@@ -498,7 +550,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "ba46871d7a2f5b707e5caa5527aed4a7a5b374d1e6871b30fbfbcea23e58f0b1"
+        "84f013b151c9f2e0d080d7977f48f02fee0d0ef8c9bb2f3bd0c6e9862483d3de"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -543,6 +595,7 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
         "timeout_seconds",
         "provider_call_outcome",
         "projector_version",
+        "reasoning_effort",
     }
 
 

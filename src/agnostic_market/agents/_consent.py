@@ -1,10 +1,9 @@
-"""Deterministic consent + escape classification — shared by every gated flow.
+"""Deterministic closed-consent classification.
 
 Committed-transcript-only (VOICE_PIPELINE §0): these decide whether a caller's words
-authorize an irreversible action (checkout place, refund) or break out of a flow. They are
-CODE, not a prompt — a model must never be the thing that decides "was that a yes." Checked
-in a fixed order (human -> no -> yes -> unclear) so negatives beat the positives they
-contain ("no, don't do it" contains "do it").
+authorize an irreversible action (checkout place, refund). They are CODE, not a prompt: a
+model must never decide whether a reply grants consent. Negation is checked before the bounded
+affirmative grammar so ambiguous language fails closed.
 
 Lifted out of checkout/flow.py at 3c so the support flow reuses the exact same classifier
 rather than a second, drifting copy (one source of truth).
@@ -13,29 +12,46 @@ rather than a second, drifting copy (one source of truth).
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Literal
 
-_HUMAN_RE = re.compile(
-    r"\b(?:human|person|agent|representative|operator|somebody real)\b", re.IGNORECASE
-)
+from agnostic_market.dtos.state import HandoffSource
+
 _NO_RE = re.compile(
     r"\b(?:no|nope|nah|don'?t|do not|cancel|stop|never ?mind|forget it|wrong)\b", re.IGNORECASE
 )
-_YES_RE = re.compile(
-    r"\b(?:yes|yeah|yep|yup|correct|right|confirm|confirmed|go ahead|place it|do it|"
-    r"sounds good|please do|ok(?:ay)?)\b",
-    re.IGNORECASE,
+_AFFIRMATIVE_SIGNALS = (
+    ("sounds", "good"),
+    ("please", "do"),
+    ("go", "ahead"),
+    ("do", "it"),
+    ("that's", "right"),
+    ("that", "is", "right"),
+    ("that's", "correct"),
+    ("that", "is", "correct"),
+    ("confirm", "it"),
+    ("yes", "sir"),
+    ("sure",),
+    ("alright",),
+    ("yes",),
+    ("yeah",),
+    ("yep",),
+    ("yup",),
+    ("confirm",),
+    ("confirmed",),
+    ("ok",),
+    ("okay",),
 )
-_ABORT_RE = re.compile(
-    r"\b(?:stop|never ?mind|forget it|cancel (?:that|it|this)|no thanks|don'?t bother)\b",
-    re.IGNORECASE,
-)
-# Support-flow abort set: NO "cancel ..." clause. Inside support, cancellation is the
-# SUBJECT MATTER — "yeah cancel it" is the caller asking for the order cancel, not an
-# abort (live 2026-07-10: it hit the abort escape and cancelled NOTHING while sounding
-# like it had). Such utterances fall through to the model, which has the context.
-_SUPPORT_ABORT_RE = re.compile(
-    r"\b(?:stop|never ?mind|forget it|no thanks|don'?t bother)\b", re.IGNORECASE
+# These may reinforce an affirmative signal, but never authorize on their own.
+_AFFIRMATIVE_FILLERS = (
+    ("thank", "you"),
+    ("and",),
+    ("please",),
+    ("then",),
+    ("absolutely",),
+    ("definitely",),
+    ("thanks",),
 )
 # The cancel-action phrase, neutralized before classifying consent AT THE CANCEL READBACK:
 # "cancel" sits in _NO_RE (correct when confirming a purchase/refund — "cancel that" =
@@ -45,31 +61,53 @@ _CANCEL_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
-Consent = Literal["human", "no", "yes", "unclear"]
+Consent = Literal["no", "yes", "unclear"]
+ConfirmationVerdict = Literal["human", "no", "yes", "unclear"]
 
 
-def wants_human(text: str) -> bool:
-    """§A9 no-trap escape: the caller asked for a person."""
-    return bool(_HUMAN_RE.search(text))
+@dataclass(frozen=True, slots=True)
+class ConfirmationDecision:
+    verdict: ConfirmationVerdict
+    handoff_source: HandoffSource | None = None
 
 
-def is_abort(text: str) -> bool:
-    """Explicit abort of the in-flight gated action (entry-router escape, checkout)."""
-    return bool(_ABORT_RE.search(text))
+def _normalize_consent_reply(text: str) -> str:
+    normalized = text.casefold().replace("\N{RIGHT SINGLE QUOTATION MARK}", "'")
+    return " ".join(re.sub(r"[,.!?;:]+", " ", normalized).split())
 
 
-def is_support_abort(text: str) -> bool:
-    """Abort escape for the SUPPORT flow — same set minus the cancel-phrase (see above)."""
-    return bool(_SUPPORT_ABORT_RE.search(text))
+def _is_bounded_affirmative(text: str) -> bool:
+    words = tuple(text.split())
+    pending = [(0, False)]
+    visited: set[tuple[int, bool]] = set()
+    while pending:
+        index, has_signal = pending.pop()
+        if (index, has_signal) in visited:
+            continue
+        visited.add((index, has_signal))
+        if index == len(words):
+            if has_signal:
+                return True
+            continue
+        pending.extend(
+            (index + len(phrase), True)
+            for phrase in _AFFIRMATIVE_SIGNALS
+            if words[index : index + len(phrase)] == phrase
+        )
+        pending.extend(
+            (index + len(phrase), has_signal)
+            for phrase in _AFFIRMATIVE_FILLERS
+            if words[index : index + len(phrase)] == phrase
+        )
+    return False
 
 
 def classify_consent(text: str) -> Consent:
-    """'human' | 'no' | 'yes' | 'unclear' — deterministic, order matters."""
-    if wants_human(text):
-        return "human"
-    if _NO_RE.search(text):
+    """Classify one closed consent reply without inferring other intents."""
+    normalized = _normalize_consent_reply(text)
+    if _NO_RE.search(normalized):
         return "no"
-    if _YES_RE.search(text):
+    if _is_bounded_affirmative(normalized):
         return "yes"
     return "unclear"
 
@@ -85,3 +123,22 @@ def classify_cancel_consent(text: str) -> Consent:
     win (§4a discipline unchanged).
     """
     return classify_consent(_CANCEL_PHRASE_RE.sub(" ", text))
+
+
+def classify_confirmation(
+    answer: Mapping[str, object],
+    *,
+    cancel_action: bool = False,
+) -> ConfirmationDecision:
+    """Combine code-owned consent with an engine-authored semantic handoff marker."""
+
+    source_value = answer.get("handoff_source")
+    if source_value is not None:
+        try:
+            source = HandoffSource(source_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confirmation handoff source is invalid") from exc
+        return ConfirmationDecision("human", source)
+    text = str(answer.get("text", ""))
+    verdict = classify_cancel_consent(text) if cancel_action else classify_consent(text)
+    return ConfirmationDecision(verdict)

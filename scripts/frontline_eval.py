@@ -1,30 +1,17 @@
-"""T1 routing-quality eval — frontline under-escalation (AGENTS.md seam #1).
+"""Explicit evaluation gates for the active typed-routing architecture.
 
-Run: uv run python scripts/frontline_eval.py
-Structural gate only: uv run python scripts/frontline_eval.py --preflight-only
-Order-target semantic corpus: uv run python scripts/frontline_eval.py --order-target-eval
-Typed semantic-router corpus: uv run python scripts/frontline_eval.py --semantic-routing-eval
-Production legacy-route diagnostic:
-uv run python scripts/frontline_eval.py --legacy-routing-diagnostic
-Offline 6E gate: uv run python scripts/frontline_eval.py --recovery-certification offline
-Live retry gate: uv run python scripts/frontline_eval.py --recovery-certification live
-The routing eval needs the merchant model credentials; the live recovery tier needs every
-configured provider credential. The offline recovery tier uses a test-only resolver and no
-upstream access. Text-only — no voice.
+Run one mode at a time:
+  uv run python scripts/frontline_eval.py --preflight-only
+  uv run python scripts/frontline_eval.py --order-target-eval
+  uv run python scripts/frontline_eval.py --semantic-routing-eval
+  uv run python scripts/frontline_eval.py --semantic-routing-structural-coverage
+  uv run python scripts/frontline_eval.py --semantic-routing-data-audit
+  uv run python scripts/frontline_eval.py --recovery-certification offline
+  uv run python scripts/frontline_eval.py --recovery-certification live
 
-Invokes the SAME graph production uses (prompt inside the graph, F1), one utterance per
-turn. The MODEL is the primary escalation decider; the slim gate is a high-certainty
-irreversible-only floor. Pre-registered:
-  - PRIMARY BAR: escalation recall (gate OR model) >= 90% on should_escalate. Every miss
-    triaged (a real answer-instead-of-escalate is a judgment gap to fix in prompt/few-shot).
-  - Gate coverage REPORTED informationally (the free fast-path share) — never a mandate.
-  - over-escalation on should_answer REPORTED (over-escalating is cheap, AGENTS §A2).
-The default routing mode is NOT an overall commerce, speech, continuation, or voice-transport
-certification. The live-call #18 structural preflight runs before provider access and blocks the
-routing score while the shared speech-authority or exact-STT contracts are broken. The routing
-section then measures escalation QUALITY only. The separate 6E modes certify provider transport
-failure against the production graph and existing effect/speech/state observer. Exit 1 when the
-selected gate fails.
+Credentialed modes use the configured provider gateway. Offline structural and recovery modes make
+no upstream calls. The historical gate/model escalation corpus is preserved as source data but is
+not an executable rubric.
 """
 
 from __future__ import annotations
@@ -67,7 +54,6 @@ from agnostic_market.agents.frontline import (
     build_frontline_graph,
 )
 from agnostic_market.agents.frontline.graph import _build_frontline_capability_registry
-from agnostic_market.agents.frontline.prompt import ORDER_TARGET_PROPOSAL_PROMPT
 from agnostic_market.agents.frontline.read_flow import (
     ANSWER_CLARIFY_NODE,
     ANSWER_RESPONSE_NODE,
@@ -75,32 +61,24 @@ from agnostic_market.agents.frontline.read_flow import (
     CATALOG_RESPONSE_NODE,
     ORDER_STATUS_TARGET_PROPOSE_NODE,
 )
-from agnostic_market.agents.gate import gate_check
-from agnostic_market.agents.legacy_observation import (
-    LEGACY_FLOW_CAPABILITIES as _LEGACY_FLOW_CAPABILITIES,
-)
-from agnostic_market.agents.legacy_observation import (
-    LEGACY_FLOW_TOOL_CAPABILITIES as _LEGACY_FLOW_TOOL_CAPABILITIES,
-)
-from agnostic_market.agents.legacy_observation import (
-    LEGACY_HANDOVER_CAPABILITIES as _LEGACY_HANDOVER_CAPABILITIES,
-)
-from agnostic_market.agents.legacy_observation import (
-    LEGACY_READ_TOOL_CAPABILITIES as _LEGACY_READ_TOOL_CAPABILITIES,
-)
+from agnostic_market.agents.frontline.typed_prompt import ORDER_TARGET_PROPOSAL_PROMPT
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LINE
 from agnostic_market.agents.routing import (
     CONTEXT_PROJECTOR_VERSION,
     ROUTE_SCHEMA_FINGERPRINT,
     ProviderCallOutcome,
     RoutingAttempt,
+    RoutingRecognizer,
+    RoutingSession,
     SemanticRouter,
     materialize_route,
     project_routing_context,
     registry_fingerprint,
     resolve_route,
 )
-from agnostic_market.agents.tooling import wrap_readonly_tool
+from agnostic_market.agents.routing_activation import (
+    SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
+)
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -119,7 +97,7 @@ from agnostic_market.commerce.profile import (
     assert_profiles_have_customers,
     load_profile_fixture,
 )
-from agnostic_market.commerce.spoken import caller_stated_order_id
+from agnostic_market.commerce.spoken import caller_stated_order_ids
 from agnostic_market.commerce.verification import (
     OtpProvider,
     VerificationStore,
@@ -139,6 +117,7 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AnswerQuestion,
+    CancelOrders,
     CapabilityId,
     ChangeProfile,
     FocusedOrderSet,
@@ -150,6 +129,7 @@ from agnostic_market.dtos.orchestration import (
     RecentOrderSet,
     RouteDecision,
     RouteProposal,
+    RouteResolution,
     RoutingContext,
     RoutingFailure,
     SearchCatalog,
@@ -161,7 +141,6 @@ from agnostic_market.llm.providers import load_conformance_targets
 from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.voice.context import CallerContext
-from agnostic_market.voice.tools import build_voice_tools
 
 if __package__:
     from .transport_fault_proxy import (
@@ -183,7 +162,6 @@ else:
     )
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
-_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_t1.yaml"
 _SAFETY_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_safety.yaml"
 _READ_OWNER_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_read_owners.yaml"
 _READ_OWNER_EVAL_SCHEMA_VERSION = "1"
@@ -193,18 +171,15 @@ _SEMANTIC_ROUTE_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_semantic_routes.y
 _SEMANTIC_ROUTE_STRUCTURAL_SUPPLEMENT_PATH = (
     _CONFIG_ROOT / "eval" / "frontline_semantic_route_structural.yaml"
 )
-_SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "3"
+_SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
-_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 27
-_SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = "5"
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 29
+_SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
     _CONFIG_ROOT / "telemetry" / "semantic_routing_structural_coverage.json"
 )
-_LEGACY_ROUTE_REPORT_SCHEMA_VERSION = "2"
-_LEGACY_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "legacy_routing_diagnostic.json"
-_LEGACY_ROUTE_COMPATIBILITY_SCHEMA_VERSION = "1"
 _ROUTING_DATA_MANIFEST_SCHEMA_VERSION = "1"
 _ROUTING_DATA_ACQUISITION_PLAN_SCHEMA_VERSION = "1"
 _ROUTING_DATA_AUTHORIZATION_SCHEMA_VERSION = "2"
@@ -215,7 +190,6 @@ _SEMANTIC_ROUTE_MIN_ACCEPTANCE_EXACT_RATE = 0.95
 _SEMANTIC_ROUTE_P50_QUANTILE = 0.50
 _SEMANTIC_ROUTE_P95_QUANTILE = 0.95
 _MERCHANT_ID = "acme_store"
-_RECALL_BAR = 0.90
 _TRANSPORT_REPORT_PATHS = {
     "offline": _CONFIG_ROOT / "telemetry" / "transport_recovery_offline_report.json",
     "live": _CONFIG_ROOT / "telemetry" / "transport_recovery_live_report.json",
@@ -227,6 +201,7 @@ _TRANSPORT_SCENARIO_TIMEOUT_SECONDS = 90.0
 
 _AUTOMATION_CHANNELS = (
     "pending_capability_dispatch",
+    "pending_router_no_action",
     "pending_cart_mutation",
     "pending_placement",
     "pending_refund",
@@ -237,7 +212,7 @@ _AUTOMATION_CHANNELS = (
     "active_invocation",
     "pending_ack",
     "pending_clarification",
-    "clarification_progress",
+    "clarification_liveness",
 )
 
 
@@ -344,6 +319,18 @@ SemanticRouteDisposition = Literal[
     "closed_failure",
     "unsafe_executable_misroute",
 ]
+SemanticRouteMismatchKind = Literal[
+    "exact",
+    "closed_failure",
+    "conservative_clarification",
+    "false_handoff",
+    "missed_handoff",
+    "continuation_mismatch",
+    "capability_mismatch",
+    "discriminator_mismatch",
+    "clarification_reason_mismatch",
+    "decision_mismatch",
+]
 
 
 class SemanticRouteEvalCase(BaseModel):
@@ -412,6 +399,23 @@ class SemanticRouteEvalCorpus(BaseModel):
             for case in self.cases
         ):
             raise ValueError("semantic-route eval requires critical acceptance cases")
+        risk_domains = {
+            self.projected_case.risk_domain,
+            *(case.risk_domain for case in self.cases),
+        }
+        required_risk_domains = set(get_args(SemanticRouteRiskDomain))
+        if risk_domains != required_risk_domains:
+            missing = ", ".join(sorted(required_risk_domains - risk_domains))
+            extra = ", ".join(sorted(risk_domains - required_risk_domains))
+            detail = "; ".join(
+                value
+                for value in (
+                    f"missing: {missing}" if missing else "",
+                    f"unexpected: {extra}" if extra else "",
+                )
+                if value
+            )
+            raise ValueError(f"semantic-route eval must cover every risk domain ({detail})")
         return self
 
 
@@ -1233,77 +1237,15 @@ class SemanticRouteCaseResult:
     evaluation_split: SemanticRouteEvaluationSplit
     expected: RouteDecision
     attempt: RoutingAttempt
+    routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary"
 
     @property
     def disposition(self) -> SemanticRouteDisposition:
         return _semantic_route_disposition(self.expected, self.attempt.resolution)
 
-
-LegacyRouteDisposition = Literal[
-    "owner_compatible",
-    "conservative_no_action",
-    "missed_owner",
-    "wrong_owner",
-    "protected_read_owner_entry",
-    "account_control_owner_entry",
-    "reversible_write_owner_entry",
-    "hitl_guarded_write_owner_entry",
-    "protected_state_changed",
-]
-LegacyOwnerSurface = Literal[
-    "none",
-    "unprotected",
-    "protected_read",
-    "account_control",
-    "reversible_write",
-    "hitl_guarded_write",
-]
-LegacyStateDelta = Literal[
-    "cart",
-    "placement",
-    "cancel",
-    "refund",
-    "return",
-    "profile",
-    "otp",
-    "verification",
-    "identity",
-]
-
-
-@dataclass(frozen=True)
-class LegacyRouteObservation:
-    capability_candidates: tuple[CapabilityId, ...]
-    tool_names: tuple[str, ...]
-    active_flow: str | None
-    handover_destination: str | None
-    handover_reason: str | None
-    handover_source: str | None
-    non_tool_ai_text_without_owner: bool
-    state_deltas: tuple[LegacyStateDelta, ...]
-
     @property
-    def owner_surface(self) -> LegacyOwnerSurface:
-        return _legacy_owner_surface(self.capability_candidates)
-
-
-@dataclass(frozen=True)
-class LegacyRouteCaseResult:
-    case_id: str
-    scenario_class: str
-    risk_class: SemanticRouteRiskClass
-    risk_domain: SemanticRouteRiskDomain
-    evaluation_split: SemanticRouteEvaluationSplit
-    expected: RouteDecision
-    observation: LegacyRouteObservation | None
-    exclusion_reason: str | None
-
-    @property
-    def disposition(self) -> LegacyRouteDisposition | Literal["excluded"]:
-        if self.exclusion_reason is not None:
-            return "excluded"
-        assert self.observation is not None
-        return _legacy_route_disposition(self.expected, self.observation)
+    def mismatch_kind(self) -> SemanticRouteMismatchKind:
+        return _semantic_route_mismatch_kind(self.expected, self.attempt.resolution)
 
 
 @dataclass(frozen=True)
@@ -1392,11 +1334,14 @@ def _checkpoint_observation(
 
 def _build_eval_runtime(
     config: MerchantConfig,
-    routing_model: BaseChatModel,
+    response_model: BaseChatModel,
     reasoning_model: BaseChatModel,
     *,
+    routing_model: BaseChatModel,
+    routing_recognizer: RoutingRecognizer | None = None,
     thread_id: str,
     structured_output_method: StructuredOutputMethod,
+    routing_structured_output_method: StructuredOutputMethod,
 ) -> EvalRuntime:
     store = OrderStore(load_orders_fixture(_CONFIG_ROOT, config.merchant_id))
     cart_store = CartStore()
@@ -1422,19 +1367,8 @@ def _build_eval_runtime(
         identity_store=identity_store,
         order_store=store,
     )
-    tools = [
-        wrap_readonly_tool(t, config.merchant_id)
-        for t in build_voice_tools(
-            store,
-            cart_store,
-            recent_orders,
-            identity_store,
-            customers,
-        )
-    ]
     assembly = build_frontline_graph(
-        routing_model,
-        tools,
+        response_model,
         display_name=config.display_name,
         tenant_id=config.merchant_id,
         reasoning_model=reasoning_model,
@@ -1458,6 +1392,21 @@ def _build_eval_runtime(
         thread_id=thread_id,
         cancellation_quiescence_timeout_seconds=(
             config.runtime.cancellation_quiescence_timeout_seconds
+        ),
+        routing=RoutingSession(
+            routing_recognizer
+            or SemanticRouter(
+                routing_model,
+                selection=config.llm.routing,
+                structured_output_method=routing_structured_output_method,
+                timeout_seconds=config.runtime.semantic_router_timeout_seconds,
+                input_max_chars=config.runtime.semantic_router_input_max_chars,
+                registry=assembly.capability_registry,
+            ),
+            identity_store=identity_store,
+            cart_store=cart_store,
+            recent_orders=recent_orders,
+            registry=assembly.capability_registry,
         ),
         lifecycle=caller_context,
     )
@@ -1540,34 +1489,6 @@ def _score_safety_observation(
     return tuple(failures)
 
 
-_THREAD_SEQ = 0
-
-# The gated flows' model-facing tools: any of these appearing in the turn's messages means
-# the turn LEFT the frontline and a flow's model ran — an escalation, even when the flow
-# then ended in a terminal decline that clears its own state (see docstring below).
-_FLOW_TOOLS = frozenset(
-    {
-        "propose_refund",
-        "propose_cancel",
-        "propose_return",  # support (returns: Group C)
-        "propose_profile_change",
-        "request_support_clarification",
-        "leave_support",  # support (profile: Group C)
-        "add_to_cart",
-        "remove_from_cart",
-        "set_quantity",
-        "review_cart",
-        "buy_now",
-        "go_to_checkout",
-        "request_cart_clarification",
-        "leave_cart",  # cart (Group B; view_cart is a FRONTLINE read, not here)
-        "propose_identity",
-        "request_identity_contact",
-        "leave_identity",  # identity (P7; list_orders is a FRONTLINE read)
-    }
-)
-
-
 def _speech_authority_failures() -> tuple[str, ...]:
     """Exercise production speech-source policy against every transactional model node."""
     failures: list[str] = []
@@ -1611,7 +1532,7 @@ def _speech_authority_failures() -> tuple[str, ...]:
         if len(list(orphan_control.flush())) != 1:
             failures.append(f"approved orphaned model text was not caller-speakable: {node!r}")
 
-    code_node = "read_render"
+    code_node = "cart_view_render"
     code_control = _TurnSpeech(FRONTLINE_SPEAKABLE_NODES, MODEL_SPEECH_NODES)
     if not isinstance(
         code_control.feed(
@@ -1637,13 +1558,16 @@ def _order_reference_failures(data: dict) -> tuple[str, ...]:
     failures: list[str] = []
 
     order_reference = data["order_reference"]
-    expected = order_reference["expected_order_id"]
-    for utterance in order_reference["accepted_labelled_stt"]:
-        if caller_stated_order_id(utterance, expected) != expected:
-            failures.append(f"labelled STT order reference was rejected: {utterance!r}")
-    for case in order_reference["rejected_stt"]:
-        if caller_stated_order_id(case["utterance"], case["proposed_order_id"]) is not None:
-            failures.append(f"weak/conflicting STT order reference was accepted: {case!r}")
+    for case in order_reference["accepted_labelled_stt"]:
+        expected = tuple(case["expected_order_refs"])
+        actual = caller_stated_order_ids(case["utterance"])
+        if actual != expected:
+            failures.append(f"labelled STT order-reference set was rejected: {case['utterance']!r}")
+    for utterance in order_reference["rejected_stt"]:
+        if caller_stated_order_ids(utterance):
+            failures.append(
+                f"weak or ambiguous STT order-reference set was accepted: {utterance!r}"
+            )
     return tuple(failures)
 
 
@@ -1689,6 +1613,29 @@ def _load_routing_eval_selection() -> _RoutingEvalSelection:
         response_structured_output_method=gateway.structured_output_method(config.llm.response),
         routing_model=gateway.chat_model(config.llm.routing),
         routing_structured_output_method=gateway.structured_output_method(config.llm.routing),
+    )
+
+
+def _parse_provider_model(value: str) -> ProviderModel:
+    provider, separator, model = value.partition(":")
+    provider = provider.strip()
+    model = model.strip()
+    if not separator or not provider or not model:
+        raise argparse.ArgumentTypeError("model selection must use provider:model")
+    try:
+        return ProviderModel(provider=provider, model=model)
+    except ValidationError as exc:
+        raise argparse.ArgumentTypeError("model selection must use provider:model") from exc
+
+
+def _resolve_conformance_target(selection: ProviderModel) -> ProviderModel:
+    targets = load_conformance_targets(_CONFIG_ROOT / "conformance" / "targets.yaml").targets
+    for target in targets:
+        if (target.provider, target.model) == (selection.provider, selection.model):
+            return target
+    raise ValueError(
+        f"semantic routing candidate {selection.provider}:{selection.model} is not a "
+        "configured conformance target"
     )
 
 
@@ -1783,485 +1730,16 @@ async def _run_semantic_route_cases(
                 evaluation_split=case.evaluation_split,
                 expected=case.expected,
                 attempt=await router.route(case.context),
+                routing_scope=case.context.routing_scope,
             )
         )
     return tuple(results)
-
-
-_LEGACY_HANDOVER_TOOL_NAME = "request_handover"
-_LEGACY_ROUTE_REPLAY_CONTRACT = (
-    "fresh unbound session, empty cart, no active invocation or recent orders"
-)
-_LEGACY_CAPABILITY_SURFACES: dict[CapabilityId, LegacyOwnerSurface] = {
-    CapabilityId.LIST_ORDERS: "protected_read",
-    CapabilityId.VERIFY_ORDER_STATUS: "protected_read",
-    CapabilityId.VIEW_IDENTITY_STATUS: "protected_read",
-    CapabilityId.VERIFY_IDENTITY: "account_control",
-    CapabilityId.SWITCH_ACCOUNT: "account_control",
-    CapabilityId.CANCEL_ORDERS: "hitl_guarded_write",
-    CapabilityId.REFUND_ORDER: "hitl_guarded_write",
-    CapabilityId.RETURN_ORDER: "hitl_guarded_write",
-    CapabilityId.CHANGE_PROFILE: "hitl_guarded_write",
-    CapabilityId.PLACE_ORDER: "hitl_guarded_write",
-    CapabilityId.MODIFY_CART: "reversible_write",
-}
-_LEGACY_OWNER_SURFACE_PRIORITY: dict[LegacyOwnerSurface, int] = {
-    "none": 0,
-    "unprotected": 1,
-    "protected_read": 2,
-    "account_control": 3,
-    "hitl_guarded_write": 4,
-    "reversible_write": 5,
-}
-_LEGACY_SURFACE_DISPOSITIONS: dict[
-    LegacyOwnerSurface,
-    LegacyRouteDisposition,
-] = {
-    "protected_read": "protected_read_owner_entry",
-    "account_control": "account_control_owner_entry",
-    "reversible_write": "reversible_write_owner_entry",
-    "hitl_guarded_write": "hitl_guarded_write_owner_entry",
-}
 
 
 def _ordered_capabilities(
     groups: Sequence[Sequence[CapabilityId]],
 ) -> tuple[CapabilityId, ...]:
     return tuple(dict.fromkeys(capability for group in groups for capability in group))
-
-
-def _legacy_owner_surface(
-    capabilities: Sequence[CapabilityId],
-) -> LegacyOwnerSurface:
-    if not capabilities:
-        return "none"
-    surfaces = {
-        _LEGACY_CAPABILITY_SURFACES.get(capability, "unprotected") for capability in capabilities
-    }
-    return max(surfaces, key=_LEGACY_OWNER_SURFACE_PRIORITY.__getitem__)
-
-
-def _legacy_state_deltas(
-    before: CommerceObservation,
-    after: CommerceObservation,
-    *,
-    cart_changed: bool,
-) -> tuple[LegacyStateDelta, ...]:
-    deltas: list[LegacyStateDelta] = []
-    if cart_changed:
-        deltas.append("cart")
-    if after.placed != before.placed:
-        deltas.append("placement")
-    if after.cancelled != before.cancelled:
-        deltas.append("cancel")
-    if after.refunded != before.refunded:
-        deltas.append("refund")
-    if after.returned != before.returned:
-        deltas.append("return")
-    if after.profile_changes != before.profile_changes:
-        deltas.append("profile")
-    if after.otp_dispatches != before.otp_dispatches:
-        deltas.append("otp")
-    if after.verification_level != before.verification_level:
-        deltas.append("verification")
-    if after.identity_bound != before.identity_bound:
-        deltas.append("identity")
-    return tuple(deltas)
-
-
-def _legacy_replay_exclusion(
-    case: SemanticRouteEvalCase,
-    registry: CapabilityRegistry,
-) -> str | None:
-    reasons: list[str] = []
-    context = case.context
-    if context.available_capabilities != registry.capability_ids:
-        reasons.append("available_capabilities differs from production registry")
-    if context.bound_customer:
-        reasons.append("bound identity requires fixture-specific authority state")
-    if context.active_capability is not None:
-        reasons.append("active capability lacks a replayable typed invocation")
-    if context.recent_order_operation is not None or context.recent_order_count:
-        reasons.append("recent-order context requires fixture-specific authorized references")
-    if context.cart_state != "empty":
-        reasons.append("nonempty cart requires fixture-specific cart lines")
-    return "; ".join(reasons) or None
-
-
-def _legacy_route_disposition(
-    expected: RouteDecision,
-    observation: LegacyRouteObservation,
-) -> LegacyRouteDisposition:
-    candidates = frozenset(observation.capability_candidates)
-    unexpected_protected_disposition = _LEGACY_SURFACE_DISPOSITIONS.get(observation.owner_surface)
-    if expected.decision == "clarify":
-        if observation.state_deltas:
-            return "protected_state_changed"
-        if unexpected_protected_disposition is not None:
-            return unexpected_protected_disposition
-        return "conservative_no_action" if not candidates else "wrong_owner"
-
-    request = expected.request
-    if request is None:
-        return "missed_owner"
-    if isinstance(request, AnswerQuestion):
-        if (
-            observation.non_tool_ai_text_without_owner
-            and not candidates
-            and not observation.state_deltas
-        ):
-            return "owner_compatible"
-        if observation.state_deltas:
-            return "protected_state_changed"
-        if unexpected_protected_disposition is not None:
-            return unexpected_protected_disposition
-        return "wrong_owner" if candidates else "missed_owner"
-    if request.kind in candidates:
-        return "owner_compatible"
-    if observation.state_deltas:
-        return "protected_state_changed"
-    if unexpected_protected_disposition is not None:
-        return unexpected_protected_disposition
-    return "wrong_owner" if candidates else "missed_owner"
-
-
-async def _observe_legacy_route(
-    runtime: EvalRuntime,
-    utterance: str,
-) -> LegacyRouteObservation:
-    config = {"configurable": {"thread_id": runtime.engine.thread_id}}
-    turn_id = uuid.uuid4().hex
-    cart_before = runtime.cart_store.view()
-    before = _commerce_observation(
-        runtime.store,
-        runtime.profile_store,
-        runtime.otp,
-        runtime.verification,
-        runtime.identity_store,
-    )
-    out = await runtime.graph.ainvoke(
-        {
-            "messages": [HumanMessage(content=utterance, id=turn_id)],
-            "consumed_turn_ids": (turn_id,),
-        },
-        config,
-    )
-    after = _commerce_observation(
-        runtime.store,
-        runtime.profile_store,
-        runtime.otp,
-        runtime.verification,
-        runtime.identity_store,
-    )
-    tool_calls = tuple(
-        call
-        for message in out.get("messages", ())
-        if isinstance(message, AIMessage)
-        for call in message.tool_calls
-    )
-    tool_names = tuple(str(call["name"]) for call in tool_calls)
-    groups: list[Sequence[CapabilityId]] = []
-    for tool_name in tool_names:
-        groups.extend(
-            mapping[tool_name]
-            for mapping in (_LEGACY_READ_TOOL_CAPABILITIES, _LEGACY_FLOW_TOOL_CAPABILITIES)
-            if tool_name in mapping
-        )
-
-    handover = out.get("handover")
-    handover_destination = getattr(handover, "destination", None)
-    handover_reason = getattr(handover, "reason_code", None)
-    handover_source = getattr(handover, "source", None)
-    for call in tool_calls:
-        if call["name"] != _LEGACY_HANDOVER_TOOL_NAME:
-            continue
-        args = call.get("args", {})
-        if isinstance(args, dict):
-            handover_destination = str(args.get("destination") or "") or handover_destination
-            handover_reason = str(args.get("reason_code") or "") or handover_reason
-            handover_source = "model"
-    active_flow = out.get("active_flow")
-    if not groups and handover_reason in _LEGACY_HANDOVER_CAPABILITIES:
-        groups.append(_LEGACY_HANDOVER_CAPABILITIES[handover_reason])
-    if not groups and active_flow in _LEGACY_FLOW_CAPABILITIES:
-        groups.append(_LEGACY_FLOW_CAPABILITIES[active_flow])
-
-    gate_hit = gate_check(utterance)
-    if not groups and gate_hit is not None and (active_flow is not None or handover is not None):
-        gate_reason, gate_destination = gate_hit
-        handover_reason = gate_reason
-        handover_destination = gate_destination
-        handover_source = "gate"
-        groups.append(_LEGACY_HANDOVER_CAPABILITIES.get(gate_reason, ()))
-
-    candidates = _ordered_capabilities(groups)
-    non_tool_ai_text_without_owner = not candidates and any(
-        isinstance(message, AIMessage)
-        and not message.tool_calls
-        and bool(str(message.content).strip())
-        for message in out.get("messages", ())
-    )
-    cart_after = runtime.cart_store.view()
-    return LegacyRouteObservation(
-        capability_candidates=candidates,
-        tool_names=tool_names,
-        active_flow=active_flow,
-        handover_destination=handover_destination,
-        handover_reason=handover_reason,
-        handover_source=handover_source,
-        non_tool_ai_text_without_owner=non_tool_ai_text_without_owner,
-        state_deltas=_legacy_state_deltas(
-            before,
-            after,
-            cart_changed=cart_after != cart_before,
-        ),
-    )
-
-
-def _legacy_route_group(
-    results: Sequence[LegacyRouteCaseResult],
-) -> dict[str, object]:
-    observations = [result.observation for result in results if result.observation is not None]
-    return {
-        "cases": len(results),
-        "replayed": sum(result.exclusion_reason is None for result in results),
-        "excluded": sum(result.exclusion_reason is not None for result in results),
-        "dispositions": {
-            disposition: sum(result.disposition == disposition for result in results)
-            for disposition in (*get_args(LegacyRouteDisposition), "excluded")
-        },
-        "owner_surfaces": {
-            surface: sum(observation.owner_surface == surface for observation in observations)
-            for surface in get_args(LegacyOwnerSurface)
-        },
-        "state_deltas": {
-            delta: sum(delta in observation.state_deltas for observation in observations)
-            for delta in get_args(LegacyStateDelta)
-        },
-    }
-
-
-def _legacy_route_report(
-    results: Sequence[LegacyRouteCaseResult],
-    *,
-    corpus: SemanticRouteEvalCorpus,
-    registry: CapabilityRegistry,
-    provider: str,
-    model: str,
-) -> dict[str, object]:
-    return {
-        "schema_version": _LEGACY_ROUTE_REPORT_SCHEMA_VERSION,
-        **_legacy_contract_identities(corpus, registry),
-        "run_at": datetime.now(tz=UTC).isoformat(),
-        "mode": "production_legacy_route_diagnostic",
-        "qualification": None,
-        "provider": provider,
-        "model": model,
-        "coverage": {
-            "replay_contract": _LEGACY_ROUTE_REPLAY_CONTRACT,
-            "limitations": [
-                "owner compatibility is not typed-route exactness",
-                "non-tool AI text is neither authorship nor speech evidence",
-                "excluded stateful cases are not inferred from utterance-only replay",
-            ],
-        },
-        "totals": _legacy_route_group(results),
-        "by_risk_domain": {
-            domain: _legacy_route_group(
-                [result for result in results if result.risk_domain == domain]
-            )
-            for domain in dict.fromkeys(result.risk_domain for result in results)
-        },
-        "by_evaluation_split": {
-            split: _legacy_route_group(
-                [result for result in results if result.evaluation_split == split]
-            )
-            for split in dict.fromkeys(result.evaluation_split for result in results)
-        },
-        "cases": [
-            {
-                "case_id": result.case_id,
-                "scenario_class": result.scenario_class,
-                "risk_class": result.risk_class,
-                "risk_domain": result.risk_domain,
-                "evaluation_split": result.evaluation_split,
-                "expected": _route_signature(result.expected),
-                "disposition": result.disposition,
-                "exclusion_reason": result.exclusion_reason,
-                "observation": (
-                    None
-                    if result.observation is None
-                    else {
-                        **asdict(result.observation),
-                        "owner_surface": result.observation.owner_surface,
-                        "capability_candidates": [
-                            capability.value
-                            for capability in result.observation.capability_candidates
-                        ],
-                    }
-                ),
-            }
-            for result in results
-        ],
-    }
-
-
-def _legacy_contract_identities(
-    corpus: SemanticRouteEvalCorpus,
-    registry: CapabilityRegistry,
-) -> dict[str, str]:
-    return {
-        "corpus_schema_version": corpus.schema_version,
-        "corpus_fingerprint": _corpus_fingerprint(corpus),
-        "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
-        "registry_fingerprint": registry_fingerprint(registry),
-        "context_projector_version": CONTEXT_PROJECTOR_VERSION,
-    }
-
-
-def _legacy_case_contract(
-    case: SemanticRouteEvalCase,
-    registry: CapabilityRegistry,
-) -> dict[str, object]:
-    return {
-        "case_id": case.case_id,
-        "scenario_class": case.scenario_class,
-        "risk_class": case.risk_class,
-        "risk_domain": case.risk_domain,
-        "evaluation_split": case.evaluation_split,
-        "expected": _route_signature(case.expected),
-        "exclusion_reason": _legacy_replay_exclusion(case, registry),
-    }
-
-
-def _legacy_compatibility_attestation(
-    source_path: Path,
-    *,
-    corpus: SemanticRouteEvalCorpus,
-    registry: CapabilityRegistry,
-) -> dict[str, object]:
-    source_bytes = source_path.read_bytes()
-    source = json.loads(source_bytes)
-    if not isinstance(source, dict):
-        raise ValueError("legacy compatibility source must be a JSON object")
-    source_cases = source.get("cases")
-    source_contract: list[dict[str, object]] | None = None
-    if isinstance(source_cases, list) and all(isinstance(case, dict) for case in source_cases):
-        contract_fields = tuple(_legacy_case_contract(corpus.cases[0], registry))
-        source_contract = [
-            {field: case.get(field) for field in contract_fields} for case in source_cases
-        ]
-    current_contract = [_legacy_case_contract(case, registry) for case in corpus.cases]
-    coverage = source.get("coverage")
-    checks = {
-        "source_schema_is_v1": source.get("schema_version") == "1",
-        "source_mode_is_legacy_diagnostic": (
-            source.get("mode") == "production_legacy_route_diagnostic"
-        ),
-        "source_is_non_qualifying": source.get("qualification") is None,
-        "replay_contract_matches": (
-            isinstance(coverage, dict)
-            and coverage.get("replay_contract") == _LEGACY_ROUTE_REPLAY_CONTRACT
-        ),
-        "case_contract_matches": source_contract == current_contract,
-    }
-    blockers = [name for name, passed in checks.items() if not passed]
-    compatible = not blockers
-    identities: dict[str, object] = {
-        "corpus_relationship": (
-            "compatible_current_corpus" if compatible else "incompatible_current_corpus"
-        ),
-        "corpus_schema_version": corpus.schema_version,
-        "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
-        "registry_fingerprint": registry_fingerprint(registry),
-        "context_projector_version": CONTEXT_PROJECTOR_VERSION,
-    }
-    if compatible:
-        identities["corpus_fingerprint"] = _corpus_fingerprint(corpus)
-    return {
-        "schema_version": _LEGACY_ROUTE_COMPATIBILITY_SCHEMA_VERSION,
-        "run_at": datetime.now(tz=UTC).isoformat(),
-        "mode": "legacy_route_compatibility_attestation",
-        "status": "compatible_current_corpus" if compatible else "incompatible",
-        "source_artifact_sha256": hashlib.sha256(source_bytes).hexdigest(),
-        "source_report_schema_version": source.get("schema_version"),
-        "current_contract": identities,
-        "checks": checks,
-        "blockers": blockers,
-    }
-
-
-def _default_legacy_compatibility_report_path(source_path: Path) -> Path:
-    return source_path.with_name(f"{source_path.stem}.compatibility.json")
-
-
-def _run_legacy_compatibility_attestation(
-    source_path: Path,
-    report_path: Path,
-) -> int:
-    report = _legacy_compatibility_attestation(
-        source_path,
-        corpus=_load_semantic_route_corpus(),
-        registry=_build_frontline_capability_registry(),
-    )
-    _write_json_report(report_path, report)
-    print(f"[legacy_routes] compatibility: {report['status']}; sanitized report: {report_path}")
-    return 0 if report["status"] == "compatible_current_corpus" else 1
-
-
-async def _run_legacy_route_diagnostic(report_path: Path) -> int:
-    selection = _load_routing_eval_selection()
-    corpus = _load_semantic_route_corpus()
-    registry = _build_frontline_capability_registry()
-    results: list[LegacyRouteCaseResult] = []
-    telemetry._TELEMETRY_PATH = telemetry._TELEMETRY_PATH.with_name(
-        "frontline_legacy_diagnostic.jsonl"
-    )
-    for case in corpus.cases:
-        exclusion_reason = _legacy_replay_exclusion(case, registry)
-        observation = None
-        if exclusion_reason is None:
-            runtime = _build_eval_runtime(
-                selection.config,
-                selection.response_model,
-                selection.gateway.chat_model(selection.config.llm.reasoning),
-                thread_id=f"legacy-route:{case.case_id}:{uuid.uuid4().hex}",
-                structured_output_method=selection.response_structured_output_method,
-            )
-            observation = await _observe_legacy_route(runtime, case.context.utterance)
-        results.append(
-            LegacyRouteCaseResult(
-                case_id=case.case_id,
-                scenario_class=case.scenario_class,
-                risk_class=case.risk_class,
-                risk_domain=case.risk_domain,
-                evaluation_split=case.evaluation_split,
-                expected=case.expected,
-                observation=observation,
-                exclusion_reason=exclusion_reason,
-            )
-        )
-
-    report = _legacy_route_report(
-        results,
-        corpus=corpus,
-        registry=registry,
-        provider=selection.config.llm.response.provider,
-        model=selection.config.llm.response.model,
-    )
-    await asyncio.to_thread(_write_json_report, report_path, report)
-    totals = report["totals"]
-    assert isinstance(totals, dict)
-    print(
-        f"[legacy_routes] replayed {totals['replayed']}/{totals['cases']}; "
-        f"excluded {totals['excluded']}"
-    )
-    for result in results:
-        if result.disposition not in {"owner_compatible", "conservative_no_action", "excluded"}:
-            print(f"    {result.case_id}: {result.disposition}")
-    print(f"    sanitized report: {report_path}")
-    print("\nPRODUCTION LEGACY ROUTING DIAGNOSTIC COMPLETED. [NO QUALIFICATION]")
-    return 0
 
 
 _ROUTE_SIGNATURE_DISCRIMINATORS = frozenset(
@@ -2297,6 +1775,32 @@ def _semantic_route_disposition(
     if actual.decision in {"direct", "continue"}:
         return "unsafe_executable_misroute"
     raise AssertionError(f"unclassified route decision {actual.decision!r}")
+
+
+def _semantic_route_mismatch_kind(
+    expected: RouteDecision,
+    actual: RouteDecision | RoutingFailure,
+) -> SemanticRouteMismatchKind:
+    if actual == expected:
+        return "exact"
+    if isinstance(actual, RoutingFailure):
+        return "closed_failure"
+    if _is_request_person(actual) and not _is_request_person(expected):
+        return "false_handoff"
+    if _is_request_person(expected) and not _is_request_person(actual):
+        return "missed_handoff"
+    if expected.decision == "continue" or actual.decision == "continue":
+        return "continuation_mismatch"
+    if actual.decision == "clarify" and expected.decision != "clarify":
+        return "conservative_clarification"
+    if expected.decision == "clarify" and actual.decision == "clarify":
+        return "clarification_reason_mismatch"
+    if expected.decision == "direct" and actual.decision == "direct":
+        assert expected.request is not None and actual.request is not None
+        if expected.request.kind != actual.request.kind:
+            return "capability_mismatch"
+        return "discriminator_mismatch"
+    return "decision_mismatch"
 
 
 def _route_signature(
@@ -2361,9 +1865,14 @@ def _semantic_route_group(
         disposition: sum(result.disposition == disposition for result in results)
         for disposition in get_args(SemanticRouteDisposition)
     }
+    mismatch_kinds = {
+        mismatch_kind: sum(result.mismatch_kind == mismatch_kind for result in results)
+        for mismatch_kind in get_args(SemanticRouteMismatchKind)
+    }
     return {
         "cases": len(results),
         "dispositions": dispositions,
+        "mismatch_kinds": mismatch_kinds,
         "provider_call_outcomes": {
             outcome: sum(result.attempt.provider_call_outcome == outcome for result in results)
             for outcome in get_args(ProviderCallOutcome)
@@ -2396,6 +1905,7 @@ def _group_semantic_route_results(
         "risk_class",
         "risk_domain",
         "evaluation_split",
+        "routing_scope",
     ],
 ) -> dict[str, dict[str, object]]:
     values = dict.fromkeys(getattr(result, attribute) for result in results)
@@ -2404,6 +1914,35 @@ def _group_semantic_route_results(
             [result for result in results if getattr(result, attribute) == value]
         )
         for value in values
+    }
+
+
+def _is_request_person(resolution: RouteDecision | RoutingFailure) -> bool:
+    return (
+        isinstance(resolution, RouteDecision)
+        and resolution.decision == "direct"
+        and resolution.request is not None
+        and resolution.request.kind == CapabilityId.REQUEST_PERSON
+    )
+
+
+def _confirmation_escape_metrics(
+    results: Sequence[SemanticRouteCaseResult],
+) -> dict[str, int]:
+    scoped = [result for result in results if result.routing_scope == "confirmation_escape"]
+    expected_escapes = [result for result in scoped if _is_request_person(result.expected)]
+    false_escapes = [
+        result
+        for result in scoped
+        if not _is_request_person(result.expected) and _is_request_person(result.attempt.resolution)
+    ]
+    return {
+        "cases": len(scoped),
+        "expected_escapes": len(expected_escapes),
+        "exact_escapes": sum(
+            _is_request_person(result.attempt.resolution) for result in expected_escapes
+        ),
+        "false_escapes": len(false_escapes),
     }
 
 
@@ -2418,6 +1957,7 @@ def _semantic_model_report(
     expected_identity = (
         first.provider,
         first.model,
+        first.reasoning_effort,
         first.structured_output_method,
         first.route_schema_fingerprint,
         first.prompt_fingerprint,
@@ -2431,6 +1971,7 @@ def _semantic_model_report(
         identity = (
             attempt.provider,
             attempt.model,
+            attempt.reasoning_effort,
             attempt.structured_output_method,
             attempt.route_schema_fingerprint,
             attempt.prompt_fingerprint,
@@ -2444,6 +1985,7 @@ def _semantic_model_report(
     report: dict[str, object] = {
         "provider": first.provider,
         "model": first.model,
+        "reasoning_effort": first.reasoning_effort,
         "structured_output_method": first.structured_output_method,
         "route_schema_fingerprint": first.route_schema_fingerprint,
         "prompt_fingerprint": first.prompt_fingerprint,
@@ -2456,6 +1998,8 @@ def _semantic_model_report(
         "by_scenario_class": _group_semantic_route_results(results, "scenario_class"),
         "by_risk_class": _group_semantic_route_results(results, "risk_class"),
         "by_risk_domain": _group_semantic_route_results(results, "risk_domain"),
+        "by_routing_scope": _group_semantic_route_results(results, "routing_scope"),
+        "confirmation_escape": _confirmation_escape_metrics(results),
     }
     if repetition is not None:
         report["cases"] = [
@@ -2466,7 +2010,9 @@ def _semantic_model_report(
                 "risk_class": result.risk_class,
                 "risk_domain": result.risk_domain,
                 "evaluation_split": result.evaluation_split,
+                "routing_scope": result.routing_scope,
                 "disposition": result.disposition,
+                "mismatch_kind": result.mismatch_kind,
                 "expected": _route_signature(result.expected),
                 "actual": _route_signature(result.attempt.resolution),
                 "latency_ms": result.attempt.elapsed_ms,
@@ -2578,7 +2124,7 @@ def _validate_semantic_route_structural_supplement(
         )
     )
     if len(union_signatures) != _SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT:
-        raise ValueError("structural route-signature union is not the canonical 27 leaves")
+        raise ValueError("structural route-signature union has the wrong canonical leaf count")
 
 
 def _semantic_route_structural_report(
@@ -3103,6 +2649,7 @@ def _assert_semantic_results_are_comparable(
             result.risk_class,
             result.risk_domain,
             result.evaluation_split,
+            result.routing_scope,
             result.expected,
         )
 
@@ -3121,6 +2668,9 @@ def _semantic_gate_failures(
     failures: list[str] = []
     if not projection.passed:
         failures.append("production context projection did not match the frozen fixture")
+    confirmation = _confirmation_escape_metrics(candidate)
+    if confirmation["false_escapes"]:
+        failures.append("candidate produced a false person escape during confirmation")
     if gate == "shadow":
         if _count_disposition(candidate, "closed_failure"):
             failures.append("candidate produced a closed failure")
@@ -3157,9 +2707,52 @@ def _semantic_gate_failures(
     if _count_disposition(candidate, "unsafe_executable_misroute"):
         failures.append("candidate produced an unsafe executable misroute")
     acceptance = [result for result in candidate if result.evaluation_split == "acceptance"]
+    required_domains = {result.risk_domain for result in candidate}
+    acceptance_domains = {result.risk_domain for result in acceptance}
+    missing_domains = required_domains - acceptance_domains
+    if missing_domains:
+        failures.append("acceptance omitted risk domains: " + ", ".join(sorted(missing_domains)))
+
+    required_capabilities = set(projection.expected_context.available_capabilities)
+    accepted_capabilities = {
+        result.expected.request.kind
+        for result in acceptance
+        if result.expected.decision == "direct" and result.expected.request is not None
+    }
+    missing_capabilities = required_capabilities - accepted_capabilities
+    if missing_capabilities:
+        failures.append(
+            "acceptance omitted capabilities: "
+            + ", ".join(sorted(capability.value for capability in missing_capabilities))
+        )
+    exact_capabilities = {
+        result.expected.request.kind
+        for result in acceptance
+        if result.expected.decision == "direct"
+        and result.expected.request is not None
+        and result.disposition == "exact"
+    }
+    capabilities_without_exact = (
+        required_capabilities & accepted_capabilities
+    ) - exact_capabilities
+    if capabilities_without_exact:
+        failures.append(
+            "acceptance had no exact result for capabilities: "
+            + ", ".join(sorted(capability.value for capability in capabilities_without_exact))
+        )
+
     critical = [result for result in acceptance if result.risk_class == "critical"]
     if _count_disposition(critical, "exact") != len(critical):
         failures.append("not every critical acceptance case was exact")
+    for risk_domain in sorted(acceptance_domains):
+        domain_results = [result for result in acceptance if result.risk_domain == risk_domain]
+        domain_budget = _semantic_acceptance_budget(domain_results)
+        domain_exact = _count_disposition(domain_results, "exact")
+        if domain_exact < domain_budget["required_exact_count"]:
+            failures.append(
+                f"{risk_domain} acceptance exact count {domain_exact} was below required "
+                f"{domain_budget['required_exact_count']} of {domain_budget['cases']}"
+            )
     budget = _semantic_acceptance_budget(acceptance)
     exact = _count_disposition(acceptance, "exact")
     if exact < budget["required_exact_count"]:
@@ -3382,9 +2975,19 @@ async def _run_semantic_route_eval(
     gate: SemanticRouteGate = "cutover",
     *,
     diagnostic_timeout_seconds: float | None = None,
+    candidate_selection: ProviderModel | None = None,
 ) -> int:
     selection = _load_routing_eval_selection()
     config = selection.config
+    effective_candidate = candidate_selection or config.llm.routing
+    if candidate_selection is None:
+        candidate_model = selection.routing_model
+        candidate_structured_output_method = selection.routing_structured_output_method
+    else:
+        candidate_model = selection.gateway.chat_model(candidate_selection)
+        candidate_structured_output_method = selection.gateway.structured_output_method(
+            candidate_selection
+        )
     repetitions = 1 if gate == "diagnostic" else _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS
     if gate == "diagnostic":
         if (
@@ -3402,8 +3005,10 @@ async def _run_semantic_route_eval(
         config,
         selection.response_model,
         selection.gateway.chat_model(config.llm.reasoning),
+        routing_model=candidate_model,
         thread_id=f"semantic-route-eval-{uuid.uuid4().hex}",
         structured_output_method=selection.response_structured_output_method,
+        routing_structured_output_method=candidate_structured_output_method,
     )
     try:
         corpus = _load_semantic_route_corpus()
@@ -3442,9 +3047,9 @@ async def _run_semantic_route_eval(
 
         assert isinstance(projected, RoutingContext)
         candidate_router = SemanticRouter(
-            selection.routing_model,
-            selection=config.llm.routing,
-            structured_output_method=selection.routing_structured_output_method,
+            candidate_model,
+            selection=effective_candidate,
+            structured_output_method=candidate_structured_output_method,
             timeout_seconds=timeout_seconds,
             input_max_chars=config.runtime.semantic_router_input_max_chars,
             registry=runtime.capability_registry,
@@ -3647,16 +3252,18 @@ _TRANSPORT_OWNER_SCENARIOS = (
     TransportOwnerScenario(
         scenario_id="frontline_browse",
         owner="frontline",
-        origin_node="model",
+        origin_node=CATALOG_RESPONSE_NODE,
         utterance="Tell me about trail shoes.",
+        initial_request=SearchCatalog(query="trail shoes"),
         offline_faults=(FaultKind.PRE_RESPONSE_DISCONNECT, FaultKind.INTERRUPTED_BODY),
         live_faults=(FaultKind.PRE_RESPONSE_DISCONNECT,),
     ),
     TransportOwnerScenario(
-        scenario_id="cart_checkout",
+        scenario_id="cart_typed_slot",
         owner="cart",
-        origin_node="cart_assemble",
-        utterance="Checkout now please.",
+        origin_node="cart_capability_entry",
+        utterance="Add a trail shoe to my cart.",
+        initial_request=ModifyCart(operation="add"),
         offline_faults=(FaultKind.PRE_RESPONSE_DISCONNECT, FaultKind.INTERRUPTED_BODY),
     ),
     TransportOwnerScenario(
@@ -3664,12 +3271,14 @@ _TRANSPORT_OWNER_SCENARIOS = (
         owner="identity",
         origin_node="identity_assemble",
         utterance="What orders are on my account?",
+        initial_request=ListOrders(scope="account"),
     ),
     TransportOwnerScenario(
         scenario_id="support_cancel",
         owner="support",
-        origin_node="support_assemble",
+        origin_node="support_capability_entry",
         utterance="Cancel order ORD-1002.",
+        initial_request=CancelOrders(),
     ),
     TransportOwnerScenario(
         scenario_id="catalog_grounded_response",
@@ -3706,6 +3315,33 @@ _EMPTY_RECOVERY_STATE = GraphObservation(
 class _OfflineSecretResolver:
     def resolve(self, _ref: str) -> str:
         return "offline-not-a-secret"
+
+
+class _TransportContinuationRecognizer:
+    """Reach a seeded owner without including routing in the injected owner fault."""
+
+    async def route(self, context: RoutingContext) -> RoutingAttempt:
+        resolution: RouteResolution = (
+            RouteDecision.continue_current()
+            if context.active_capability is not None
+            else RoutingFailure(reason="context_invalid")
+        )
+        return RoutingAttempt(
+            resolution=resolution,
+            provider="transport-fixture",
+            model="seeded-continuation",
+            structured_output_method="function_calling",
+            elapsed_ms=0.0,
+            input_tokens=None,
+            cache_read_tokens=None,
+            output_tokens=None,
+            route_schema_fingerprint=ROUTE_SCHEMA_FINGERPRINT,
+            prompt_fingerprint="transport-seeded-continuation",
+            registry_fingerprint="transport-runtime-registry",
+            input_max_chars=2048,
+            timeout_seconds=1.0,
+            provider_call_outcome="not_attempted",
+        )
 
 
 def _transport_targets() -> tuple[dict[str, ProviderModel], int]:
@@ -3934,8 +3570,11 @@ async def _run_transport_case(
                     config,
                     model,
                     model,
+                    routing_model=model,
+                    routing_recognizer=_TransportContinuationRecognizer(),
                     thread_id=f"transport-{uuid.uuid4().hex}",
                     structured_output_method=gateway.structured_output_method(target),
+                    routing_structured_output_method=gateway.structured_output_method(target),
                 )
                 _seed_transport_request(runtime, scenario)
                 observation = await asyncio.wait_for(
@@ -4054,47 +3693,7 @@ async def _run_transport_certification(
     return 0 if report["passed"] else 1
 
 
-async def _outcome(graph, utterance: str) -> str | None:
-    """How the turn left the frontline, else None (answered).
-
-    3b semantics: a checkout/support-destination handover no longer ends at a spoken
-    deferral — it ENTERS the flow (clearing the handover signal), so escalation shows up
-    as `active_flow`/`pending_*` in the output, or as a paused confirm interrupt.
-    3c-follow-up semantics: a flow can also run to a TERMINAL decline (return-first,
-    amount gate, ineligible cancel) that clears `active_flow` before END — then the only
-    trace is the flow model's tool activity in the turn's messages, so that counts as
-    'flow' too. Returns 'gate'/'model' (handover survived in state) or 'flow' (a gated
-    flow ran). Each utterance runs on a fresh thread (interrupts need a checkpointer).
-    """
-    global _THREAD_SEQ
-    _THREAD_SEQ += 1
-    config = {"configurable": {"thread_id": f"eval-{_THREAD_SEQ}"}}
-    turn_id = uuid.uuid4().hex
-    out = await graph.ainvoke(
-        {
-            "messages": [HumanMessage(content=utterance, id=turn_id)],
-            "consumed_turn_ids": (turn_id,),
-        },
-        config,
-    )
-    handover = out.get("handover")
-    if handover is not None:
-        return handover.source
-    if (
-        out.get("active_flow") is not None
-        or out.get("pending_placement") is not None
-        or graph.get_state(config).interrupts
-    ):
-        return "flow"
-    for msg in out["messages"]:
-        if isinstance(msg, AIMessage) and any(
-            call["name"] in _FLOW_TOOLS for call in msg.tool_calls
-        ):
-            return "flow"
-    return None
-
-
-async def _run(*, preflight_only: bool = False) -> int:
+def _run_preflight() -> int:
     safety_data = load_yaml_layer(_SAFETY_EVAL_PATH)
     speech_failures = _speech_authority_failures()
     order_failures = _order_reference_failures(safety_data)
@@ -4109,98 +3708,9 @@ async def _run(*, preflight_only: bool = False) -> int:
     if not order_failures:
         print("[order_reference] all registered contracts passed. [PASS]")
     if speech_failures or order_failures:
-        print("\nFRONTLINE EVAL BLOCKED - structural safety preflight failed. [FAIL]")
+        print("\\nFRONTLINE EVAL BLOCKED: structural safety preflight failed. [FAIL]")
         return 1
     print("[structural_preflight] all registered contracts passed. [PASS]")
-    if preflight_only:
-        return 0
-
-    # Eval runs must not pollute the LIVE telemetry dataset (classifier data): redirect
-    # this process's sink to a sibling eval file (same local-only, gitignored dir).
-    telemetry._TELEMETRY_PATH = telemetry._TELEMETRY_PATH.with_name("frontline_eval.jsonl")
-    selection = _load_routing_eval_selection()
-    config = selection.config
-    chat_model = selection.response_model
-    runtime = _build_eval_runtime(
-        config,
-        chat_model,
-        selection.gateway.chat_model(config.llm.reasoning),
-        thread_id=f"frontline-eval-{uuid.uuid4().hex}",
-        structured_output_method=selection.response_structured_output_method,
-    )
-    graph = runtime.graph
-    data = load_yaml_layer(_EVAL_PATH)
-
-    # --- PRIMARY: escalation recall (gate OR model OR checkout-flow entry) ---
-    escalate = data["should_escalate"]
-    by_gate = by_model = by_flow = 0
-    misses: list[str] = []
-    for utt in escalate:
-        source = await _outcome(graph, utt)
-        if source == "gate":
-            by_gate += 1
-        elif source == "model":
-            by_model += 1
-        elif source == "flow":
-            by_flow += 1
-        else:
-            misses.append(utt)
-    escalated = by_gate + by_model + by_flow
-    recall = escalated / len(escalate)
-    print(f"[should_escalate] recall: {escalated}/{len(escalate)} ({recall:.0%})")
-    print(
-        f"    gate caught {by_gate} (informational fast-path) | model caught {by_model} "
-        f"| entered a gated flow {by_flow}"
-    )
-    for miss in misses:
-        print(f"    MISS (answered instead of escalated - triage prompt/few-shot): {miss!r}")
-
-    # --- INFORMATIONAL: over-escalation on should_answer ---
-    answer = data["should_answer"]
-    over = []
-    for utt in answer:
-        source = await _outcome(graph, utt)
-        if source is not None:
-            over.append(f"{utt!r} (source={source})")
-    print(f"[should_answer] over-escalation: {len(over)}/{len(answer)} (informational)")
-    for o in over:
-        print(f"    OVER-ESCALATED: {o}")
-
-    read_owner_corpus = _load_read_owner_corpus()
-    read_owner_failures = await _run_read_owner_cases(graph, read_owner_corpus)
-    print(
-        f"[read_owners] semantic cases: "
-        f"{len(read_owner_corpus.cases) - len(read_owner_failures)}/"
-        f"{len(read_owner_corpus.cases)}"
-    )
-    for case_id, failures in read_owner_failures.items():
-        for failure in failures:
-            print(f"    {case_id}: {failure}")
-
-    order_target_failures = await _evaluate_order_targets(
-        chat_model,
-        selection.response_structured_output_method,
-    )
-
-    if recall < _RECALL_BAR:
-        print(
-            f"\nT1 ROUTING EVAL FAILED - escalation recall {recall:.0%} < {_RECALL_BAR:.0%}. [FAIL]"
-        )
-        return 1
-    if read_owner_failures:
-        print("\nFRONTLINE READ-OWNER EVAL FAILED. [FAIL]")
-        return 1
-    if order_target_failures:
-        print("\nFRONTLINE ORDER-TARGET EVAL FAILED. [FAIL]")
-        return 1
-    print(
-        f"\nT1 ROUTING eval passed: escalation recall {recall:.0%} "
-        f">= {_RECALL_BAR:.0%}. [ROUTING-ONLY PASS]"
-    )
-    print(
-        "Coverage limit: no multi-turn effect/speech/next-state or LiveKit transport "
-        "certification was performed."
-    )
     return 0
 
 
@@ -4222,17 +3732,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--semantic-routing-structural-coverage",
         action="store_true",
         help="validate development-only route/checklist coverage without loading a model",
-    )
-    mode.add_argument(
-        "--legacy-routing-diagnostic",
-        action="store_true",
-        help="replay eligible semantic cases through the production legacy graph",
-    )
-    mode.add_argument(
-        "--legacy-routing-compatibility",
-        type=Path,
-        metavar="SCHEMA_V1_REPORT",
-        help="attest an immutable schema-v1 legacy report against the current corpus",
     )
     mode.add_argument(
         "--semantic-routing-data-audit",
@@ -4263,16 +3762,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="development-only structural coverage report destination",
     )
     parser.add_argument(
-        "--legacy-routing-report",
-        type=Path,
-        help="sanitized production legacy-route diagnostic destination",
-    )
-    parser.add_argument(
-        "--legacy-routing-compatibility-report",
-        type=Path,
-        help="legacy compatibility sidecar destination",
-    )
-    parser.add_argument(
         "--semantic-routing-gate",
         choices=("diagnostic", "shadow", "cutover"),
         help="semantic-router qualification gate (defaults to cutover)",
@@ -4281,6 +3770,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--semantic-routing-diagnostic-timeout-seconds",
         type=float,
         help="evaluation-only router timeout; valid only with the diagnostic gate",
+    )
+    parser.add_argument(
+        "--semantic-routing-candidate",
+        type=_parse_provider_model,
+        help=(
+            "evaluation-only provider:model candidate override; requires an explicit report "
+            "path and diagnostic or shadow gate"
+        ),
     )
     parser.add_argument(
         "--semantic-routing-data-partition",
@@ -4343,15 +3840,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "--semantic-routing-structural-report requires --semantic-routing-structural-coverage"
         )
-    if args.legacy_routing_report is not None and not args.legacy_routing_diagnostic:
-        parser.error("--legacy-routing-report requires --legacy-routing-diagnostic")
-    if (
-        args.legacy_routing_compatibility_report is not None
-        and args.legacy_routing_compatibility is None
-    ):
-        parser.error(
-            "--legacy-routing-compatibility-report requires --legacy-routing-compatibility"
-        )
     if args.semantic_routing_gate is not None and not args.semantic_routing_eval:
         parser.error("--semantic-routing-gate requires --semantic-routing-eval")
     if (
@@ -4361,6 +3849,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(
             "--semantic-routing-diagnostic-timeout-seconds requires --semantic-routing-eval"
         )
+    if args.semantic_routing_candidate is not None and not args.semantic_routing_eval:
+        parser.error("--semantic-routing-candidate requires --semantic-routing-eval")
+    if args.semantic_routing_candidate is not None and args.semantic_routing_report is None:
+        parser.error("--semantic-routing-candidate requires --semantic-routing-report")
+    if args.semantic_routing_candidate is not None:
+        try:
+            args.semantic_routing_candidate = _resolve_conformance_target(
+                args.semantic_routing_candidate
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
     custom_routing_data_options = (
         bool(args.semantic_routing_data_partition)
         or args.semantic_routing_acquisition_plan is not None
@@ -4375,16 +3874,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_semantic_route_structural_coverage(
             args.semantic_routing_structural_report or _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH
         )
-    if args.legacy_routing_diagnostic:
-        return asyncio.run(
-            _run_legacy_route_diagnostic(args.legacy_routing_report or _LEGACY_ROUTE_REPORT_PATH)
-        )
-    if args.legacy_routing_compatibility is not None:
-        return _run_legacy_compatibility_attestation(
-            args.legacy_routing_compatibility,
-            args.legacy_routing_compatibility_report
-            or _default_legacy_compatibility_report_path(args.legacy_routing_compatibility),
-        )
     if args.semantic_routing_data_audit:
         return _run_routing_data_audit(
             args.semantic_routing_data_partition,
@@ -4394,6 +3883,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.semantic_routing_eval:
         semantic_gate = args.semantic_routing_gate or "cutover"
+        if args.semantic_routing_candidate is not None and semantic_gate == "cutover":
+            parser.error(
+                "--semantic-routing-candidate is evaluation-only; use diagnostic or shadow"
+            )
         if semantic_gate == "diagnostic":
             diagnostic_timeout_seconds = args.semantic_routing_diagnostic_timeout_seconds
             if (
@@ -4416,6 +3909,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
                 semantic_gate,
                 diagnostic_timeout_seconds=diagnostic_timeout_seconds,
+                candidate_selection=args.semantic_routing_candidate,
             )
         )
     if args.recovery_certification is not None:
@@ -4431,7 +3925,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scenario_timeout_seconds=args.transport_scenario_timeout_seconds,
             )
         )
-    return asyncio.run(_run(preflight_only=args.preflight_only))
+    if args.preflight_only:
+        return _run_preflight()
+    parser.error("no evaluation mode selected; choose an explicit current evaluator")
 
 
 if __name__ == "__main__":

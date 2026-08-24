@@ -35,6 +35,7 @@ def _valid_merchant_dict() -> dict:
                 "identity": 1,
                 "support": 2,
                 "cart": 2,
+                "router": 2,
             },
         },
         "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
@@ -140,6 +141,7 @@ def test_to_policy_context_carries_every_enforced_value() -> None:
     assert context.identity_clarification_reask_max == 1
     assert context.support_clarification_reask_max == 2
     assert context.cart_clarification_reask_max == 2
+    assert context.router_clarification_reask_max == 2
     assert context.cancel_batch_max == 10
 
 
@@ -185,6 +187,7 @@ def test_negative_order_cap_rejected() -> None:
                     "identity": 1,
                     "support": 2,
                     "cart": 2,
+                    "router": 2,
                 },
             }
         )

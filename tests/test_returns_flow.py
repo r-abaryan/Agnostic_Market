@@ -21,6 +21,12 @@ from turn_helpers import engine_events
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.orchestration import (
+    ExplicitOrderTarget,
+    RefundOrder,
+    ReturnOrder,
+    RouteDecision,
+)
 from agnostic_market.dtos.state import PolicyContext
 
 # returnless high (the default): the return tests drive the RETURN door directly.
@@ -45,12 +51,11 @@ def _return_harness(
         build_support_engine(
             config_root,
             policy=policy,
-            reasoning=FakeChatModel(
-                force_tool="propose_return",
-                canned_args={"propose_return": {"order_key": order_key}},
-                tool_call_limit=1,
-            ),
+            reasoning=FakeChatModel(),
             thread_id=thread_id,
+            routing_resolution=RouteDecision.direct(
+                ReturnOrder(target=ExplicitOrderTarget(order_ref=f"ORD-100{order_key}"))
+            ),
         )
     )
 
@@ -209,18 +214,15 @@ async def test_steered_refund_out_of_window_declines_before_promising(
         build_support_engine(
             config_root,
             policy=tight,
-            reasoning=FakeChatModel(
-                force_tool="propose_refund",
-                canned_args={
-                    "propose_refund": {
-                        "order_key": "3",
-                        "amount_usd": 40.0,
-                        "destination": "original",
-                    }
-                },
-                tool_call_limit=1,
-            ),
+            reasoning=FakeChatModel(),
             thread_id="ret-steer-1",
+            routing_resolution=RouteDecision.direct(
+                RefundOrder(
+                    target=ExplicitOrderTarget(order_ref="ORD-1003"),
+                    amount_usd=40.0,
+                    destination="original",
+                )
+            ),
         )
     )
     events = await _events(h.engine, "I want a refund for my socks order")
@@ -237,18 +239,15 @@ async def test_refund_with_open_return_points_at_it(config_root: Path) -> None:
         build_support_engine(
             config_root,
             policy=_POLICY,
-            reasoning=FakeChatModel(
-                force_tool="propose_refund",
-                canned_args={
-                    "propose_refund": {
-                        "order_key": "1",
-                        "amount_usd": 150.0,
-                        "destination": "original",
-                    }
-                },
-                tool_call_limit=1,
-            ),
+            reasoning=FakeChatModel(),
             thread_id="ret-open-1",
+            routing_resolution=RouteDecision.direct(
+                RefundOrder(
+                    target=ExplicitOrderTarget(order_ref="ORD-1001"),
+                    amount_usd=150.0,
+                    destination="original",
+                )
+            ),
         )
     )
     existing = h.store.create_return(
@@ -329,18 +328,15 @@ async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path
         build_support_engine(
             config_root,
             policy=_POLICY,
-            reasoning=FakeChatModel(
-                force_tool="propose_refund",
-                canned_args={
-                    "propose_refund": {
-                        "order_key": "2",
-                        "amount_usd": 129.0,
-                        "destination": "new_instrument",
-                    }
-                },
-                tool_call_limit=1,
-            ),
+            reasoning=FakeChatModel(),
             thread_id="ret-cross-1",
+            routing_resolution=RouteDecision.direct(
+                RefundOrder(
+                    target=ExplicitOrderTarget(order_ref="ORD-1002"),
+                    amount_usd=129.0,
+                    destination="new_instrument",
+                )
+            ),
         )
     )
     await _events(h.engine, "I'd like a refund to a different card")  # pauses at OTP

@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -299,6 +299,7 @@ class NodePolicyRegistry:
         self._infrastructure: set[str] = set()
         self._handled: set[str] = set()
         self._handled_infrastructure: set[str] = set()
+        self._consent_interrupt_kinds: dict[str, Literal["standard", "cancel"]] = {}
         self._execution_tracker = NodeExecutionTracker()
         self._validated: Mapping[str, NodeRecoveryPolicy] | None = None
 
@@ -330,9 +331,15 @@ class NodePolicyRegistry:
         on_exception: ExceptionAction,
         on_abandonment: AbandonmentKind,
         *,
+        consent_interrupt_kind: Literal["standard", "cancel"] | None = None,
         destinations: tuple[str, ...] | None = None,
     ) -> None:
         self._ensure_open_and_unique(name)
+        if (
+            consent_interrupt_kind is not None
+            and on_abandonment != AbandonmentKind.LIFECYCLE_SPECIAL
+        ):
+            raise ValueError("a consent interrupt must use lifecycle-special abandonment")
         policy = NodeRecoveryPolicy(
             on_exception=on_exception,
             on_abandonment=on_abandonment,
@@ -354,6 +361,8 @@ class NodePolicyRegistry:
             destinations=destinations,
         )
         self._policies[name] = policy
+        if consent_interrupt_kind is not None:
+            self._consent_interrupt_kinds[name] = consent_interrupt_kind
         if handler is not None:
             self._handled.add(name)
 
@@ -435,6 +444,12 @@ class NodePolicyRegistry:
     def validated_execution_tracker(self) -> NodeExecutionTracker:
         self.validated_policies()
         return self._execution_tracker
+
+    def validated_consent_interrupt_kinds(
+        self,
+    ) -> Mapping[str, Literal["standard", "cancel"]]:
+        self.validated_policies()
+        return MappingProxyType(dict(self._consent_interrupt_kinds))
 
 
 def ordinary_exception_handler_enabled(action: ExceptionAction) -> bool:
@@ -755,7 +770,7 @@ _NON_PREFIXED_AUTOMATION_FIELDS = frozenset(
         "handover",
         "identity_claim_misses",
         "active_flow",
-        "clarification_progress",
+        "clarification_liveness",
     }
 )
 _PROTECTED_STATE_FIELDS = frozenset({"messages", "automation_terminal"})
@@ -763,6 +778,7 @@ _AUTOMATION_STATE_RESET: Mapping[str, object] = MappingProxyType(
     {
         "handover": None,
         "pending_capability_dispatch": None,
+        "pending_router_no_action": None,
         "pending_cart_mutation": None,
         "pending_placement": None,
         "pending_refund": None,
@@ -776,7 +792,7 @@ _AUTOMATION_STATE_RESET: Mapping[str, object] = MappingProxyType(
         "active_flow": None,
         "pending_ack": None,
         "pending_clarification": None,
-        "clarification_progress": None,
+        "clarification_liveness": None,
     }
 )
 
