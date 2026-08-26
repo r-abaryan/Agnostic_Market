@@ -25,8 +25,7 @@ from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutput
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
 
-type SemanticRoutingQualificationSchemaVersion = Literal["7"]
-SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION: SemanticRoutingQualificationSchemaVersion = "7"
+type SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION = Literal["7"]
 RoutingRecognizerFactory = Callable[[CapabilityRegistry], RoutingRecognizer]
 
 _STRICT = ConfigDict(extra="ignore", frozen=True)
@@ -74,7 +73,7 @@ class _QualificationModels(BaseModel):
 class SemanticRoutingQualification(BaseModel):
     model_config = _STRICT
 
-    schema_version: SemanticRoutingQualificationSchemaVersion
+    schema_version: SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
     run_at: datetime
     corpus_fingerprint: str = Field(min_length=1)
     gate: _QualificationGate
