@@ -55,7 +55,11 @@ from agnostic_market.dtos.orchestration import (
     ViewCart,
     ViewIdentityStatus,
 )
-from agnostic_market.dtos.state import ReasoningState, open_active_invocation
+from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
+    ReasoningState,
+    open_active_invocation,
+)
 from agnostic_market.llm.gateway import load_provider_credentials
 from scripts import frontline_eval
 from scripts.frontline_eval import (
@@ -473,7 +477,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         )
         line = runtime.cart_store.view()[0]
         expected_state = GraphObservation(
-            active_flow=None,
+            execution_owner=None,
             automation_channels=(),
             handover_destination=None,
             interrupted=False,
@@ -522,6 +526,7 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
     runtime.graph.update_state(
         {"configurable": {"thread_id": runtime.engine.thread_id}},
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
             "active_invocation": open_active_invocation(
                 ModifyCart(
@@ -558,7 +563,7 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
                 observation,
                 expected_effects=observation.before,
                 expected_state=GraphObservation(
-                    active_flow="cart",
+                    execution_owner="cart",
                     automation_channels=("pending_cart_mutation",),
                     handover_destination=None,
                     interrupted=True,
@@ -595,6 +600,7 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
     runtime.graph.update_state(
         {"configurable": {"thread_id": runtime.engine.thread_id}},
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
             "active_invocation": open_active_invocation(
                 SearchCatalog(query="running"),
@@ -630,7 +636,7 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
         assert observation.final.model_calls == 1
         assert observation.final.effects == observation.before
         assert observation.final.state == GraphObservation(
-            active_flow=None,
+            execution_owner=None,
             automation_channels=(),
             handover_destination=None,
             interrupted=False,
@@ -667,6 +673,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
     runtime.graph.update_state(
         {"configurable": {"thread_id": runtime.engine.thread_id}},
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
             "active_invocation": open_active_invocation(
                 PlaceOrder(),
@@ -699,7 +706,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
                 observation,
                 expected_effects=observation.before,
                 expected_state=GraphObservation(
-                    active_flow="cart",
+                    execution_owner="cart",
                     automation_channels=("pending_placement",),
                     handover_destination=None,
                     interrupted=True,
@@ -3218,7 +3225,7 @@ def test_live_transport_scorer_requires_a_successful_upstream_retry(
                 ),
                 effects=effects,
                 state=GraphObservation(
-                    active_flow=None,
+                    execution_owner=None,
                     automation_channels=(),
                     handover_destination=None,
                     interrupted=False,
@@ -3268,7 +3275,7 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
                 audible=(AudibleObservation(kind="token", text="unsafe claim", node=None),),
                 effects=_effects(otp_dispatches=1),
                 state=GraphObservation(
-                    active_flow="support",
+                    execution_owner="support",
                     automation_channels=(),
                     handover_destination=None,
                     interrupted=False,
@@ -3284,7 +3291,7 @@ def test_safety_scorer_reports_effect_speech_and_state_failures() -> None:
         observed,
         expected_effects=_effects(),
         expected_state=GraphObservation(
-            active_flow=None,
+            execution_owner=None,
             automation_channels=(),
             handover_destination=None,
             interrupted=False,
@@ -3325,7 +3332,7 @@ async def test_evaluator_confirms_failed_turn_recovery_admits_the_next_utterance
         model_call_count=lambda: _model_calls(reasoning),
     )
     expected_state = GraphObservation(
-        active_flow=None,
+        execution_owner=None,
         automation_channels=(),
         handover_destination=None,
         interrupted=False,
@@ -3370,7 +3377,7 @@ async def test_support_no_tool_fabrication_is_dropped_and_clarified_in_code(
         model_call_count=lambda: _model_calls(reasoning),
     )
     expected_state = GraphObservation(
-        active_flow="support",
+        execution_owner="support",
         automation_channels=("active_invocation", "clarification_liveness"),
         handover_destination=None,
         interrupted=False,
@@ -3470,7 +3477,7 @@ async def test_identity_assurance_fabrication_is_blocked_without_granting_author
         model_call_count=lambda: _model_calls(frontline, reasoning),
     )
     expected_state = GraphObservation(
-        active_flow="identity",
+        execution_owner="identity",
         automation_channels=("pending_identity", "active_invocation"),
         handover_destination=None,
         interrupted=True,
@@ -3504,7 +3511,7 @@ async def test_identity_assurance_fabrication_is_blocked_without_granting_author
 
 def _assert_terminal_turn(turn: TurnObservation) -> None:
     assert turn.state == GraphObservation(
-        active_flow=None,
+        execution_owner=None,
         automation_channels=(),
         handover_destination=None,
         interrupted=False,
@@ -3638,6 +3645,7 @@ async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root
     harness.engine._graph.update_state(
         {"configurable": {"thread_id": harness.engine.thread_id}},
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "automation_terminal": True,
             "consumed_turn_ids": consumed_turn_ids,
             "active_invocation": open_active_invocation(

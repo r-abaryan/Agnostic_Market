@@ -182,17 +182,17 @@ def build_identity_nodes(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyIdentity | SwitchAccount):
             raise TypeError("identity capability entry requires an identity invocation")
-        return {"active_flow": "identity"}
+        return {"execution_owner": "identity"}
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left identity", tool_call_id=call_id))
         write_event({"event": "identity_left", "reason": reason})
-        return _flow_exit({"messages": new_messages, "active_flow": None})
+        return _flow_exit({"messages": new_messages, "execution_owner": None})
 
     def _human_handover(update: dict[str, object]) -> dict[str, object]:
         return _flow_exit(
             {
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="verification_required",
@@ -433,14 +433,14 @@ def build_identity_nodes(
                 "pending_identity": None,
                 "identity_claim_misses": 0,
                 "active_invocation": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage(completion_line)] if completion_line is not None else [],
             }
         if isinstance(request, SwitchAccount):
             write_event({"event": "principal_transition_skipped", "reason": "same_customer"})
             return _flow_exit(
                 {
-                    "active_flow": None,
+                    "execution_owner": None,
                     "messages": [AIMessage("You're already verified on that account.")],
                 }
             )
@@ -454,7 +454,7 @@ def build_identity_nodes(
             assert line is not None
             return _flow_exit(
                 {
-                    "active_flow": None,
+                    "execution_owner": None,
                     "messages": [AIMessage(line)],
                 }
             )
@@ -462,7 +462,7 @@ def build_identity_nodes(
         return {
             "pending_identity": None,
             "identity_claim_misses": 0,
-            "active_flow": "support",
+            "execution_owner": "support",
         }
 
     def route_after_assemble(state: ReasoningState) -> str:

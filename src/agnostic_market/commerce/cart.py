@@ -6,11 +6,13 @@ confirmed mutation ledger prevents retry or recovery from applying one approved 
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
+from agnostic_market.dtos.money import UsdAmount, validate_usd
 from agnostic_market.dtos.orchestration import CartOperation
 from agnostic_market.dtos.state import CartLine
 
@@ -29,7 +31,7 @@ class CartMutationRecord(BaseModel):
     operation: CartOperation
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    price_usd: float = Field(ge=0)
+    price_usd: UsdAmount
     quantity: int | None = Field(default=None, strict=True, ge=0)
     pre_confirm_quantity: int = Field(strict=True, ge=0)
     previous_quantity: int = Field(strict=True, ge=0)
@@ -60,7 +62,7 @@ def _mutation_matches(
     operation: CartOperation,
     sku: str,
     name: str,
-    price_usd: float,
+    price_usd: UsdAmount,
     quantity: int | None,
     pre_confirm_quantity: int,
 ) -> bool:
@@ -81,7 +83,7 @@ class CartStore:
         self._lines: dict[str, CartLine] = {}
         self._mutations_by_key: dict[str, CartMutationRecord] = {}
 
-    def add_item(self, *, sku: str, name: str, price_usd: float, quantity: int) -> CartLine:
+    def add_item(self, *, sku: str, name: str, price_usd: UsdAmount, quantity: int) -> CartLine:
         """Add `quantity` of an item — ADDITIVE (a second add increments the existing line).
         `sku`/`name`/`price_usd` are code-resolved from the candidate list, never model-set."""
         existing = self._lines.get(sku)
@@ -113,7 +115,7 @@ class CartStore:
         operation: CartOperation,
         sku: str,
         name: str,
-        price_usd: float,
+        price_usd: UsdAmount,
         quantity: int | None,
         pre_confirm_quantity: int,
     ) -> CartMutationRecord:
@@ -122,6 +124,7 @@ class CartStore:
         if not idempotency_key.strip():
             raise CartMutationError("cart mutation idempotency key must not be blank")
 
+        checked_price = validate_usd(price_usd)
         existing_record = self._mutations_by_key.get(idempotency_key)
         if existing_record is not None:
             if not _mutation_matches(
@@ -129,7 +132,7 @@ class CartStore:
                 operation=operation,
                 sku=sku,
                 name=name,
-                price_usd=price_usd,
+                price_usd=checked_price,
                 quantity=quantity,
                 pre_confirm_quantity=pre_confirm_quantity,
             ):
@@ -159,7 +162,7 @@ class CartStore:
             operation=operation,
             sku=sku,
             name=name,
-            price_usd=price_usd,
+            price_usd=checked_price,
             quantity=quantity,
             pre_confirm_quantity=pre_confirm_quantity,
             previous_quantity=previous_quantity,
@@ -172,7 +175,7 @@ class CartStore:
             self._lines[sku] = CartLine(
                 sku=sku,
                 name=name,
-                price_usd=price_usd,
+                price_usd=checked_price,
                 quantity=final_quantity,
             )
         self._mutations_by_key[idempotency_key] = record
@@ -185,7 +188,7 @@ class CartStore:
         operation: CartOperation,
         sku: str,
         name: str,
-        price_usd: float,
+        price_usd: UsdAmount,
         quantity: int | None,
         pre_confirm_quantity: int,
     ) -> ReceiptLookup[CartMutationRecord]:
@@ -194,6 +197,7 @@ class CartStore:
         if not idempotency_key.strip():
             raise CartMutationError("cart mutation idempotency key must not be blank")
 
+        checked_price = validate_usd(price_usd)
         return classify_receipt(
             self._mutations_by_key.get(idempotency_key),
             lambda record: _mutation_matches(
@@ -201,7 +205,7 @@ class CartStore:
                 operation=operation,
                 sku=sku,
                 name=name,
-                price_usd=price_usd,
+                price_usd=checked_price,
                 quantity=quantity,
                 pre_confirm_quantity=pre_confirm_quantity,
             ),
@@ -215,8 +219,8 @@ class CartStore:
     def is_empty(self) -> bool:
         return not self._lines
 
-    def cart_total(self) -> float:
-        return round(sum(line.line_total for line in self._lines.values()), 2)
+    def cart_total(self) -> UsdAmount:
+        return sum((line.line_total for line in self._lines.values()), start=Decimal("0"))
 
     def snapshot(self) -> tuple[CartLine, ...]:
         """A frozen copy of the lines for `PendingPlacement` (the confirm/place nodes read

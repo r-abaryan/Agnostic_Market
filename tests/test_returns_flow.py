@@ -308,11 +308,11 @@ async def test_human_at_readback_escapes_with_onramp_package(
         "schema_version",
         "tenant",
         "verification_level",
-        "active_flow",
+        "execution_owner",
         "reason_code",
         "source",
     }
-    assert onramps[0]["schema_version"] == 1
+    assert onramps[0]["schema_version"] == 2
     assert onramps[0]["tenant"] == "acme_store"
     responses = [
         e for e in _telemetry_events(tmp_path) if e.get("event") == "automation_terminal_response"

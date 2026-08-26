@@ -266,7 +266,7 @@ def build_frontline_graph(
     def cart_view_render_node(state: ReasoningState) -> dict[str, object]:
         """Typed `ViewCart` owner: speak the live cart. No model, no tools, no mutation.
 
-        `active_flow` is left untouched: nothing on this path sets one, so clearing would be a
+        `execution_owner` is left untouched: nothing on this path sets one, so clearing would be a
         no-op today and a silent flow-exit the day it is reachable mid-flow.
         """
         if state.active_invocation is None or not isinstance(
@@ -311,10 +311,10 @@ def build_frontline_graph(
         write_event(
             {
                 "event": "human_onramp",
-                "schema_version": 1,
+                "schema_version": 2,
                 "tenant": tenant_id,
                 "verification_level": verification_store.current_level(),
-                "active_flow": state.active_flow,
+                "execution_owner": state.execution_owner,
                 "reason_code": handover.reason_code,
                 "source": handover.source,
             }
@@ -406,12 +406,12 @@ def build_frontline_graph(
             answer = interrupt(f"To {action} and clear this call's context, say yes or no.")
             decision = classify_confirmation(answer)
         if decision.verdict == "yes":
-            return {"active_flow": "identity"}
+            return {"execution_owner": "identity"}
         if decision.verdict == "human":
             assert decision.handoff_source is not None
             return {
                 "active_invocation": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="switch_account" if switching else "verification_required",
@@ -425,7 +425,7 @@ def build_frontline_graph(
         )
         return {
             "active_invocation": None,
-            "active_flow": None,
+            "execution_owner": None,
             "messages": [AIMessage(declined)],
         }
 
@@ -508,7 +508,7 @@ def build_frontline_graph(
         """Consume one admitted dispatch or resume one already-open invocation."""
 
         def continuation_destination(invocation: ActiveInvocation) -> str:
-            if state.active_flow == "identity":
+            if state.execution_owner == "identity":
                 return "identity_assemble"
             return capability_registry.resolve(invocation.request).node_name
 
@@ -727,7 +727,7 @@ def build_frontline_graph(
 
     def route_after_support_capability_entry(state: ReasoningState) -> str:
         if (
-            state.active_flow != "identity"
+            state.execution_owner != "identity"
             and state.active_invocation is not None
             and isinstance(state.active_invocation.request, ListOrders)
         ):

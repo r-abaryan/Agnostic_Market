@@ -80,7 +80,7 @@ def build_stepup_nodes(
             write_event({"event": f"{event_prefix}_stepup_failed", "reason": "sim_swap_risk"})
             return {
                 pending_field: None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="verification_required",
@@ -118,7 +118,7 @@ def build_stepup_nodes(
             write_event({"event": f"{event_prefix}_stepup_failed", "reason": "otp_exhausted"})
             return {
                 pending_field: None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="verification_required",

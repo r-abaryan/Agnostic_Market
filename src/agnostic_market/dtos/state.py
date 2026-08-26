@@ -9,14 +9,16 @@ kept out here so nothing imports a half-defined shape prematurely.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from langchain_core.messages import AnyMessage, HumanMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
+from agnostic_market.dtos.money import UsdAmount
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
@@ -30,6 +32,18 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import PendingRecovery
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
+_STATE_CONFIG = ConfigDict(extra="forbid")
+
+CheckpointSchemaVersion = Literal["1"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "1"
+
+
+class CheckpointSchemaError(ValueError):
+    """Persisted state does not match the current checkpoint contract."""
+
+
+class StateSchemaError(ValueError):
+    """A graph update contains fields outside the reasoning-state contract."""
 
 
 def merge_consumed_turn_ids(
@@ -84,13 +98,13 @@ class PolicyContext(BaseModel):
 
     model_config = _FROZEN
 
-    max_order_value_usd: float = Field(ge=0)
+    max_order_value_usd: UsdAmount
     allow_ai_merchant_handoff: bool
-    refund_auto_approve_under_usd: float = Field(ge=0)
-    refund_require_human_above_usd: float = Field(ge=0)
+    refund_auto_approve_under_usd: UsdAmount
+    refund_require_human_above_usd: UsdAmount
     # Return-first floor for SHIPPED/DELIVERED refunds: above this, the refund waits for
     # the return (industry standard); at/below it may pay out returnless.
-    refund_returnless_under_usd: float = Field(ge=0)
+    refund_returnless_under_usd: UsdAmount
     # Return-eligibility window in days, counted from DELIVERY (Group C; shipped-not-yet-
     # delivered is always in window). REQUIRED (no default) on purpose: PolicyContext is
     # constructed at several sites in lockstep — a site that forgets a new field must fail
@@ -135,12 +149,12 @@ class CartLine(BaseModel):
 
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    price_usd: float = Field(ge=0)
+    price_usd: UsdAmount
     quantity: int = Field(ge=1)
 
     @property
-    def line_total(self) -> float:
-        return round(self.price_usd * self.quantity, 2)
+    def line_total(self) -> UsdAmount:
+        return self.price_usd * self.quantity
 
 
 class PendingCartMutation(BaseModel):
@@ -155,7 +169,7 @@ class PendingCartMutation(BaseModel):
     operation: CartOperation
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    price_usd: float = Field(ge=0)
+    price_usd: UsdAmount
     quantity: int | None = Field(default=None, strict=True, ge=0)
     pre_confirm_quantity: int = Field(strict=True, ge=0)
     idempotency_key: str = Field(min_length=1)
@@ -195,7 +209,7 @@ class PendingPlacement(BaseModel):
     model_config = _FROZEN
 
     lines: tuple[CartLine, ...] = Field(min_length=1)
-    total_usd: float = Field(ge=0)
+    total_usd: UsdAmount
     idempotency_key: str = Field(min_length=1)
     created_at: float  # unix seconds; Clock-A expiry is checked against this on resume
     # Set by the guardrail when a LIVE identical order already exists this session: the
@@ -222,7 +236,7 @@ class PendingRefund(BaseModel):
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)  # the human order description, spoken in the readback so a
     # wrong owned-order selection is caught (INV-32: ownership alone can't tell WHICH owned order).
-    amount_usd: float = Field(ge=0)
+    amount_usd: UsdAmount
     destination: RefundDestination
     instrument_ref: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
@@ -267,7 +281,7 @@ class BatchCancelOutcome(BaseModel):
     outcome: CancelOutcomeCode
     # Present ONLY for a "cancelled" outcome (the CancelRecord's reversed total) — a refusal
     # returns no record, so no amount. Optional by construction, not laziness.
-    amount_usd: float | None = Field(default=None, ge=0)
+    amount_usd: UsdAmount | None = None
 
     @model_validator(mode="after")
     def amount_matches_outcome(self) -> BatchCancelOutcome:
@@ -333,7 +347,7 @@ class PendingReturn(BaseModel):
 
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
-    refund_due_usd: float = Field(ge=0)
+    refund_due_usd: UsdAmount
     idempotency_key: str = Field(min_length=1)
     created_at: float
 
@@ -400,7 +414,7 @@ class PendingIdentity(BaseModel):
 
 
 # Graph-local execution phase for transactional capability owners.
-ActiveFlow = Literal["cart", "support", "identity"]
+ExecutionOwner = Literal["cart", "support", "identity"]
 
 
 class IdentityClarification(BaseModel):
@@ -475,12 +489,15 @@ class ReasoningState(BaseModel):
     """The reasoning graph's state (Phase 3a/3b slice of AGENTS.md §A1).
 
     `messages` uses the append reducer. `handover`, when set, routes the turn to the
-    handover sink. Pending Cart proposals and `active_flow` carry in-flight confirmation
+    handover sink. Pending Cart proposals and `execution_owner` carry in-flight confirmation
     work across interrupts and turns (the thread is checkpointed from 3b on).
     Every non-`messages` field MUST default: the engine feeds turns as
     `{"messages": [<new user message>]}` deltas.
     """
 
+    model_config = _STATE_CONFIG
+
+    checkpoint_schema_version: CheckpointSchemaVersion = CHECKPOINT_SCHEMA_VERSION
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     # Stable transport IDs admitted or explicitly consumed in this caller session. This is
     # replay-defense metadata, not an automation channel: ordinary flow cleanup preserves it,
@@ -508,7 +525,7 @@ class ReasoningState(BaseModel):
     # softened re-ask on a no-match — STT mishears emails constantly — then a silent human
     # handover). Spans turns within the identity invocation and clears on every exit.
     identity_claim_misses: int = 0
-    active_flow: ActiveFlow | None = None
+    execution_owner: ExecutionOwner | None = None
     # Turn-scoped, CODE-authored spoken line the cart flow's assemble hands to the speakable
     # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response).
     # Separate from the closed clarification selector below because these lines carry dynamic
@@ -519,6 +536,20 @@ class ReasoningState(BaseModel):
     pending_clarification: PendingClarification | None = None
     # One liveness tracker owned by an invocation or consecutive router clarification.
     clarification_liveness: ClarificationLiveness | None = None
+
+    @classmethod
+    def from_checkpoint(cls, values: Mapping[str, object]) -> Self:
+        """Validate persisted state while allowing only a truly pristine unversioned thread."""
+
+        if not isinstance(values, Mapping):
+            raise CheckpointSchemaError("checkpoint state must be a mapping")
+        if values and "checkpoint_schema_version" not in values:
+            raise CheckpointSchemaError("checkpoint_schema_version is missing from persisted state")
+        try:
+            validate_reasoning_state_keys(values, source="persisted checkpoint")
+            return cls.model_validate(values)
+        except (StateSchemaError, ValidationError) as exc:
+            raise CheckpointSchemaError("persisted state violates the checkpoint schema") from exc
 
     def last_user_text(self) -> str:
         """Return the latest committed caller text."""
@@ -574,6 +605,21 @@ class ReasoningState(BaseModel):
         ):
             raise ValueError("order-status target source turn was not admitted")
         return self
+
+
+def validate_reasoning_state_keys(
+    values: Mapping[object, object],
+    *,
+    allowed_keys: Collection[str] | None = None,
+    source: str = "reasoning-state update",
+) -> None:
+    """Reject fields outside the owning state or compiled-channel schema."""
+
+    allowed = ReasoningState.model_fields if allowed_keys is None else allowed_keys
+    unexpected = tuple(key for key in values if not isinstance(key, str) or key not in allowed)
+    if unexpected:
+        rendered = ", ".join(sorted(repr(key) for key in unexpected))
+        raise StateSchemaError(f"{source} contains unknown fields: {rendered}")
 
 
 def open_active_invocation(

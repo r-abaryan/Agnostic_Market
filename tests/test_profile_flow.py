@@ -140,7 +140,7 @@ async def test_wrong_otp_twice_hands_to_human_without_changing(
     ]
     assert len(onramps) == 1
     assert onramps[0]["reason_code"] == "verification_required"
-    assert onramps[0]["schema_version"] == 1
+    assert onramps[0]["schema_version"] == 2
 
 
 async def test_sim_swap_flag_blocks_the_otp_entirely(config_root: Path) -> None:

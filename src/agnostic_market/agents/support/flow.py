@@ -42,6 +42,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -105,6 +106,7 @@ from agnostic_market.dtos.confirmation import (
     refund_required_level,
     validate_confirmation_rendering,
 )
+from agnostic_market.dtos.money import UsdAmount
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CancellableOrderScope,
@@ -180,11 +182,11 @@ def _caller_stated_profile_value(utterance: str, field: ProfileField, value: str
     return caller_stated_phone(utterance, value)
 
 
-def _caller_stated_refund_amount(utterance: str, amount_usd: float) -> float | None:
-    variants = {f"{amount_usd:g}", f"{amount_usd:.2f}"}
+def _caller_stated_refund_amount(utterance: str, amount_usd: UsdAmount) -> UsdAmount | None:
+    variants = {format(amount_usd.normalize(), "f"), f"{amount_usd:.2f}"}
     amount = "|".join(re.escape(value) for value in sorted(variants, key=len, reverse=True))
     pattern = rf"(?:\$\s*(?:{amount})\b|\b(?:{amount})\s*(?:dollars?|usd)\b)"
-    return round(amount_usd, 2) if re.search(pattern, utterance, re.IGNORECASE) else None
+    return amount_usd if re.search(pattern, utterance, re.IGNORECASE) else None
 
 
 def _caller_stated_refund_destination(
@@ -308,7 +310,7 @@ class _ProvideRefundOrder(BaseModel):
 class _ProvideRefundAmount(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    amount_usd: float
+    amount_usd: UsdAmount
 
 
 class _ProvideRefundDestination(BaseModel):
@@ -443,7 +445,7 @@ def build_support_nodes(
         raise NotImplementedError("intercepted by the capability entry; never executed")
 
     @tool
-    def provide_refund_amount(amount_usd: float) -> str:
+    def provide_refund_amount(amount_usd: UsdAmount) -> str:
         """Supply only the missing amount for the active refund request."""
         raise NotImplementedError("intercepted by the capability entry; never executed")
 
@@ -528,7 +530,7 @@ def build_support_nodes(
         write_event({"event": "support_left", "reason": "left_flow"})
         return {
             "messages": new_messages,
-            "active_flow": None,
+            "execution_owner": None,
             "pending_refund": None,
             "pending_cancel": None,
             "pending_return": None,
@@ -545,7 +547,7 @@ def build_support_nodes(
         write_event({"event": "profile_change_denied", "reason": "no_profile"})
         result: dict[str, object] = {
             "active_invocation": None,
-            "active_flow": None,
+            "execution_owner": None,
             "pending_profile_change": None,
             "handover": HandoffRequest(
                 destination="human",
@@ -586,7 +588,7 @@ def build_support_nodes(
         )
         return {
             "active_invocation": None,
-            "active_flow": None,
+            "execution_owner": None,
             "messages": [AIMessage(line)],
         }
 
@@ -900,7 +902,7 @@ def build_support_nodes(
                     return _enter_identity_for_action(state, [], request, invocation=invocation)
                 return {
                     "active_invocation": None,
-                    "active_flow": "support",
+                    "execution_owner": "support",
                     "pending_cancel": request.target,
                 }
             if isinstance(request.target, ExplicitOrderSet):
@@ -926,7 +928,7 @@ def build_support_nodes(
                     _record_authorized(order.order_id)
                 return {
                     "active_invocation": None,
-                    "active_flow": "support",
+                    "execution_owner": "support",
                     "pending_cancel": _mint_cancel_batch(
                         [(order.order_id, order.summary) for order in resolved]
                     ),
@@ -962,7 +964,7 @@ def build_support_nodes(
                 )
                 return {
                     "active_invocation": None,
-                    "active_flow": None,
+                    "execution_owner": None,
                     "handover": HandoffRequest(
                         destination="human",
                         reason_code="refund",
@@ -971,7 +973,7 @@ def build_support_nodes(
                 }
             return {
                 "active_invocation": None,
-                "active_flow": "support",
+                "execution_owner": "support",
                 "pending_refund": pending,
             }
 
@@ -991,7 +993,7 @@ def build_support_nodes(
             _record_authorized(chosen.order_id)
             return {
                 "active_invocation": None,
-                "active_flow": "support",
+                "execution_owner": "support",
                 "pending_return": _mint_return(chosen),
             }
 
@@ -1000,7 +1002,7 @@ def build_support_nodes(
             if pending is not None:
                 return {
                     "active_invocation": None,
-                    "active_flow": "support",
+                    "execution_owner": "support",
                     "pending_profile_change": pending,
                 }
             if identity_store.current() is None:
@@ -1034,7 +1036,7 @@ def build_support_nodes(
         )
         return {
             "messages": new_messages,
-            "active_flow": "identity",
+            "execution_owner": "identity",
             "active_invocation": next_invocation,
             "pending_clarification": None,
             "identity_claim_misses": 0,
@@ -1125,7 +1127,7 @@ def build_support_nodes(
         write_event({"event": "support_action_authorized", "order_id": order_ref.strip().upper()})
 
     def _mint_refund(
-        chosen: OrderCandidate, *, amount_usd: float, destination: RefundDestination
+        chosen: OrderCandidate, *, amount_usd: UsdAmount, destination: RefundDestination
     ) -> PendingRefund | None:
         if destination == "original":
             instrument_ref = "original payment method"
@@ -1147,7 +1149,7 @@ def build_support_nodes(
         return PendingRefund(
             order_id=chosen.order_id,
             summary=chosen.summary,
-            amount_usd=round(amount_usd, 2),
+            amount_usd=amount_usd,
             destination=destination,
             instrument_ref=instrument_ref,
             idempotency_key=uuid.uuid4().hex,
@@ -1157,13 +1159,10 @@ def build_support_nodes(
 
     def _mint_return(chosen: OrderCandidate) -> PendingReturn:
         refund_due = max(
-            0.0,
-            round(
-                chosen.total_usd
-                - order_store.refunded_so_far(chosen.order_id)
-                - order_store.return_refund_due(chosen.order_id),
-                2,
-            ),
+            Decimal("0"),
+            chosen.total_usd
+            - order_store.refunded_so_far(chosen.order_id)
+            - order_store.return_refund_due(chosen.order_id),
         )
         return PendingReturn(
             order_id=chosen.order_id,
@@ -1201,7 +1200,7 @@ def build_support_nodes(
         if step.exhausted:
             return {
                 "messages": new_messages,
-                "active_flow": None,
+                "execution_owner": None,
                 "pending_refund": None,
                 "pending_cancel": None,
                 "pending_return": None,
@@ -1216,7 +1215,7 @@ def build_support_nodes(
             }
         return {
             "messages": new_messages,
-            "active_flow": "support",
+            "execution_owner": "support",
             "pending_clarification": SupportClarification(detail=detail),
             "clarification_liveness": step.liveness,
         }
@@ -1227,7 +1226,7 @@ def build_support_nodes(
             raise TypeError("support clarify node requires SupportClarification")
         return {
             "pending_clarification": None,
-            "active_flow": "support",
+            "execution_owner": "support",
             "messages": [AIMessage(_SUPPORT_CLARIFICATION_LINES[clarification.detail])],
         }
 
@@ -1269,7 +1268,7 @@ def build_support_nodes(
             write_event({"event": "refund_denied", "reason": "order_cancelled"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "That order was already cancelled, so the charge is reversed - "
@@ -1287,7 +1286,7 @@ def build_support_nodes(
             write_event({"event": "refund_denied", "reason": "return_already_open"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"A return is already set up for that order ({open_return.rma_id}) - "
@@ -1300,7 +1299,7 @@ def build_support_nodes(
         if (
             pending.destination == "original"
             and captured is not None
-            and round(pending.amount_usd, 2) >= round(captured, 2)
+            and pending.amount_usd >= captured
             and order_store.refunded_so_far(pending.order_id) == 0
             and order_store.is_cancellable(pending.order_id)
         ):
@@ -1332,7 +1331,7 @@ def build_support_nodes(
             )
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"A ${pending.amount_usd:.2f} refund is above what I can process on "
@@ -1355,7 +1354,7 @@ def build_support_nodes(
                 write_event({"event": "refund_needs_return", "reason": "out_of_window"})
                 return {
                     "pending_refund": None,
-                    "active_flow": None,
+                    "execution_owner": None,
                     "messages": [
                         AIMessage(
                             "Since that order has already shipped, the "
@@ -1417,7 +1416,7 @@ def build_support_nodes(
             write_event({"event": "refund_expired", "reason": "pending_ttl"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "That refund confirmation sat for a while, so I haven't processed "
@@ -1437,7 +1436,7 @@ def build_support_nodes(
             write_event({"event": "refund_cancelled", "reason": "human_requested"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="refund",
@@ -1448,7 +1447,7 @@ def build_support_nodes(
             write_event({"event": "refund_cancelled", "reason": "declined"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage("Okay, I won't refund anything - nothing has changed.")],
             }
         return {}  # yes: pending survives; router -> place
@@ -1457,7 +1456,7 @@ def build_support_nodes(
         """Finish one authoritative refund; safe to re-run after receipt reconciliation."""
         update = {
             "pending_refund": None,
-            "active_flow": None,
+            "execution_owner": None,
             "messages": [
                 AIMessage(
                     f"Done - your ${record.amount_usd:.2f} refund is on its way to your "
@@ -1471,7 +1470,7 @@ def build_support_nodes(
             {
                 "event": "refund_confirmed",
                 "refund_id": record.refund_id,
-                "amount": record.amount_usd,
+                "amount": str(record.amount_usd),
                 "verification": verification,
             }
         )
@@ -1490,7 +1489,7 @@ def build_support_nodes(
             write_event({"event": "refund_stepup_failed", "reason": "level_lapsed_at_place"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="verification_required",
@@ -1510,7 +1509,7 @@ def build_support_nodes(
             write_event({"event": "refund_denied", "reason": "store_refused"})
             return {
                 "pending_refund": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     # Outcome only — the handover node's deferral speaks the transfer
                     # sentence; adding one here would say it twice.
@@ -1567,7 +1566,7 @@ def build_support_nodes(
             write_event({"event": "cancel_stepup_to_human", "reason": "risk_flagged"})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="verification_required",
@@ -1578,7 +1577,7 @@ def build_support_nodes(
             write_event({"event": "cancel_batch_over_cap", "count": len(pending.targets)})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"That's more orders than I can cancel in one go - I can do up to "
@@ -1605,7 +1604,7 @@ def build_support_nodes(
             )
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage(render_batch_cancel_outcome(ineligible))],
             }
         return {
@@ -1624,7 +1623,7 @@ def build_support_nodes(
             write_event({"event": "cancel_expired", "reason": "pending_ttl"})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "That sat for a while, so I haven't changed anything. If you still "
@@ -1646,7 +1645,7 @@ def build_support_nodes(
             write_event({"event": "cancel_declined", "reason": "human_requested"})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="cancel_order",
@@ -1662,7 +1661,7 @@ def build_support_nodes(
             )
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage(decline_line)],
             }
         return {}  # yes: pending survives; router -> void
@@ -1697,7 +1696,7 @@ def build_support_nodes(
             all_outcomes = [*pending.ineligible, *outcomes]
             update = {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage(render_batch_cancel_outcome(all_outcomes))],
             }
             recent_orders.record(
@@ -1759,7 +1758,7 @@ def build_support_nodes(
             write_event({"event": "cancel_resolve_declined", "reason": "not_bound"})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage("I couldn't confirm your account, so I haven't changed anything.")
                 ],
@@ -1786,7 +1785,7 @@ def build_support_nodes(
             )
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "I couldn't safely match those orders to your account, so I haven't "
@@ -1798,7 +1797,7 @@ def build_support_nodes(
             write_event({"event": "cancel_resolve_declined", "reason": "none_cancellable"})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage("None of your orders can be cancelled right now - nothing to do.")
                 ],
@@ -1815,7 +1814,7 @@ def build_support_nodes(
             )
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "I found only one order that can be cancelled, so I need you to tell "
@@ -1832,7 +1831,7 @@ def build_support_nodes(
             write_event({"event": "cancel_resolve_over_cap"})
             return {
                 "pending_cancel": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"You've got more orders than I can cancel in one go - I can do up to "
@@ -1848,7 +1847,7 @@ def build_support_nodes(
                 "count": len(candidates),
             }
         )
-        return {"pending_cancel": batch, "active_flow": "support"}
+        return {"pending_cancel": batch, "execution_owner": "support"}
 
     # --- returns sub-path (Group C; single interrupt: guardrail -> confirm -> place) ------
 
@@ -1871,7 +1870,7 @@ def build_support_nodes(
             write_event({"event": "return_denied", "reason": "order_cancelled"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"That order for {pending.summary} was already cancelled and the "
@@ -1903,7 +1902,7 @@ def build_support_nodes(
             write_event({"event": "return_denied", "reason": "already_open"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"A return for that order is already set up - your reference is "
@@ -1916,7 +1915,7 @@ def build_support_nodes(
             write_event({"event": "return_denied", "reason": "out_of_window"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"That order was delivered more than {policy.return_window_days} "
@@ -1938,7 +1937,7 @@ def build_support_nodes(
             )
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"A ${pending.refund_due_usd:.2f} refund is above what I can set up "
@@ -1960,7 +1959,7 @@ def build_support_nodes(
             write_event({"event": "return_expired", "reason": "pending_ttl"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "That return confirmation sat for a while, so I haven't set "
@@ -1980,7 +1979,7 @@ def build_support_nodes(
             write_event({"event": "return_cancelled", "reason": "human_requested"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="refund",
@@ -1991,7 +1990,7 @@ def build_support_nodes(
             write_event({"event": "return_cancelled", "reason": "declined"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage("Okay, I won't set up a return - nothing has changed.")],
             }
         return {}  # yes: pending survives; router -> place
@@ -2000,7 +1999,7 @@ def build_support_nodes(
         """Finish one authoritative return; safe to re-run after receipt reconciliation."""
         update = {
             "pending_return": None,
-            "active_flow": None,
+            "execution_owner": None,
             "messages": [
                 AIMessage(
                     f"Done - your return for {record.summary} is set up; your reference is "
@@ -2015,7 +2014,7 @@ def build_support_nodes(
                 "event": "return_confirmed",
                 "rma_id": record.rma_id,
                 "order_id": record.order_id,
-                "refund_due": record.refund_due_usd,
+                "refund_due": str(record.refund_due_usd),
             }
         )
         return update
@@ -2040,7 +2039,7 @@ def build_support_nodes(
             write_event({"event": "return_denied", "reason": "store_refused"})
             return {
                 "pending_return": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     # Outcome only — the handover node's deferral speaks the transfer line.
                     AIMessage("I wasn't able to set up that return - nothing has changed.")
@@ -2096,7 +2095,7 @@ def build_support_nodes(
             write_event({"event": "profile_expired", "reason": "pending_ttl"})
             return {
                 "pending_profile_change": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "That change sat for a while, so I haven't updated anything. If "
@@ -2116,7 +2115,7 @@ def build_support_nodes(
             write_event({"event": "profile_change_cancelled", "reason": "human_requested"})
             return {
                 "pending_profile_change": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code=(
@@ -2129,7 +2128,7 @@ def build_support_nodes(
             write_event({"event": "profile_change_cancelled", "reason": "declined"})
             return {
                 "pending_profile_change": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage("Okay, I'll leave your details as they are - nothing has changed.")
                 ],
@@ -2141,7 +2140,7 @@ def build_support_nodes(
         noun = "delivery address" if record.field == "address" else "contact number"
         update = {
             "pending_profile_change": None,
-            "active_flow": None,
+            "execution_owner": None,
             "messages": [
                 AIMessage(f"Done - the {noun} on your account is updated to {record.new_value}.")
             ],
@@ -2176,7 +2175,7 @@ def build_support_nodes(
             write_event({"event": "profile_stepup_failed", "reason": reason})
             return {
                 "pending_profile_change": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="verification_required",
@@ -2195,7 +2194,7 @@ def build_support_nodes(
             write_event({"event": "profile_change_denied", "reason": "store_refused"})
             return {
                 "pending_profile_change": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     # Outcome only — the handover node's deferral speaks the transfer line.
                     AIMessage("I wasn't able to update that - nothing has changed.")
@@ -2227,7 +2226,7 @@ def build_support_nodes(
             return "handover"
         if current_turn_called(state.messages, "leave_support"):
             return "leave"  # model explicitly left; normal pipeline answers this turn
-        if state.active_flow == "identity":
+        if state.execution_owner == "identity":
             return "needs_identity"  # unbound "cancel all" — verify first, then resolve
         if isinstance(state.pending_cancel, CancellableOrderScope):
             return "resolve"  # a BOUND caller's scope resolves immediately

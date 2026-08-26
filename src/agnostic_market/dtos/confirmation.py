@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agnostic_market.dtos.money import UsdAmount
+
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 
 # The platform's critical-value vocabulary (VOICE_PIPELINE §7): values where one STT error
@@ -93,7 +95,7 @@ def validate_confirmation_rendering(
 RefundDestination = Literal["original", "new_instrument", "new_address"]
 
 
-def refund_required_level(amount_usd: float, destination: RefundDestination) -> int:
+def refund_required_level(amount_usd: UsdAmount, destination: RefundDestination) -> int:
     """The minimum verification level a refund needs — PLATFORM code, not a merchant knob.
 
     §A4b (a fraud FLOOR, un-removable): refund to a NEW instrument/address requires L2
