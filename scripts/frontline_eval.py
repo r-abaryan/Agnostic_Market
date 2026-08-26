@@ -135,7 +135,11 @@ from agnostic_market.dtos.orchestration import (
     SearchCatalog,
     VerifyOrderStatus,
 )
-from agnostic_market.dtos.state import ReasoningState, open_active_invocation
+from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
+    ReasoningState,
+    open_active_invocation,
+)
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.llm.providers import load_conformance_targets
 from agnostic_market.secrets.base import SecretResolver
@@ -1153,7 +1157,7 @@ class CommerceObservation:
 
 @dataclass(frozen=True)
 class GraphObservation:
-    active_flow: str | None
+    execution_owner: str | None
     automation_channels: tuple[str, ...]
     handover_destination: str | None
     interrupted: bool
@@ -1314,7 +1318,7 @@ def _checkpoint_observation(
     handover = values.get("handover")
     return (
         GraphObservation(
-            active_flow=values.get("active_flow"),
+            execution_owner=values.get("execution_owner"),
             automation_channels=tuple(
                 name for name in _AUTOMATION_CHANNELS if values.get(name) is not None
             ),
@@ -3013,7 +3017,7 @@ async def _run_semantic_route_eval(
     try:
         corpus = _load_semantic_route_corpus()
         config_key = {"configurable": {"thread_id": runtime.engine.thread_id}}
-        state = ReasoningState.model_validate(runtime.graph.get_state(config_key).values)
+        state = ReasoningState.from_checkpoint(runtime.graph.get_state(config_key).values)
         projected = project_routing_context(
             corpus.projected_case.turn,
             state,
@@ -3303,7 +3307,7 @@ _TRANSPORT_OWNER_SCENARIOS = (
     ),
 )
 _EMPTY_RECOVERY_STATE = GraphObservation(
-    active_flow=None,
+    execution_owner=None,
     automation_channels=(),
     handover_destination=None,
     interrupted=False,
@@ -3391,6 +3395,7 @@ def _seed_transport_request(runtime: EvalRuntime, scenario: TransportOwnerScenar
     runtime.graph.update_state(
         config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
             "active_invocation": open_active_invocation(
                 scenario.initial_request,
@@ -3403,7 +3408,7 @@ def _seed_transport_request(runtime: EvalRuntime, scenario: TransportOwnerScenar
         as_node=runtime.graph.principal_seed_complete_node,
     )
     snapshot = runtime.graph.get_state(config)
-    state = ReasoningState.model_validate(snapshot.values)
+    state = ReasoningState.from_checkpoint(snapshot.values)
     if (
         snapshot.next
         or snapshot.interrupts

@@ -4,6 +4,7 @@ resolution, and the principal-transition projection. Pure contracts: no graph, n
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from decimal import Decimal
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -56,6 +57,8 @@ from agnostic_market.dtos.orchestration import (
     validate_route_output,
 )
 from agnostic_market.dtos.state import (
+    CartLine,
+    CheckpointSchemaError,
     HandoffRequest,
     HandoffSource,
     ReasoningState,
@@ -355,6 +358,43 @@ def test_reasoning_state_revalidates_existing_active_invocation_instance() -> No
                 "active_invocation": corrupt,
             }
         )
+
+
+def test_checkpoint_state_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError, match="unexpected_checkpoint_field"):
+        ReasoningState.model_validate({"unexpected_checkpoint_field": "ignored today"})
+
+
+def test_checkpoint_state_has_an_explicit_version_and_execution_owner() -> None:
+    state = ReasoningState(execution_owner="cart")
+
+    assert state.checkpoint_schema_version == "1"
+    assert state.execution_owner == "cart"
+    assert "active_flow" not in ReasoningState.model_fields
+    assert ReasoningState.from_checkpoint({}) == ReasoningState()
+    with pytest.raises(ValueError, match="checkpoint_schema_version"):
+        ReasoningState.from_checkpoint({"consumed_turn_ids": ("turn-1",)})
+    with pytest.raises(ValidationError, match="checkpoint_schema_version"):
+        ReasoningState(checkpoint_schema_version="2")
+
+
+def test_checkpoint_loader_rejects_a_mutated_state_instance() -> None:
+    state = ReasoningState()
+    state.checkpoint_schema_version = "2"  # type: ignore[assignment]
+
+    with pytest.raises(CheckpointSchemaError, match="mapping"):
+        ReasoningState.from_checkpoint(state)  # type: ignore[arg-type]
+
+
+def test_checkpointed_money_is_exact_to_usd_minor_units() -> None:
+    line = CartLine(sku="SKU-1", name="trail shoes", price_usd="16.65", quantity=3)
+    refund = RefundOrder(amount_usd="12.34")
+
+    assert line.price_usd == Decimal("16.65")
+    assert line.line_total == Decimal("49.95")
+    assert refund.amount_usd == Decimal("12.34")
+    with pytest.raises(ValidationError, match="decimal places"):
+        CartLine(sku="SKU-2", name="invalid price", price_usd="1.001", quantity=1)
 
 
 def test_invocation_opening_uses_only_the_admitted_ledger_tail() -> None:

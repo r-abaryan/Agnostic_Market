@@ -2,7 +2,7 @@ schema_version: "1"
 purpose: development_only
 frozen_corpus_fingerprint: 977704137a22a967d9379eceae1f04be52cf4364af0393ad1a5c81835c2384b1
 route_schema_fingerprint: c117cf4c0c259dea449c5b05adc17bc351ef9a43d546d61027e5e51237961623
-registry_fingerprint: 0ad1ca4d16a23754d684d83806d04adb46eba4ede15fe39527ff5416c2a6ef0a
+registry_fingerprint: d50355f1ccb888953fcca5e07c87ed6c6909eaf9bf6163f29a75f43c11e66660
 context_projector_version: "3"
 
 cases:

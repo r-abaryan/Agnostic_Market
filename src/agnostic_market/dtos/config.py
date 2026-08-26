@@ -15,9 +15,12 @@ Strictness (Phase-0 plan, YAML-footgun defense):
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+
+from agnostic_market.dtos.money import UsdAmount
 
 if TYPE_CHECKING:
     from agnostic_market.dtos.state import PolicyContext
@@ -105,14 +108,14 @@ class RefundPolicy(BaseModel):
 
     model_config = _STRICT
 
-    auto_approve_under_usd: float = Field(ge=0)
-    require_human_above_usd: float = Field(ge=0)
+    auto_approve_under_usd: UsdAmount
+    require_human_above_usd: UsdAmount
     # Return-first is the industry default for SHIPPED/DELIVERED orders: the refund is
     # issued once the return exists, else the caller keeps both goods and money. A refund
     # at or under this value may skip the return ("returnless refund" — a deliberate
     # policy for items where return shipping costs more than the goods). Default 0 =
     # return-first for every shipped refund; bounded by the platform ceiling.
-    returnless_under_usd: float = Field(ge=0, default=0.0)
+    returnless_under_usd: UsdAmount = Decimal("0")
 
 
 class ReturnsPolicy(BaseModel):
@@ -183,7 +186,7 @@ class PolicyConfig(BaseModel):
 
     model_config = _STRICT
 
-    max_order_value_usd: float = Field(ge=0)
+    max_order_value_usd: UsdAmount
     refunds: RefundPolicy
     # Defaults so existing merchant YAMLs (which don't set it) get the platform default.
     returns: ReturnsPolicy = Field(default_factory=ReturnsPolicy)

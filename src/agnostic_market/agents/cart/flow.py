@@ -244,13 +244,13 @@ def build_cart_nodes(
         if step.exhausted:
             return {
                 "messages": new_messages,
-                "active_flow": None,
+                "execution_owner": None,
                 "active_invocation": None,
                 "pending_clarification": None,
             }
         return {
             "messages": new_messages,
-            "active_flow": "cart",
+            "execution_owner": "cart",
             "pending_clarification": CartClarification(detail=detail),
             "clarification_liveness": step.liveness,
         }
@@ -260,7 +260,7 @@ def build_cart_nodes(
         write_event({"event": "cart_left", "reason": "left_flow"})
         return {
             "messages": new_messages,
-            "active_flow": None,
+            "execution_owner": None,
             "active_invocation": None,
             "pending_cart_mutation": None,
             "pending_placement": None,
@@ -276,12 +276,12 @@ def build_cart_nodes(
             if cart_store.is_empty():
                 return {
                     "active_invocation": None,
-                    "active_flow": None,
+                    "execution_owner": None,
                     "pending_ack": _EMPTY_CART_CHECKOUT_LINE,
                 }
             return {
                 "active_invocation": None,
-                "active_flow": "cart",
+                "execution_owner": "cart",
                 **_mint_placement(),
             }
         request = invocation.request
@@ -307,7 +307,7 @@ def build_cart_nodes(
 
         def clarify(detail: CartClarificationDetail) -> dict[str, object]:
             result = _clarification_result(state, new_messages, detail)
-            if result.get("active_flow") == "cart":
+            if result.get("execution_owner") == "cart":
                 result["active_invocation"] = invocation
             return result
 
@@ -315,7 +315,7 @@ def build_cart_nodes(
             return {
                 "messages": new_messages,
                 "active_invocation": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "pending_ack": _EMPTY_CART_REVIEW_LINE,
             }
 
@@ -474,7 +474,7 @@ def build_cart_nodes(
         return {
             "messages": new_messages,
             "active_invocation": None,
-            "active_flow": "cart",
+            "execution_owner": "cart",
             "pending_cart_mutation": _mint_mutation(
                 request.operation,
                 live_item,
@@ -505,7 +505,7 @@ def build_cart_nodes(
             write_event({"event": "cart_mutation_expired", "reason": "pending_ttl"})
             return {
                 "pending_cart_mutation": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage("That confirmation expired, so I haven't changed your cart.")
                 ],
@@ -522,7 +522,7 @@ def build_cart_nodes(
             write_event({"event": "cart_mutation_cancelled", "reason": "human_requested"})
             return {
                 "pending_cart_mutation": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="other",
@@ -533,7 +533,7 @@ def build_cart_nodes(
             write_event({"event": "cart_mutation_cancelled", "reason": "declined"})
             return {
                 "pending_cart_mutation": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [AIMessage("Okay, I won't change your cart.")],
             }
         return {}
@@ -582,7 +582,7 @@ def build_cart_nodes(
         ack = _mutation_result_ack(record)
         update: dict[str, object] = {
             "pending_cart_mutation": None,
-            "active_flow": None,
+            "execution_owner": None,
         }
         if speak_now:
             update["messages"] = [AIMessage(ack)]
@@ -644,7 +644,7 @@ def build_cart_nodes(
                 line = f"I found multiple matches: {rendered}. Which item would you like?"
         return {
             "pending_clarification": None,
-            "active_flow": "cart",
+            "execution_owner": "cart",
             "messages": [AIMessage(line)],
         }
 
@@ -659,12 +659,12 @@ def build_cart_nodes(
                 {
                     "event": "checkout_denied",
                     "reason": "order_value_cap",
-                    "total": pending.total_usd,
+                    "total": str(pending.total_usd),
                 }
             )
             return {
                 "pending_placement": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         f"I'm sorry - that order comes to ${pending.total_usd:.2f}, which is more "
@@ -689,7 +689,7 @@ def build_cart_nodes(
             write_event({"event": "checkout_expired", "reason": "pending_ttl"})
             return {
                 "pending_placement": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "That confirmation sat for a while, so I haven't placed anything. Your "
@@ -709,7 +709,7 @@ def build_cart_nodes(
             write_event({"event": "checkout_cancelled", "reason": "human_requested"})
             return {
                 "pending_placement": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "handover": HandoffRequest(
                     destination="human",
                     reason_code="other",
@@ -720,7 +720,7 @@ def build_cart_nodes(
             write_event({"event": "checkout_cancelled", "reason": "declined"})
             return {
                 "pending_placement": None,
-                "active_flow": None,
+                "execution_owner": None,
                 "messages": [
                     AIMessage(
                         "Okay, I won't place it - your cart's still saved if you want to change "
@@ -734,7 +734,7 @@ def build_cart_nodes(
         """Finish one authoritative placement; safe to re-run after receipt reconciliation."""
         update = {
             "pending_placement": None,
-            "active_flow": None,
+            "execution_owner": None,
             "messages": [
                 AIMessage(
                     f"Done - your order for {speak_lines(placed.lines)} is placed. Your order "
@@ -745,7 +745,11 @@ def build_cart_nodes(
         cart_store.clear()
         recent_orders.record([placed.order_id], operation="place")
         write_event(
-            {"event": "checkout_confirmed", "order_id": placed.order_id, "total": placed.total_usd}
+            {
+                "event": "checkout_confirmed",
+                "order_id": placed.order_id,
+                "total": str(placed.total_usd),
+            }
         )
         return update
 

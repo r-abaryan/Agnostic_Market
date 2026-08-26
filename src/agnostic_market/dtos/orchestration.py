@@ -25,6 +25,7 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
+from agnostic_market.dtos.money import PositiveUsdAmount
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -320,7 +321,7 @@ class RefundOrder(IntentRequestModel):
 
     kind: Literal[CapabilityId.REFUND_ORDER] = CapabilityId.REFUND_ORDER
     target: OrderTarget | None = None
-    amount_usd: float | None = Field(default=None, gt=0)
+    amount_usd: PositiveUsdAmount | None = None
     destination: RefundDestination | None = None
 
     def is_slot_complete(self) -> bool:

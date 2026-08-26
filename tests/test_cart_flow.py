@@ -123,7 +123,7 @@ def _build(
 
 
 def _flow(graph) -> str | None:
-    return graph.get_state(_CFG).values.get("active_flow")
+    return graph.get_state(_CFG).values.get("execution_owner")
 
 
 def _ai_texts(out) -> list[str]:
@@ -171,7 +171,7 @@ def _assert_cart_clarification(
     snapshot = graph.get_state(_CFG)
     state = snapshot.values
     assert snapshot.next == ()
-    assert state.get("active_flow") == "cart"
+    assert state.get("execution_owner") == "cart"
     assert state.get("pending_clarification") is None
     for field in (
         "pending_placement",
@@ -269,7 +269,7 @@ async def test_typed_cart_mutation_requires_confirmation_before_effect(
     assert paused.interrupts
     assert paused.interrupts[0].value == (f"Just to confirm: add 2 of {product.name} to your cart?")
     assert paused.values["active_invocation"] is None
-    assert paused.values["active_flow"] == "cart"
+    assert paused.values["execution_owner"] == "cart"
     assert paused.values["pending_cart_mutation"].sku == product.sku
 
     out = await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
@@ -566,7 +566,7 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
     assert (lines[0].quantity if lines else 0) == final_quantity
     assert records == [{"event": event, "sku": product.sku}]
     assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
-    assert graph.get_state(_CFG).values.get("active_flow") is None
+    assert graph.get_state(_CFG).values.get("execution_owner") is None
     assert len(_ai_texts(out)) == 1
     assert product.name in _ai_texts(out)[0]
 

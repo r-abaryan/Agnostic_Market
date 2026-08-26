@@ -16,6 +16,7 @@ from typing import Annotated, TypedDict, get_args, get_origin
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.serde.event_hooks import register_serde_event_listener
 from langgraph.graph.message import add_messages
 from langgraph.types import PregelTask, StateSnapshot
@@ -104,6 +105,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
     BatchCancelOutcome,
     CancelTarget,
     CartClarification,
@@ -120,6 +122,7 @@ from agnostic_market.dtos.state import (
     PendingRefund,
     PendingReturn,
     ReasoningState,
+    StateSchemaError,
     SupportClarification,
     open_active_invocation,
 )
@@ -238,6 +241,7 @@ def _engine(
     thread_id: str = "session-1",
     routing_recognizer: RoutingRecognizer | None = None,
     routing_model: FakeChatModel | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> tuple[ReasoningEngine, OrderStore]:
     store = OrderStore(load_orders_fixture(config_root, "acme_store"))
     policy = make_policy(refund_returnless_under_usd=50.0)
@@ -275,7 +279,7 @@ def _engine(
         lifecycle=caller_context,
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
-        checkpointer=build_checkpointer(),
+        checkpointer=checkpointer if checkpointer is not None else build_checkpointer(),
     )
     if routing_recognizer is not None and routing_model is not None:
         raise ValueError("test engine accepts either a routing recognizer or routing model")
@@ -348,6 +352,100 @@ async def _adapter_turn(
 async def _pause_at_confirmation(engine: ReasoningEngine) -> list:
     """Drive a routed typed placement to its readback interrupt."""
     return await _events(engine, "checkout now please")
+
+
+async def test_first_admitted_turn_persists_checkpoint_schema_version(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(config_root)
+
+    await _events(engine, "hello")
+
+    assert engine._graph.get_state(engine._config).values["checkpoint_schema_version"] == "1"
+
+
+def test_engine_rejects_unknown_fields_before_graph_input_or_direct_update(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(config_root)
+    unknown = {"retired_field": "must not disappear"}
+
+    with pytest.raises(StateSchemaError, match="retired_field"):
+        engine._validate_graph_input(unknown)
+    with pytest.raises(StateSchemaError, match="retired_field"):
+        engine._update_state(engine._config, unknown, as_node="__start__")
+
+
+async def test_unversioned_checkpoint_is_replaced_by_valid_terminal_state(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(config_root)
+    engine._graph.update_state(
+        engine._config,
+        {"consumed_turn_ids": ("legacy-turn",)},
+        as_node="__start__",
+    )
+
+    events = await _events(engine, "hello")
+    state = ReasoningState.from_checkpoint(engine._graph.get_state(engine._config).values)
+
+    assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+        AUTOMATION_TERMINAL_LINE
+    ]
+    assert state.checkpoint_schema_version == CHECKPOINT_SCHEMA_VERSION
+    assert state.automation_terminal is True
+    assert state.consumed_turn_ids == ()
+
+
+def _seed_foreign_checkpoint(
+    checkpointer: BaseCheckpointSaver,
+    config: dict[str, dict[str, str]],
+    values: dict[str, object],
+) -> None:
+    from langgraph.graph import START, StateGraph
+
+    class ForeignState(TypedDict, total=False):
+        checkpoint_schema_version: str
+        consumed_turn_ids: tuple[str, ...]
+        retired_field: str
+
+    graph = StateGraph(ForeignState)
+    graph.add_node("foreign", lambda _state: {})
+    graph.add_edge(START, "foreign")
+    graph.compile(checkpointer=checkpointer).invoke(values, config)
+
+
+@pytest.mark.parametrize(
+    "foreign_values",
+    (
+        {"checkpoint_schema_version": "1", "retired_field": "must not survive"},
+        {"checkpoint_schema_version": "2", "consumed_turn_ids": ("foreign-turn",)},
+    ),
+    ids=("unknown-channel", "unsupported-version"),
+)
+async def test_incompatible_checkpoint_is_replaced_without_retaining_foreign_state(
+    config_root: Path,
+    foreign_values: dict[str, object],
+) -> None:
+    thread_id = "incompatible-checkpoint"
+    config = {"configurable": {"thread_id": thread_id}}
+    checkpointer = build_checkpointer()
+    _seed_foreign_checkpoint(checkpointer, config, foreign_values)
+    engine, _ = _engine(config_root, thread_id=thread_id, checkpointer=checkpointer)
+
+    events = await _events(engine, "hello")
+    snapshot = engine._graph.get_state(engine._config)
+    state = ReasoningState.from_checkpoint(snapshot.values)
+    saved = engine._graph.checkpointer.get_tuple(engine._config)
+
+    assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+        AUTOMATION_TERMINAL_LINE
+    ]
+    assert state == ReasoningState(automation_terminal=True, messages=state.messages)
+    assert len(state.messages) == 1
+    assert state.messages[0].content == AUTOMATION_TERMINAL_LINE
+    assert saved is not None
+    assert "retired_field" not in saved.checkpoint["channel_values"]
 
 
 def _block_placement(
@@ -439,7 +537,7 @@ async def test_failed_cart_turn_admits_changed_intent_instead_of_resuming_old_wo
 
     assert admitted == ("add something to my cart", "never mind")
     assert store.placed_count == 0
-    assert snapshot.values.get("active_flow") is None
+    assert snapshot.values.get("execution_owner") is None
     assert snapshot.next == ()
 
 
@@ -534,7 +632,11 @@ async def test_graph_terminal_state_bypasses_router_without_pending_route_state(
     )
     engine._graph.update_state(
         engine._config,
-        {**clear_automation_state(), "automation_terminal": True},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            **clear_automation_state(),
+            "automation_terminal": True,
+        },
         as_node=engine._graph.principal_seed_complete_node,
     )
 
@@ -630,7 +732,7 @@ async def test_semantic_abort_current_clears_active_work_without_an_effect(
 
     assert spoken == ["Okay. I've stopped that request."]
     assert state.active_invocation is None
-    assert state.active_flow is None
+    assert state.execution_owner is None
     assert state.pending_cart_mutation is None
     assert state.pending_clarification is None
     assert cart.line_count == 0
@@ -761,6 +863,7 @@ async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_rout
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "messages": [HumanMessage(content="what is in my cart?", id=turn_id)],
             "consumed_turn_ids": (turn_id,),
             "pending_capability_dispatch": CapabilityDispatchEnvelope(
@@ -811,6 +914,7 @@ async def test_duplicate_typed_cart_dispatch_cannot_resume_mutation_confirmation
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "messages": [HumanMessage(content=f"add one {product.name}", id=dispatch_id)],
             "consumed_turn_ids": (dispatch_id,),
             "pending_capability_dispatch": CapabilityDispatchEnvelope(
@@ -884,6 +988,7 @@ async def test_restored_unregistered_invocation_speaks_once_and_releases_the_nex
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": (origin_id,),
             "active_invocation": ActiveInvocation(
                 request=DiscloseAiIdentity(),
@@ -917,7 +1022,10 @@ async def test_duplicate_list_turn_cannot_open_an_invocation(config_root: Path) 
     duplicate_id = "already-consumed-list-turn"
     engine._graph.update_state(
         engine._config,
-        {"consumed_turn_ids": (duplicate_id,)},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "consumed_turn_ids": (duplicate_id,),
+        },
         as_node="__start__",
     )
 
@@ -949,6 +1057,7 @@ async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "messages": [HumanMessage(content="list my account orders", id=abandoned_id)],
             "consumed_turn_ids": (abandoned_id,),
             "pending_recovery": PendingRecovery(
@@ -1113,6 +1222,7 @@ def _seed_typed_place_order(engine: ReasoningEngine, *, origin_id: str) -> None:
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": consumed_turn_ids,
             "active_invocation": open_active_invocation(
                 PlaceOrder(),
@@ -1221,7 +1331,7 @@ async def test_typed_place_order_decline_keeps_cart_and_clears_automation(
     assert cart.line_count == 1
     assert state.active_invocation is None
     assert state.pending_placement is None
-    assert state.active_flow is None
+    assert state.execution_owner is None
     assert not engine.pending_interrupt()
     assert any(
         isinstance(event, SpokenMessageEvent) and "won't place it" in event.text.lower()
@@ -1252,7 +1362,7 @@ async def test_typed_place_order_value_cap_denies_before_consent(
     assert not engine.pending_interrupt()
     assert state.active_invocation is None
     assert state.pending_placement is None
-    assert state.active_flow is None
+    assert state.execution_owner is None
     assert any(
         isinstance(event, SpokenMessageEvent)
         and "more than i'm able to place" in event.text.lower()
@@ -2011,7 +2121,7 @@ def test_cancelled_checkpoint_classifier_rejects_every_ambiguous_shape(
         tasks: tuple[PregelTask, ...],
     ) -> StateSnapshot:
         return StateSnapshot(
-            values=state,
+            values=state.model_dump(),
             next=next_nodes,
             config=engine._config,
             metadata=None,
@@ -2075,7 +2185,10 @@ async def test_untyped_bare_next_terminalizes_without_replaying_graph_work(
     )
     engine._graph.update_state(
         engine._config,
-        {"active_flow": "cart"},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "execution_owner": "cart",
+        },
         as_node="__start__",
     )
     before = engine._graph.get_state(engine._config)
@@ -2573,6 +2686,7 @@ def _seed_typed_read(
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": consumed_turn_ids,
             "active_invocation": open_active_invocation(
                 request,
@@ -2714,6 +2828,7 @@ async def test_incoherent_persisted_invocation_terminalizes_before_any_execution
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": ("admitted-turn",),
             "active_invocation": ActiveInvocation(
                 request=ViewIdentityStatus(),
@@ -2770,6 +2885,7 @@ async def test_clarification_state_roundtrips_and_clears_without_an_active_owner
     engine._graph.update_state(
         engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "pending_clarification": SupportClarification(detail="order"),
             "clarification_liveness": ClarificationLiveness(owner=owner, reasks=1),
         },
@@ -2840,7 +2956,7 @@ async def test_cart_clarification_never_routes_to_identity_contact(config_root: 
     state = engine._graph.get_state(
         {"configurable": {"thread_id": "cart-identity-isolation"}}
     ).values
-    assert state.get("active_flow") == "cart"
+    assert state.get("execution_owner") == "cart"
     assert state.get("pending_clarification") is None
 
 

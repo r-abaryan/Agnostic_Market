@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -372,7 +373,7 @@ def test_return_promise_cannot_exceed_refundable_balance(config_root: Path) -> N
     ok = store.create_return(
         "rk-2", order_id="ORD-1001", refund_due_usd=99.98, destination="original"
     )
-    assert ok.refund_due_usd == 99.98
+    assert ok.refund_due_usd == Decimal("99.98")
 
 
 def test_open_return_promise_blocks_a_refund_on_the_same_dollars(config_root: Path) -> None:

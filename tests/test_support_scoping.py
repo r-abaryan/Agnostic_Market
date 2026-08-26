@@ -76,7 +76,7 @@ def test_incomplete_refund_owner_reprompts_invalid_model_output(config_root: Pat
     state = ReasoningState(
         messages=[HumanMessage(content="refund order ORD-1001", id="turn-1")],
         consumed_turn_ids=consumed_turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             RefundOrder(target=ExplicitOrderTarget(order_ref="ORD-1001")),
             consumed_turn_ids=consumed_turn_ids,
@@ -104,7 +104,7 @@ def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
     state = ReasoningState(
         messages=[HumanMessage(content="refund $20", id="turn-1")],
         consumed_turn_ids=consumed_turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             RefundOrder(target=ExplicitOrderTarget(order_ref="ORD-1001")),
             consumed_turn_ids=consumed_turn_ids,
@@ -156,7 +156,7 @@ def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value
     state = ReasoningState(
         messages=[HumanMessage(content="change my address", id="turn-1")],
         consumed_turn_ids=first_turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             request,
             consumed_turn_ids=first_turn_ids,
@@ -166,7 +166,7 @@ def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value
     first = h.engine._graph.nodes["support_capability_entry"].invoke(state)
 
     assert reasoning.invoke_count == 2
-    assert first["active_flow"] == "support"
+    assert first["execution_owner"] == "support"
     assert first["active_invocation"].request == request
     assert first["pending_clarification"] == SupportClarification(detail="profile_value")
     h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
@@ -174,7 +174,7 @@ def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value
     bound_state = ReasoningState(
         messages=[HumanMessage(content="42 New Road", id="turn-2")],
         consumed_turn_ids=second_turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             request,
             consumed_turn_ids=second_turn_ids,
@@ -213,7 +213,7 @@ def test_refund_owner_rejects_replacement_of_fixed_target_and_amount(
     state = ReasoningState(
         messages=[HumanMessage(content="the original payment method", id="turn-1")],
         consumed_turn_ids=turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(request, consumed_turn_ids=turn_ids),
     )
 
@@ -265,7 +265,7 @@ def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
     first_state = ReasoningState(
         messages=[HumanMessage(content="use that order", id="turn-1")],
         consumed_turn_ids=first_turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             initial_request,
             consumed_turn_ids=first_turn_ids,
@@ -282,7 +282,7 @@ def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
     second_state = ReasoningState(
         messages=[HumanMessage(content="ORD-1001", id="turn-2")],
         consumed_turn_ids=("turn-1", "turn-2"),
-        active_flow="support",
+        execution_owner="support",
         active_invocation=retained,
         clarification_liveness=first["clarification_liveness"],
     )
@@ -308,7 +308,7 @@ def test_profile_owner_does_not_read_orders_or_expose_order_candidates(
     state = ReasoningState(
         messages=[HumanMessage(content="change my address", id="turn-1")],
         consumed_turn_ids=turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             ChangeProfile(field="address"),
             consumed_turn_ids=turn_ids,
@@ -331,7 +331,7 @@ def test_profile_owner_checks_availability_before_requesting_new_pii(config_root
     state = ReasoningState(
         messages=[HumanMessage(content="change my address", id="turn-1")],
         consumed_turn_ids=turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             ChangeProfile(field="address"),
             consumed_turn_ids=turn_ids,
@@ -359,7 +359,7 @@ def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
     state = ReasoningState(
         messages=[HumanMessage(content="refund $20", id="turn-1")],
         consumed_turn_ids=turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             RefundOrder(
                 target=ExplicitOrderTarget(order_ref="ORD-1001"),
@@ -392,7 +392,7 @@ def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_referen
     state = ReasoningState(
         messages=[HumanMessage(content="refund it", id="turn-1")],
         consumed_turn_ids=turn_ids,
-        active_flow="support",
+        execution_owner="support",
         active_invocation=open_active_invocation(
             RefundOrder(
                 target=FocusedOrderTarget(),
@@ -405,7 +405,7 @@ def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_referen
 
     update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
 
-    assert update["active_flow"] == "support"
+    assert update["execution_owner"] == "support"
     assert update.get("pending_refund") is None
     assert update["pending_clarification"] == SupportClarification(detail="order")
 
@@ -488,8 +488,8 @@ def _fresh_active_request(harness: SupportHarness, thread_id: str):
     return invocation.request
 
 
-def _active_flow(harness: SupportHarness, thread_id: str) -> str | None:
-    return _state_values(harness, thread_id).get("active_flow")
+def _execution_owner(harness: SupportHarness, thread_id: str) -> str | None:
+    return _state_values(harness, thread_id).get("execution_owner")
 
 
 def _bind_cust2(harness: SupportHarness) -> None:
@@ -574,7 +574,7 @@ async def test_unbound_cancel_detours_to_identity_without_leaking_details(
     assert _no_details_spoken(events)
     assert h.store.cancel_count == 0
     assert _no_pendings(h, "scope-1")
-    assert _active_flow(h, "scope-1") == "identity"  # the detour is in flight
+    assert _execution_owner(h, "scope-1") == "identity"  # the detour is in flight
     assert isinstance(_fresh_active_request(h, "scope-1"), CancelOrders)
     tel = _telemetry(tmp_path)
     assert any(e["event"] == "support_action_needs_identity" for e in tel)
@@ -597,7 +597,7 @@ async def test_model_only_order_reference_cannot_cross_identity(config_root: Pat
     state = _state_values(h, "scope-model-ref")
     assert _active_request(h, "scope-model-ref") == CancelOrders()
     assert state.get("pending_cancel") is None
-    assert state.get("active_flow") != "identity"
+    assert state.get("execution_owner") != "identity"
     assert h.identity.current() is None
     assert h.store.cancel_count == 0
 
@@ -620,7 +620,7 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
         thread_id="scope-resume",
     )
     await _events(h.engine, "cancel order ORD-1002")  # -> identity (asks for contact)
-    assert _active_flow(h, "scope-resume") == "identity"
+    assert _execution_owner(h, "scope-resume") == "identity"
     e1 = await _events(h.engine, _CONTACT_1002)  # -> OTP dispatched
     assert any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in e1)
     e2 = await _events(h.engine, TEST_OTP)  # OTP -> bind -> resume assemble -> readback
@@ -656,7 +656,7 @@ async def test_guest_profile_change_verifies_then_resumes_under_the_new_principa
     )
 
     await _events(h.engine, f"change my address to {new_address}")
-    assert _active_flow(h, "scope-profile-resume") == "identity"
+    assert _execution_owner(h, "scope-profile-resume") == "identity"
     await _events(h.engine, _CONTACT_1001)
     assert h.otp.dispatch_count == 1
     events = await _events(h.engine, TEST_OTP)
@@ -715,7 +715,7 @@ async def test_strong_labelled_stt_enters_each_guest_mutation_identity_detour(
     await _events(harness.engine, utterance)
     state = _state_values(harness, thread_id)
     assert isinstance(_active_request(harness, thread_id), request_type)
-    assert state.get("active_flow") == "identity"
+    assert state.get("execution_owner") == "identity"
     assert state.get("pending_cancel") is None
     assert state.get("pending_return") is None
     assert state.get("pending_refund") is None
@@ -742,7 +742,7 @@ async def test_guest_batch_requires_every_deduplicated_target_in_caller_speech(
     state = _state_values(harness, thread_id)
     assert _active_request(harness, thread_id) == CancelOrders()
     assert state.get("pending_cancel") is None
-    assert state.get("active_flow") != "identity"
+    assert state.get("execution_owner") != "identity"
     assert harness.store.cancel_count == 0
 
 
@@ -1075,7 +1075,7 @@ async def test_guest_batch_detours_to_identity(config_root: Path, tmp_path: Path
     events = await _events(h.engine, "cancel order ORD-1002 and order ORD-9001")
     assert any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
-    assert _active_flow(h, "scope-batch-guest") == "identity"
+    assert _execution_owner(h, "scope-batch-guest") == "identity"
     assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
 
@@ -1216,7 +1216,7 @@ async def test_one_caller_turn_consumes_at_most_one_order_denial(
     ] == [1]
     assert _spoken(first) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
     assert not any(isinstance(event, TokenEvent) for event in first)
-    assert _active_flow(harness, thread_id) == "support"
+    assert _execution_owner(harness, thread_id) == "support"
     assert _no_pendings(harness, thread_id)
     assert (
         harness.store.cancel_count == harness.store.return_count == harness.store.refund_count == 0
@@ -1283,7 +1283,7 @@ async def test_unbound_model_only_order_target_asks_for_caller_stated_number(
     ]
     assert not any(isinstance(event, (TokenEvent, InterruptEvent)) for event in events)
     state = _state_values(harness, thread_id)
-    assert state["active_flow"] == "support"
+    assert state["execution_owner"] == "support"
     request = _active_request(harness, thread_id)
     assert isinstance(request, CancelOrders | RefundOrder | ReturnOrder)
     assert request.target is None
@@ -1399,7 +1399,7 @@ async def test_rung1_read_grant_does_not_authorize_a_mutation(
     events = await _events(h.engine, "cancel order ORD-1002")
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
-    assert _active_flow(h, "scope-11") == "identity"
+    assert _execution_owner(h, "scope-11") == "identity"
     assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
 
 
@@ -1528,7 +1528,7 @@ async def test_unbound_profile_change_detours_to_identity(
     # detours into the identity OTP flow (no profile step-up dispatched, nothing changed).
     h = _profile_harness(config_root, thread_id="scope-prof-unbound")
     await _events(h.engine, "Change my phone number to 555 111 2222")
-    assert _active_flow(h, "scope-prof-unbound") == "identity"
+    assert _execution_owner(h, "scope-prof-unbound") == "identity"
     assert isinstance(_fresh_active_request(h, "scope-prof-unbound"), ChangeProfile)
     assert h.otp.dispatch_count == 0  # no profile OTP — we're verifying identity first
     assert h.profile.change_count == 0
@@ -1551,7 +1551,7 @@ async def test_model_only_profile_value_cannot_cross_identity(config_root: Path)
     assert not any(isinstance(event, TokenEvent) for event in events)
     assert _active_request(h, "scope-prof-model-value") == ChangeProfile(field="contact")
     assert state.get("pending_profile_change") is None
-    assert state.get("active_flow") == "support"
+    assert state.get("execution_owner") == "support"
     assert state.get("pending_clarification") is None
     assert h.otp.dispatch_count == 0
     assert h.profile.change_count == 0
@@ -1569,7 +1569,7 @@ async def test_order_number_cannot_become_a_model_proposed_contact(
     state = _state_values(h, "scope-prof-order-number")
     assert _active_request(h, "scope-prof-order-number") == ChangeProfile(field="contact")
     assert state.get("pending_profile_change") is None
-    assert state.get("active_flow") != "identity"
+    assert state.get("execution_owner") != "identity"
     assert h.otp.dispatch_count == 0
     assert h.profile.change_count == 0
 
@@ -1591,7 +1591,7 @@ async def test_bound_customer_without_profile_fails_closed(
         "Please contact the store directly for further help."
     ]
     state = _state_values(h, "scope-prof-noprofile")
-    assert state.get("active_flow") is None
+    assert state.get("execution_owner") is None
     assert state.get("pending_profile_change") is None
     assert state.get("handover") is None
     assert state.get("automation_terminal") is True

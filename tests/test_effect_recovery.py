@@ -27,6 +27,7 @@ from agnostic_market.commerce.receipts import CommittedReceipt, IndeterminateRec
 from agnostic_market.dtos.events import SpokenMessageEvent
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
     BatchCancelOutcome,
     CancelTarget,
     CartLine,
@@ -226,9 +227,10 @@ def _seed(
     harness.engine._graph.update_state(
         harness.engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             case.pending_field: case.pending,
             "consumed_turn_ids": consumed_turn_ids,
-            "active_flow": "cart"
+            "execution_owner": "cart"
             if case.action == (ExceptionAction.RECONCILE_PLACEMENT)
             else "support",
         },
@@ -581,8 +583,9 @@ async def test_external_cancellation_mid_batch_reconciles_current_and_aborts_rem
     harness.engine._graph.update_state(
         harness.engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "pending_cancel": pending,
-            "active_flow": "support",
+            "execution_owner": "support",
             "consumed_turn_ids": (abandoned_message_id,),
         },
         as_node="support_cancel_confirm",

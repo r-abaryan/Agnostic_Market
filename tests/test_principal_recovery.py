@@ -33,7 +33,12 @@ from agnostic_market.dtos.orchestration import (
     VerifyIdentity,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
-from agnostic_market.dtos.state import PendingIdentity, ReasoningState, open_active_invocation
+from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
+    PendingIdentity,
+    ReasoningState,
+    open_active_invocation,
+)
 
 _FACTS = TurnFacts()
 _OTP = "482913"
@@ -150,7 +155,7 @@ def test_principal_recovery_rejects_missing_or_mismatched_initiating_request(
     )
     state = ReasoningState(
         consumed_turn_ids=consumed_turn_ids,
-        active_flow="identity",
+        execution_owner="identity",
         active_invocation=invocation,
         pending_identity=PendingIdentity(
             customer_ref=_CUST1.customer_ref,
@@ -288,7 +293,7 @@ def test_identity_apply_missing_invocation_fails_before_transition_publication(
         display_name="Acme Store",
     )
     state = ReasoningState(
-        active_flow="identity",
+        execution_owner="identity",
         pending_identity=PendingIdentity(
             customer_ref=_CUST1.customer_ref,
             masked_contact=_CUST1.masked_contact,
@@ -392,6 +397,7 @@ async def test_verify_apply_failure_after_coherent_publish_preserves_acknowledge
     harness.engine._graph.update_state(
         harness.engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": consumed_turn_ids,
             "active_invocation": open_active_invocation(
                 VerifyIdentity(),
@@ -872,7 +878,10 @@ async def test_terminal_response_failure_escapes_once_to_engine_takeover(
     harness = _identity_harness(config_root, thread_id="terminal-response-failure")
     harness.engine._graph.update_state(
         harness.engine._config,
-        {"automation_terminal": True},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "automation_terminal": True,
+        },
         as_node="entry",
     )
     real_write = frontline_graph.write_event

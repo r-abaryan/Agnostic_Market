@@ -10,9 +10,12 @@ from langgraph.errors import NodeError
 from langgraph.graph import START, StateGraph
 
 from agnostic_market.agents.recovery import (
+    RECOVERY_NODE_NAME,
+    RECOVERY_TERMINALIZER_NODE_NAME,
     NodePolicyRegistry,
     NodeRecoveryPolicy,
     build_node_error_handler,
+    build_recovery_infrastructure_handler,
     clear_automation_state,
     validate_automation_state_clear,
 )
@@ -103,7 +106,7 @@ def test_automation_state_clear_is_total_and_preserves_persistent_state() -> Non
         "active_invocation": None,
         "pending_recovery": None,
         "identity_claim_misses": 0,
-        "active_flow": None,
+        "execution_owner": None,
         "pending_ack": None,
         "pending_clarification": None,
         "clarification_liveness": None,
@@ -233,6 +236,22 @@ def test_registry_destinations_are_rendering_only() -> None:
     assert visited == ["source"]
 
 
+def test_registry_rejects_unknown_state_update_before_langgraph_filters_it() -> None:
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+    registry.register(
+        "invalid_update",
+        lambda _state: {"unexpected_checkpoint_field": "must not disappear"},
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    graph.add_edge(START, "invalid_update")
+    registry.validated_policies()
+
+    with pytest.raises(ValueError, match="unexpected_checkpoint_field"):
+        graph.compile().invoke({})
+
+
 def test_handler_origin_mismatch_mints_a_marker_the_consumer_must_reject() -> None:
     policy = NodeRecoveryPolicy(
         on_exception=ExceptionAction.SAFE_ABORT,
@@ -251,3 +270,34 @@ def test_handler_origin_mismatch_mints_a_marker_the_consumer_must_reject() -> No
     assert marker.action == ExceptionAction.TERMINAL
     assert marker.trigger == "node_exception"
     assert "not persisted" not in marker.model_dump_json()
+
+
+def test_recovery_infrastructure_failure_reaches_terminalizer() -> None:
+    def fail(_state: ReasoningState) -> dict:
+        raise RuntimeError("failed")
+
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph, error_handler_factory=build_node_error_handler)
+    registry.register(
+        "origin",
+        fail,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+        destinations=(RECOVERY_NODE_NAME,),
+    )
+    registry.register_infrastructure(
+        RECOVERY_NODE_NAME,
+        fail,
+        error_handler=build_recovery_infrastructure_handler,
+        destinations=(RECOVERY_TERMINALIZER_NODE_NAME,),
+    )
+    registry.register_infrastructure(
+        RECOVERY_TERMINALIZER_NODE_NAME,
+        lambda _state: {"automation_terminal": True},
+    )
+    graph.add_edge(START, "origin")
+    registry.validated_policies()
+
+    result = graph.compile().invoke({})
+
+    assert result["automation_terminal"] is True

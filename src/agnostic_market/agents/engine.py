@@ -33,12 +33,14 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Collection, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
@@ -83,7 +85,9 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
     CartClarification,
+    CheckpointSchemaError,
     ClarificationLiveness,
     HandoffRequest,
     HandoffSource,
@@ -96,9 +100,11 @@ from agnostic_market.dtos.state import (
     PendingRefund,
     PendingReturn,
     ReasoningState,
+    StateSchemaError,
     SupportClarification,
     merge_consumed_turn_ids,
     open_active_invocation,
+    validate_reasoning_state_keys,
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
@@ -141,14 +147,46 @@ _CHECKPOINT_CHANNEL_DTOS = (
     HandoffRequest,
 )
 # Pydantic's Python-mode model_dump flattens nested models but retains custom enum values.
-# LangGraph therefore sees these two constructors independently while decoding otherwise valid
+# LangGraph therefore sees these constructors independently while decoding otherwise valid
 # channel DTOs. Keep them separate from the schema-derived channel boundary and exact-pinned.
 _CHECKPOINT_NESTED_ENUMS = (CapabilityId, ExceptionAction, HandoffSource)
 
 
-def build_checkpointer() -> InMemorySaver:
+class SchemaValidatedInMemorySaver(InMemorySaver):
+    """In-memory saver that rejects channels outside its compiled graph contract."""
+
+    _allowed_checkpoint_channels: frozenset[str] | None = None
+
+    def bind_checkpoint_channels(self, channels: Collection[str]) -> None:
+        allowed = frozenset(channels)
+        missing = frozenset(ReasoningState.model_fields) - allowed
+        if missing:
+            raise ValueError(f"compiled graph omits reasoning-state fields: {sorted(missing)!r}")
+        if self._allowed_checkpoint_channels not in (None, allowed):
+            raise ValueError("checkpointer is already bound to a different graph schema")
+        self._allowed_checkpoint_channels = allowed
+
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        saved = super().get_tuple(config)
+        if saved is None or self._allowed_checkpoint_channels is None:
+            return saved
+        channel_values = saved.checkpoint.get("channel_values")
+        if not isinstance(channel_values, Mapping):
+            raise CheckpointSchemaError("persisted checkpoint channels are malformed")
+        try:
+            validate_reasoning_state_keys(
+                channel_values,
+                allowed_keys=self._allowed_checkpoint_channels,
+                source="persisted checkpoint",
+            )
+        except StateSchemaError as exc:
+            raise CheckpointSchemaError("persisted checkpoint has unknown channels") from exc
+        return saved
+
+
+def build_checkpointer() -> SchemaValidatedInMemorySaver:
     """Build the strict saver for custom channel DTOs and their serialized enum values."""
-    return InMemorySaver(
+    return SchemaValidatedInMemorySaver(
         serde=JsonPlusSerializer(
             allowed_msgpack_modules=[*_CHECKPOINT_CHANNEL_DTOS, *_CHECKPOINT_NESTED_ENUMS]
         )
@@ -354,7 +392,7 @@ def _classify_cancelled_checkpoint(
     abandoned_message_id: str,
     resumed_interrupt_node: str | None,
 ) -> _CancellationCheckpoint:
-    state = ReasoningState.model_validate(snapshot.values)
+    state = ReasoningState.from_checkpoint(snapshot.values)
     if state.pending_recovery is not None:
         return _CancellationCheckpoint("invalid")
     if snapshot.interrupts:
@@ -419,6 +457,10 @@ class ReasoningEngine:
                 "ReasoningEngine requires a checkpointer-backed graph "
                 "(interrupt/resume needs a durable thread)"
             )
+        bind_checkpoint_channels = getattr(graph.checkpointer, "bind_checkpoint_channels", None)
+        if not callable(bind_checkpoint_channels):
+            raise ValueError("ReasoningEngine requires a schema-validating checkpointer")
+        bind_checkpoint_channels(graph.channels)
         self._graph = graph
         self._thread_id = thread_id
         self._config = {"configurable": {"thread_id": thread_id}}
@@ -496,7 +538,29 @@ class ReasoningEngine:
         """True if the thread is paused at a HITL interrupt (next turn must resume it)."""
         if not self._node_execution_tracker.turn_admission_open or self._terminal_latched:
             return False
-        return bool(self._graph.get_state(self._config).interrupts)
+        try:
+            return bool(self._graph.get_state(self._config).interrupts)
+        except CheckpointSchemaError:
+            return False
+
+    def _update_state(
+        self,
+        config: RunnableConfig,
+        values: Mapping[str, object],
+        *,
+        as_node: str,
+    ) -> None:
+        validate_reasoning_state_keys(values, source=f"engine update from {as_node!r}")
+        self._graph.update_state(config, dict(values), as_node=as_node)
+
+    @staticmethod
+    def _validate_graph_input(value: object) -> None:
+        update = value.update if isinstance(value, Command) else value
+        if update is None:
+            return
+        if not isinstance(update, Mapping):
+            raise StateSchemaError("engine graph input contains a non-mapping state update")
+        validate_reasoning_state_keys(update, source="engine graph input")
 
     def _rotate_pending_transition(
         self,
@@ -510,7 +574,7 @@ class ReasoningEngine:
         transition = inspection.transition
         assert transition is not None
         current = self._graph.get_state(self._config)
-        current_state = ReasoningState.model_validate(current.values)
+        current_state = ReasoningState.from_checkpoint(current.values)
         if current_state.automation_terminal:
             self._lifecycle.invalidate_principal_transition(transition.transition_id)
             return None
@@ -527,7 +591,10 @@ class ReasoningEngine:
         )
         switched = False
         try:
-            seed: dict[str, object] = {"consumed_turn_ids": carried_turn_ids}
+            seed: dict[str, object] = {
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "consumed_turn_ids": carried_turn_ids,
+            }
             expected_invocation: ActiveInvocation | None = None
             if transition.continuation is not None:
                 expected_invocation = open_active_invocation(
@@ -538,9 +605,9 @@ class ReasoningEngine:
                 seed_author = "__start__"
             else:
                 seed_author = self._principal_seed_complete_node
-            self._graph.update_state(new_config, seed, as_node=seed_author)
+            self._update_state(new_config, seed, as_node=seed_author)
             seeded = self._graph.get_state(new_config)
-            seeded_state = ReasoningState.model_validate(seeded.values)
+            seeded_state = ReasoningState.from_checkpoint(seeded.values)
             expected_clear = clear_automation_state()
             expected_next = ("entry",) if transition.continuation is not None else ()
             contaminated = bool(
@@ -607,9 +674,9 @@ class ReasoningEngine:
                     exc_info=True,
                 )
 
-    def _enter_last_resort(self) -> SpokenMessageEvent:
+    def _enter_last_resort(self, *, replace_checkpoint: bool = False) -> SpokenMessageEvent:
         self._latch_last_resort()
-        self._finalize_last_resort_state()
+        self._finalize_last_resort_state(replace_checkpoint=replace_checkpoint)
         return SpokenMessageEvent(
             text=AUTOMATION_TERMINAL_LINE,
             node=self._terminal_takeover_node,
@@ -624,9 +691,10 @@ class ReasoningEngine:
         except Exception:
             logger.critical("last-resort telemetry failed", exc_info=True)
 
-    def _finalize_last_resort_state(self) -> None:
+    def _finalize_last_resort_state(self, *, replace_checkpoint: bool = False) -> None:
         self._invalidate_pending_transition_for_terminal()
-        terminal_update = {
+        terminal_update: dict[str, object] = {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             **clear_automation_state(),
             "automation_terminal": True,
             "messages": [
@@ -636,8 +704,11 @@ class ReasoningEngine:
                 )
             ],
         }
+        if replace_checkpoint:
+            self._replace_with_terminal_checkpoint(terminal_update)
+            return
         try:
-            self._graph.update_state(
+            self._update_state(
                 self._config,
                 terminal_update,
                 as_node=self._terminal_takeover_node,
@@ -651,13 +722,17 @@ class ReasoningEngine:
         except Exception:
             logger.critical("last-resort checkpoint takeover failed", exc_info=True)
             return
+
+        self._replace_with_terminal_checkpoint(terminal_update)
+
+    def _replace_with_terminal_checkpoint(self, terminal_update: dict[str, object]) -> None:
         try:
             # A schema-incoherent checkpoint cannot accept even a total-clear update because
             # LangGraph validates the old state before applying the delta. The session is
             # already terminal-latched, so replace that unusable thread with one terminal
             # checkpoint rather than retaining corrupt continuation or authority state.
             self._graph.checkpointer.delete_thread(self._thread_id)
-            self._graph.update_state(
+            self._update_state(
                 self._config,
                 terminal_update,
                 as_node=self._terminal_takeover_node,
@@ -823,6 +898,7 @@ class ReasoningEngine:
         if message_id is None:
             raise ValueError("ordinary routed turn requires a committed id")
         payload: dict[str, object] = {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "messages": [HumanMessage(content=turn.text, id=message_id)],
             "consumed_turn_ids": (message_id,),
         }
@@ -887,16 +963,17 @@ class ReasoningEngine:
     ) -> None:
         abandoned_message_id = marker.abandoned_message_id
         assert abandoned_message_id is not None
-        self._graph.update_state(
+        self._update_state(
             self._config,
             {
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
                 "pending_recovery": marker,
                 "consumed_turn_ids": (abandoned_message_id,),
             },
             as_node="__start__",
         )
         seeded = self._graph.get_state(self._config)
-        seeded_state = ReasoningState.model_validate(seeded.values)
+        seeded_state = ReasoningState.from_checkpoint(seeded.values)
         if (
             seeded_state.pending_recovery != marker
             or not seeded_state.consumed_turn_ids
@@ -979,6 +1056,11 @@ class ReasoningEngine:
                     self._enter_last_resort()
                     return
                 self._seed_stream_recovery(disposition.marker)
+            except CheckpointSchemaError:
+                logger.exception(
+                    "cancelled-stream checkpoint is schema-incoherent; terminalizing the session"
+                )
+                self._enter_last_resort(replace_checkpoint=True)
             except Exception:
                 logger.exception("cancelled-stream takeover failed; terminalizing the session")
                 self._enter_last_resort()
@@ -1033,6 +1115,10 @@ class ReasoningEngine:
         arrived_thread_id = self._thread_id
         try:
             arrived = self._graph.get_state(self._config)
+        except CheckpointSchemaError:
+            logger.exception("initial checkpoint schema rejected; terminalizing the session")
+            yield self._enter_last_resort(replace_checkpoint=True)
+            return
         except Exception:
             logger.exception("initial checkpoint read failed; terminalizing the session")
             yield self._enter_last_resort()
@@ -1054,7 +1140,7 @@ class ReasoningEngine:
                     return
                 self._rotate_pending_transition(message_id)
                 snapshot = self._graph.get_state(self._config)
-                snapshot_state = ReasoningState.model_validate(snapshot.values)
+                snapshot_state = ReasoningState.from_checkpoint(snapshot.values)
                 cross_thread = arrived_thread_id != self._thread_id
                 marker = (
                     None
@@ -1101,7 +1187,7 @@ class ReasoningEngine:
                             return
                         payload = Command(update={"consumed_turn_ids": (message_id,)})
                     elif not snapshot.next and not snapshot.tasks:
-                        self._graph.update_state(
+                        self._update_state(
                             self._config,
                             {"consumed_turn_ids": (message_id,)},
                             as_node=self._principal_seed_complete_node,
@@ -1196,6 +1282,7 @@ class ReasoningEngine:
                     # completed message deltas that are committed to state.
                     owned_stream_thread_id = self._thread_id
                     owned_resumed_interrupt_node = resumed_interrupt_node
+                    self._validate_graph_input(payload)
                     async for item in self._graph.astream(
                         payload,
                         config=self._config,
@@ -1232,6 +1319,10 @@ class ReasoningEngine:
                         resumed_interrupt_node=owned_resumed_interrupt_node,
                     )
                 raise original_cancellation
+            except CheckpointSchemaError:
+                logger.exception("checkpoint schema rejected; terminalizing the session")
+                yield self._enter_last_resort(replace_checkpoint=True)
+                return
             except Exception:
                 logger.exception("unhandled turn failure; terminalizing the session")
                 yield self._enter_last_resort()
@@ -1240,6 +1331,9 @@ class ReasoningEngine:
                 if not cancelled_stream and not self._terminal_latched:
                     try:
                         self._rotate_pending_transition(message_id)
+                    except CheckpointSchemaError:
+                        logger.exception("close-stream checkpoint schema rejected")
+                        self._enter_last_resort(replace_checkpoint=True)
                     except Exception:
                         logger.exception("close-stream principal rotation failed")
                         # Generator close has no remaining consumer for a yielded event.

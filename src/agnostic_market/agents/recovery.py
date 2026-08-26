@@ -44,6 +44,8 @@ from agnostic_market.dtos.state import (
     PendingRefund,
     PendingReturn,
     ReasoningState,
+    StateSchemaError,
+    validate_reasoning_state_keys,
 )
 
 logger = logging.getLogger(__name__)
@@ -284,6 +286,34 @@ NodeErrorHandler = Callable[[ReasoningState, NodeError], Command]
 NodeErrorHandlerFactory = Callable[[str, NodeRecoveryPolicy], NodeErrorHandler | None]
 
 
+def _validate_node_result(node_name: str, result: object) -> object:
+    update = result.update if isinstance(result, Command) else result
+    if update is None:
+        return result
+    if not isinstance(update, Mapping):
+        raise StateSchemaError(f"node {node_name!r} returned a non-mapping state update")
+    validate_reasoning_state_keys(update, source=f"node {node_name!r}")
+    return result
+
+
+def _wrap_state_node(node_name: str, node: object) -> Callable[[object, RunnableConfig], Any]:
+    runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
+
+    def run(state: object, config: RunnableConfig) -> Any:
+        return _validate_node_result(node_name, runnable.invoke(state, config))
+
+    return run
+
+
+def _wrap_error_handler(node_name: str, handler: NodeErrorHandler) -> NodeErrorHandler:
+    def run(state: ReasoningState, error: NodeError) -> Command:
+        command = handler(state, error)
+        _validate_node_result(node_name, command)
+        return command
+
+    return run
+
+
 class NodePolicyRegistry:
     """The only production seam for registering reasoning-graph nodes."""
 
@@ -319,10 +349,10 @@ class NodePolicyRegistry:
     ) -> None:
         options: dict[str, object] = {}
         if error_handler is not None:
-            options["error_handler"] = error_handler
+            options["error_handler"] = _wrap_error_handler(name, error_handler)
         if destinations is not None:
             options["destinations"] = destinations
-        self._graph.add_node(name, node, **options)
+        self._graph.add_node(name, _wrap_state_node(name, node), **options)
 
     def register(
         self,
@@ -487,8 +517,9 @@ def build_node_error_handler(
 
 def build_recovery_infrastructure_handler(
     _state: ReasoningState,
-    _error: NodeError,
+    error: NodeError,
 ) -> Command:
+    del error
     return Command(goto=RECOVERY_TERMINALIZER_NODE_NAME)
 
 
@@ -769,7 +800,7 @@ _NON_PREFIXED_AUTOMATION_FIELDS = frozenset(
         "active_invocation",
         "handover",
         "identity_claim_misses",
-        "active_flow",
+        "execution_owner",
         "clarification_liveness",
     }
 )
@@ -789,7 +820,7 @@ _AUTOMATION_STATE_RESET: Mapping[str, object] = MappingProxyType(
         "pending_recovery": None,
         "active_invocation": None,
         "identity_claim_misses": 0,
-        "active_flow": None,
+        "execution_owner": None,
         "pending_ack": None,
         "pending_clarification": None,
         "clarification_liveness": None,

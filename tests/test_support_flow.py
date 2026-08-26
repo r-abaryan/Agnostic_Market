@@ -137,7 +137,7 @@ def _assert_refund_destination_failed_closed(
     snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
     assert snapshot.next == ()
     assert snapshot.values.get("automation_terminal") is True
-    assert snapshot.values.get("active_flow") is None
+    assert snapshot.values.get("execution_owner") is None
     assert snapshot.values.get("handover") is None
     assert snapshot.values.get("pending_refund") is None
 
@@ -150,7 +150,7 @@ def _assert_refund_destination_failed_closed(
     assert len(onramps) == 1
     assert onramps[0]["reason_code"] == "refund"
     assert onramps[0]["source"] == "deterministic_policy"
-    assert onramps[0]["active_flow"] is None
+    assert onramps[0]["execution_owner"] is None
     assert [event for event in telemetry if event["event"] == "automation_terminal_response"] == [
         {"event": "automation_terminal_response"}
     ]
@@ -1509,7 +1509,7 @@ async def test_incomplete_typed_support_request_selects_one_code_authored_line(
     state = engine._graph.get_state(
         {"configurable": {"thread_id": f"support-clarify-{detail}"}}
     ).values
-    assert state["active_flow"] == "support"
+    assert state["execution_owner"] == "support"
     assert state.get("pending_clarification") is None
     assert store.refund_count == store.return_count == store.cancel_count == 0
 
@@ -1632,7 +1632,7 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
         engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
     )
     assert state.automation_terminal is True
-    assert state.active_flow is None
+    assert state.execution_owner is None
     assert state.active_invocation is None
     assert state.clarification_liveness is None
     assert verification.current_level() == 1
@@ -1728,7 +1728,7 @@ async def test_support_two_malformed_clarification_calls_are_paired_then_fall_ba
         message.tool_call_id for message in state["messages"] if isinstance(message, ToolMessage)
     }
     assert tool_use_ids == tool_result_ids
-    assert state["active_flow"] == "support"
+    assert state["execution_owner"] == "support"
     assert state["clarification_liveness"].reasks == 1
     assert store.refund_count == store.return_count == store.cancel_count == 0
 

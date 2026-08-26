@@ -384,7 +384,7 @@ def test_continue_dispatch_envelope_requires_and_preserves_the_observed_invocati
             messages=[HumanMessage("the shoes", id="turn-2")],
             consumed_turn_ids=("turn-1", "turn-2"),
             active_invocation=invocation,
-            active_flow="cart",
+            execution_owner="cart",
             clarification_liveness=ClarificationLiveness(
                 owner=InvocationClarificationOwner(invocation_id=invocation.invocation_id),
                 reasks=1,
@@ -409,7 +409,7 @@ def test_continue_dispatch_retains_identity_detour_execution_ownership(
             messages=[HumanMessage("casey@example.com", id="turn-2")],
             consumed_turn_ids=("turn-1", "turn-2"),
             active_invocation=invocation,
-            active_flow="identity",
+            execution_owner="identity",
             pending_capability_dispatch=CapabilityDispatchEnvelope(
                 turn_id="turn-2",
                 mode="continue",
@@ -439,7 +439,7 @@ def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
             messages=[HumanMessage("show my cart", id="turn-2")],
             consumed_turn_ids=("turn-1", "turn-2"),
             active_invocation=old,
-            active_flow="cart",
+            execution_owner="cart",
             identity_claim_misses=1,
             pending_ack="old response",
             pending_clarification=CartClarification(detail="item"),
@@ -458,13 +458,13 @@ def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
     assert replacement.invocation_id != old.invocation_id
     assert replacement.request == ViewCart()
     assert {
-        "active_flow": command.update["active_flow"],
+        "execution_owner": command.update["execution_owner"],
         "identity_claim_misses": command.update["identity_claim_misses"],
         "pending_ack": command.update["pending_ack"],
         "pending_clarification": command.update["pending_clarification"],
         "clarification_liveness": command.update["clarification_liveness"],
     } == {
-        "active_flow": None,
+        "execution_owner": None,
         "identity_claim_misses": 0,
         "pending_ack": None,
         "pending_clarification": None,
@@ -568,7 +568,7 @@ def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
     assert reasoning.invoke_count == 0
     assert cart.is_empty()
     assert result["active_invocation"] is None
-    assert result["active_flow"] == "cart"
+    assert result["execution_owner"] == "cart"
     pending = result["pending_cart_mutation"]
     assert isinstance(pending, PendingCartMutation)
     assert pending.sku == product.sku
@@ -655,13 +655,13 @@ def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> No
         ],
         consumed_turn_ids=("typed-cart-item", "typed-cart-quantity"),
         active_invocation=retained,
-        active_flow="cart",
+        execution_owner="cart",
         clarification_liveness=first["clarification_liveness"],
     )
     second = graph.nodes["cart_capability_entry"].invoke(second_state)
 
     assert second["active_invocation"] is None
-    assert second["active_flow"] == "cart"
+    assert second["execution_owner"] == "cart"
     pending = second["pending_cart_mutation"]
     assert isinstance(pending, PendingCartMutation)
     assert pending.quantity == 2
@@ -750,7 +750,7 @@ def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path
     retained = result["active_invocation"]
     assert isinstance(retained, ActiveInvocation)
     assert retained.request == ModifyCart(operation="add", quantity=2)
-    assert result["active_flow"] == "cart"
+    assert result["execution_owner"] == "cart"
     assert _only_spoken(result) == "Which item would you like?"
     assert reasoning.invoke_count == 0
 
@@ -824,7 +824,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
             messages=[HumanMessage("the second option", id="typed-cart-selection")],
             consumed_turn_ids=("typed-cart-duplicate", "typed-cart-selection"),
             active_invocation=retained,
-            active_flow="cart",
+            execution_owner="cart",
             clarification_liveness=first["clarification_liveness"],
         )
     )
@@ -849,7 +849,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
                 "typed-cart-quantity",
             ),
             active_invocation=selected,
-            active_flow="cart",
+            execution_owner="cart",
             clarification_liveness=second["clarification_liveness"],
         )
     )
@@ -1076,7 +1076,7 @@ def test_typed_cart_empty_remove_uses_review_ack_and_clears(config_root: Path) -
     )
 
     assert result["active_invocation"] is None
-    assert result["active_flow"] is None
+    assert result["execution_owner"] is None
     assert _only_spoken(result) == "Your cart's empty right now - what would you like to add?"
     assert reasoning.invoke_count == 0
 
@@ -1109,7 +1109,7 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
             messages=[HumanMessage("I still don't know", id="typed-cart-exit")],
             consumed_turn_ids=("typed-cart-exit",),
             active_invocation=invocation,
-            active_flow="cart",
+            execution_owner="cart",
             clarification_liveness=ClarificationLiveness(
                 owner=InvocationClarificationOwner(invocation_id=invocation.invocation_id),
                 reasks=2,
@@ -1117,7 +1117,7 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
         )
     )
     assert exhausted["active_invocation"] is None
-    assert exhausted["active_flow"] is None
+    assert exhausted["execution_owner"] is None
 
     graph = _graph(config_root, FakeChatModel())
     update = graph.nodes["abort_current"].invoke(
@@ -1127,7 +1127,7 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
                 request=AbortCurrent(),
                 opened_turn_id="typed-cart-exit",
             ),
-            active_flow="cart",
+            execution_owner="cart",
         )
     )
     assert update["active_invocation"] is None
@@ -1153,7 +1153,7 @@ def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
         "exhaustion": "I still cannot choose",
     }[exit_kind]
     state: dict[str, object] = {
-        "active_flow": "cart",
+        "execution_owner": "cart",
         "active_invocation": ActiveInvocation(
             request=ModifyCart(operation="add"),
             opened_turn_id=f"typed-cart-{exit_kind}",
@@ -1366,7 +1366,7 @@ def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: P
 
     assert reasoning.invoke_count == 0
     assert result["active_invocation"] is None
-    assert result["active_flow"] is None
+    assert result["execution_owner"] is None
     assert "hit a snag" not in _only_spoken(result).lower()
 
 
@@ -1385,7 +1385,7 @@ def test_identity_capability_entry_is_preparation_only(config_root: Path) -> Non
         )
         update = graph.nodes["identity_capability_entry"].invoke(state)
 
-        assert update == {"active_flow": "identity"}
+        assert update == {"execution_owner": "identity"}
 
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
 
@@ -1430,7 +1430,7 @@ def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
     )
     assert cart.line_count == 1
     assert result["active_invocation"] is None
-    assert result["active_flow"] is None
+    assert result["execution_owner"] is None
     assert _only_spoken(result) == "You're verified on this call."
 
 

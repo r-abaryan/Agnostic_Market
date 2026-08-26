@@ -40,7 +40,12 @@ from agnostic_market.dtos.orchestration import (
     RouteDecision,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
-from agnostic_market.dtos.state import PendingRefund, ReasoningState, open_active_invocation
+from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
+    PendingRefund,
+    ReasoningState,
+    open_active_invocation,
+)
 
 _ACTION_CASES = (
     ("answer_response", ExceptionAction.SAFE_ABORT, TURN_FALLBACK_LINE),
@@ -198,7 +203,7 @@ def test_every_ordinary_recovery_action_has_one_closed_result(
             action=action,
             trigger="node_exception",
         ),
-        active_flow="support",
+        execution_owner="support",
         pending_ack="stale",
         identity_claim_misses=1,
     )
@@ -326,7 +331,10 @@ def test_pending_recovery_is_strict_and_checkpoint_safe(
         config = {"configurable": {"thread_id": f"recovery-serde-{index}"}}
         harness.engine._graph.update_state(
             config,
-            {"pending_recovery": marker},
+            {
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "pending_recovery": marker,
+            },
             as_node="__start__",
         )
         restored = harness.engine._graph.get_state(config)
@@ -349,6 +357,7 @@ async def test_seeded_recovery_precedes_a_pending_continuation_and_clears_it(
     harness.engine._graph.update_state(
         harness.engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "pending_recovery": PendingRecovery(
                 origin_node="answer_response",
                 action=ExceptionAction.SAFE_ABORT,
@@ -393,6 +402,7 @@ async def test_capability_entry_exception_is_owned_by_the_destination_not_the_di
     harness.engine._graph.update_state(
         harness.engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": consumed_turn_ids,
             "active_invocation": open_active_invocation(
                 CancelOrders(target=ExplicitOrderSet(order_refs=("ORD-1001",))),
@@ -466,7 +476,7 @@ async def test_cart_mutation_then_exception_reconciles_the_committed_effect(
     assert len(spoken) == 1 and spoken[0].node == RECOVERY_NODE_NAME
     assert "waterproof rain jacket" in spoken[0].text
     assert spoken[0].text.startswith("Added 1 waterproof rain jacket to your cart.")
-    assert snapshot.values.get("active_flow") is None
+    assert snapshot.values.get("execution_owner") is None
     assert snapshot.values.get("pending_recovery") is None
     assert snapshot.next == ()
 
@@ -533,7 +543,11 @@ async def test_otp_dispatch_exception_does_not_retry_or_enter_collection(
     )
     harness.engine._graph.update_state(
         harness.engine._config,
-        {"pending_refund": _pending_refund(harness), "active_flow": "support"},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "pending_refund": _pending_refund(harness),
+            "execution_owner": "support",
+        },
         as_node="support_risk_check",
     )
 
@@ -565,7 +579,11 @@ async def test_otp_collect_exception_does_not_verify_or_redispatch(
     )
     harness.engine._graph.update_state(
         harness.engine._config,
-        {"pending_refund": _pending_refund(harness), "active_flow": "support"},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "pending_refund": _pending_refund(harness),
+            "execution_owner": "support",
+        },
         as_node="support_risk_check",
     )
 
@@ -714,7 +732,10 @@ async def test_terminal_node_exception_stays_terminal_without_reentry(
     )
     harness.engine._graph.update_state(
         harness.engine._config,
-        {"automation_terminal": True},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "automation_terminal": True,
+        },
         as_node="__start__",
     )
 

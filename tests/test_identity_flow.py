@@ -24,7 +24,12 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     VerifyIdentity,
 )
-from agnostic_market.dtos.state import PendingIdentity, ReasoningState, open_active_invocation
+from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
+    PendingIdentity,
+    ReasoningState,
+    open_active_invocation,
+)
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
@@ -119,6 +124,7 @@ def _seed_typed_verification(harness: SupportHarness, *, turn_id: str) -> None:
     harness.engine._graph.update_state(
         harness.engine._config,
         {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": consumed_turn_ids,
             "active_invocation": open_active_invocation(
                 VerifyIdentity(),
@@ -156,7 +162,7 @@ def _assert_identity_contact_ask(
     snapshot = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
     state = snapshot.values
     assert snapshot.next == ()
-    assert state.get("active_flow") == "identity"
+    assert state.get("execution_owner") == "identity"
     assert state.get("identity_claim_misses") == expected_misses
     assert _active_request(state) == ListOrders(scope="account")
     assert state.get("pending_clarification") is None
@@ -270,7 +276,7 @@ async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover
     assert [event.node for event in _spoken(exhausted)] == ["automation_terminal_response"]
     state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
     assert state.get("automation_terminal") is True
-    assert state.get("active_flow") is None
+    assert state.get("execution_owner") is None
     assert state.get("active_invocation") is None
     assert state.get("clarification_liveness") is None
     assert h.identity.current() is None
@@ -445,7 +451,7 @@ def test_same_principal_apply_preserves_invocation_until_continuation(
     )
     state = ReasoningState(
         consumed_turn_ids=consumed_turn_ids,
-        active_flow="identity",
+        execution_owner="identity",
         active_invocation=invocation,
         pending_identity=PendingIdentity(
             customer_ref=_CUST1_REF,
@@ -536,7 +542,7 @@ async def test_typed_verification_decline_preserves_discardable_context(
     assert reasoning.invoke_count == 0
     state = ReasoningState.model_validate(h.engine._graph.get_state(h.engine._config).values)
     assert state.active_invocation is None
-    assert state.active_flow is None
+    assert state.execution_owner is None
 
 
 async def test_typed_verification_accepts_context_warning_then_rotates(
@@ -978,7 +984,7 @@ async def test_direct_semantic_route_replaces_an_identity_invocation(
     )
     await _events(h.engine, "cancel my order please")
     state = h.engine._graph.get_state({"configurable": {"thread_id": "ident-cross-1"}})
-    assert state.values.get("active_flow") == "support"
+    assert state.values.get("execution_owner") == "support"
     assert state.values.get("pending_identity") is None
     new_invocation = state.values["active_invocation"]
     assert new_invocation.invocation_id != old_invocation.invocation_id

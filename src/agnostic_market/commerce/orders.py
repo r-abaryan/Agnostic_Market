@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -29,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.dtos.money import UsdAmount, validate_usd
 from agnostic_market.dtos.orchestration import OrderContextOperation
 from agnostic_market.dtos.state import BatchCancelOutcome, CartLine
 
@@ -46,7 +48,7 @@ class _NamedItem(Protocol):
 
 class _CandidateItem(_NamedItem, Protocol):
     sku: str
-    price_usd: float
+    price_usd: UsdAmount
 
 
 def speak_quantity(quantity: int, name: str) -> str:
@@ -172,7 +174,7 @@ def render_order_status_line(
     return f"Your order {order_id} - {items} - is {phrase}{eta_clause}."
 
 
-def render_cart_line(lines: Sequence[CartLine], total_usd: float) -> str:
+def render_cart_line(lines: Sequence[CartLine], total_usd: UsdAmount) -> str:
     """CODE-authored spoken cart line (the deterministic view_cart renderer). Empty cart is the
     caller's job to detect (the node speaks the empty line); this renders a non-empty cart."""
     return f"You've got {speak_lines(lines)} in your cart, ${total_usd:.2f} in total."
@@ -292,7 +294,7 @@ class _OrderEntry(BaseModel):
     customer_ref: str = Field(min_length=1)
     # Captured amount — the refund cumulative-cap join reads this (§A4b); a real SoR always
     # knows what it captured. Required so a refund can never run against an unknown total.
-    total_usd: float = Field(ge=0)
+    total_usd: UsdAmount
     # Timezone-aware ISO 8601 delivery instant (e.g. "2026-07-01T00:00:00Z") — the return
     # window counts from here (Group C). Required for DELIVERED orders (fail-loud at fixture
     # load); shipped-not-yet-delivered orders have none and are trivially in window.
@@ -310,7 +312,7 @@ class CatalogProduct(BaseModel):
 
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    price_usd: float = Field(ge=0)
+    price_usd: UsdAmount
 
 
 class OrdersFixture(BaseModel):
@@ -342,7 +344,7 @@ class Candidate(BaseModel):
     key: str = Field(min_length=1)
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    price_usd: float = Field(ge=0)
+    price_usd: UsdAmount
 
 
 class OrderCandidate(BaseModel):
@@ -361,7 +363,7 @@ class OrderCandidate(BaseModel):
     key: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
-    total_usd: float = Field(ge=0)
+    total_usd: UsdAmount
     status: str = Field(min_length=1)
 
 
@@ -372,7 +374,7 @@ class PlacedLine(BaseModel):
 
     sku: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    price_usd: float = Field(ge=0)
+    price_usd: UsdAmount
     quantity: int = Field(ge=1)
 
 
@@ -386,7 +388,7 @@ class PlacedOrder(BaseModel):
     model_config = _FROZEN
 
     order_id: str = Field(min_length=1)
-    total_usd: float = Field(ge=0)
+    total_usd: UsdAmount
     lines: tuple[PlacedLine, ...] = Field(min_length=1)
 
 
@@ -403,7 +405,7 @@ class RefundRecord(BaseModel):
 
     refund_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
-    amount_usd: float = Field(ge=0)
+    amount_usd: UsdAmount
     destination: str = Field(min_length=1)
     instrument_ref: str = Field(min_length=1)
 
@@ -420,7 +422,7 @@ class CancelRecord(BaseModel):
 
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
-    total_usd: float = Field(ge=0)
+    total_usd: UsdAmount
 
 
 class CancelError(ValueError):
@@ -440,7 +442,7 @@ class ReturnRecord(BaseModel):
     rma_id: str = Field(min_length=1)
     order_id: str = Field(min_length=1)
     summary: str = Field(min_length=1)
-    refund_due_usd: float = Field(ge=0)
+    refund_due_usd: UsdAmount
     destination: str = Field(min_length=1)
 
 
@@ -451,7 +453,7 @@ class ReturnError(ValueError):
 
 def _line_fingerprint(
     lines: Iterable[CartLine | PlacedLine],
-) -> tuple[tuple[str, str, float, int], ...]:
+) -> tuple[tuple[str, str, UsdAmount, int], ...]:
     return tuple((line.sku, line.name, line.price_usd, line.quantity) for line in lines)
 
 
@@ -459,7 +461,7 @@ def _placement_matches(
     record: PlacedOrder,
     *,
     lines: Sequence[CartLine],
-    total_usd: float,
+    total_usd: UsdAmount,
 ) -> bool:
     return record.total_usd == total_usd and _line_fingerprint(record.lines) == _line_fingerprint(
         lines
@@ -470,7 +472,7 @@ def _refund_matches(
     record: RefundRecord,
     *,
     order_id: str,
-    amount_usd: float,
+    amount_usd: UsdAmount,
     destination: str,
     instrument_ref: str,
 ) -> bool:
@@ -490,7 +492,7 @@ def _return_matches(
     record: ReturnRecord,
     *,
     order_id: str,
-    refund_due_usd: float,
+    refund_due_usd: UsdAmount,
     destination: str,
 ) -> bool:
     return (
@@ -817,7 +819,7 @@ class OrderStore:
         return None
 
     def place_cart(
-        self, idempotency_key: str, *, lines: Sequence[CartLine], total_usd: float
+        self, idempotency_key: str, *, lines: Sequence[CartLine], total_usd: UsdAmount
     ) -> PlacedOrder:
         """Place a WHOLE cart as ONE multi-line order, deduplicated by `idempotency_key`
         (SoR-arbiter rule — Group B).
@@ -828,16 +830,17 @@ class OrderStore:
         about ONE order). `lines`/`total_usd` are code-computed by the flow (never model
         arithmetic).
         """
+        checked_total = validate_usd(total_usd)
         existing = self._placed_by_key.get(idempotency_key)
         if existing is not None:
-            if not _placement_matches(existing, lines=lines, total_usd=total_usd):
+            if not _placement_matches(existing, lines=lines, total_usd=checked_total):
                 raise PlacementError(
                     "placement idempotency key was reused with different parameters"
                 )
             return existing
         placed = PlacedOrder(
             order_id=f"ORD-{self._next_seq}",
-            total_usd=total_usd,
+            total_usd=checked_total,
             lines=tuple(
                 PlacedLine(sku=ln.sku, name=ln.name, price_usd=ln.price_usd, quantity=ln.quantity)
                 for ln in lines
@@ -853,12 +856,13 @@ class OrderStore:
         idempotency_key: str,
         *,
         lines: Sequence[CartLine],
-        total_usd: float,
+        total_usd: UsdAmount,
     ) -> ReceiptLookup[PlacedOrder]:
         """Read the placement ledger without placing or restoring session visibility."""
+        checked_total = validate_usd(total_usd)
         return classify_receipt(
             self._placed_by_key.get(idempotency_key),
-            lambda record: _placement_matches(record, lines=lines, total_usd=total_usd),
+            lambda record: _placement_matches(record, lines=lines, total_usd=checked_total),
         )
 
     @property
@@ -916,7 +920,7 @@ class OrderStore:
         ]
         return fixture_candidates + placed_candidates
 
-    def captured_total(self, order_id: str) -> float | None:
+    def captured_total(self, order_id: str) -> UsdAmount | None:
         """The captured amount for an order (fixture OR placed); None if unknown.
 
         The refund cumulative-cap join reads this — a refund against an order whose total
@@ -931,12 +935,12 @@ class OrderStore:
                 return placed.total_usd
         return None
 
-    def refunded_so_far(self, order_id: str) -> float:
+    def refunded_so_far(self, order_id: str) -> UsdAmount:
         """Sum of refunds already issued against an order (the cumulative-cap left side)."""
         normalized = order_id.strip().upper()
-        return round(
-            sum(r.amount_usd for r in self._refunds_by_key.values() if r.order_id == normalized),
-            2,
+        return sum(
+            (r.amount_usd for r in self._refunds_by_key.values() if r.order_id == normalized),
+            start=Decimal("0"),
         )
 
     def delivered_at_epoch(self, order_id: str) -> float | None:
@@ -961,15 +965,13 @@ class OrderStore:
                 return record
         return None
 
-    def return_refund_due(self, order_id: str) -> float:
+    def return_refund_due(self, order_id: str) -> UsdAmount:
         """Sum of refunds PROMISED on open returns for an order — the promise side of the
         cumulative-cap join (refunds paid + refunds promised may never exceed captured)."""
         normalized = order_id.strip().upper()
-        return round(
-            sum(
-                r.refund_due_usd for r in self._returns_by_key.values() if r.order_id == normalized
-            ),
-            2,
+        return sum(
+            (r.refund_due_usd for r in self._returns_by_key.values() if r.order_id == normalized),
+            start=Decimal("0"),
         )
 
     def issue_refund(
@@ -977,7 +979,7 @@ class OrderStore:
         idempotency_key: str,
         *,
         order_id: str,
-        amount_usd: float,
+        amount_usd: UsdAmount,
         destination: str,
         instrument_ref: str,
     ) -> RefundRecord:
@@ -994,12 +996,13 @@ class OrderStore:
         return the money twice), or an over-cap amount; the caller must have already gated
         destination -> level (§A4b).
         """
+        checked_amount = validate_usd(amount_usd)
         existing = self._refunds_by_key.get(idempotency_key)
         if existing is not None:
             if not _refund_matches(
                 existing,
                 order_id=order_id,
-                amount_usd=amount_usd,
+                amount_usd=checked_amount,
                 destination=destination,
                 instrument_ref=instrument_ref,
             ):
@@ -1018,16 +1021,16 @@ class OrderStore:
             )
         already = self.refunded_so_far(order_id)
         promised = self.return_refund_due(order_id)
-        if round(already + promised + amount_usd, 2) > captured:
+        if already + promised + checked_amount > captured:
             raise RefundError(
-                f"refund ${amount_usd:.2f} exceeds refundable balance on {order_id} "
+                f"refund ${checked_amount:.2f} exceeds refundable balance on {order_id} "
                 f"(captured ${captured:.2f}, already refunded ${already:.2f}, "
                 f"promised on open returns ${promised:.2f})"
             )
         record = RefundRecord(
             refund_id=f"R-{self._next_refund_seq}",
             order_id=order_id.strip().upper(),
-            amount_usd=amount_usd,
+            amount_usd=checked_amount,
             destination=destination,
             instrument_ref=cleaned_instrument_ref,
         )
@@ -1040,17 +1043,18 @@ class OrderStore:
         idempotency_key: str,
         *,
         order_id: str,
-        amount_usd: float,
+        amount_usd: UsdAmount,
         destination: str,
         instrument_ref: str,
     ) -> ReceiptLookup[RefundRecord]:
         """Read one exact refund-intent result from the authoritative ledger."""
+        checked_amount = validate_usd(amount_usd)
         return classify_receipt(
             self._refunds_by_key.get(idempotency_key),
             lambda record: _refund_matches(
                 record,
                 order_id=order_id,
-                amount_usd=amount_usd,
+                amount_usd=checked_amount,
                 destination=destination,
                 instrument_ref=instrument_ref,
             ),
@@ -1066,7 +1070,7 @@ class OrderStore:
         idempotency_key: str,
         *,
         order_id: str,
-        refund_due_usd: float,
+        refund_due_usd: UsdAmount,
         destination: str,
     ) -> ReturnRecord:
         """Create a return/RMA, deduplicated by per-INTENT `idempotency_key` (SoR-arbiter
@@ -1082,12 +1086,13 @@ class OrderStore:
         at the Phase-4 SoR once the return is processed, re-running the destination->level
         check there.
         """
+        checked_refund_due = validate_usd(refund_due_usd)
         existing = self._returns_by_key.get(idempotency_key)
         if existing is not None:
             if not _return_matches(
                 existing,
                 order_id=order_id,
-                refund_due_usd=refund_due_usd,
+                refund_due_usd=checked_refund_due,
                 destination=destination,
             ):
                 raise ReturnError("return idempotency key was reused with different parameters")
@@ -1110,16 +1115,16 @@ class OrderStore:
         # No `return_refund_due` term here: the already-open check above guarantees zero
         # open returns for this order, so the promised side is structurally 0 (unlike
         # issue_refund, which CAN run alongside an open return and must count it).
-        if round(already + refund_due_usd, 2) > captured:
+        if already + checked_refund_due > captured:
             raise ReturnError(
-                f"return refund ${refund_due_usd:.2f} exceeds refundable balance on "
+                f"return refund ${checked_refund_due:.2f} exceeds refundable balance on "
                 f"{normalized} (captured ${captured:.2f}, already refunded ${already:.2f})"
             )
         record = ReturnRecord(
             rma_id=f"RMA-{self._next_return_seq}",
             order_id=normalized,
             summary=self.order_item_summary(normalized),
-            refund_due_usd=refund_due_usd,
+            refund_due_usd=checked_refund_due,
             destination=destination,
         )
         self._next_return_seq += 1
@@ -1131,16 +1136,17 @@ class OrderStore:
         idempotency_key: str,
         *,
         order_id: str,
-        refund_due_usd: float,
+        refund_due_usd: UsdAmount,
         destination: str,
     ) -> ReceiptLookup[ReturnRecord]:
         """Read one exact return-intent result from the authoritative ledger."""
+        checked_refund_due = validate_usd(refund_due_usd)
         return classify_receipt(
             self._returns_by_key.get(idempotency_key),
             lambda record: _return_matches(
                 record,
                 order_id=order_id,
-                refund_due_usd=refund_due_usd,
+                refund_due_usd=checked_refund_due,
                 destination=destination,
             ),
         )
