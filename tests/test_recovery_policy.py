@@ -90,6 +90,13 @@ def test_production_mutators_remain_in_the_six_reconcile_nodes() -> None:
     }
 
 
+def test_production_authorization_has_no_test_only_grant_path() -> None:
+    assert (
+        _production_calls(frozenset({"grant_mutation_for_test", "mutation_granted_for_test"}))
+        == set()
+    )
+
+
 def test_automation_state_clear_is_total_and_preserves_persistent_state() -> None:
     validate_automation_state_clear()
     assert clear_automation_state() == {

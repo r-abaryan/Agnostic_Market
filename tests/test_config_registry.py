@@ -31,11 +31,17 @@ secrets_ref: "vault://m1"
 _BASE_BODY = (
     "_safety_locked: [policies.cancel_batch_max, "
     "runtime.cancellation_quiescence_timeout_seconds, "
+    "runtime.checkpoint_io_timeout_seconds, "
+    "runtime.response_model_node_timeout_seconds, "
+    "runtime.reasoning_model_node_timeout_seconds, "
     "runtime.caller_audible_model_text_max_chars, "
     "runtime.semantic_router_input_max_chars, "
     'runtime.semantic_router_timeout_seconds]\nschema_version: "0.2"\n'
     "runtime: { cancellation_quiescence_timeout_seconds: 2.0, "
-    "caller_audible_model_text_max_chars: 500, semantic_router_input_max_chars: 2048, "
+    "checkpoint_io_timeout_seconds: 2.0, response_model_node_timeout_seconds: 2.0, "
+    "reasoning_model_node_timeout_seconds: 6.0, "
+    "caller_audible_model_text_max_chars: 500, "
+    "semantic_router_input_max_chars: 2048, "
     "semantic_router_timeout_seconds: 2.0 }\n"
     'compliance: { call_start_disclosure: "Hi, this is an AI assistant." }\n'
     "policies:\n"
@@ -81,16 +87,21 @@ def test_both_repository_templates_resolve_the_closed_llm_role_map(
 ) -> None:
     registry = ConfigRegistry(config_root).load()
 
-    for merchant_id in ("acme_store", "demo_shop"):
+    expected_routing = {
+        "acme_store": ("openai", "gpt-5.6-luna", "none"),
+        "demo_shop": ("openai", "gpt-5.4-mini", None),
+    }
+    for merchant_id in expected_routing:
         llm = registry.get(merchant_id).config.llm
         assert (llm.response.provider, llm.response.model) == (
             "anthropic",
             "claude-haiku-4-5",
         )
-        assert (llm.routing.provider, llm.routing.model) == (
-            "openai",
-            "gpt-5.4-mini",
-        )
+        assert (
+            llm.routing.provider,
+            llm.routing.model,
+            llm.routing.reasoning_effort,
+        ) == expected_routing[merchant_id]
         assert (llm.reasoning.provider, llm.reasoning.model) == (
             "anthropic",
             "claude-opus-4-8",

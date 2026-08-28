@@ -133,7 +133,7 @@ async def test_wrong_otp_twice_hands_to_human_without_changing(
     await _events(h.engine, "111111")
     assert h.profile.change_count == 0
     assert h.verification.current_level() == 1  # no free level
-    assert not h.engine.pending_interrupt()  # not trapped
+    assert not await h.engine.apending_interrupt()  # not trapped
     # The on-ramp package fired (2nd converging path besides the consent-"human" exit).
     onramps = [
         json.loads(line) for line in _telemetry(tmp_path).splitlines() if '"human_onramp"' in line
@@ -165,10 +165,10 @@ async def test_kill_mid_stepup_leaves_no_ghost_change_and_no_free_level(
 ) -> None:
     h = _profile_harness(config_root)
     await _events(h.engine, _REQUEST)  # paused at OTP collect
-    h.engine.delete_thread()  # Clock B: the call dropped
+    await h.engine.adelete_thread()  # Clock B: the call dropped
     assert h.profile.change_count == 0
     assert h.verification.current_level() == 1
-    assert not h.engine.pending_interrupt()
+    assert not await h.engine.apending_interrupt()
 
 
 # --- consent exits --------------------------------------------------------------------------
@@ -183,7 +183,7 @@ async def test_stale_profile_readback_expires_before_changing(
     monkeypatch.setattr(support_flow.time, "time", lambda: 9_999_999_999.0)
     events = await _events(h.engine, "yes")
     assert h.profile.change_count == 0
-    assert not h.engine.pending_interrupt()
+    assert not await h.engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("sat for a while" in e.text for e in spoken)
 
@@ -231,7 +231,7 @@ async def test_payment_change_still_defers_honestly(config_root: Path) -> None:
         )
     ]
     assert h.profile.change_count == 0
-    assert not h.engine.pending_interrupt()
+    assert not await h.engine.apending_interrupt()
 
 
 # --- PII discipline (value spoken, never persisted to observability) -----------------------

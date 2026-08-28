@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import wraps
 
@@ -15,7 +15,7 @@ from agnostic_market.dtos.state import (
 )
 
 NodeUpdate = dict[str, object]
-StateNode = Callable[[ReasoningState], NodeUpdate]
+AsyncStateNode = Callable[[ReasoningState], Awaitable[NodeUpdate]]
 
 
 @dataclass(frozen=True)
@@ -63,12 +63,12 @@ def advance_clarification(
     )
 
 
-def with_clarification_lifecycle(node: StateNode) -> StateNode:
+def with_clarification_lifecycle(node: AsyncStateNode) -> AsyncStateNode:
     """Clear progress whenever an assemble result is not another clarification."""
 
     @wraps(node)
-    def wrapped(state: ReasoningState) -> NodeUpdate:
-        update = node(state)
+    async def wrapped(state: ReasoningState) -> NodeUpdate:
+        update = await node(state)
         if update.get("pending_clarification") is None:
             return {**update, "clarification_liveness": None}
         return update

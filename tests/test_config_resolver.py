@@ -18,6 +18,9 @@ def _base() -> dict:
             "schema_version",
             "policies.cancel_batch_max",
             "runtime.cancellation_quiescence_timeout_seconds",
+            "runtime.checkpoint_io_timeout_seconds",
+            "runtime.response_model_node_timeout_seconds",
+            "runtime.reasoning_model_node_timeout_seconds",
             "runtime.caller_audible_model_text_max_chars",
             "runtime.semantic_router_input_max_chars",
             "runtime.semantic_router_timeout_seconds",
@@ -44,6 +47,9 @@ def _base() -> dict:
         "schema_version": "0.2",
         "runtime": {
             "cancellation_quiescence_timeout_seconds": 2.0,
+            "checkpoint_io_timeout_seconds": 2.0,
+            "response_model_node_timeout_seconds": 2.0,
+            "reasoning_model_node_timeout_seconds": 6.0,
             "caller_audible_model_text_max_chars": 500,
             "semantic_router_input_max_chars": 2048,
             "semantic_router_timeout_seconds": 2.0,
@@ -181,6 +187,27 @@ def test_caller_audible_model_text_limit_comes_from_locked_base() -> None:
         SafetyLockViolationError,
         match="caller_audible_model_text_max_chars",
     ):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_checkpoint_io_timeout_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.checkpoint_io_timeout_seconds == 2.0
+
+    bad = _override()
+    bad["runtime"] = {"checkpoint_io_timeout_seconds": 60.0}
+    with pytest.raises(SafetyLockViolationError, match="checkpoint_io_timeout_seconds"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_model_node_timeouts_come_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.response_model_node_timeout_seconds == 2.0
+    assert config.runtime.reasoning_model_node_timeout_seconds == 6.0
+
+    bad = _override()
+    bad["runtime"] = {"reasoning_model_node_timeout_seconds": 60.0}
+    with pytest.raises(SafetyLockViolationError, match="reasoning_model_node_timeout_seconds"):
         resolve_merchant_config(_base(), _template(), bad)
 
 

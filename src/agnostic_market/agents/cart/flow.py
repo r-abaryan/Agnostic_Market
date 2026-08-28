@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,13 +35,17 @@ from agnostic_market.agents.clarification import (
 )
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
-from agnostic_market.commerce.orders import (
+from agnostic_market.commerce.catalog import (
     Candidate,
+    CatalogPort,
+    match_named_items,
+    number_candidates,
+)
+from agnostic_market.commerce.orders import (
+    GuestOrderScope,
     OrderStore,
     PlacedOrder,
     RecentOrderContext,
-    match_named_items,
-    number_candidates,
     speak_lines,
 )
 from agnostic_market.dtos.confirmation import (
@@ -136,7 +140,7 @@ class CartNodes:
     owns only behavior. Routers that branch on store-owned outcomes stay with this bundle.
     """
 
-    capability_entry: Callable[[ReasoningState], dict[str, object]]
+    capability_entry: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     ack: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     mutation_confirm: Callable[[ReasoningState], dict[str, object]]
@@ -153,6 +157,8 @@ class CartNodes:
 def build_cart_nodes(
     reasoning_model: BaseChatModel,
     order_store: OrderStore,
+    catalog: CatalogPort,
+    guest_orders: GuestOrderScope,
     cart_store: CartStore,
     policy: PolicyContext,
     recent_orders: RecentOrderContext,
@@ -267,7 +273,7 @@ def build_cart_nodes(
             "pending_clarification": None,
         }
 
-    def capability_entry_node(state: ReasoningState) -> dict[str, object]:
+    async def capability_entry_node(state: ReasoningState) -> dict[str, object]:
         """Prepare one typed Cart request; code owns live state and every effect boundary."""
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, ModifyCart | PlaceOrder):
@@ -288,11 +294,24 @@ def build_cart_nodes(
         new_messages: list = []
 
         def domain():
-            items = (
-                list(order_store.fixture.products)
-                if request.operation == "add"
-                else list(cart_store.view())
-            )
+            if request.operation != "add":
+                items = list(cart_store.view())
+            elif isinstance(request.item, CartItemQuery):
+                items = list(catalog.search(request.item.query).products)
+            elif isinstance(request.item, CartItemChoices):
+                items = [
+                    product
+                    for product in catalog.resolve_products(request.item.skus)
+                    if product is not None
+                ]
+            elif isinstance(request.item, ResolvedCartItemRef):
+                items = [
+                    product
+                    for product in catalog.resolve_products((request.item.sku,))
+                    if product is not None
+                ]
+            else:
+                items = list(catalog.browse().products)
             candidates = number_candidates(items)
             return (
                 items,
@@ -324,7 +343,11 @@ def build_cart_nodes(
             return empty_cart()
 
         if isinstance(request.item, CartItemQuery):
-            matches = match_named_items(items, request.item.query)
+            matches = (
+                items
+                if request.operation == "add"
+                else match_named_items(items, request.item.query)
+            )
             if not matches:
                 retain(
                     ModifyCart(
@@ -398,7 +421,7 @@ def build_cart_nodes(
             messages: list = [prompt, current_user_message]
             expected_tool = proposal_tool.name
             for _attempt in range(2):
-                response = capability_model.invoke(messages)
+                response = await capability_model.ainvoke(messages)
                 if not response.tool_calls:
                     return clarify("item" if selecting_item else "quantity")
                 new_messages.append(response)
@@ -631,7 +654,13 @@ def build_cart_nodes(
         ):
             request = invocation.request
             items = (
-                order_store.fixture.products if request.operation == "add" else cart_store.view()
+                tuple(
+                    product
+                    for product in catalog.resolve_products(request.item.skus)
+                    if product is not None
+                )
+                if request.operation == "add"
+                else cart_store.view()
             )
             item_by_sku = {item.sku: item for item in items}
             choices = [item_by_sku.get(sku) for sku in request.item.skus]
@@ -673,7 +702,7 @@ def build_cart_nodes(
                     )
                 ],
             }
-        dup = order_store.identical_cart_order(pending.lines)
+        dup = order_store.identical_cart_order(pending.lines, guest_orders)
         if dup is not None:
             write_event({"event": "checkout_duplicate_flagged", "existing": dup.order_id})
             return {"pending_placement": pending.model_copy(update={"duplicate_of": dup.order_id})}
@@ -742,6 +771,7 @@ def build_cart_nodes(
                 )
             ],
         }
+        guest_orders.record(placed.order_id)
         cart_store.clear()
         recent_orders.record([placed.order_id], operation="place")
         write_event(
@@ -769,7 +799,7 @@ def build_cart_nodes(
         if state.pending_cart_mutation is not None:
             return "mutation_confirm"
         if state.pending_placement is not None:
-            return "place"  # buy_now / go_to_checkout minted a placement
+            return "place"  # Typed PlaceOrder minted a placement.
         if state.pending_ack is not None:
             return "ack"  # a mutation / review / empty-cart line to speak
         if state.pending_clarification is not None:

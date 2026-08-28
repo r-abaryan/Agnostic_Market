@@ -16,7 +16,7 @@ The pins that matter most: the steer-leak regressions (the refund guardrail RE-M
 whose lines speak dollar amounts, so the gate must hold strictly UPSTREAM of the mint), the
 prompt-content pins (no unauthorized order data ever enters the support model's context), and the
 guest happy-path (detour → OTP bind → resume → cancel commits). Zero network (fake models +
-InMemorySaver). Harnesses here are UNAUTHORIZED by construction (no authorize_fixture_orders —
+InMemorySaver). Harnesses here are UNAUTHORIZED by construction (no authorize_customer —
 that helper exists for suites pinning post-authorization money logic).
 """
 
@@ -69,7 +69,7 @@ _CONTACT_1002 = "casey@example.com"  # CUST-002's on-file contact (the OTP recip
 _FIXTURE_DETAILS = ("ORD-100", "trail running", "waterproof rain jacket", "merino", "$129", "$179")
 
 
-def test_incomplete_refund_owner_reprompts_invalid_model_output(config_root: Path) -> None:
+async def test_incomplete_refund_owner_reprompts_invalid_model_output(config_root: Path) -> None:
     h = _harness(config_root, FakeChatModel(), thread_id="incomplete-refund-owner")
     h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="masked"))
     consumed_turn_ids = ("turn-1",)
@@ -83,13 +83,13 @@ def test_incomplete_refund_owner_reprompts_invalid_model_output(config_root: Pat
         ),
     )
 
-    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert update["active_invocation"] == state.active_invocation
     assert update["pending_clarification"] == SupportClarification(detail="amount")
 
 
-def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
+async def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
@@ -111,7 +111,7 @@ def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
         ),
     )
 
-    first = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    first = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
     retained = first["active_invocation"]
     assert retained.request == RefundOrder(
         target=ExplicitOrderTarget(order_ref="ORD-1001"),
@@ -132,7 +132,7 @@ def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
         }
     )
 
-    second = h.engine._graph.nodes["support_capability_entry"].invoke(second_state)
+    second = await h.engine._graph.nodes["support_capability_entry"].ainvoke(second_state)
 
     assert second["active_invocation"] is None
     assert second["pending_refund"].order_id == "ORD-1001"
@@ -140,7 +140,7 @@ def test_refund_owner_retains_one_caller_stated_slot_then_gathers_the_next(
     assert second["pending_refund"].destination == "new_instrument"
 
 
-def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value(
+async def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value(
     config_root: Path,
 ) -> None:
     proposal = [
@@ -163,7 +163,7 @@ def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value
         ),
     )
 
-    first = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    first = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert reasoning.invoke_count == 2
     assert first["execution_owner"] == "support"
@@ -181,7 +181,7 @@ def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value
         ),
     )
 
-    completed = h.engine._graph.nodes["support_capability_entry"].invoke(bound_state)
+    completed = await h.engine._graph.nodes["support_capability_entry"].ainvoke(bound_state)
 
     assert reasoning.invoke_count == 3
     assert completed["active_invocation"] is None
@@ -189,7 +189,7 @@ def test_profile_owner_rejects_model_only_value_then_accepts_caller_stated_value
     assert completed["pending_profile_change"].new_value == "42 New Road"
 
 
-def test_refund_owner_rejects_replacement_of_fixed_target_and_amount(
+async def test_refund_owner_rejects_replacement_of_fixed_target_and_amount(
     config_root: Path,
 ) -> None:
     replacement = {
@@ -217,7 +217,7 @@ def test_refund_owner_rejects_replacement_of_fixed_target_and_amount(
         active_invocation=open_active_invocation(request, consumed_turn_ids=turn_ids),
     )
 
-    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert update["active_invocation"].request == request
     assert update.get("pending_refund") is None
@@ -251,7 +251,7 @@ def test_refund_owner_rejects_replacement_of_fixed_target_and_amount(
         ),
     ],
 )
-def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
+async def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
     config_root: Path,
     initial_request: IntentRequest,
     tool_name: str,
@@ -272,7 +272,7 @@ def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
         ),
     )
 
-    first = h.engine._graph.nodes["support_capability_entry"].invoke(first_state)
+    first = await h.engine._graph.nodes["support_capability_entry"].ainvoke(first_state)
 
     retained = first["active_invocation"]
     assert retained.request.target is None
@@ -286,13 +286,13 @@ def test_missing_focus_becomes_an_explicitly_gatherable_order_slot(
         active_invocation=retained,
         clarification_liveness=first["clarification_liveness"],
     )
-    second = h.engine._graph.nodes["support_capability_entry"].invoke(second_state)
+    second = await h.engine._graph.nodes["support_capability_entry"].ainvoke(second_state)
 
     assert second["active_invocation"] is None
     assert second[pending_field] is not None
 
 
-def test_profile_owner_does_not_read_orders_or_expose_order_candidates(
+async def test_profile_owner_does_not_read_orders_or_expose_order_candidates(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -315,7 +315,7 @@ def test_profile_owner_does_not_read_orders_or_expose_order_candidates(
         ),
     )
 
-    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert update["pending_clarification"] == SupportClarification(detail="profile_value")
     assert reasoning._seen_prompts
@@ -323,7 +323,9 @@ def test_profile_owner_does_not_read_orders_or_expose_order_candidates(
     assert "trail running" not in reasoning._seen_prompts[-1]
 
 
-def test_profile_owner_checks_availability_before_requesting_new_pii(config_root: Path) -> None:
+async def test_profile_owner_checks_availability_before_requesting_new_pii(
+    config_root: Path,
+) -> None:
     reasoning = FakeChatModel(record_prompts=True)
     h = _harness(config_root, reasoning, thread_id="profile-unavailable-before-pii")
     h.identity.bind(BoundIdentity(customer_ref="CUST-002", masked_contact="masked"))
@@ -338,7 +340,7 @@ def test_profile_owner_checks_availability_before_requesting_new_pii(config_root
         ),
     )
 
-    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert reasoning.invoke_count == 0
     assert not reasoning._seen_prompts
@@ -348,7 +350,7 @@ def test_profile_owner_checks_availability_before_requesting_new_pii(config_root
     assert update["handover"].reason_code == "address_change"
 
 
-def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
+async def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -369,7 +371,7 @@ def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
         ),
     )
 
-    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert update["pending_refund"] is not None
     assert [
@@ -379,7 +381,7 @@ def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
     ] == [{"event": "support_action_authorized", "order_id": "ORD-1001"}]
 
 
-def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_reference(
+async def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_reference(
     config_root: Path,
 ) -> None:
     h = _harness(config_root, FakeChatModel(), thread_id="focused-owner-boundary")
@@ -403,7 +405,7 @@ def test_focused_refund_cannot_cross_identity_without_an_explicit_caller_referen
         ),
     )
 
-    update = h.engine._graph.nodes["support_capability_entry"].invoke(state)
+    update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(state)
 
     assert update["execution_owner"] == "support"
     assert update.get("pending_refund") is None
@@ -464,7 +466,8 @@ def _telemetry(tmp_path: Path) -> list[dict]:
 
 
 def _state_values(harness: SupportHarness, thread_id: str) -> dict:
-    return harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    assert harness.engine.thread_id == thread_id
+    return harness.engine._graph.get_state(harness.engine._config).values
 
 
 def _validated_state(harness: SupportHarness, thread_id: str) -> ReasoningState:
@@ -1067,11 +1070,12 @@ async def test_guest_batch_detours_to_identity(config_root: Path, tmp_path: Path
     )
     # A placed order IS rung-2 (session-placed) — but ORD-1002 is not, and ANY unauthorized
     # target short-circuits the batch into the detour (fail-closed, no partial batch).
-    h.store.place_cart(
+    placed = h.store.place_cart(
         "guest-batch-seed",
         lines=[CartLine(sku="SKU-SOCK-01", name="wool socks", price_usd=24.0, quantity=1)],
         total_usd=24.0,
     )
+    h.guest_orders.record(placed.order_id)
     events = await _events(h.engine, "cancel order ORD-1002 and order ORD-9001")
     assert any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
@@ -1344,6 +1348,7 @@ async def test_session_placed_order_needs_no_verification(
         lines=[CartLine(sku="SKU-SOCK-01", name="wool socks", price_usd=24.0, quantity=1)],
         total_usd=24.0,
     )
+    h.guest_orders.record(placed.order_id)
     h.recent_orders.record(
         (placed.order_id,),
         operation="place",

@@ -18,7 +18,7 @@ from llm_fakes import (
 )
 from policy_helpers import make_policy
 from pydantic import ValidationError
-from support_helpers import authorize_fixture_orders, build_support_engine
+from support_helpers import authorize_customer, build_support_engine
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.frontline import read_flow
@@ -400,6 +400,8 @@ def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Pat
     )
     # The evaluator scores the production graph, so it must read availability from the same
     # registry the dispatcher resolves against, never rebuild its own alongside it.
+    assert runtime.application.engine is runtime.engine
+    assert runtime.application.assembly.graph is runtime.graph
     assert runtime.capability_registry is runtime.graph.capability_registry
     assert runtime.capability_registry.capability_ids
 
@@ -452,7 +454,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
-    product = runtime.store.fixture.products[0]
+    product = runtime.application.services.catalog.browse().products[0]
     stale_price = round(product.price_usd / 2, 2)
     assert stale_price != product.price_usd
     runtime.cart_store.add_item(
@@ -503,7 +505,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
             == ()
         )
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
@@ -521,10 +523,10 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
-    product = runtime.store.fixture.products[0]
+    product = runtime.application.services.catalog.browse().products[0]
     opening_turn_ids = ("eval-typed-cart:opening",)
-    runtime.graph.update_state(
-        {"configurable": {"thread_id": runtime.engine.thread_id}},
+    await runtime.graph.aupdate_state(
+        runtime.engine._config,
         {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
@@ -575,7 +577,7 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
             == ()
         )
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_speech(
@@ -597,8 +599,8 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
     opening_turn_ids = ("eval-typed-catalog:opening",)
-    runtime.graph.update_state(
-        {"configurable": {"thread_id": runtime.engine.thread_id}},
+    await runtime.graph.aupdate_state(
+        runtime.engine._config,
         {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
@@ -644,7 +646,7 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
             automation_terminal=False,
         )
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 async def test_evaluator_executes_seeded_typed_placement_without_semantic_routing(
@@ -662,7 +664,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
     )
-    product = runtime.store.fixture.products[0]
+    product = runtime.application.services.catalog.browse().products[0]
     runtime.cart_store.add_item(
         sku=product.sku,
         name=product.name,
@@ -670,8 +672,8 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
         quantity=1,
     )
     opening_turn_ids = ("eval-typed-place:opening",)
-    runtime.graph.update_state(
-        {"configurable": {"thread_id": runtime.engine.thread_id}},
+    await runtime.graph.aupdate_state(
+        runtime.engine._config,
         {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
@@ -718,7 +720,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
             == ()
         )
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 def test_frontline_eval_order_reference_preflight_is_green(config_root: Path) -> None:
@@ -966,7 +968,7 @@ def test_cli_runs_structural_coverage_without_provider_construction(
     assert report["checklist"]["uncovered_cells"] == []
 
 
-def test_routing_data_contract_reuses_the_production_registry(config_root: Path) -> None:
+async def test_routing_data_contract_reuses_the_production_registry(config_root: Path) -> None:
     contract = _routing_data_contract()
     config = ConfigRegistry(config_root).load().get("acme_store").config
     runtime = _build_eval_runtime(
@@ -987,7 +989,7 @@ def test_routing_data_contract_reuses_the_production_registry(config_root: Path)
             runtime.capability_registry
         )
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 def test_routing_data_readiness_requires_bound_steward_authorization(
@@ -1430,7 +1432,7 @@ def test_routing_data_protected_and_synthetic_review_contracts_are_closed() -> N
         _routing_data_manifest("calibration", synthetic, contract=contract)
 
 
-def test_production_projector_matches_the_fixture_built_registry(config_root: Path) -> None:
+async def test_production_projector_matches_the_fixture_built_registry(config_root: Path) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
     runtime = _build_eval_runtime(
         config,
@@ -1452,7 +1454,7 @@ def test_production_projector_matches_the_fixture_built_registry(config_root: Pa
             registry=runtime.capability_registry,
         )
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
     assert projected == RoutingContext(
         utterance="Show my cart",
@@ -1608,7 +1610,7 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
     try:
         results = await _run_semantic_route_cases(router, corpus)
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
     assert all(result.disposition == "exact" for result in results)
     assert model.invoke_count == 6
@@ -2405,9 +2407,9 @@ async def test_read_owner_corpus_runs_through_the_production_graph_without_netwo
     )
 
     try:
-        assert await _run_read_owner_cases(runtime.graph, corpus) == {}
+        assert await _run_read_owner_cases(runtime.engine, corpus) == {}
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 def test_read_owner_corpus_retains_each_answer_boundary_case(config_root: Path) -> None:
@@ -2758,7 +2760,7 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     config = ConfigRegistry(config_root).load().get("acme_store").config
     alternate_selection = ProviderModel(
         provider="openai",
-        model="gpt-5.6-luna",
+        model="gpt-5.6-terra",
         reasoning_effort="none",
     )
 
@@ -3096,9 +3098,9 @@ async def test_read_owner_eval_observes_the_executed_branch_not_matching_copy(
     )
 
     try:
-        failures = await _run_read_owner_cases(runtime.graph, corpus)
+        failures = await _run_read_owner_cases(runtime.engine, corpus)
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
     assert failures == {
         f"answer_arm_disguised_as_{expected_disposition}": (
@@ -3564,9 +3566,7 @@ async def test_human_onramp_is_terminal_for_the_current_automated_session(
         assert turn.model_calls == exhausted.model_calls
         assert turn.completed_tool_calls == exhausted.completed_tool_calls
         assert turn.effects == exhausted.effects
-    snapshot = harness.engine._graph.get_state(
-        {"configurable": {"thread_id": harness.engine.thread_id}}
-    )
+    snapshot = await harness.engine._graph.aget_state(harness.engine._config)
     assert snapshot.values.get("identity_claim_misses") == 0
 
 
@@ -3603,7 +3603,7 @@ async def test_non_identity_human_path_uses_the_same_terminal_session_contract(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel()
-    harness = authorize_fixture_orders(
+    harness = authorize_customer(
         build_support_engine(
             config_root,
             policy=make_policy(),
@@ -3613,7 +3613,8 @@ async def test_non_identity_human_path_uses_the_same_terminal_session_contract(
             routing_resolution=RouteDecision.direct(
                 CancelOrders(target=ExplicitOrderSet(order_refs=("ORD-1002",)))
             ),
-        )
+        ),
+        "CUST-002",
     )
     observation = await _observe_scenario(
         harness.engine,
@@ -3642,8 +3643,8 @@ async def test_terminal_route_precedes_a_seeded_pending_continuation(config_root
         thread_id="eval-terminal-route-order",
     )
     consumed_turn_ids = ("seeded-continuation",)
-    harness.engine._graph.update_state(
-        {"configurable": {"thread_id": harness.engine.thread_id}},
+    await harness.engine._graph.aupdate_state(
+        harness.engine._config,
         {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "automation_terminal": True,
@@ -3700,7 +3701,7 @@ async def test_fresh_session_is_not_blocked_by_prior_session_exhaustion(
         model_call_count=lambda: _model_calls(prior_frontline),
     )
     _assert_terminal_turn(prior_observation.final)
-    prior.caller_context.close_session()
+    await prior.caller_context.aclose_session()
 
     frontline = FakeChatModel(emit_tool_calls=False)
     harness = build_support_engine(

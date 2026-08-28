@@ -18,6 +18,7 @@ from llm_fakes import (
     TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
+    NativeAsyncOnlyFakeChatModel,
 )
 from policy_helpers import make_policy
 
@@ -32,6 +33,7 @@ from agnostic_market.agents.recovery import (
 )
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
     BoundIdentity,
     CallerIdentityStore,
@@ -39,7 +41,7 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
-    CatalogLookup,
+    GuestOrderScope,
     OrdersFixture,
     OrderStore,
     RecentOrderContext,
@@ -91,7 +93,7 @@ from agnostic_market.dtos.state import (
     PendingCartMutation,
     ReasoningState,
 )
-from agnostic_market.voice.context import CallerContext
+from agnostic_market.session import CallerContext
 
 # A DEFERRING destination (planner) — these tests exercise the destination-agnostic handover
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
@@ -113,7 +115,9 @@ def _granted(*order_ids: str) -> CallerIdentityStore:
 
 
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
-    store = kwargs.pop("store", None) or OrderStore(load_orders_fixture(config_root, "acme_store"))
+    fixture = load_orders_fixture(config_root, "acme_store")
+    store = kwargs.pop("store", None) or OrderStore("acme_store", fixture.orders)
+    catalog = kwargs.pop("catalog", None) or FixtureCatalog("acme_store", fixture)
     # Routing projection and graph owners share these session stores.
     cart = kwargs.pop("cart_store", None) or CartStore()
     policy = kwargs.pop("policy", None) or make_policy(refund_returnless_under_usd=50.0)
@@ -123,17 +127,21 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     identity = kwargs.pop("identity", None) or CallerIdentityStore()
     otp = kwargs.pop("otp", None) or OtpProvider(valid_code=_TEST_OTP)
     verification = kwargs.pop("verification_store", None) or VerificationStore(otp)
+    guest_orders = kwargs.pop("guest_orders", None) or GuestOrderScope(
+        tenant_id="acme_store", session_id="frontline-graph"
+    )
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
-        order_store=store,
+        guest_orders=guest_orders,
     )
     return build_frontline_graph(
         fake,
         display_name="Acme Store",
         tenant_id="acme_store",
+        guest_orders=guest_orders,
         cart_store=cart,
         recent_orders=recent_orders,
         otp=otp,
@@ -147,6 +155,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
+        catalog=catalog,
         policy=policy,
         lifecycle=caller_context,
         structured_output_method=kwargs.pop(
@@ -156,8 +165,25 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
             "caller_audible_model_text_max_chars",
             TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         ),
+        response_model_node_timeout_seconds=kwargs.pop("response_model_node_timeout_seconds", 2.0),
+        reasoning_model_node_timeout_seconds=kwargs.pop(
+            "reasoning_model_node_timeout_seconds", 6.0
+        ),
         **kwargs,
     ).graph
+
+
+@pytest.mark.parametrize("dependency", ("catalog", "store", "guest_orders"))
+def test_graph_rejects_cross_tenant_dependencies(config_root: Path, dependency: str) -> None:
+    fixture = load_orders_fixture(config_root, "acme_store")
+    dependencies = {
+        "catalog": FixtureCatalog("other_store", fixture),
+        "store": OrderStore("other_store", fixture.orders),
+        "guest_orders": GuestOrderScope(tenant_id="other_store", session_id="foreign"),
+    }
+
+    with pytest.raises(ValueError, match="tenant dependencies do not match"):
+        _graph(config_root, FakeChatModel(), **{dependency: dependencies[dependency]})
 
 
 def _admitted_turn(text: str, *, turn_id: str, **state: object) -> dict[str, object]:
@@ -192,7 +218,7 @@ def test_frontline_has_no_broad_model_or_tool_routing_surface(config_root: Path)
         ("x" * 41, 40),
     ),
 )
-def test_typed_answer_owner_rejects_invalid_caller_audible_text(
+async def test_typed_answer_owner_rejects_invalid_caller_audible_text(
     config_root: Path,
     tmp_path: Path,
     model_text: str,
@@ -204,7 +230,7 @@ def test_typed_answer_owner_rejects_invalid_caller_audible_text(
         caller_audible_model_text_max_chars=max_chars,
     )
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="general"),
         turn_id="bounded-model",
@@ -531,26 +557,44 @@ def test_invalid_dispatch_envelope_closes_without_executing_an_owner(
     ]
 
 
-def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
+async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    fixture = load_orders_fixture(config_root, "acme_store")
+    catalog = FixtureCatalog("acme_store", fixture)
+    store = OrderStore("acme_store", fixture.orders)
     cart = CartStore()
     reasoning = FakeChatModel(emit_tool_calls=False)
     records: list[dict[str, object]] = []
+    searches: list[str] = []
+    resolutions: list[tuple[str, ...]] = []
+    search = catalog.search
+    resolve_products = catalog.resolve_products
+
+    def observed_search(query: str):
+        searches.append(query)
+        return search(query)
+
+    def observed_resolution(skus: tuple[str, ...]):
+        resolutions.append(skus)
+        return resolve_products(skus)
+
     monkeypatch.setattr(cart_flow, "write_event", records.append)
+    monkeypatch.setattr(catalog, "search", observed_search)
+    monkeypatch.setattr(catalog, "resolve_products", observed_resolution)
     graph = _graph(
         config_root,
         FakeChatModel(),
         store=store,
+        catalog=catalog,
         cart_store=cart,
         reasoning_model=reasoning,
     )
-    product = store.fixture.products[0]
+    product = fixture.products[0]
     turn_id = "typed-cart-add"
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             f"add one {product.name}",
             turn_id=turn_id,
@@ -573,22 +617,24 @@ def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_call(
     assert isinstance(pending, PendingCartMutation)
     assert pending.sku == product.sku
     assert pending.price_usd == product.price_usd
+    assert searches == [product.name]
+    assert resolutions == [(product.sku,)]
     assert result["__interrupt__"][0].value == (
         f"Just to confirm: add 1 of {product.name} to your cart?"
     )
     assert records == []
 
 
-def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
+async def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
     config_root: Path,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
     graph = _graph(config_root, FakeChatModel(), store=store, cart_store=cart)
-    product = store.fixture.products[0]
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-resolved"
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "add it",
             turn_id=turn_id,
@@ -610,10 +656,10 @@ def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
     assert pending.sku == product.sku
 
 
-def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+async def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> None:
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
-    reasoning = FakeChatModel(
+    reasoning = NativeAsyncOnlyFakeChatModel(
         scripted_calls=[
             [("provide_cart_item", {"candidate_key": "1"})],
             [("provide_cart_quantity", {"quantity": 2})],
@@ -636,7 +682,7 @@ def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> No
         active_invocation=invocation,
     )
 
-    first = graph.nodes["cart_capability_entry"].invoke(first_state)
+    first = await graph.nodes["cart_capability_entry"].ainvoke(first_state)
 
     retained = first["active_invocation"]
     assert isinstance(retained, ActiveInvocation)
@@ -658,7 +704,7 @@ def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> No
         execution_owner="cart",
         clarification_liveness=first["clarification_liveness"],
     )
-    second = graph.nodes["cart_capability_entry"].invoke(second_state)
+    second = await graph.nodes["cart_capability_entry"].ainvoke(second_state)
 
     assert second["active_invocation"] is None
     assert second["execution_owner"] == "cart"
@@ -678,14 +724,14 @@ def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path) -> No
         ("remove", None),
     ),
 )
-def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
+async def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
     quantity: int | None,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    product = store.fixture.products[0]
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     cart.add_item(
         sku=product.sku,
@@ -710,7 +756,7 @@ def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
         quantity=quantity,
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             f"{operation} {product.name}",
             turn_id=turn_id,
@@ -729,7 +775,7 @@ def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
     assert records == []
 
 
-def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path) -> None:
+async def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path) -> None:
     reasoning = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
     turn_id = "typed-cart-no-match"
@@ -739,7 +785,7 @@ def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path
         quantity=2,
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "add two unavailable things",
             turn_id=turn_id,
@@ -755,7 +801,7 @@ def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path
     assert reasoning.invoke_count == 0
 
 
-def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
+async def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     config_root: Path,
 ) -> None:
     fixture = load_orders_fixture(config_root, "acme_store")
@@ -765,8 +811,10 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
         "sku": "SKU-DUPLICATE",
         "price_usd": payload["products"][0]["price_usd"] + 10,
     }
-    payload["products"].append(duplicate)
-    store = OrderStore(OrdersFixture.model_validate(payload))
+    payload["products"] = (*payload["products"], duplicate)
+    custom_fixture = OrdersFixture.model_validate(payload)
+    store = OrderStore("acme_store", custom_fixture.orders)
+    catalog = FixtureCatalog("acme_store", custom_fixture)
     reasoning = FakeChatModel(
         scripted_calls=[
             [("provide_cart_item", {"candidate_key": "2"})],
@@ -779,10 +827,11 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
         config_root,
         FakeChatModel(),
         store=store,
+        catalog=catalog,
         cart_store=cart,
         reasoning_model=reasoning,
     )
-    name = store.fixture.products[0].name
+    name = custom_fixture.products[0].name
     invocation = ActiveInvocation(
         request=ModifyCart(
             operation="add",
@@ -790,7 +839,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
         ),
         opened_turn_id="typed-cart-duplicate",
     )
-    first = graph.nodes["cart_capability_entry"].invoke(
+    first = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage(f"add the {name}", id="typed-cart-duplicate")],
             consumed_turn_ids=("typed-cart-duplicate",),
@@ -802,7 +851,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     assert isinstance(retained, ActiveInvocation)
     assert retained.request == ModifyCart(
         operation="add",
-        item=CartItemChoices(skus=(store.fixture.products[0].sku, "SKU-DUPLICATE")),
+        item=CartItemChoices(skus=(custom_fixture.products[0].sku, "SKU-DUPLICATE")),
     )
     assert first["pending_clarification"].detail == "item"
     assert reasoning.invoke_count == 0
@@ -819,7 +868,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     assert name in spoken_choices
     assert "waterproof rain jacket" not in spoken_choices
 
-    second = graph.nodes["cart_capability_entry"].invoke(
+    second = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("the second option", id="typed-cart-selection")],
             consumed_turn_ids=("typed-cart-duplicate", "typed-cart-selection"),
@@ -840,7 +889,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     assert reasoning.invoke_count == 1
     assert "waterproof rain jacket" not in reasoning._seen_prompts[-1]
 
-    third = graph.nodes["cart_capability_entry"].invoke(
+    third = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("make it two", id="typed-cart-quantity")],
             consumed_turn_ids=(
@@ -863,7 +912,7 @@ def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     assert reasoning.invoke_count == 2
 
 
-def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
+async def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
@@ -872,7 +921,7 @@ def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
     )
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
 
-    update = graph.nodes["cart_capability_entry"].invoke(
+    update = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[
                 HumanMessage("add the jacket", id="prior-turn"),
@@ -892,7 +941,7 @@ def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
     assert "add the jacket" not in reasoning._seen_prompts[-1]
 
 
-def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path) -> None:
+async def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path) -> None:
     reasoning = FakeChatModel(
         scripted_calls=[
             [("provide_cart_quantity", {"quantity": True})],
@@ -908,7 +957,7 @@ def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path) -> No
     )
     product = load_orders_fixture(config_root, "acme_store").products[0]
 
-    update = graph.nodes["cart_capability_entry"].invoke(
+    update = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("add it", id="typed-cart-boolean")],
             consumed_turn_ids=("typed-cart-boolean",),
@@ -927,7 +976,7 @@ def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path) -> No
     assert reasoning.invoke_count == 2
 
 
-def test_stale_resolved_cart_sku_performs_no_effect_and_returns_to_selection(
+async def test_stale_resolved_cart_sku_performs_no_effect_and_returns_to_selection(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(emit_tool_calls=False)
@@ -941,7 +990,7 @@ def test_stale_resolved_cart_sku_performs_no_effect_and_returns_to_selection(
         opened_turn_id="typed-cart-stale",
     )
 
-    update = graph.nodes["cart_capability_entry"].invoke(
+    update = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("add it")],
             consumed_turn_ids=("typed-cart-stale",),
@@ -956,7 +1005,7 @@ def test_stale_resolved_cart_sku_performs_no_effect_and_returns_to_selection(
     assert reasoning.invoke_count == 0
 
 
-def test_two_invalid_typed_cart_item_keys_enter_bounded_clarification(
+async def test_two_invalid_typed_cart_item_keys_enter_bounded_clarification(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
@@ -971,7 +1020,7 @@ def test_two_invalid_typed_cart_item_keys_enter_bounded_clarification(
         opened_turn_id="typed-cart-invalid",
     )
 
-    update = graph.nodes["cart_capability_entry"].invoke(
+    update = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("add something", id="typed-cart-invalid")],
             consumed_turn_ids=("typed-cart-invalid",),
@@ -994,7 +1043,7 @@ def test_two_invalid_typed_cart_item_keys_enter_bounded_clarification(
     assert tool_uses == tool_results
 
 
-def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing_slot(
+async def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing_slot(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
@@ -1015,7 +1064,7 @@ def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing_slot(
         opened_turn_id="typed-cart-fixed-slot",
     )
 
-    update = graph.nodes["cart_capability_entry"].invoke(
+    update = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("add the first one", id="typed-cart-fixed-slot")],
             consumed_turn_ids=("typed-cart-fixed-slot",),
@@ -1035,13 +1084,15 @@ def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing_slot(
     )
 
 
-def test_typed_cart_model_prose_is_replaced_by_code_clarification(config_root: Path) -> None:
+async def test_typed_cart_model_prose_is_replaced_by_code_clarification(
+    config_root: Path,
+) -> None:
     fabricated = "I added it to your cart."
     reasoning = FakeChatModel(emit_tool_calls=False, text_response=fabricated)
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
     turn_id = "typed-cart-prose"
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "add something",
             turn_id=turn_id,
@@ -1056,12 +1107,12 @@ def test_typed_cart_model_prose_is_replaced_by_code_clarification(config_root: P
     assert fabricated not in _only_spoken(result)
 
 
-def test_typed_cart_empty_remove_uses_review_ack_and_clears(config_root: Path) -> None:
+async def test_typed_cart_empty_remove_uses_review_ack_and_clears(config_root: Path) -> None:
     reasoning = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
     turn_id = "typed-cart-empty-remove"
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "remove the shoes",
             turn_id=turn_id,
@@ -1081,7 +1132,7 @@ def test_typed_cart_empty_remove_uses_review_ack_and_clears(config_root: Path) -
     assert reasoning.invoke_count == 0
 
 
-def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> None:
+async def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> None:
     request = ModifyCart(operation="add")
     invocation = ActiveInvocation(request=request, opened_turn_id="typed-cart-exit")
 
@@ -1090,7 +1141,7 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
         FakeChatModel(),
         reasoning_model=FakeChatModel(scripted_calls=[[("leave_cart", {})]]),
     )
-    leave = leave_graph.nodes["cart_capability_entry"].invoke(
+    leave = await leave_graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("never mind", id="typed-cart-exit")],
             consumed_turn_ids=("typed-cart-exit",),
@@ -1104,7 +1155,7 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
         FakeChatModel(),
         reasoning_model=FakeChatModel(emit_tool_calls=False),
     )
-    exhausted = exhausted_graph.nodes["cart_capability_entry"].invoke(
+    exhausted = await exhausted_graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
             messages=[HumanMessage("I still don't know", id="typed-cart-exit")],
             consumed_turn_ids=("typed-cart-exit",),
@@ -1134,7 +1185,7 @@ def test_all_typed_cart_exit_shapes_clear_the_invocation(config_root: Path) -> N
 
 
 @pytest.mark.parametrize("exit_kind", ("leave", "exhaustion"))
-def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
+async def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
     config_root: Path,
     exit_kind: str,
 ) -> None:
@@ -1167,18 +1218,18 @@ def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
             reasks=2,
         )
 
-    result = graph.invoke(_admitted_turn(text, turn_id=f"typed-cart-{exit_kind}", **state))
+    result = await graph.ainvoke(_admitted_turn(text, turn_id=f"typed-cart-{exit_kind}", **state))
 
     assert result["active_invocation"] is None
 
 
-def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
+async def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
-    product = store.fixture.products[0]
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     cart.add_item(
         sku=product.sku,
@@ -1200,7 +1251,7 @@ def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
 
     monkeypatch.setattr(cart, "snapshot", fail_snapshot)
     turn_id = "typed-place-recovery"
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "place my cart",
             turn_id=turn_id,
@@ -1223,12 +1274,12 @@ def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
 
 
 @pytest.mark.parametrize("fails_after_mutation", (False, True))
-def test_typed_cart_recovery_reconciles_without_replaying_mutation(
+async def test_typed_cart_recovery_reconciles_without_replaying_mutation(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     fails_after_mutation: bool,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
     graph = _graph(
         config_root,
@@ -1237,7 +1288,7 @@ def test_typed_cart_recovery_reconciles_without_replaying_mutation(
         cart_store=cart,
         checkpointer=InMemorySaver(),
     )
-    product = store.fixture.products[0]
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     real_apply = cart.apply_confirmed_mutation
     if fails_after_mutation:
 
@@ -1255,7 +1306,7 @@ def test_typed_cart_recovery_reconciles_without_replaying_mutation(
     turn_id = f"typed-cart-recovery-{fails_after_mutation}"
     config = {"configurable": {"thread_id": turn_id}}
 
-    first = graph.invoke(
+    first = await graph.ainvoke(
         _admitted_turn(
             f"add one {product.name}",
             turn_id=turn_id,
@@ -1276,7 +1327,7 @@ def test_typed_cart_recovery_reconciles_without_replaying_mutation(
         f"Just to confirm: add 1 of {product.name} to your cart?"
     )
 
-    result = graph.invoke(Command(resume={"text": "yes"}), config)
+    result = await graph.ainvoke(Command(resume={"text": "yes"}), config)
 
     assert cart.line_count == int(fails_after_mutation)
     assert result["active_invocation"] is None
@@ -1290,11 +1341,11 @@ def test_typed_cart_recovery_reconciles_without_replaying_mutation(
         assert "Please review your cart before trying again." in line
 
 
-def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
+async def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
     graph = _graph(
         config_root,
@@ -1303,10 +1354,10 @@ def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
         cart_store=cart,
         checkpointer=InMemorySaver(),
     )
-    product = store.fixture.products[0]
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-malformed-receipt"
     config = {"configurable": {"thread_id": turn_id}}
-    graph.invoke(
+    await graph.ainvoke(
         _admitted_turn(
             f"add one {product.name}",
             turn_id=turn_id,
@@ -1332,7 +1383,7 @@ def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
         lambda *_args, **_kwargs: CommittedReceipt(record="malformed"),
     )
 
-    result = graph.invoke(Command(resume={"text": "yes"}), config)
+    result = await graph.ainvoke(Command(resume={"text": "yes"}), config)
 
     assert cart.is_empty()
     assert result["automation_terminal"] is True
@@ -1347,7 +1398,9 @@ def _only_spoken(result: dict[str, object]) -> str:
     return str(spoken[0].content)
 
 
-def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: Path) -> None:
+async def test_dispatch_reaches_session_list_owner_without_a_model_call(
+    config_root: Path,
+) -> None:
     reasoning = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
     turn_id = "typed-session-list"
@@ -1356,7 +1409,7 @@ def test_dispatch_reaches_session_list_owner_without_a_model_call(config_root: P
         opened_turn_id=turn_id,
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "what did I order on this call?",
             turn_id=turn_id,
@@ -1390,7 +1443,7 @@ def test_identity_capability_entry_is_preparation_only(config_root: Path) -> Non
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
 
 
-def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
+async def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
@@ -1412,7 +1465,7 @@ def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
         cart_store=cart,
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "verify me",
             turn_id="bound-verify",
@@ -1437,8 +1490,14 @@ def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
 # --- capability-dispatched answer owners ---------------------------------------------
 
 
-def _typed_read(graph, request: IntentRequest, *, turn_id: str, text: str) -> dict[str, object]:
-    return graph.invoke(
+async def _typed_read(
+    graph,
+    request: IntentRequest,
+    *,
+    turn_id: str,
+    text: str,
+) -> dict[str, object]:
+    return await graph.ainvoke(
         _admitted_turn(
             text,
             turn_id=turn_id,
@@ -1447,26 +1506,28 @@ def _typed_read(graph, request: IntentRequest, *, turn_id: str, text: str) -> di
     )
 
 
-def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_call(
+async def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_call(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lookup_queries: list[str] = []
-    real_lookup = read_flow.lookup_catalog
+    fixture = load_orders_fixture(config_root, "acme_store")
+    catalog = FixtureCatalog("acme_store", fixture)
+    real_search = catalog.search
 
-    def observed_lookup(fixture: OrdersFixture, query: str) -> CatalogLookup:
+    def observed_search(query: str):
         lookup_queries.append(query)
-        return real_lookup(fixture, query)
+        return real_search(query)
 
-    monkeypatch.setattr(read_flow, "lookup_catalog", observed_lookup)
-    response_model = FakeChatModel(
+    monkeypatch.setattr(catalog, "search", observed_search)
+    response_model = NativeAsyncOnlyFakeChatModel(
         emit_tool_calls=False,
         text_response="We carry trail running shoes for $89.99.",
         record_prompts=True,
     )
-    graph = _graph(config_root, response_model)
+    graph = _graph(config_root, response_model, catalog=catalog)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         SearchCatalog(query="running"),
         turn_id="catalog-complete",
@@ -1483,7 +1544,7 @@ def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_call(
     assert "waterproof rain jacket" not in prompt
 
 
-def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
+async def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
     config_root: Path,
 ) -> None:
     response_model = FakeChatModel(
@@ -1493,7 +1554,7 @@ def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
     )
     graph = _graph(config_root, response_model)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         SearchCatalog(query="walking shoes"),
         turn_id="catalog-no-match",
@@ -1504,13 +1565,14 @@ def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
         "No catalog name matched. The catalog contains trail running shoes."
     )
     prompt = response_model._seen_prompts[-1]
-    assert "do not claim they match the request" in prompt
-    assert "or are relevant alternatives" in prompt
-    assert "trail running shoes" in prompt
-    assert "waterproof rain jacket" in prompt
+    assert "Do not claim that other products match" in prompt
+    assert "Do not invent products" in prompt
+    assert "- No matching catalog products." in prompt
+    assert "trail running shoes" not in prompt
+    assert "waterproof rain jacket" not in prompt
 
 
-def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
+async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -1519,7 +1581,7 @@ def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
         FakeChatModel(emit_tool_calls=False, text_response="We carry trail running shoes."),
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         {
             "messages": [
                 HumanMessage("Tell me about running shoes.", id="catalog-current"),
@@ -1545,13 +1607,13 @@ def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
     ]
 
 
-def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn(
+async def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     response_model = FakeChatModel(emit_tool_calls=False, text_response="We carry everyday socks.")
     graph = _graph(config_root, response_model)
-    opening = _typed_read(
+    opening = await _typed_read(
         graph,
         SearchCatalog(),
         turn_id="catalog-opening",
@@ -1572,7 +1634,9 @@ def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn(
     ]
 
 
-def test_catalog_owner_rejects_a_blank_followup_without_a_model_call(config_root: Path) -> None:
+async def test_catalog_owner_rejects_a_blank_followup_without_a_model_call(
+    config_root: Path,
+) -> None:
     response_model = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, response_model)
     invocation = ActiveInvocation(
@@ -1580,7 +1644,7 @@ def test_catalog_owner_rejects_a_blank_followup_without_a_model_call(config_root
         opened_turn_id="catalog-opening",
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "   ",
             turn_id="catalog-blank",
@@ -1595,7 +1659,7 @@ def test_catalog_owner_rejects_a_blank_followup_without_a_model_call(config_root
 
 
 @pytest.mark.parametrize("text_response", ("", "   "))
-def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_response(
+async def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_response(
     config_root: Path,
     tmp_path: Path,
     text_response: str,
@@ -1605,7 +1669,7 @@ def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_respon
         FakeChatModel(emit_tool_calls=False, text_response=text_response),
     )
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         SearchCatalog(query="running"),
         turn_id="catalog-blank-model",
@@ -1617,7 +1681,7 @@ def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_respon
     assert _answered_rows(tmp_path) == []
 
 
-def test_catalog_owner_rejects_model_text_over_the_platform_limit(
+async def test_catalog_owner_rejects_model_text_over_the_platform_limit(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -1628,7 +1692,7 @@ def test_catalog_owner_rejects_model_text_over_the_platform_limit(
         caller_audible_model_text_max_chars=limit,
     )
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         SearchCatalog(query="running"),
         turn_id="catalog-over-limit",
@@ -1658,13 +1722,13 @@ class _UnexpectedCatalogToolCall(FakeChatModel):
         return response
 
 
-def test_catalog_owner_rejects_an_unexpected_tool_call_before_speech_or_telemetry(
+async def test_catalog_owner_rejects_an_unexpected_tool_call_before_speech_or_telemetry(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     graph = _graph(config_root, _UnexpectedCatalogToolCall())
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         SearchCatalog(query="running"),
         turn_id="catalog-tool-call",
@@ -1676,14 +1740,14 @@ def test_catalog_owner_rejects_an_unexpected_tool_call_before_speech_or_telemetr
     assert _answered_rows(tmp_path) == []
 
 
-def test_catalog_owner_fails_closed_when_the_admitted_turn_has_no_matching_message(
+async def test_catalog_owner_fails_closed_when_the_admitted_turn_has_no_matching_message(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     response_model = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, response_model)
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         {
             "messages": [HumanMessage("an older question", id="older")],
             "consumed_turn_ids": ("older", "missing-current"),
@@ -1720,21 +1784,21 @@ def test_catalog_speech_authority_is_owned_by_the_response_and_code_rejection_no
         ("general", "general_model_response", "A shoe midsole cushions each step."),
     ),
 )
-def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_provenance(
+async def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_provenance(
     config_root: Path,
     tmp_path: Path,
     topic: str,
     answer_source: str,
     answer: str,
 ) -> None:
-    response_model = FakeChatModel(
+    response_model = NativeAsyncOnlyFakeChatModel(
         structured_args={"AnswerResponse": ({"decision": "answer", "answer": answer},)},
         record_prompts=True,
     )
     graph = _graph(config_root, response_model)
     utterance = "What is your return policy?" if topic == "policy" else "What is a shoe midsole?"
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic=topic),  # type: ignore[arg-type]
         turn_id=f"answer-{topic}",
@@ -1766,7 +1830,7 @@ def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_provenanc
     ]
 
 
-def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
+async def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -1778,7 +1842,7 @@ def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
         ),
     )
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="policy"),
         turn_id="answer-unknown-policy",
@@ -1802,7 +1866,7 @@ def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
         ),
     ),
 )
-def test_answer_no_answer_decisions_use_only_their_code_authored_destination(
+async def test_answer_no_answer_decisions_use_only_their_code_authored_destination(
     config_root: Path,
     tmp_path: Path,
     decision: str,
@@ -1814,7 +1878,7 @@ def test_answer_no_answer_decisions_use_only_their_code_authored_destination(
     )
     graph = _graph(config_root, response_model)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="general"),
         turn_id=f"answer-{decision}",
@@ -1829,13 +1893,13 @@ def test_answer_no_answer_decisions_use_only_their_code_authored_destination(
     assert node in graph.speakable_nodes
 
 
-def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
+async def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     graph = _graph(config_root, FakeChatModel(raise_transport=True))
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="general"),
         turn_id="answer-transport-failure",
@@ -1857,7 +1921,7 @@ def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
         ". . .",
     ),
 )
-def test_answer_owner_rejects_model_text_without_lexical_content(
+async def test_answer_owner_rejects_model_text_without_lexical_content(
     config_root: Path,
     tmp_path: Path,
     answer: str,
@@ -1869,7 +1933,7 @@ def test_answer_owner_rejects_model_text_without_lexical_content(
         ),
     )
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="general"),
         turn_id="answer-non-lexical",
@@ -1881,7 +1945,7 @@ def test_answer_owner_rejects_model_text_without_lexical_content(
     assert _answered_rows(tmp_path) == []
 
 
-def test_answer_owner_rejects_model_text_over_the_platform_limit(
+async def test_answer_owner_rejects_model_text_over_the_platform_limit(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -1896,7 +1960,7 @@ def test_answer_owner_rejects_model_text_over_the_platform_limit(
         caller_audible_model_text_max_chars=limit,
     )
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="general"),
         turn_id="answer-over-limit",
@@ -1913,13 +1977,13 @@ class _RawAnswerMappingModel(FakeChatModel):
         return RunnableLambda(lambda _messages: {"decision": "answer", "answer": "unvalidated"})
 
 
-def test_answer_owner_rejects_a_raw_mapping_from_the_structured_wrapper(
+async def test_answer_owner_rejects_a_raw_mapping_from_the_structured_wrapper(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     graph = _graph(config_root, _RawAnswerMappingModel())
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         AnswerQuestion(topic="general"),
         turn_id="answer-raw-mapping",
@@ -1951,14 +2015,14 @@ def test_answer_owner_uses_the_required_configured_structured_transport(config_r
     assert response_model.structured_methods == (configured_method, configured_method)
 
 
-def test_order_status_owner_grants_and_renders_one_explicit_order_without_model_speech(
+async def test_order_status_owner_grants_and_renders_one_explicit_order_without_model_speech(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     model = FakeChatModel()
     graph = _graph(config_root, model)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1001",))),
         turn_id="status-explicit",
@@ -1979,13 +2043,13 @@ def test_order_status_owner_grants_and_renders_one_explicit_order_without_model_
     ]
 
 
-def test_order_status_spoken_email_after_contact_phrase_matches_end_to_end(
+async def test_order_status_spoken_email_after_contact_phrase_matches_end_to_end(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
     graph = _graph(config_root, FakeChatModel(), identity=identity)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
         turn_id="status-spoken-email",
@@ -1996,7 +2060,7 @@ def test_order_status_spoken_email_after_contact_phrase_matches_end_to_end(
     assert "Your order ORD-1002" in _only_spoken(result)
 
 
-def _pause_unwitnessed_order_status_target(config_root: Path, *, thread_id: str):
+async def _pause_unwitnessed_order_status_target(config_root: Path, *, thread_id: str):
     identity = CallerIdentityStore()
     graph = _graph(
         config_root,
@@ -2005,7 +2069,7 @@ def _pause_unwitnessed_order_status_target(config_root: Path, *, thread_id: str)
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": thread_id}}
-    paused = graph.invoke(
+    paused = await graph.ainvoke(
         _admitted_turn(
             "I do not know the order number. My email is casey@example.com.",
             turn_id=thread_id,
@@ -2021,11 +2085,11 @@ def _pause_unwitnessed_order_status_target(config_root: Path, *, thread_id: str)
     return graph, identity, config, paused
 
 
-def test_unwitnessed_router_target_requires_caller_confirmation_before_guest_grant(
+async def test_unwitnessed_router_target_requires_caller_confirmation_before_guest_grant(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
-    graph, identity, config, paused = _pause_unwitnessed_order_status_target(
+    graph, identity, config, paused = await _pause_unwitnessed_order_status_target(
         config_root,
         thread_id="status-router-confirm",
     )
@@ -2035,7 +2099,7 @@ def test_unwitnessed_router_target_requires_caller_confirmation_before_guest_gra
     assert not identity.order_granted("ORD-1002")
     assert _answered_rows(tmp_path) == []
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         Command(
             resume={"text": "yes"},
             update={"consumed_turn_ids": ("status-router-confirm-answer",)},
@@ -2048,7 +2112,7 @@ def test_unwitnessed_router_target_requires_caller_confirmation_before_guest_gra
     assert "Your order ORD-1002" in _only_spoken(result)
 
 
-def test_model_only_order_status_target_cannot_grant_before_confirmation(
+async def test_model_only_order_status_target_cannot_grant_before_confirmation(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -2070,7 +2134,7 @@ def test_model_only_order_status_target_cannot_grant_before_confirmation(
         opened_turn_id="status-opening",
     )
 
-    paused = graph.invoke(
+    paused = await graph.ainvoke(
         _admitted_turn(
             "I do not know the order number. My email is casey@example.com.",
             turn_id="status-followup",
@@ -2087,7 +2151,7 @@ def test_model_only_order_status_target_cannot_grant_before_confirmation(
     assert _answered_rows(tmp_path) == []
 
 
-def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
+async def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
@@ -2098,7 +2162,7 @@ def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "status-confirm-then-contact"}}
-    paused = graph.invoke(
+    paused = await graph.ainvoke(
         _admitted_turn(
             "I do not know the order number.",
             turn_id="status-target-source",
@@ -2113,7 +2177,7 @@ def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
     )
     assert "I heard ORD-1002" in str(paused["__interrupt__"][0].value)
 
-    contact_question = graph.invoke(
+    contact_question = await graph.ainvoke(
         Command(
             resume={"text": "yes"},
             update={"consumed_turn_ids": ("status-target-confirmation",)},
@@ -2126,7 +2190,7 @@ def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
     assert not identity.order_granted("ORD-1002")
     prior_message_count = len(contact_question["messages"])
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "casey@example.com",
             turn_id="status-contact-followup",
@@ -2144,15 +2208,15 @@ def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
     assert "Your order ORD-1002" in str(new_spoken[0].content)
 
 
-def test_declined_order_status_target_confirmation_grants_nothing(
+async def test_declined_order_status_target_confirmation_grants_nothing(
     config_root: Path,
 ) -> None:
-    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+    graph, identity, config, _paused = await _pause_unwitnessed_order_status_target(
         config_root,
         thread_id="status-confirm-no",
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         Command(
             resume={"text": "no"},
             update={"consumed_turn_ids": ("status-confirm-no-answer",)},
@@ -2165,15 +2229,15 @@ def test_declined_order_status_target_confirmation_grants_nothing(
     assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
 
 
-def test_unclear_order_status_target_confirmation_is_bounded(
+async def test_unclear_order_status_target_confirmation_is_bounded(
     config_root: Path,
 ) -> None:
-    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+    graph, identity, config, _paused = await _pause_unwitnessed_order_status_target(
         config_root,
         thread_id="status-confirm-unclear",
     )
 
-    retry = graph.invoke(
+    retry = await graph.ainvoke(
         Command(
             resume={"text": "maybe"},
             update={"consumed_turn_ids": ("status-confirm-unclear-1",)},
@@ -2184,7 +2248,7 @@ def test_unclear_order_status_target_confirmation_is_bounded(
     assert "Please say yes or no" in str(retry["__interrupt__"][0].value)
     assert not identity.order_granted("ORD-1002")
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         Command(
             resume={"text": "I am not sure"},
             update={"consumed_turn_ids": ("status-confirm-unclear-2",)},
@@ -2197,15 +2261,15 @@ def test_unclear_order_status_target_confirmation_is_bounded(
     assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
 
 
-def test_interrupted_order_status_target_readback_reconfirms_before_grant(
+async def test_interrupted_order_status_target_readback_reconfirms_before_grant(
     config_root: Path,
 ) -> None:
-    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+    graph, identity, config, _paused = await _pause_unwitnessed_order_status_target(
         config_root,
         thread_id="status-confirm-interrupted",
     )
 
-    retry = graph.invoke(
+    retry = await graph.ainvoke(
         Command(
             resume={"text": "yes", "readback_interrupted": True},
             update={"consumed_turn_ids": ("status-confirm-interrupted-1",)},
@@ -2216,7 +2280,7 @@ def test_interrupted_order_status_target_readback_reconfirms_before_grant(
     assert "Please say yes or no" in str(retry["__interrupt__"][0].value)
     assert not identity.order_granted("ORD-1002")
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         Command(
             resume={"text": "yes"},
             update={"consumed_turn_ids": ("status-confirm-interrupted-2",)},
@@ -2228,15 +2292,15 @@ def test_interrupted_order_status_target_readback_reconfirms_before_grant(
     assert "Your order ORD-1002" in _only_spoken(result)
 
 
-def test_order_status_target_confirmation_human_escape_uses_terminal_handover(
+async def test_order_status_target_confirmation_human_escape_uses_terminal_handover(
     config_root: Path,
 ) -> None:
-    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+    graph, identity, config, _paused = await _pause_unwitnessed_order_status_target(
         config_root,
         thread_id="status-confirm-human",
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         Command(
             resume={
                 "text": "I want a person",
@@ -2252,12 +2316,12 @@ def test_order_status_target_confirmation_human_escape_uses_terminal_handover(
     assert result["automation_terminal"] is True
 
 
-def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
+async def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
     config_root: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph, identity, config, _paused = _pause_unwitnessed_order_status_target(
+    graph, identity, config, _paused = await _pause_unwitnessed_order_status_target(
         config_root,
         thread_id="status-confirm-failure",
     )
@@ -2266,7 +2330,7 @@ def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
         raise RuntimeError("injected confirmation failure")
 
     monkeypatch.setattr(read_flow, "classify_confirmation", _fail_consent)
-    result = graph.invoke(
+    result = await graph.ainvoke(
         Command(
             resume={"text": "yes"},
             update={"consumed_turn_ids": ("status-confirm-failure-answer",)},
@@ -2280,7 +2344,7 @@ def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
     assert _failed_nodes(tmp_path) == ["order_status_target_confirm"]
 
 
-def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
+async def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
     config_root: Path,
 ) -> None:
     model = FakeChatModel(
@@ -2292,7 +2356,7 @@ def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
         }
     )
     graph = _graph(config_root, model)
-    opening = _typed_read(
+    opening = await _typed_read(
         graph,
         VerifyOrderStatus(),
         turn_id="status-opening",
@@ -2302,7 +2366,7 @@ def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
     retained = opening["active_invocation"]
     assert retained is not None
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "ORD-1002, casey@example.com",
             turn_id="status-followup",
@@ -2318,12 +2382,12 @@ def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
     assert "order_status_target_propose" not in graph.speakable_nodes
 
 
-def test_order_status_focused_selector_fails_closed_without_live_focus(
+async def test_order_status_focused_selector_fails_closed_without_live_focus(
     config_root: Path,
 ) -> None:
     graph = _graph(config_root, FakeChatModel())
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=FocusedOrderSet()),
         turn_id="status-no-focus",
@@ -2334,7 +2398,7 @@ def test_order_status_focused_selector_fails_closed_without_live_focus(
     assert _only_spoken(result) == "What is the order number, for example ORD-1234?"
 
 
-def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
+async def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
@@ -2342,7 +2406,7 @@ def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
     identity = CallerIdentityStore()
     graph = _graph(config_root, FakeChatModel(), recent_orders=recent, identity=identity)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1001", "ORD-1003"))),
         turn_id="status-plural",
@@ -2357,14 +2421,14 @@ def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
     assert len(_answered_rows(tmp_path)) == 1
 
 
-def test_order_status_bound_principal_cannot_widen_with_a_foreign_contact(
+async def test_order_status_bound_principal_cannot_widen_with_a_foreign_contact(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     graph = _graph(config_root, FakeChatModel(), identity=identity)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
         turn_id="status-bound-foreign",
@@ -2376,14 +2440,14 @@ def test_order_status_bound_principal_cannot_widen_with_a_foreign_contact(
     assert identity.current() is not None
 
 
-def test_order_status_recent_selector_uses_the_complete_bounded_set(
+async def test_order_status_recent_selector_uses_the_complete_bounded_set(
     config_root: Path,
 ) -> None:
     recent = RecentOrderContext(max_refs=3)
     recent.record(("ORD-1001", "ORD-1003"), operation="list")
     graph = _graph(config_root, FakeChatModel(), recent_orders=recent)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=RecentOrderSet()),
         turn_id="status-recent",
@@ -2394,7 +2458,7 @@ def test_order_status_recent_selector_uses_the_complete_bounded_set(
     assert "Your order ORD-1001" in line and "Your order ORD-1003" in line
 
 
-def test_order_status_alternatives_retain_the_owner_and_ask_without_read_or_grant(
+async def test_order_status_alternatives_retain_the_owner_and_ask_without_read_or_grant(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
@@ -2414,7 +2478,7 @@ def test_order_status_alternatives_retain_the_owner_and_ask_without_read_or_gran
         opened_turn_id="status-opening",
     )
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         _admitted_turn(
             "Either ORD-1001 or ORD-1002",
             turn_id="status-alternative",
@@ -2429,13 +2493,13 @@ def test_order_status_alternatives_retain_the_owner_and_ask_without_read_or_gran
     assert not identity.order_granted("ORD-1002")
 
 
-def test_order_status_multiple_contact_claims_clarify_without_matching(
+async def test_order_status_multiple_contact_claims_clarify_without_matching(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
     graph = _graph(config_root, FakeChatModel(), identity=identity)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph,
         VerifyOrderStatus(target=ExplicitOrderSet(order_refs=("ORD-1001",))),
         turn_id="status-multiple-contact",
@@ -2447,14 +2511,16 @@ def test_order_status_multiple_contact_claims_clarify_without_matching(
     assert not identity.order_granted("ORD-1001")
 
 
-def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(config_root: Path) -> None:
+async def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(
+    config_root: Path,
+) -> None:
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
     frontline = FakeChatModel()
     reasoning = FakeChatModel()
     graph = _graph(config_root, frontline, cart_store=cart, reasoning_model=reasoning)
 
-    result = _typed_read(graph, ViewCart(), turn_id="typed-cart", text="what's in my cart?")
+    result = await _typed_read(graph, ViewCart(), turn_id="typed-cart", text="what's in my cart?")
 
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
     assert result["active_invocation"] is None
@@ -2463,43 +2529,45 @@ def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(config_root: 
     assert cart.line_count == 1  # a read mutates nothing
 
 
-def test_cart_view_owner_re_reads_the_store_on_every_turn(config_root: Path) -> None:
+async def test_cart_view_owner_re_reads_the_store_on_every_turn(config_root: Path) -> None:
     # Live-read freshness: the owner must render the CURRENT cart, never a value captured when
     # the invocation was opened.
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
     graph = _graph(config_root, FakeChatModel(), cart_store=cart)
 
-    first = _only_spoken(_typed_read(graph, ViewCart(), turn_id="cart-1", text="my cart?"))
+    first = _only_spoken(await _typed_read(graph, ViewCart(), turn_id="cart-1", text="my cart?"))
     cart.add_item(sku="SKU-2", name="trail running shoes", price_usd=95.0, quantity=1)
-    second = _only_spoken(_typed_read(graph, ViewCart(), turn_id="cart-2", text="and now?"))
+    second = _only_spoken(await _typed_read(graph, ViewCart(), turn_id="cart-2", text="and now?"))
 
     assert "trail running shoes" not in first
     assert "trail running shoes" in second and "waterproof rain jacket" in second
 
 
-def test_cart_view_owner_speaks_the_empty_line_with_no_close(config_root: Path) -> None:
+async def test_cart_view_owner_speaks_the_empty_line_with_no_close(config_root: Path) -> None:
     from agnostic_market.agents._copy import all_closes
 
     graph = _graph(config_root, FakeChatModel(), cart_store=CartStore())
 
-    line = _only_spoken(_typed_read(graph, ViewCart(), turn_id="cart-empty", text="my cart?"))
+    line = _only_spoken(await _typed_read(graph, ViewCart(), turn_id="cart-empty", text="my cart?"))
 
     assert line == "Your cart's empty at the moment."
     assert not any(line.endswith(close) for close in all_closes())
 
 
-def test_typed_cart_read_uses_the_shared_live_renderer(config_root: Path) -> None:
+async def test_typed_cart_read_uses_the_shared_live_renderer(config_root: Path) -> None:
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
     graph = _graph(config_root, FakeChatModel(), cart_store=cart)
 
-    typed_line = _only_spoken(_typed_read(graph, ViewCart(), turn_id="same-typed", text="my cart?"))
+    typed_line = _only_spoken(
+        await _typed_read(graph, ViewCart(), turn_id="same-typed", text="my cart?")
+    )
 
     assert typed_line.startswith(render_cart_line(cart.view(), cart.cart_total()))
 
 
-def test_typed_cart_read_takes_exactly_one_close(
+async def test_typed_cart_read_takes_exactly_one_close(
     config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[int] = []
@@ -2512,7 +2580,7 @@ def test_typed_cart_read_takes_exactly_one_close(
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
 
-    _typed_read(
+    await _typed_read(
         _graph(config_root, FakeChatModel(), cart_store=cart),
         ViewCart(),
         turn_id="close-typed",
@@ -2521,7 +2589,7 @@ def test_typed_cart_read_takes_exactly_one_close(
     assert len(calls) == 1
 
 
-def test_identity_status_owner_reports_the_live_binding_only(config_root: Path) -> None:
+async def test_identity_status_owner_reports_the_live_binding_only(config_root: Path) -> None:
     from agnostic_market.agents._copy import (
         IDENTITY_STATUS_UNVERIFIED,
         IDENTITY_STATUS_VERIFIED,
@@ -2533,10 +2601,12 @@ def test_identity_status_owner_reports_the_live_binding_only(config_root: Path) 
     reasoning = FakeChatModel()
     graph = _graph(config_root, frontline, identity=identity, reasoning_model=reasoning)
 
-    unbound_result = _typed_read(graph, ViewIdentityStatus(), turn_id="id-1", text="am I verified?")
+    unbound_result = await _typed_read(
+        graph, ViewIdentityStatus(), turn_id="id-1", text="am I verified?"
+    )
     unbound = _only_spoken(unbound_result)
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    bound_result = _typed_read(
+    bound_result = await _typed_read(
         graph, ViewIdentityStatus(), turn_id="id-2", text="am I verified now?"
     )
     bound = _only_spoken(bound_result)
@@ -2568,7 +2638,7 @@ def _failed_nodes(tmp_path: Path) -> list[str]:
     return [str(row["node"]) for row in _rows(tmp_path) if row.get("event") == "turn_failed"]
 
 
-def test_every_capability_answer_owner_records_one_answered_turn(
+async def test_every_capability_answer_owner_records_one_answered_turn(
     config_root: Path, tmp_path: Path
 ) -> None:
     # These nodes END, bypassing finalize_node, so without their own record a typed read would
@@ -2578,10 +2648,15 @@ def test_every_capability_answer_owner_records_one_answered_turn(
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
     graph = _graph(config_root, FakeChatModel(), cart_store=cart)
 
-    _typed_read(graph, ViewCart(), turn_id="tel-cart", text="what's in my cart?")
-    _typed_read(graph, ViewIdentityStatus(), turn_id="tel-id", text="am I verified?")
-    _typed_read(graph, ListOrders(scope="session"), turn_id="tel-list", text="what have I ordered?")
-    _typed_read(
+    await _typed_read(graph, ViewCart(), turn_id="tel-cart", text="what's in my cart?")
+    await _typed_read(graph, ViewIdentityStatus(), turn_id="tel-id", text="am I verified?")
+    await _typed_read(
+        graph,
+        ListOrders(scope="session"),
+        turn_id="tel-list",
+        text="what have I ordered?",
+    )
+    await _typed_read(
         graph,
         SearchCatalog(query="running"),
         turn_id="tel-catalog",
@@ -2623,7 +2698,7 @@ def test_every_capability_answer_owner_records_one_answered_turn(
     assert all("tool" not in row for row in _answered_rows(tmp_path))
 
 
-def test_rotated_read_continuation_records_no_blank_utterance(
+async def test_rotated_read_continuation_records_no_blank_utterance(
     config_root: Path, tmp_path: Path
 ) -> None:
     # An ACCOUNT list is the only read `project_principal_transition` lets survive rotation
@@ -2634,7 +2709,7 @@ def test_rotated_read_continuation_records_no_blank_utterance(
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     graph = _graph(config_root, FakeChatModel(), identity=identity)
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         {
             "messages": [],
             "consumed_turn_ids": ("rotated",),
@@ -2653,7 +2728,7 @@ def _failing_render(*_args: object, **_kwargs: object) -> NoReturn:
     raise RuntimeError("render failed")
 
 
-def test_a_failed_cart_render_records_no_answered_turn(
+async def test_a_failed_cart_render_records_no_answered_turn(
     config_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The record must FOLLOW the line it reports, as the tool path's does. Written first it
@@ -2663,7 +2738,7 @@ def test_a_failed_cart_render_records_no_answered_turn(
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
     graph = _graph(config_root, FakeChatModel(), cart_store=cart)
 
-    result = _typed_read(graph, ViewCart(), turn_id="cart-fail", text="what's in my cart?")
+    result = await _typed_read(graph, ViewCart(), turn_id="cart-fail", text="what's in my cart?")
 
     # Pinned to the owner: "hit a snag" alone would also pass if some EARLIER node had broken.
     assert _failed_nodes(tmp_path) == ["cart_view_render"]
@@ -2671,7 +2746,7 @@ def test_a_failed_cart_render_records_no_answered_turn(
     assert _answered_rows(tmp_path) == []
 
 
-def test_a_failed_order_list_render_records_no_answered_turn(
+async def test_a_failed_order_list_render_records_no_answered_turn(
     config_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(support_flow, "render_order_list_line", _failing_render)
@@ -2679,7 +2754,7 @@ def test_a_failed_order_list_render_records_no_answered_turn(
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     graph = _graph(config_root, FakeChatModel(), identity=identity)
 
-    result = _typed_read(
+    result = await _typed_read(
         graph, ListOrders(scope="account"), turn_id="list-fail", text="what are my orders?"
     )
 

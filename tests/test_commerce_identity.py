@@ -20,7 +20,7 @@ from agnostic_market.commerce.identity import (
     order_read_allowed,
     try_grant_orders_by_contact,
 )
-from agnostic_market.commerce.orders import OrderStore, load_orders_fixture
+from agnostic_market.commerce.orders import GuestOrderScope, OrderStore, load_orders_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
 
@@ -130,7 +130,7 @@ def test_store_grants_validate_the_complete_set_before_mutating() -> None:
 
 
 def test_contact_grant_is_atomic_across_a_same_owner_set(config_root: Path) -> None:
-    orders = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    orders = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     customers = _directory(config_root)
     identity = CallerIdentityStore()
 
@@ -160,7 +160,7 @@ def test_contact_grant_is_atomic_across_a_same_owner_set(config_root: Path) -> N
 def test_contact_grant_rejects_mixed_owners_without_partial_authority(
     config_root: Path,
 ) -> None:
-    orders = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    orders = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     identity = CallerIdentityStore()
     identity.grant_orders("ORD-1001")
 
@@ -181,7 +181,7 @@ def test_contact_grant_rejects_mixed_owners_without_partial_authority(
 
 
 def test_bound_principal_refuses_contact_grants(config_root: Path) -> None:
-    orders = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    orders = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     identity = CallerIdentityStore()
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
 
@@ -199,38 +199,71 @@ def test_bound_principal_refuses_contact_grants(config_root: Path) -> None:
 
 
 def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="identity-read")
     identity = CallerIdentityStore()
     # Unverified: nothing readable.
-    assert not order_read_allowed("ORD-1001", store=store, identity=identity)
+    assert not order_read_allowed(
+        "ORD-1001", store=store, guest_orders=guest_orders, identity=identity
+    )
     # Rung 1: a grant unlocks exactly that order.
     identity.grant_orders("ORD-1001")
-    assert order_read_allowed("ORD-1001", store=store, identity=identity)
-    assert not order_read_allowed("ORD-1003", store=store, identity=identity)
+    assert order_read_allowed("ORD-1001", store=store, guest_orders=guest_orders, identity=identity)
+    assert not order_read_allowed(
+        "ORD-1003", store=store, guest_orders=guest_orders, identity=identity
+    )
     # Rung 2: a binding unlocks all OWNED orders — and only those.
     identity.clear()
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    assert order_read_allowed("ORD-1003", store=store, identity=identity)
-    assert not order_read_allowed("ORD-1002", store=store, identity=identity)  # CUST-002's
+    assert order_read_allowed("ORD-1003", store=store, guest_orders=guest_orders, identity=identity)
+    assert not order_read_allowed(
+        "ORD-1002", store=store, guest_orders=guest_orders, identity=identity
+    )
     # Session-placed: readable with NO identity at all (placed-by-this-caller).
     placed = store.place_cart(
         "k1",
         lines=[CartLine(sku="SKU-GRN-15", name="socks", price_usd=14.5, quantity=1)],
         total_usd=14.5,
     )
-    assert order_read_allowed(placed.order_id, store=store, identity=CallerIdentityStore())
+    guest_orders.record(placed.order_id)
+    assert order_read_allowed(
+        placed.order_id,
+        store=store,
+        guest_orders=guest_orders,
+        identity=CallerIdentityStore(),
+    )
 
 
 def test_bound_principal_cannot_be_widened_by_a_residual_guest_grant(
     config_root: Path,
 ) -> None:
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="identity-bound")
     identity = CallerIdentityStore()
     identity.grant_orders("ORD-1002")
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
 
-    assert not order_read_allowed("ORD-1002", store=store, identity=identity)
-    assert not order_mutation_allowed("ORD-1002", store=store, identity=identity)
+    assert not order_read_allowed(
+        "ORD-1002", store=store, guest_orders=guest_orders, identity=identity
+    )
+    assert not order_mutation_allowed(
+        "ORD-1002", store=store, guest_orders=guest_orders, identity=identity
+    )
+
+
+def test_guest_scope_reference_requires_a_committed_tenant_placement(config_root: Path) -> None:
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="corrupted-scope")
+    guest_orders.record("ORD-1002")
+    identity = CallerIdentityStore()
+
+    assert not store.is_guest_order("ORD-1002", guest_orders)
+    assert not order_read_allowed(
+        "ORD-1002", store=store, guest_orders=guest_orders, identity=identity
+    )
+    assert not order_mutation_allowed(
+        "ORD-1002", store=store, guest_orders=guest_orders, identity=identity
+    )
 
 
 # --- fixture loader + build-time cross-check (fail-loud) ------------------------------------

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from agnostic_market.commerce.orders import (
     CancelError,
+    GuestOrderScope,
     OrderStore,
     PlacementError,
     RefundError,
@@ -29,7 +30,7 @@ _ORIGINAL_INSTRUMENT = "original payment method"
 
 
 def _orders(config_root: Path) -> OrderStore:
-    return OrderStore(load_orders_fixture(config_root, "acme_store"))
+    return OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
 
 
 def _profiles(config_root: Path) -> ProfileStore:
@@ -62,18 +63,20 @@ def test_placement_receipt_is_exact_and_does_not_restore_principal_visibility(
     config_root: Path,
 ) -> None:
     store = _orders(config_root)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="receipt")
     lines = [_line()]
     assert store.placement_receipt("place-key", lines=lines, total_usd=129.0).kind == (
         "not_committed"
     )
     placed = store.place_cart("place-key", lines=lines, total_usd=129.0)
     assert placed.order_id == "ORD-9001"
-    store.clear_session_placed()
+    guest_orders.record(placed.order_id)
+    guest_orders.clear()
 
     receipt = store.placement_receipt("place-key", lines=lines, total_usd=129.0)
     assert isinstance(receipt, CommittedReceipt)
     assert receipt.record is placed
-    assert not store.is_session_placed(placed.order_id)
+    assert not guest_orders.contains(placed.order_id)
 
     conflict = store.placement_receipt(
         "place-key",
@@ -84,7 +87,7 @@ def test_placement_receipt_is_exact_and_does_not_restore_principal_visibility(
     with pytest.raises(PlacementError, match="different parameters"):
         store.place_cart("place-key", lines=[_line(quantity=2)], total_usd=258.0)
     assert store.placed_count == 1
-    assert not store.is_session_placed(placed.order_id)
+    assert not guest_orders.contains(placed.order_id)
 
 
 def test_refund_receipt_proves_the_masked_instrument_and_rejects_key_conflict(

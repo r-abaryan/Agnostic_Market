@@ -18,13 +18,9 @@ from agnostic_market.voice.graph import GraphVoiceAdapter
 class ScriptedEngine:
     """ReasoningEngine double: replays canned TurnEvents, records what it was asked."""
 
-    def __init__(self, events: list, *, pending: bool = False) -> None:
+    def __init__(self, events: list) -> None:
         self._events = events
-        self._pending = pending
         self.calls: list[tuple[CommittedTurn, TurnFacts]] = []
-
-    def pending_interrupt(self) -> bool:
-        return self._pending
 
     async def stream_turn(self, turn: CommittedTurn, facts: TurnFacts):
         self.calls.append((turn, facts))
@@ -101,8 +97,8 @@ async def test_empty_transport_input_is_an_empty_turn() -> None:
     assert engine.calls == []  # engine never invoked
 
 
-async def test_4a_fact_set_when_pending_and_readback_barged() -> None:
-    engine = ScriptedEngine([], pending=True)
+async def test_adapter_passes_the_transport_interruption_fact_without_checkpoint_io() -> None:
+    engine = ScriptedEngine([])
     adapter = GraphVoiceAdapter(engine)
     adapter.attach_session(
         _FakeSession(
@@ -116,21 +112,21 @@ async def test_4a_fact_set_when_pending_and_readback_barged() -> None:
     assert engine.calls[0][1].readback_interrupted is True
 
 
-async def test_4a_fact_false_when_no_pending_interrupt() -> None:
-    # An interrupted PAST utterance is irrelevant on a normal turn: the fact is only
-    # asserted while the engine is paused at a confirmation.
-    engine = ScriptedEngine([], pending=False)
+async def test_transport_interruption_fact_is_perceptual_not_resume_authority() -> None:
+    # The adapter reports transport perception only. The engine decides whether the current
+    # checkpoint makes that fact relevant to a confirmation resume.
+    engine = ScriptedEngine([])
     adapter = GraphVoiceAdapter(engine)
     adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=True)]))
     await _spoken(
         adapter,
         {"messages": [HumanMessage("what's the status", id="turn-1")]},
     )
-    assert engine.calls[0][1].readback_interrupted is False
+    assert engine.calls[0][1].readback_interrupted is True
 
 
 async def test_4a_fact_false_when_readback_played_out() -> None:
-    engine = ScriptedEngine([], pending=True)
+    engine = ScriptedEngine([])
     adapter = GraphVoiceAdapter(engine)
     adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=False)]))
     await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})

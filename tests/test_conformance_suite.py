@@ -363,6 +363,9 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
             "isolation": {"tier": "shared"},
             "runtime": {
                 "cancellation_quiescence_timeout_seconds": 2.0,
+                "checkpoint_io_timeout_seconds": 2.0,
+                "response_model_node_timeout_seconds": 2.0,
+                "reasoning_model_node_timeout_seconds": 6.0,
                 "caller_audible_model_text_max_chars": 500,
                 "semantic_router_input_max_chars": 2048,
                 "semantic_router_timeout_seconds": 2.0,

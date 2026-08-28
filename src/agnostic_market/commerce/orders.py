@@ -1,33 +1,23 @@
-"""Order SoR access — the fixture-backed stub store (Phase 3b; real SoR integration Phase 4).
+"""Order reads and idempotent effects through the fixture-backed development store.
 
-Moved here from voice/tools.py at 3b: the fixture is COMMERCE data (orders + catalog), not
-a voice concern — voice tools read it through this module, keeping the plane arrow
-voice -> commerce, never the reverse.
-
-`OrderStore` is the **order-SoR arbiter** (AGENTS §A10 rule 5): `place()` is idempotent by
-`idempotency_key` — a seen key returns the SAME placed order and never creates a duplicate,
-so ANY replay/retry of the place effect (crash between effect and checkpoint, double
-resume) cannot double-order. That dedup lives HERE, in the store, because in production the
-merchant's order SoR is the arbiter — the graph must not be the thing that remembers.
-
-`resolve_candidates` is the CODE-side product search for checkout selection: the model
-never emits a raw SKU; it picks a `candidate_key` INTO the bounded list this returns, and
-code resolves key -> sku -> price (industry-standard narrowed-choice selection). It is a
-separate surface from the prose `catalog_search` tool on purpose — same fixture data, one
-prose surface to speak from, one structured surface to select from.
+`OrderStore` owns order records and effect receipts only. Catalog retrieval is injected through
+the separate tenant-scoped catalog port.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from functools import wraps
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Concatenate, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from agnostic_market.commerce.catalog import CatalogFixture
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.money import UsdAmount, validate_usd
@@ -40,15 +30,6 @@ _FROZEN = ConfigDict(extra="forbid", frozen=True)
 # Stub-store copy for orders this store itself placed (real ETA logic = the Phase-4 SoR).
 _PLACED_STATUS = "processing"
 _PLACED_ETA = "3-5 business days"
-
-
-class _NamedItem(Protocol):
-    name: str
-
-
-class _CandidateItem(_NamedItem, Protocol):
-    sku: str
-    price_usd: UsdAmount
 
 
 def speak_quantity(quantity: int, name: str) -> str:
@@ -307,44 +288,12 @@ class _OrderEntry(BaseModel):
         return self
 
 
-class CatalogProduct(BaseModel):
-    model_config = _STRICT
-
-    sku: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    price_usd: UsdAmount
-
-
-class OrdersFixture(BaseModel):
+class OrdersFixture(CatalogFixture):
     """Validated stub SoR content for one merchant."""
 
     model_config = _STRICT
 
     orders: dict[str, _OrderEntry]
-    products: list[CatalogProduct] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _product_skus_are_unique(self) -> OrdersFixture:
-        seen: set[str] = set()
-        duplicates: set[str] = set()
-        for product in self.products:
-            if product.sku in seen:
-                duplicates.add(product.sku)
-            seen.add(product.sku)
-        if duplicates:
-            raise ValueError(f"product SKUs must be unique: {sorted(duplicates)!r}")
-        return self
-
-
-class Candidate(BaseModel):
-    """One transient code-numbered catalog/cart option a model may pick (by key, never SKU)."""
-
-    model_config = _FROZEN
-
-    key: str = Field(min_length=1)
-    sku: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    price_usd: UsdAmount
 
 
 class OrderCandidate(BaseModel):
@@ -585,6 +534,35 @@ class RecentOrderContext:
         )
 
 
+class GuestOrderScope:
+    """Tenant-bound order references visible only to one caller session."""
+
+    def __init__(self, *, tenant_id: str, session_id: str) -> None:
+        if not tenant_id.strip():
+            raise ValueError("guest order scope requires a tenant id")
+        if not session_id.strip():
+            raise ValueError("guest order scope requires a session id")
+        self.tenant_id = tenant_id.strip()
+        self.session_id = session_id.strip()
+        self._order_refs: dict[str, None] = {}
+
+    @property
+    def order_refs(self) -> tuple[str, ...]:
+        return tuple(self._order_refs)
+
+    def record(self, order_id: str) -> None:
+        normalized = order_id.strip().upper()
+        if not normalized:
+            raise ValueError("guest order scope requires a non-empty order id")
+        self._order_refs[normalized] = None
+
+    def contains(self, order_id: str) -> bool:
+        return order_id.strip().upper() in self._order_refs
+
+    def clear(self) -> None:
+        self._order_refs.clear()
+
+
 def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:
     """Load + validate the merchant's orders fixture. Fails loudly (build time, not mid-call)."""
     path = config_root / "fixtures" / "orders" / f"{merchant_id}.yaml"
@@ -594,64 +572,29 @@ def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:
         raise ConfigError(f"orders fixture {path} failed validation:\n{exc}") from exc
 
 
-def match_named_items[T: _NamedItem](items: Sequence[T], query: str) -> list[T]:
-    """Return only deterministic name matches; no fallback or caller-choice policy."""
-    needle = query.strip().lower()
-    return [
-        item
-        for item in items
-        if needle and (needle in item.name.lower() or item.name.lower() in needle)
-    ]
+def _synchronized[**P, R](
+    method: Callable[Concatenate[OrderStore, P], R],
+) -> Callable[Concatenate[OrderStore, P], R]:
+    @wraps(method)
+    def locked(self: OrderStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
 
-
-@dataclass(frozen=True)
-class CatalogLookup:
-    """One bounded catalog read: exact matches plus the fallback products callers may mention."""
-
-    matches: tuple[CatalogProduct, ...]
-    available: tuple[CatalogProduct, ...]
-
-
-def lookup_catalog(fixture: OrdersFixture, query: str) -> CatalogLookup:
-    """Apply one-way, case-insensitive product-name containment."""
-
-    needle = query.strip().lower()
-    products = tuple(fixture.products)
-    matches = tuple(product for product in products if needle and needle in product.name.lower())
-    return CatalogLookup(matches=matches, available=products)
-
-
-def number_candidates(items: Sequence[_CandidateItem]) -> list[Candidate]:
-    """Render live catalog/cart items as local model-facing keys; no fallback or persistence."""
-    return [
-        Candidate(key=str(index), sku=item.sku, name=item.name, price_usd=item.price_usd)
-        for index, item in enumerate(items, start=1)
-    ]
-
-
-def resolve_candidates(fixture: OrdersFixture, query: str) -> list[Candidate]:
-    """Broad product selection for the conversational Cart model.
-
-    `query` may be a short phrase ("rain jacket") or a WHOLE utterance ("I'd like the
-    waterproof rain jacket"), so containment is checked both ways. Empty/no-match queries
-    return the FULL (tiny, fixture-bounded) catalog so the model can steer the caller to
-    real items; keys are 1-based list positions as strings.
-    """
-    matched = match_named_items(fixture.products, query)
-    products = matched or fixture.products
-    return number_candidates(products)
+    return locked
 
 
 class OrderStore:
     """The stub order SoR: fixture reads + idempotent placement (the dedup ARBITER)."""
 
-    def __init__(self, fixture: OrdersFixture) -> None:
-        self.fixture = fixture
-        # `_placed_by_key` is the store's committed placement/idempotency ledger. Visibility
-        # is a separate caller-context concern: principal rotation clears the ids below without
-        # deleting the order record or making a replay create a second order.
+    def __init__(self, tenant_id: str, orders: Mapping[str, _OrderEntry]) -> None:
+        if not tenant_id.strip():
+            raise ValueError("order store requires a tenant id")
+        self.tenant_id = tenant_id.strip()
+        self._lock = threading.RLock()
+        self._orders = {order_id: entry.model_copy(deep=True) for order_id, entry in orders.items()}
+        # `_placed_by_key` is the committed placement/idempotency ledger. Caller visibility
+        # belongs to the separately injected GuestOrderScope.
         self._placed_by_key: dict[str, PlacedOrder] = {}
-        self._session_placed_ids: set[str] = set()
         self._next_seq = 9001  # placed-order ids ORD-9001.. (disjoint from fixture ids)
         self._refunds_by_key: dict[str, RefundRecord] = {}
         self._next_refund_seq = 7001  # refund references R-7001..
@@ -660,6 +603,11 @@ class OrderStore:
         self._returns_by_key: dict[str, ReturnRecord] = {}
         self._next_return_seq = 3001  # return ids RMA-3001.. (disjoint from ORD-/R- spaces)
 
+    def _require_guest_scope(self, scope: GuestOrderScope) -> None:
+        if scope.tenant_id != self.tenant_id:
+            raise ValueError("guest order scope does not match the order-store tenant")
+
+    @_synchronized
     def order_status(self, order_id: str) -> str | None:
         """The effective fulfillment status of an order; None if unknown.
 
@@ -670,7 +618,7 @@ class OrderStore:
         normalized = order_id.strip().upper()
         if normalized in self._cancelled_ids:
             return CANCELLED_STATUS
-        entry = self.fixture.orders.get(normalized)
+        entry = self._orders.get(normalized)
         if entry is not None:
             return entry.status
         for placed in self._placed_by_key.values():
@@ -678,6 +626,7 @@ class OrderStore:
                 return _PLACED_STATUS
         return None
 
+    @_synchronized
     def order_summary(self, order_id: str) -> str | None:
         """Human-readable status line for fixture AND just-placed orders; None if unknown.
 
@@ -685,7 +634,7 @@ class OrderStore:
         a cancel hears the truth."""
         normalized = order_id.strip().upper()
         cancelled = normalized in self._cancelled_ids
-        entry = self.fixture.orders.get(normalized)
+        entry = self._orders.get(normalized)
         if entry is not None:
             status = CANCELLED_STATUS if cancelled else entry.status
             return f"Order {normalized}: {entry.summary} - status {status}, ETA {entry.eta}."
@@ -698,39 +647,36 @@ class OrderStore:
                 )
         return None
 
+    @_synchronized
     def order_owner(self, order_id: str) -> str | None:
-        """The owning customer_ref of a FIXTURE order; None for unknown AND for session-placed
-        orders (those are owned by "this session's caller" — `is_session_placed` is that
-        check; a placed order joins a customer's durable account at the Phase-4 real SoR)."""
-        entry = self.fixture.orders.get(order_id.strip().upper())
+        """Return a fixture order's customer, or None for unknown and guest orders."""
+        entry = self._orders.get(order_id.strip().upper())
         return entry.customer_ref if entry is not None else None
 
-    def is_session_placed(self, order_id: str) -> bool:
-        """True when THIS session's store placed the order (the caller placed it on this
-        call — readable by them without any further verification, P7 rung 1)."""
+    @_synchronized
+    def is_guest_order(self, order_id: str, scope: GuestOrderScope) -> bool:
+        """Whether this scope names a placement committed by this tenant store."""
+        self._require_guest_scope(scope)
         normalized = order_id.strip().upper()
-        return normalized in self._session_placed_ids
-
-    def clear_session_placed(self) -> None:
-        """Drop only the caller-scoped authorization/view of placed orders.
-
-        The committed placement records and idempotency keys remain in `_placed_by_key`, just
-        like cancellation/refund/return records and their overlays. A principal switch must
-        neither expose the prior caller's orders nor erase a completed business outcome."""
-        self._session_placed_ids.clear()
-
-    def _iter_session_placed(self) -> Iterator[PlacedOrder]:
-        """Yield committed placements visible to the current caller context."""
-        return (
-            record
-            for record in self._placed_by_key.values()
-            if record.order_id in self._session_placed_ids
+        return bool(
+            scope.contains(normalized)
+            and any(record.order_id == normalized for record in self._placed_by_key.values())
         )
+
+    def _iter_guest_orders(self, scope: GuestOrderScope) -> Iterator[PlacedOrder]:
+        """Resolve one session's explicit references against committed placements."""
+        self._require_guest_scope(scope)
+        records = {record.order_id: record for record in self._placed_by_key.values()}
+        for order_id in scope.order_refs:
+            record = records.get(order_id)
+            if record is None:
+                raise ValueError("guest order scope references an unknown committed order")
+            yield record
 
     def _placed_candidate(self, record: PlacedOrder, key: str) -> OrderCandidate:
         """The ONE placed-record -> OrderCandidate mapping (summary from `speak_lines`, effective
         cancelled-overlay status). Shared by every listing so the placed view can't drift between
-        `_iter_owned_orders`, `actionable_orders`, and `session_placed_orders`."""
+        `_iter_owned_orders`, `actionable_orders`, and `guest_orders`."""
         return OrderCandidate(
             key=key,
             order_id=record.order_id,
@@ -739,10 +685,12 @@ class OrderStore:
             status=self.order_status(record.order_id) or "unknown",
         )
 
-    def _iter_owned_orders(self, customer_ref: str) -> Iterator[OrderCandidate]:
+    def _iter_owned_orders(
+        self, customer_ref: str, guest_scope: GuestOrderScope
+    ) -> Iterator[OrderCandidate]:
         """Yield the account/session order view without materializing full history."""
         index = 1
-        for order_id, entry in self.fixture.orders.items():
+        for order_id, entry in self._orders.items():
             if entry.customer_ref != customer_ref:
                 continue
             yield OrderCandidate(
@@ -753,39 +701,30 @@ class OrderStore:
                 status=self.order_status(order_id) or "unknown",
             )
             index += 1
-        for record in self._iter_session_placed():
+        for record in self._iter_guest_orders(guest_scope):
             yield self._placed_candidate(record, str(index))
             index += 1
 
-    def session_placed_orders(self) -> list[OrderCandidate]:
-        """The GUEST enumeration view: orders placed THIS session, keyed "1".."N". Readable with
-        NO verification — the caller placed them on this call, so reading them back is not a
-        privacy leak (the same session-placed rule `order_read_allowed` already honors for reads).
-        Structurally excludes fixture/account orders and committed placements outside the current
-        caller view, so an unbound listing can never surface another principal's order.
-
-        PHASE-4 CAVEAT: "session" here means "this per-session OrderStore instance" — there is
-        no `session_id`; the isolation is the fixture store's per-call lifetime. When the store
-        becomes a durable SHARED SoR that boundary disappears: Phase 4 must stamp each guest-placed
-        order with an explicit GUEST SESSION ID (a temp-user handle minted per call) + tenant,
-        filter every query on it, and — for a guest who later signs up — migrate those session
-        orders onto the real account. This "session = the store" assumption must NOT be copied
-        into a shared store."""
+    @_synchronized
+    def guest_orders(self, scope: GuestOrderScope) -> list[OrderCandidate]:
+        """Return only committed placements referenced by this guest session."""
         return [
             self._placed_candidate(record, str(i))
-            for i, record in enumerate(self._iter_session_placed(), start=1)
+            for i, record in enumerate(self._iter_guest_orders(scope), start=1)
         ]
 
-    def owned_orders(self, customer_ref: str) -> list[OrderCandidate]:
+    @_synchronized
+    def owned_orders(self, customer_ref: str, guest_scope: GuestOrderScope) -> list[OrderCandidate]:
         """The bounded, keyed list of orders the IDENTIFIED caller may hear enumerated (P7
         rung 2): fixture orders owned by `customer_ref` + everything placed THIS session
         (placed-by-this-caller by construction). Effective status (cancelled overlay wins).
         Same OrderCandidate shape as `actionable_orders` — whose MODEL-VISIBLE subset the
         support assemble scopes through `order_read_allowed` (SECURITY §7d, call #15)."""
-        return list(self._iter_owned_orders(customer_ref))
+        return list(self._iter_owned_orders(customer_ref, guest_scope))
 
+    @_synchronized
     def owned_cancellable_orders(
-        self, customer_ref: str, *, limit: int
+        self, customer_ref: str, guest_scope: GuestOrderScope, *, limit: int
     ) -> tuple[list[OrderCandidate], bool]:
         """The bounded set of the caller's orders that are CURRENTLY cancellable (F-16.2
         Milestone B) — the resolver's target universe for a "cancel all my orders" scope.
@@ -796,7 +735,7 @@ class OrderStore:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         cancellable: list[OrderCandidate] = []
-        for candidate in self._iter_owned_orders(customer_ref):
+        for candidate in self._iter_owned_orders(customer_ref, guest_scope):
             if not self.is_cancellable(candidate.order_id):
                 continue
             if len(cancellable) == limit:
@@ -804,13 +743,14 @@ class OrderStore:
             cancellable.append(candidate)
         return cancellable, False
 
+    @_synchronized
     def order_eta(self, order_id: str) -> str | None:
         """The raw ETA for an order (fixture `entry.eta`, a date "2026-07-09"; or `_PLACED_ETA`
         for a placed order, a duration "3-5 business days"); None if unknown. The public accessor
         the deterministic read renderer reads — mirrors the fixture/placed fork in
         `order_summary`, so the render node never touches the private `fixture.orders` dict."""
         normalized = order_id.strip().upper()
-        entry = self.fixture.orders.get(normalized)
+        entry = self._orders.get(normalized)
         if entry is not None:
             return entry.eta
         for placed in self._placed_by_key.values():
@@ -818,6 +758,7 @@ class OrderStore:
                 return _PLACED_ETA
         return None
 
+    @_synchronized
     def place_cart(
         self, idempotency_key: str, *, lines: Sequence[CartLine], total_usd: UsdAmount
     ) -> PlacedOrder:
@@ -848,9 +789,9 @@ class OrderStore:
         )
         self._next_seq += 1
         self._placed_by_key[idempotency_key] = placed
-        self._session_placed_ids.add(placed.order_id)
         return placed
 
+    @_synchronized
     def placement_receipt(
         self,
         idempotency_key: str,
@@ -866,11 +807,15 @@ class OrderStore:
         )
 
     @property
+    @_synchronized
     def placed_count(self) -> int:
         """How many DISTINCT orders this store has placed (test/verification surface)."""
         return len(self._placed_by_key)
 
-    def identical_cart_order(self, lines: Sequence[CartLine]) -> PlacedOrder | None:
+    @_synchronized
+    def identical_cart_order(
+        self, lines: Sequence[CartLine], guest_scope: GuestOrderScope
+    ) -> PlacedOrder | None:
         """A LIVE (non-cancelled) order this session already placed with the SAME line set
         (sku→quantity), regardless of order (Group B).
 
@@ -881,7 +826,7 @@ class OrderStore:
         re-ordering after a cancel is a normal intent.
         """
         want = {ln.sku: ln.quantity for ln in lines}
-        for placed in self._iter_session_placed():
+        for placed in self._iter_guest_orders(guest_scope):
             if placed.order_id in self._cancelled_ids:
                 continue
             have = {ln.sku: ln.quantity for ln in placed.lines}
@@ -889,7 +834,8 @@ class OrderStore:
                 return placed
         return None
 
-    def actionable_orders(self) -> list[OrderCandidate]:
+    @_synchronized
+    def actionable_orders(self, guest_scope: GuestOrderScope) -> list[OrderCandidate]:
         """The bounded, keyed list of orders a support action (refund OR cancel) may target
         (fixture + placed), each with its EFFECTIVE status (cancelled overlay wins).
 
@@ -901,9 +847,7 @@ class OrderStore:
         listed (the caller may ask about them); the status lets the model — and the
         guardrails — answer honestly instead of proposing a dead action.
         """
-        fixture = [
-            (oid, entry.summary, entry.total_usd) for oid, entry in self.fixture.orders.items()
-        ]
+        fixture = [(oid, entry.summary, entry.total_usd) for oid, entry in self._orders.items()]
         fixture_candidates = [
             OrderCandidate(
                 key=str(i),
@@ -916,10 +860,11 @@ class OrderStore:
         ]
         placed_candidates = [
             self._placed_candidate(record, str(len(fixture) + i))
-            for i, record in enumerate(self._iter_session_placed(), start=1)
+            for i, record in enumerate(self._iter_guest_orders(guest_scope), start=1)
         ]
         return fixture_candidates + placed_candidates
 
+    @_synchronized
     def captured_total(self, order_id: str) -> UsdAmount | None:
         """The captured amount for an order (fixture OR placed); None if unknown.
 
@@ -927,7 +872,7 @@ class OrderStore:
         the store doesn't know is refused, never guessed.
         """
         normalized = order_id.strip().upper()
-        entry = self.fixture.orders.get(normalized)
+        entry = self._orders.get(normalized)
         if entry is not None:
             return entry.total_usd
         for placed in self._placed_by_key.values():
@@ -935,6 +880,7 @@ class OrderStore:
                 return placed.total_usd
         return None
 
+    @_synchronized
     def refunded_so_far(self, order_id: str) -> UsdAmount:
         """Sum of refunds already issued against an order (the cumulative-cap left side)."""
         normalized = order_id.strip().upper()
@@ -943,6 +889,7 @@ class OrderStore:
             start=Decimal("0"),
         )
 
+    @_synchronized
     def delivered_at_epoch(self, order_id: str) -> float | None:
         """The delivery instant as a UTC epoch; None if not (yet) delivered.
 
@@ -951,11 +898,12 @@ class OrderStore:
         as an AWARE datetime (the fixture stores tz-aware ISO 8601), compared as instants —
         no naive-date boundary ambiguity on the window's last day.
         """
-        entry = self.fixture.orders.get(order_id.strip().upper())
+        entry = self._orders.get(order_id.strip().upper())
         if entry is None or entry.delivered_at is None:
             return None
         return datetime.fromisoformat(entry.delivered_at).timestamp()
 
+    @_synchronized
     def return_for_order(self, order_id: str) -> ReturnRecord | None:
         """The open return for an order, if one exists — THE open-return lookup (guards need
         the record itself to speak its RMA id; a separate bool would be a second way)."""
@@ -965,6 +913,7 @@ class OrderStore:
                 return record
         return None
 
+    @_synchronized
     def return_refund_due(self, order_id: str) -> UsdAmount:
         """Sum of refunds PROMISED on open returns for an order — the promise side of the
         cumulative-cap join (refunds paid + refunds promised may never exceed captured)."""
@@ -974,6 +923,7 @@ class OrderStore:
             start=Decimal("0"),
         )
 
+    @_synchronized
     def issue_refund(
         self,
         idempotency_key: str,
@@ -1038,6 +988,7 @@ class OrderStore:
         self._refunds_by_key[idempotency_key] = record
         return record
 
+    @_synchronized
     def refund_receipt(
         self,
         idempotency_key: str,
@@ -1061,10 +1012,12 @@ class OrderStore:
         )
 
     @property
+    @_synchronized
     def refund_count(self) -> int:
         """How many DISTINCT refunds this store has issued (test/verification surface)."""
         return len(self._refunds_by_key)
 
+    @_synchronized
     def create_return(
         self,
         idempotency_key: str,
@@ -1131,6 +1084,7 @@ class OrderStore:
         self._returns_by_key[idempotency_key] = record
         return record
 
+    @_synchronized
     def return_receipt(
         self,
         idempotency_key: str,
@@ -1152,16 +1106,19 @@ class OrderStore:
         )
 
     @property
+    @_synchronized
     def return_count(self) -> int:
         """How many DISTINCT returns this store has created (test/verification surface)."""
         return len(self._returns_by_key)
 
+    @_synchronized
     def is_cancellable(self, order_id: str) -> bool:
         """Whether an order is currently in a cancellable (pre-shipment) state — the cancel
         guardrail reads this LIVE to decide eligibility. Unknown/shipped/delivered/cancelled
         all return False."""
         return self.order_status(order_id) in _CANCELLABLE_STATUSES
 
+    @_synchronized
     def cancel_order(self, idempotency_key: str, *, order_id: str) -> CancelRecord:
         """Void an order, deduplicated by per-INTENT `idempotency_key` (SoR-arbiter rule).
 
@@ -1204,6 +1161,7 @@ class OrderStore:
         self._cancels_by_key[idempotency_key] = record
         return record
 
+    @_synchronized
     def cancel_receipt(
         self,
         idempotency_key: str,
@@ -1216,10 +1174,11 @@ class OrderStore:
             lambda record: _cancel_matches(record, order_id=order_id),
         )
 
+    @_synchronized
     def order_item_summary(self, order_id: str) -> str:
         """The short item summary for an order (fixture or placed) — for spoken readbacks."""
         normalized = order_id.strip().upper()
-        entry = self.fixture.orders.get(normalized)
+        entry = self._orders.get(normalized)
         if entry is not None:
             return entry.summary
         for placed in self._placed_by_key.values():
@@ -1228,6 +1187,7 @@ class OrderStore:
         return normalized
 
     @property
+    @_synchronized
     def cancel_count(self) -> int:
         """How many DISTINCT orders this store has cancelled (test/verification surface)."""
         return len(self._cancels_by_key)

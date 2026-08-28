@@ -28,6 +28,10 @@ from agnostic_market.agents._consent import classify_consent
         "alright",
         "that's correct",
         "yes sir",
+        "yes ma'am",
+        "certainly",
+        "that works",
+        "let's do it",
     ),
 )
 def test_bounded_whole_reply_affirmations_authorize(utterance: str) -> None:
@@ -90,6 +94,9 @@ def test_composed_affirmations_authorize(utterance: str) -> None:
         "sure, but wait",
         "I think that's correct",
         "yes sir, but not yet",
+        "certainly not",
+        "that works if the total changes",
+        "let's do it later",
     ),
 )
 def test_mixed_or_ambiguous_replies_never_authorize(utterance: str) -> None:

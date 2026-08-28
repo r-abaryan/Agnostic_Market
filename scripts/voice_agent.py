@@ -6,6 +6,7 @@ Run:
 
 Needs in .env: the provider keys referenced by merchant config plus
 LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET for dev mode.
+VOICE_AGENT_DEPLOYMENT_ID must identify the immutable deployed artifact.
 Merchant served: env VOICE_AGENT_MERCHANT_ID (default "acme_store").
 
 Startup requires current LLM conformance and semantic-routing qualification reports. A qualified
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 from livekit import agents
 
 from agnostic_market.agents.routing_activation import QualifiedSemanticRouterFactory
+from agnostic_market.application import build_fixture_tenant_services
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
@@ -51,8 +53,16 @@ load_dotenv()
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 _MERCHANT_ID = os.environ.get("VOICE_AGENT_MERCHANT_ID", "acme_store")
+_DEPLOYMENT_ID_ENV = "VOICE_AGENT_DEPLOYMENT_ID"
 
 logger = logging.getLogger("voice_agent")
+
+
+def _deployment_id() -> str:
+    value = os.environ.get(_DEPLOYMENT_ID_ENV, "").strip()
+    if not value:
+        raise RuntimeError(f"{_DEPLOYMENT_ID_ENV} must identify the immutable deployment artifact")
+    return value
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
@@ -92,9 +102,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         resolved,
         credentials,
         secrets,
-        config_root=_CONFIG_ROOT,
+        deployment_id=_deployment_id(),
+        tenant_services=build_fixture_tenant_services(_CONFIG_ROOT, _MERCHANT_ID),
         routing_recognizer_factory=routing_factory,
     )
+    loop.register_shutdown(ctx)
     logger.info(
         "serving merchant %s (config_version %s)", _MERCHANT_ID, resolved.config_version[:12]
     )
@@ -113,6 +125,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             session=loop.session,
             room=ctx.room,
             engine=loop.engine,
+            effect_source=loop.application.services.order_store,
             linked_participant_identity=participant.identity,
         )
         ctx.add_shutdown_callback(close_recorder.wait_for_completion)

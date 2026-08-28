@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END
 from langgraph.types import Command
 from llm_fakes import (
@@ -30,15 +31,17 @@ from turn_helpers import (
 )
 
 from agnostic_market.agents.cart import flow as cart_flow
-from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
+from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.commerce.cart import CartMutationError, CartStore
+from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
+    GuestOrderScope,
     OrderStore,
     RecentOrderContext,
     load_orders_fixture,
@@ -59,7 +62,7 @@ from agnostic_market.dtos.orchestration import (
     PlaceOrder,
 )
 from agnostic_market.dtos.state import PendingCartMutation
-from agnostic_market.voice.context import CallerContext
+from agnostic_market.session import CallerContext
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _CFG = {"configurable": {"thread_id": "t1"}}
@@ -83,10 +86,13 @@ def _build(
     cart: CartStore | None = None,
     recent_orders: RecentOrderContext | None = None,
 ):
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    fixture = load_orders_fixture(config_root, "acme_store")
+    catalog = FixtureCatalog("acme_store", fixture)
+    store = OrderStore("acme_store", fixture.orders)
     cart = cart or CartStore()
     recent_orders = recent_orders or RecentOrderContext(max_refs=_POLICY.cancel_batch_max)
     identity = CallerIdentityStore()
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="t1")
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     otp = OtpProvider(valid_code=_TEST_OTP)
     verification = VerificationStore(otp)
@@ -95,7 +101,7 @@ def _build(
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
-        order_store=store,
+        guest_orders=guest_orders,
     )
     assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -103,6 +109,8 @@ def _build(
         tenant_id="acme_store",
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
         store=store,
+        catalog=catalog,
+        guest_orders=guest_orders,
         cart_store=cart,  # the SAME cart the view_cart tool reads (no split-brain)
         otp=otp,
         verification_store=verification,
@@ -117,7 +125,9 @@ def _build(
         lifecycle=caller_context,
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
-        checkpointer=build_checkpointer(),
+        response_model_node_timeout_seconds=2.0,
+        reasoning_model_node_timeout_seconds=6.0,
+        checkpointer=InMemorySaver(),
     )
     return assembly.graph, store, cart
 
@@ -137,7 +147,10 @@ async def _events(engine: ReasoningEngine, text: str) -> list:
 def _reasoning_engine(graph) -> ReasoningEngine:
     return ReasoningEngine(
         graph,
+        tenant_id="acme_store",
+        deployment_id="test-deployment",
         thread_id="t1",
+        checkpoint_io_timeout_seconds=2.0,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         routing=make_routing_session(
             graph.capability_registry,
@@ -239,8 +252,8 @@ def test_cart_quantity_slot_is_a_strict_integer(quantity: object) -> None:
 async def test_typed_cart_mutation_requires_confirmation_before_effect(
     config_root: Path,
 ) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-confirmation"
 
     await graph.ainvoke(
@@ -522,8 +535,8 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
 ) -> None:
     records: list[dict[str, object]] = []
     monkeypatch.setattr(cart_flow, "write_event", records.append)
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     if starting_quantity:
         cart.add_item(
             sku=product.sku,
@@ -572,8 +585,8 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
 
 
 async def test_cart_mutation_decline_is_exact_and_has_no_effect(config_root: Path) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-decline"
     await graph.ainvoke(
         {
@@ -601,8 +614,8 @@ async def test_cart_mutation_decline_is_exact_and_has_no_effect(config_root: Pat
 async def test_cart_mutation_unclear_twice_uses_one_fixed_retry_then_declines(
     config_root: Path,
 ) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-unclear"
     await graph.ainvoke(
         {
@@ -638,8 +651,8 @@ async def test_cart_mutation_unclear_twice_uses_one_fixed_retry_then_declines(
 async def test_cart_mutation_human_reply_uses_the_existing_terminal_path(
     config_root: Path,
 ) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-human"
     await graph.ainvoke(
         {
@@ -671,8 +684,8 @@ async def test_cart_mutation_expiry_is_exact_and_does_not_consume_yes(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-expiry"
     await graph.ainvoke(
         {
@@ -706,8 +719,8 @@ async def test_cart_mutation_expiry_is_exact_and_does_not_consume_yes(
 async def test_barged_cart_mutation_readback_reconfirms_before_effect(
     config_root: Path,
 ) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-barged"
     await graph.ainvoke(
         {
@@ -742,8 +755,8 @@ async def test_barged_cart_mutation_readback_reconfirms_before_effect(
 async def test_wrong_negative_family_nomination_cannot_mutate_without_consent(
     config_root: Path,
 ) -> None:
-    graph, store, cart = _build(config_root)
-    product = store.fixture.products[0]
+    graph, _store, cart = _build(config_root)
+    product = load_orders_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-wrong-negative-nomination"
 
     await graph.ainvoke(

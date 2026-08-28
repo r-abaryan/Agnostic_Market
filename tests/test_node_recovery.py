@@ -328,7 +328,13 @@ def test_pending_recovery_is_strict_and_checkpoint_safe(
     )
 
     for index, marker in enumerate(markers):
-        config = {"configurable": {"thread_id": f"recovery-serde-{index}"}}
+        binding = harness.engine._checkpoint_binding.rotate(f"recovery-serde-{index}")
+        harness.engine._graph.checkpointer.bind_checkpoint_contract(
+            harness.engine._graph.channels,
+            binding=binding,
+            io_timeout_seconds=harness.engine._checkpoint_io_timeout_seconds,
+        )
+        config = binding.config
         harness.engine._graph.update_state(
             config,
             {
@@ -673,7 +679,7 @@ async def test_cancelled_otp_collect_does_not_reverify_bind_or_resume_the_action
         thread_id="cancelled-otp-collect",
     )
     await _events(harness.engine, "list my account orders")
-    assert harness.engine.pending_interrupt()
+    assert await harness.engine.apending_interrupt()
     assert harness.otp.dispatch_count == 1
     entered = threading.Event()
     release = threading.Event()

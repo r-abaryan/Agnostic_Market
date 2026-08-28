@@ -4,6 +4,7 @@ never bind on a failed OTP), and the anti-oracle posture. Zero network."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from turn_helpers import engine_events, next_committed_turn
 
 from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
+from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent, TurnFacts
 from agnostic_market.dtos.orchestration import (
@@ -46,6 +48,11 @@ _VERIFY_CONTEXT_WARNING = (
     "conversation. Would you like to continue?"
 )
 _REQUEST = "what orders do I have on my account?"
+
+
+def _assert_checkpoint_thread_retired(engine, config) -> None:
+    with pytest.raises(CheckpointScopeError, match="namespace"):
+        engine._graph.get_state(config)
 
 
 def _active_request(values: dict) -> object | None:
@@ -159,7 +166,8 @@ def _assert_identity_contact_ask(
         ("identity_ask_contact", ACCOUNT_CONTACT_QUESTION)
     ]
     assert not any(isinstance(event, TokenEvent | InterruptEvent) for event in events)
-    snapshot = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert harness.engine.thread_id == thread_id
+    snapshot = harness.engine._graph.get_state(harness.engine._config)
     state = snapshot.values
     assert snapshot.next == ()
     assert state.get("execution_owner") == "identity"
@@ -217,7 +225,7 @@ async def test_identity_no_tool_prose_falls_back_to_code_question(config_root: P
     )
     events = await _events(h.engine, _REQUEST)
     _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=0)
-    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = h.engine._graph.get_state(h.engine._config).values
     assert not any(raw_model_text in str(message.content) for message in state["messages"])
 
 
@@ -245,7 +253,7 @@ async def test_unknown_identity_tool_uses_bounded_correction_without_authority(
     events = await _events(h.engine, _REQUEST)
 
     _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=0)
-    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = h.engine._graph.get_state(h.engine._config).values
     assert reasoning.invoke_count == 2
     assert (
         sum(
@@ -274,7 +282,7 @@ async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover
     assert [event.node for event in _spoken(first)] == ["identity_ask_contact"]
     assert [event.node for event in _spoken(second)] == ["identity_ask_contact"]
     assert [event.node for event in _spoken(exhausted)] == ["automation_terminal_response"]
-    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = h.engine._graph.get_state(h.engine._config).values
     assert state.get("automation_terminal") is True
     assert state.get("execution_owner") is None
     assert state.get("active_invocation") is None
@@ -306,12 +314,12 @@ async def test_valid_identity_claim_clears_prior_clarification_liveness(
     h = _identity_harness(config_root, thread_id=thread_id, reasoning=reasoning)
 
     await _events(h.engine, _REQUEST)
-    before = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    before = h.engine._graph.get_state(h.engine._config).values
     assert before["clarification_liveness"].reasks == 0
     events = await _events(h.engine, _CUST1_PHONE)
 
     assert any(isinstance(event, InterruptEvent) for event in events)
-    after = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    after = h.engine._graph.get_state(h.engine._config).values
     assert after.get("clarification_liveness") is None
     assert h.otp.dispatch_count == 1
 
@@ -335,14 +343,14 @@ async def test_malformed_identity_tools_preserve_miss_budget_and_continuation(
     h = _identity_harness(config_root, thread_id=thread_id, reasoning=reasoning)
 
     await _events(h.engine, _REQUEST)
-    after_miss = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    after_miss = h.engine._graph.get_state(h.engine._config).values
     assert after_miss.get("identity_claim_misses") == 1
     assert _active_request(after_miss) == ListOrders(scope="account")
 
     events = await _events(h.engine, "It is the same contact I gave you.")
     _assert_identity_contact_ask(h, events, thread_id=thread_id, expected_misses=1)
     assert reasoning.invoke_count == 3
-    state = h.engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = h.engine._graph.get_state(h.engine._config).values
     assert state["clarification_liveness"].reasks == 0
 
 
@@ -371,6 +379,7 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(
 ) -> None:
     h = _identity_harness(config_root)
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
     await _events(h.engine, _REQUEST)
     before_rotation = ReasoningState.model_validate(
         h.engine._graph.get_state(h.engine._config).values
@@ -378,23 +387,23 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(
     old_invocation = before_rotation.active_invocation
     assert old_invocation is not None
     rotation_seeds: list[dict[str, object]] = []
-    real_update_state = h.engine._graph.update_state
+    real_update_state = h.engine._graph.aupdate_state
 
-    def observe_rotation_seed(config, values, *, as_node=None):
+    async def observe_rotation_seed(config, values, *, as_node=None):
         invocation = values.get("active_invocation")
-        if config["configurable"]["thread_id"] != old_thread_id and isinstance(
-            invocation, ActiveInvocation
-        ):
+        if config["configurable"]["thread_id"] != old_config["configurable"][
+            "thread_id"
+        ] and isinstance(invocation, ActiveInvocation):
             rotation_seeds.append(dict(values))
-        return real_update_state(config, values, as_node=as_node)
+        return await real_update_state(config, values, as_node=as_node)
 
-    monkeypatch.setattr(h.engine._graph, "update_state", observe_rotation_seed)
+    monkeypatch.setattr(h.engine._graph, "aupdate_state", observe_rotation_seed)
     events = await _events(h.engine, _VALID_OTP)
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-001"
     assert h.verification.current_level() == 2
     assert h.engine.thread_id != old_thread_id
-    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    _assert_checkpoint_thread_retired(h.engine, old_config)
     new_state = h.engine._graph.get_state(h.engine._config)
     assert tuple(new_state.values["consumed_turn_ids"]) == ("test-turn-1", "test-turn-2")
     assert len(rotation_seeds) == 1
@@ -412,7 +421,7 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(
     assert "CUST-" not in lines[0].text  # closed slugs never spoken
 
 
-def test_rotation_preserves_populated_profile_slots_exactly(config_root: Path) -> None:
+async def test_rotation_preserves_populated_profile_slots_exactly(config_root: Path) -> None:
     h = _identity_harness(config_root, thread_id="ident-profile-slot-rotation")
     assert h.verification.verify_otp(_VALID_OTP)
     request = ChangeProfile(field="address", new_value="10 High Street")
@@ -422,12 +431,13 @@ def test_rotation_preserves_populated_profile_slots_exactly(config_root: Path) -
         request,
     )
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
 
-    rotated = h.engine._rotate_pending_transition("profile-rotation-turn")
+    rotated = await h.engine._arotate_pending_transition("profile-rotation-turn")
 
     assert rotated == transition
     assert h.engine.thread_id != old_thread_id
-    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    _assert_checkpoint_thread_retired(h.engine, old_config)
     snapshot = h.engine._graph.get_state(h.engine._config)
     state = ReasoningState.model_validate(snapshot.values)
     invocation = state.active_invocation
@@ -439,7 +449,7 @@ def test_rotation_preserves_populated_profile_slots_exactly(config_root: Path) -
     assert snapshot.next == ("entry",)
 
 
-def test_same_principal_apply_preserves_invocation_until_continuation(
+async def test_same_principal_apply_preserves_invocation_until_continuation(
     config_root: Path,
 ) -> None:
     h = _identity_harness(config_root, thread_id="ident-same-principal-invocation")
@@ -470,7 +480,7 @@ def test_same_principal_apply_preserves_invocation_until_continuation(
     assert after_apply.active_invocation.opened_turn_id == invocation.opened_turn_id
     # The tool-capable entry hands a read off untouched; only the code-only render node,
     # which authors the caller-audible line, consumes the invocation.
-    entry_update = h.engine._graph.nodes["support_capability_entry"].invoke(after_apply)
+    entry_update = await h.engine._graph.nodes["support_capability_entry"].ainvoke(after_apply)
     assert "active_invocation" not in entry_update
     after_entry = ReasoningState.model_validate(
         {**after_apply.model_dump(mode="python"), **entry_update}
@@ -484,6 +494,7 @@ async def test_typed_verification_binds_rotates_and_completes_once(config_root: 
     h = _identity_harness(config_root, thread_id="typed-verify")
     _seed_typed_verification(h, turn_id="typed-verify-opening")
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
 
     dispatched = await _events(h.engine, "continue")
     assert [event.prompt for event in dispatched if isinstance(event, InterruptEvent)] == [
@@ -502,7 +513,7 @@ async def test_typed_verification_binds_rotates_and_completes_once(config_root: 
         masked_contact=_CUST1_MASK,
     )
     assert h.engine.thread_id != old_thread_id
-    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    _assert_checkpoint_thread_retired(h.engine, old_config)
     new_state = h.engine._graph.get_state(h.engine._config)
     assert new_state.next == ()
     assert new_state.values.get("active_invocation") is None
@@ -552,6 +563,7 @@ async def test_typed_verification_accepts_context_warning_then_rotates(
     _seed_cart(h)
     _seed_typed_verification(h, turn_id="typed-verify-accept-opening")
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
 
     warning = await _events(h.engine, "continue")
     assert [event.prompt for event in warning if isinstance(event, InterruptEvent)] == [
@@ -575,7 +587,7 @@ async def test_typed_verification_accepts_context_warning_then_rotates(
     )
     assert h.engine.thread_id != old_thread_id
     assert h.caller_context.cart_store.is_empty()
-    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    _assert_checkpoint_thread_retired(h.engine, old_config)
     new_state = h.engine._graph.get_state(h.engine._config)
     assert new_state.next == ()
     assert new_state.values.get("active_invocation") is None
@@ -605,10 +617,10 @@ async def test_verified_account_switch_rotates_all_principal_context(
     )
     old_proof_id = _establish_customer_one(h)
     h.identity.grant_orders("ORD-1001")
-    h.identity.grant_mutation_for_test("ORD-1001")
     _seed_cart(h)
     h.recent_orders.record(["ORD-1001"], operation="read")
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
 
     warning = await _events(h.engine, "I want to use another account")
     prompts = [event.prompt for event in warning if isinstance(event, InterruptEvent)]
@@ -632,12 +644,10 @@ async def test_verified_account_switch_rotates_all_principal_context(
     assert h.caller_context.cart_store.is_empty()
     assert h.recent_orders.snapshot().order_refs == ()
     assert not h.identity.order_granted("ORD-1001")
-    assert not h.identity.mutation_granted_for_test("ORD-1001")
+    assert not h.identity.has_residual_order_authority()
     assert len(h.verification.grants) == 1
     assert h.verification.grants[0].proof_id != old_proof_id
-    old_state = h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}})
-    assert old_state.values == {}
-    assert old_state.interrupts == ()
+    _assert_checkpoint_thread_retired(h.engine, old_config)
     new_state = h.engine._graph.get_state(h.engine._config)
     assert tuple(new_state.values["consumed_turn_ids"]) == (
         "test-turn-1",
@@ -670,7 +680,7 @@ async def test_failed_account_switch_preserves_original_principal(
     assert h.identity.current().customer_ref == _CUST1_REF
     assert not h.caller_context.cart_store.is_empty()
     assert [proof.proof_id for proof in h.verification.grants] == [old_proof_id]
-    state = h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}})
+    state = h.engine._graph.get_state(h.engine._config)
     assert state.values.get("active_invocation") is None
 
 
@@ -706,6 +716,7 @@ async def test_closing_turn_stream_completes_a_pending_context_rotation(
     )
     _establish_customer_one(h)
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
     dispatched = await _events(h.engine, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
 
@@ -722,7 +733,55 @@ async def test_closing_turn_stream_completes_a_pending_context_rotation(
     assert h.caller_context.pending_transition() is None
     assert h.engine.thread_id != old_thread_id
     assert h.identity.current().customer_ref == _CUST2_REF
-    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    _assert_checkpoint_thread_retired(h.engine, old_config)
+
+
+async def test_cancelled_stream_close_finishes_pending_context_rotation(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _switch_harness(
+        config_root,
+        claim=_CUST2_EMAIL,
+        thread_id="switch-cancelled-stream-close",
+    )
+    _establish_customer_one(h)
+    old_thread_id = h.engine.thread_id
+    dispatched = await _events(h.engine, "switch my account")
+    assert any(isinstance(event, InterruptEvent) for event in dispatched)
+
+    stream = h.engine.stream_turn(next_committed_turn(h.engine, _VALID_OTP), _FACTS)
+    while True:
+        event = await anext(stream)
+        if isinstance(event, SpokenMessageEvent) and event.node == "identity_apply":
+            break
+    assert h.caller_context.pending_transition() is not None
+
+    rotation_started = asyncio.Event()
+    rotation_release = asyncio.Event()
+    rotation_completed = False
+    real_rotate = h.engine._arotate_pending_transition
+
+    async def observed_rotate(message_id: str):
+        nonlocal rotation_completed
+        rotation_started.set()
+        await rotation_release.wait()
+        result = await real_rotate(message_id)
+        rotation_completed = True
+        return result
+
+    monkeypatch.setattr(h.engine, "_arotate_pending_transition", observed_rotate)
+    closing = asyncio.create_task(stream.aclose())
+    await asyncio.wait_for(rotation_started.wait(), timeout=1.0)
+    closing.cancel("transport-close-cancelled")
+    rotation_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+    assert cancelled.value.args == ("transport-close-cancelled",)
+    assert rotation_completed is True
+    assert h.caller_context.pending_transition() is None
+    assert h.engine.thread_id != old_thread_id
 
 
 async def test_rotation_failure_during_stream_close_latches_terminal_for_next_turn(
@@ -736,6 +795,7 @@ async def test_rotation_failure_during_stream_close_latches_terminal_for_next_tu
     )
     _establish_customer_one(h)
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
     dispatched = await _events(h.engine, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
 
@@ -747,14 +807,15 @@ async def test_rotation_failure_during_stream_close_latches_terminal_for_next_tu
                 break
         assert h.caller_context.pending_transition() is not None
 
-        real_delete = h.engine._graph.checkpointer.delete_thread
+        old_storage_thread_id = old_config["configurable"]["thread_id"]
+        real_delete = h.engine._graph.checkpointer.adelete_thread
 
-        def fail_old_thread_delete(thread_id: str) -> None:
-            if thread_id == old_thread_id:
+        async def fail_old_thread_delete(thread_id: str) -> None:
+            if thread_id == old_storage_thread_id:
                 raise RuntimeError("injected close-stream rotation failure")
-            real_delete(thread_id)
+            await real_delete(thread_id)
 
-        monkeypatch.setattr(h.engine._graph.checkpointer, "delete_thread", fail_old_thread_delete)
+        monkeypatch.setattr(h.engine._graph.checkpointer, "adelete_thread", fail_old_thread_delete)
     finally:
         await stream.aclose()
 
@@ -781,11 +842,12 @@ async def test_session_placed_order_appears_in_the_identified_list(config_root: 
 
     h = _identity_harness(config_root, thread_id="ident-placed-1")
     h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    h.store.place_cart(
+    placed = h.store.place_cart(
         "k1",
         lines=[CartLine(sku="SKU-GRN-15", name="merino hiking socks", price_usd=14.5, quantity=2)],
         total_usd=29.0,
     )
+    h.guest_orders.record(placed.order_id)
     # Bound -> the enumeration ask code-renders the account list directly (handover node), no OTP.
     events = await _events(h.engine, _REQUEST)
     line = next(e for e in _spoken(events) if e.node == "support_capability_render")
@@ -975,15 +1037,13 @@ async def test_direct_semantic_route_replaces_an_identity_invocation(
         thread_id="ident-cross-1",
     )
     await _events(h.engine, _REQUEST)
-    before_switch = h.engine._graph.get_state(
-        {"configurable": {"thread_id": "ident-cross-1"}}
-    ).values
+    before_switch = h.engine._graph.get_state(h.engine._config).values
     old_invocation = before_switch["active_invocation"]
     assert before_switch["clarification_liveness"].owner.invocation_id == (
         old_invocation.invocation_id
     )
     await _events(h.engine, "cancel my order please")
-    state = h.engine._graph.get_state({"configurable": {"thread_id": "ident-cross-1"}})
+    state = h.engine._graph.get_state(h.engine._config)
     assert state.values.get("execution_owner") == "support"
     assert state.values.get("pending_identity") is None
     new_invocation = state.values["active_invocation"]
@@ -1004,7 +1064,7 @@ async def test_identity_stepup_never_touches_refund_or_profile_state(
     await _events(h.engine, _REQUEST)
     await _events(h.engine, "000000")
     await _events(h.engine, "111111")  # exhaust -> human
-    state = h.engine._graph.get_state({"configurable": {"thread_id": "ident-iso-1"}})
+    state = h.engine._graph.get_state(h.engine._config)
     assert state.values.get("pending_refund") is None
     assert state.values.get("pending_profile_change") is None
     assert h.profile.change_count == 0

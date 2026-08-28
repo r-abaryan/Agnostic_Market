@@ -299,6 +299,9 @@ class RuntimeConfig(BaseModel):
     model_config = _STRICT
 
     cancellation_quiescence_timeout_seconds: float = Field(gt=0)
+    checkpoint_io_timeout_seconds: float = Field(gt=0)
+    response_model_node_timeout_seconds: float = Field(gt=0)
+    reasoning_model_node_timeout_seconds: float = Field(gt=0)
     caller_audible_model_text_max_chars: int = Field(gt=0)
     semantic_router_input_max_chars: int = Field(gt=0)
     semantic_router_timeout_seconds: float = Field(gt=0)

@@ -79,7 +79,38 @@ def test_diagnostic_report_cannot_activate_routing(config_root: Path, tmp_path: 
     path = tmp_path / "qualification.json"
     _write_report(path, _report(registry, gate="diagnostic", passed=None))
 
-    with pytest.raises(RoutingActivationError, match="missing or invalid"):
+    with pytest.raises(RoutingActivationError, match=r"gate\.mode"):
+        _factory(config_root, path)(registry)
+
+
+def test_failed_cutover_report_exposes_sanitized_gate_failures(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry(())
+    path = tmp_path / "qualification.json"
+    payload = _report(registry, passed=False)
+    payload["gate"]["failures"] = ["candidate produced an unsafe executable misroute"]  # type: ignore[index]
+    _write_report(path, payload)
+
+    with pytest.raises(
+        RoutingActivationError,
+        match="candidate produced an unsafe executable misroute",
+    ):
+        _factory(config_root, path)(registry)
+
+
+def test_inexact_projection_reports_its_actual_activation_failure(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry(())
+    path = tmp_path / "qualification.json"
+    payload = _report(registry)
+    payload["projection"]["exact"] = False  # type: ignore[index]
+    _write_report(path, payload)
+
+    with pytest.raises(RoutingActivationError, match="context projection was not exact"):
         _factory(config_root, path)(registry)
 
 

@@ -2,8 +2,8 @@
 integration Phase 4).
 
 `ProfileStore` follows the OrderStore shape: fixture reads + idempotent per-INTENT updates
-(the store is the dedup arbiter, AGENTS §A10 rule 5). One instance per session, built at
-session build alongside OrderStore.
+(the store is the dedup arbiter, AGENTS §A10 rule 5). One tenant-scoped instance is shared
+across application sessions.
 
 PII discipline (SECURITY §6): the on-file CONTACT is stored as a MASKED factor reference
 (e.g. "number ending 0119") — the voice plane never holds a raw phone number or email; the
@@ -14,6 +14,7 @@ telemetered — flow telemetry carries the field slug only.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -114,13 +115,15 @@ class ProfileStore:
 
     def __init__(self, fixture: ProfileFixture) -> None:
         self.fixture = fixture
+        self._lock = threading.RLock()
         self._changes_by_key: dict[tuple[str, str], ProfileChangeRecord] = {}
 
     def has_profile(self, customer_ref: str) -> bool:
         """Whether THIS customer has a profile on file. The flow checks this BEFORE a mutation
         and fails closed (neutral handover) when False — never revealing whether other profiles
         exist."""
-        return customer_ref in self.fixture.profiles
+        with self._lock:
+            return customer_ref in self.fixture.profiles
 
     def _current(self, customer_ref: str, field: ProfileField) -> str:
         base = self.fixture.profiles.get(customer_ref)
@@ -136,12 +139,14 @@ class ProfileStore:
 
     def address_on_file(self, customer_ref: str) -> str:
         """The bound customer's effective delivery address (latest change wins over fixture)."""
-        return self._current(customer_ref, "address")
+        with self._lock:
+            return self._current(customer_ref, "address")
 
     def contact_on_file(self, customer_ref: str) -> str:
         """The bound customer's effective MASKED contact factor reference (latest change wins).
         This is the OTP factor for that customer — never another customer's."""
-        return self._current(customer_ref, "contact")
+        with self._lock:
+            return self._current(customer_ref, "contact")
 
     def update_profile(
         self, idempotency_key: str, *, customer_ref: str, field: ProfileField, new_value: str
@@ -151,25 +156,28 @@ class ProfileStore:
         twice. Fails closed for a customer with no profile on file. The caller must have already
         gated the L2 step-up AND proven a binding to THIS customer (§A4c — the flow's live
         re-read of both level and binding at place time)."""
-        if not self.has_profile(customer_ref):
-            raise ProfileError(f"no profile on file for {customer_ref}")
-        key = (customer_ref, idempotency_key)
-        existing = self._changes_by_key.get(key)
-        if existing is not None:
-            if not _profile_change_matches(
-                existing,
-                customer_ref=customer_ref,
-                field=field,
-                new_value=new_value,
-            ):
-                raise ProfileError("profile idempotency key was reused with different parameters")
-            return existing
-        cleaned = new_value.strip()
-        if not cleaned:
-            raise ProfileError(f"empty {field} value - nothing to update")
-        record = ProfileChangeRecord(customer_ref=customer_ref, field=field, new_value=cleaned)
-        self._changes_by_key[key] = record
-        return record
+        with self._lock:
+            if not self.has_profile(customer_ref):
+                raise ProfileError(f"no profile on file for {customer_ref}")
+            key = (customer_ref, idempotency_key)
+            existing = self._changes_by_key.get(key)
+            if existing is not None:
+                if not _profile_change_matches(
+                    existing,
+                    customer_ref=customer_ref,
+                    field=field,
+                    new_value=new_value,
+                ):
+                    raise ProfileError(
+                        "profile idempotency key was reused with different parameters"
+                    )
+                return existing
+            cleaned = new_value.strip()
+            if not cleaned:
+                raise ProfileError(f"empty {field} value - nothing to update")
+            record = ProfileChangeRecord(customer_ref=customer_ref, field=field, new_value=cleaned)
+            self._changes_by_key[key] = record
+            return record
 
     def profile_change_receipt(
         self,
@@ -180,17 +188,19 @@ class ProfileStore:
         new_value: str,
     ) -> ReceiptLookup[ProfileChangeRecord]:
         """Read one customer-scoped profile-change result without searching other scopes."""
-        return classify_receipt(
-            self._changes_by_key.get((customer_ref, idempotency_key)),
-            lambda record: _profile_change_matches(
-                record,
-                customer_ref=customer_ref,
-                field=field,
-                new_value=new_value,
-            ),
-        )
+        with self._lock:
+            return classify_receipt(
+                self._changes_by_key.get((customer_ref, idempotency_key)),
+                lambda record: _profile_change_matches(
+                    record,
+                    customer_ref=customer_ref,
+                    field=field,
+                    new_value=new_value,
+                ),
+            )
 
     @property
     def change_count(self) -> int:
         """How many DISTINCT changes this store has applied (test/verification surface)."""
-        return len(self._changes_by_key)
+        with self._lock:
+            return len(self._changes_by_key)

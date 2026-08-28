@@ -12,10 +12,10 @@ check (-> chat-only); a transport/auth error raises `ConformanceRunError` and NO
 recorded — infrastructure failure is never converted into a capability verdict.
 
 Checks use async APIs (`ainvoke`/`astream`) to certify async tool, structured-output, and
-incremental-delivery capabilities. Production graph model nodes currently use synchronous
-`.invoke()`; exact production transport-path failure behavior is a separate certification concern.
-The structured-output check uses the real provider wire contracts and the gateway-selected
-native transport. Routing conformance covers the flat coarse `RouteProposal`; deterministic
+incremental-delivery capabilities. Production response and reasoning graph nodes use the same
+`ainvoke` surface and tool/structured wrappers behind one whole-node deadline. The
+structured-output check uses the real provider wire contracts and the gateway-selected native
+transport. Routing conformance covers the flat coarse `RouteProposal`; deterministic
 materialization into the nested internal `RouteDecision` is a separate local contract.
 """
 

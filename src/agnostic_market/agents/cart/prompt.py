@@ -1,11 +1,7 @@
-"""Cart model-facing text: the assemble-node instructions + candidate rendering (Group B).
+"""Cart model-facing instructions and candidate rendering.
 
-PROMPT ONLY — what the cart (reasoning-tier) model reads while turning a request into a cart
-tool call (`add_to_cart`/`remove_from_cart`/`set_quantity`/`review_cart`/`buy_now`/
-`go_to_checkout`/`request_cart_clarification`/`leave_cart`). The model picks a KEY into the
-code-narrowed candidate list;
-it never authors a SKU, a price, or a total (those are code). Consent classification, the
-readback, the guardrail, and the cart mutations are CODE in flow.py, not here.
+The cart model fills one missing typed request field, asks for clarification, or leaves the
+capability. It selects only code-issued keys and never authors a SKU, price, total, or effect.
 
 Every rule below that reads like scar tissue IS scar tissue — each was paid for with a live
 failure in checkout/support and must survive the fold into the cart flow (act-or-ask,
@@ -15,7 +11,7 @@ tool-calls-carry-no-text, no-narration, already-placed⇒leave, silent-leave).
 from __future__ import annotations
 
 from agnostic_market.agents._shared_prompt import compose_shared_context
-from agnostic_market.commerce.orders import Candidate
+from agnostic_market.commerce.catalog import Candidate
 from agnostic_market.dtos.orchestration import (
     CartItemChoices,
     ModifyCart,

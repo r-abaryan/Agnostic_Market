@@ -25,7 +25,8 @@ from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutput
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
 
-type SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION = Literal["7"]
+type SemanticRoutingQualificationSchemaVersion = Literal["7"]
+SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION: SemanticRoutingQualificationSchemaVersion = "7"
 RoutingRecognizerFactory = Callable[[CapabilityRegistry], RoutingRecognizer]
 
 _STRICT = ConfigDict(extra="ignore", frozen=True)
@@ -38,15 +39,15 @@ class RoutingActivationError(RuntimeError):
 class _QualificationGate(BaseModel):
     model_config = _STRICT
 
-    mode: Literal["cutover"]
-    passed: Literal[True]
+    mode: Literal["diagnostic", "shadow", "cutover"]
+    passed: bool | None
     failures: tuple[str, ...]
 
 
 class _QualificationProjection(BaseModel):
     model_config = _STRICT
 
-    exact: Literal[True]
+    exact: bool
 
 
 class _QualifiedRecognizer(BaseModel):
@@ -73,7 +74,7 @@ class _QualificationModels(BaseModel):
 class SemanticRoutingQualification(BaseModel):
     model_config = _STRICT
 
-    schema_version: SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
+    schema_version: SemanticRoutingQualificationSchemaVersion
     run_at: datetime
     corpus_fingerprint: str = Field(min_length=1)
     gate: _QualificationGate
@@ -116,10 +117,19 @@ class QualifiedSemanticRouterFactory:
         candidate = qualification.models.candidate
         now = datetime.now(tz=UTC)
         run_at = qualification.run_at
+        failures: list[str] = []
+        if qualification.gate.mode != "cutover":
+            failures.append(f"gate.mode={qualification.gate.mode}")
+        if qualification.gate.passed is not True:
+            failures.append("qualification gate did not pass")
+        if qualification.gate.failures:
+            failures.append("gate failures: " + "; ".join(qualification.gate.failures))
+        if not qualification.projection.exact:
+            failures.append("production context projection was not exact")
         if run_at.tzinfo is None:
-            raise RoutingActivationError("semantic routing qualification timestamp has no timezone")
-        if run_at > now or now - run_at > timedelta(days=self.max_report_age_days):
-            raise RoutingActivationError("semantic routing qualification is not current")
+            failures.append("qualification timestamp has no timezone")
+        elif run_at > now or now - run_at > timedelta(days=self.max_report_age_days):
+            failures.append("qualification is not current")
         expected = {
             "provider": self.selection.provider,
             "model": self.selection.model,
@@ -138,10 +148,11 @@ class QualifiedSemanticRouterFactory:
         ]
         if qualification.corpus_fingerprint != self.expected_corpus_fingerprint:
             mismatches.append("corpus_fingerprint")
-        if qualification.gate.failures or mismatches:
-            details = ", ".join(mismatches) or "gate failures"
+        if mismatches:
+            failures.append("runtime contract mismatches: " + ", ".join(mismatches))
+        if failures:
             raise RoutingActivationError(
-                f"semantic routing qualification does not match the runtime contract: {details}"
+                "semantic routing activation refused: " + " | ".join(failures)
             )
         gateway = LLMGateway(self.credentials, self.secrets)
         return SemanticRouter(

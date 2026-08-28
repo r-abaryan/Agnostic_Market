@@ -7,50 +7,32 @@ agent's `on_enter` hook owns disclosure ordering before any caller turn can be a
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent
+from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent, JobContext
 from livekit.agents.voice.background_audio import AudioConfig, BackgroundAudioPlayer
 from livekit.plugins import langchain as lk_langchain
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
-from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
-from agnostic_market.agents.frontline import build_frontline_graph
-from agnostic_market.agents.routing import RoutingSession
+from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.routing_activation import RoutingRecognizerFactory
 from agnostic_market.agents.telemetry import write_event
-from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.identity import (
-    CallerIdentityStore,
-    CustomerDirectory,
-    assert_orders_have_customers,
-    load_customers_fixture,
-)
-from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
-from agnostic_market.commerce.payment_instruments import (
-    PaymentInstrumentDirectory,
-    assert_payment_instruments_have_customers,
-    load_payment_instruments_fixture,
-)
-from agnostic_market.commerce.profile import (
-    ProfileStore,
-    assert_profiles_have_customers,
-    load_profile_fixture,
-)
-from agnostic_market.commerce.verification import (
-    OtpProvider,
-    RiskProvider,
-    VerificationStore,
-    load_verification_fixture,
+from agnostic_market.application import (
+    ApplicationModels,
+    ApplicationSession,
+    ApplicationSettings,
+    TenantServices,
+    build_application_session,
 )
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
-from agnostic_market.voice.context import CallerContext
+from agnostic_market.session import CallerContext
+from agnostic_market.tenancy.context import TenantContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.stt_engine import build_stt
 from agnostic_market.voice.tts_engine import build_tts
@@ -87,13 +69,24 @@ class VoiceLoop:
 
     session: AgentSession
     agent: DisclosureFirstAgent
-    engine: ReasoningEngine
-    capability_registry: CapabilityRegistry
+    application: ApplicationSession
     # Background "thinking" earcon — a subtle typing sound while the graph works, masking the
     # LLM/tool dead-air on turns the deterministic read renderer can't shortcut (catalog
     # search, multi-intent). CONSTRUCTED here from config; STARTED in the worker entrypoint
     # where the room lives (`background_audio.start(room=..., agent_session=...)`).
     background_audio: BackgroundAudioPlayer
+
+    @property
+    def engine(self) -> ReasoningEngine:
+        return self.application.engine
+
+    @property
+    def capability_registry(self) -> CapabilityRegistry:
+        return self.application.assembly.capability_registry
+
+    def register_shutdown(self, job_context: JobContext) -> None:
+        """Make job shutdown await the caller lifecycle's idempotent teardown."""
+        job_context.add_shutdown_callback(self.application.state.caller_context.aclose_session)
 
 
 # The thinking earcon: a subtle double-blip (assets/audio/, reproducible via its generator
@@ -124,100 +117,31 @@ def build_voice_loop(
     credentials: ProviderCredentialsConfig,
     secrets: SecretResolver,
     *,
-    config_root: Path,
+    deployment_id: str,
+    tenant_services: TenantServices,
     routing_recognizer_factory: RoutingRecognizerFactory,
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
-    store = OrderStore(load_orders_fixture(config_root, config.merchant_id))
-    # The session cart (Group B): mutable working state, built once here like OrderStore and
-    # reaped with the session. The SAME instance feeds BOTH the read-only view_cart tool and
-    # the cart flow (below) — pass one instance to both, or the frontline reads a different
-    # cart than the flow mutates (split-brain).
-    cart_store = CartStore()
-    # Per-session step-up seams (AGENTS §A4a): built once here, like OrderStore, and torn
-    # down with the session (no cross-session state — the durable/keyed form lands in Phase
-    # 4). The store shares the SAME otp the dispatch node uses (verify + dispatch agree).
-    verification_fixture = load_verification_fixture(config_root, config.merchant_id)
-    otp = OtpProvider(valid_code=verification_fixture.otp_code)
-    verification_store = VerificationStore(otp)
-    risk = RiskProvider()
-    policy = config.policies.to_policy_context()
-    # Per-session profile SoR (Group C) — fixture-backed like OrderStore; validated against
-    # the customer directory below before its flow-facing store is constructed.
-    profile_fixture = load_profile_fixture(config_root, config.merchant_id)
-    # Bounded per-principal order references shared by reads and guarded flows.
-    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
-    # Per-session authorization state + the customer directory (P7): the order_status tool
-    # GRANTS into identity_store (rung 1) and the identity flow BINDS it (rung 2); the graph
-    # reads the SAME instance (the render router's order-read gate) — split-brain otherwise.
-    # The build-time cross-checks fail loudly when an order or profile owner names nobody.
-    customers_fixture = load_customers_fixture(config_root, config.merchant_id)
-    payment_instruments_fixture = load_payment_instruments_fixture(config_root, config.merchant_id)
-    assert_orders_have_customers(store.fixture, customers_fixture)
-    assert_profiles_have_customers(profile_fixture, customers_fixture)
-    assert_payment_instruments_have_customers(payment_instruments_fixture, customers_fixture)
-    profile_store = ProfileStore(profile_fixture)
-    customers = CustomerDirectory(customers_fixture)
-    payment_instruments = PaymentInstrumentDirectory(payment_instruments_fixture)
-    identity_store = CallerIdentityStore()
-    caller_context = CallerContext(
-        verification_store=verification_store,
-        cart_store=cart_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        order_store=store,
-    )
     gateway = LLMGateway(credentials, secrets)
-    response_structured_output_method = gateway.structured_output_method(config.llm.response)
-    assembly = build_frontline_graph(
-        chat_model=gateway.chat_model(config.llm.response),
-        display_name=config.display_name,
+    tenant = TenantContext(
         tenant_id=config.merchant_id,
-        # Checkout runs on the reasoning tier (AGENTS §A11: big model for gated flows).
-        reasoning_model=gateway.chat_model(config.llm.reasoning),
-        store=store,
-        cart_store=cart_store,
-        # The ONE config->runtime policy mapping (dtos/config.py to_policy_context) — a new
-        # policy field lands there once, never per-site.
-        policy=policy,
-        # Support step-up seams (3c): the verification level lives in verification_store and
-        # is read LIVE inside the support guardrail — never a checkpointed channel, so a
-        # replayed checkpoint can't re-grant a level (§A388).
-        verification_store=verification_store,
-        otp=otp,
-        risk=risk,
-        profile_store=profile_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        customers=customers,
-        payment_instruments=payment_instruments,
-        lifecycle=caller_context,
-        structured_output_method=response_structured_output_method,
-        caller_audible_model_text_max_chars=(config.runtime.caller_audible_model_text_max_chars),
-        # The checkout/support HITL interrupts need a durable thread (in-memory for the build
-        # phase; the Redis saver is a constructor swap at deploy). The serde trusts our
-        # checkpointed DTOs (build_checkpointer) — no 'unregistered type' warning.
-        checkpointer=build_checkpointer(),
+        config_version=resolved.config_version,
+        policy=config.policies.to_policy_context(),
     )
-    routing = RoutingSession(
-        routing_recognizer_factory(assembly.capability_registry),
-        identity_store=identity_store,
-        cart_store=cart_store,
-        recent_orders=recent_orders,
-        registry=assembly.capability_registry,
-    )
-    engine = ReasoningEngine(
-        assembly.graph,
-        thread_id=uuid.uuid4().hex,
-        cancellation_quiescence_timeout_seconds=(
-            config.runtime.cancellation_quiescence_timeout_seconds
+    application = build_application_session(
+        tenant,
+        ApplicationSettings.from_merchant_config(config),
+        ApplicationModels(
+            response=gateway.chat_model(config.llm.response),
+            reasoning=gateway.chat_model(config.llm.reasoning),
+            response_structured_output_method=gateway.structured_output_method(config.llm.response),
         ),
-        routing=routing,
-        lifecycle=caller_context,
+        tenant_services,
+        deployment_id=deployment_id,
+        routing_factory=routing_recognizer_factory,
     )
-    caller_context.attach_engine(engine)
-    adapter = GraphVoiceAdapter(engine)
+    adapter = GraphVoiceAdapter(application.engine)
 
     session = AgentSession(
         stt=build_stt(config.voice.stt, credentials, secrets),
@@ -246,7 +170,7 @@ def build_voice_loop(
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
     _attach_turn_metrics_logger(session)
-    _attach_thread_reaper(session, caller_context)
+    _attach_thread_reaper(session, application.state.caller_context)
 
     agent = DisclosureFirstAgent(
         # Prompt lives in the graph (F1); empty here is dropped by the adapter, no duplicate.
@@ -259,8 +183,7 @@ def build_voice_loop(
     return VoiceLoop(
         session=session,
         agent=agent,
-        engine=engine,
-        capability_registry=assembly.capability_registry,
+        application=application,
         background_audio=_build_background_audio(),
     )
 
@@ -270,11 +193,12 @@ def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) 
     UNCONDITIONALLY — a dropped call must never leave a resumable placement/refund, a stale
     level, cart, recent-order context, verified identity, or guest order for a reattaching
     session. The per-session stores already die with it; this is belt-and-suspenders. The whole
-    teardown lives in `CallerContext.close_session` (Fix 5), which is itself idempotent; the
+    teardown lives in `CallerContext.aclose_session` (Fix 5), which is itself idempotent; the
     reaper adds the session-close-specific `flow_abandoned` telemetry (pending interrupt) and a
     re-entrant guard so a double-fired close acts at most once. Nothing is spoken (the caller is
     gone); expiry of a still-connected caller's pending action is Clock A (the confirm node)."""
     reaped = False
+    close_tasks: set[asyncio.Task[None]] = set()
 
     @session.on("close")
     def _reap(_event: object) -> None:
@@ -282,9 +206,23 @@ def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) 
         if reaped:
             return
         reaped = True
-        if caller_context.engine.pending_interrupt():
-            write_event({"event": "flow_abandoned", "reason": "session_closed"})
-        caller_context.close_session()
+
+        async def close() -> None:
+            await caller_context.aclose_session()
+            if caller_context.close_had_pending_interrupt:
+                write_event({"event": "flow_abandoned", "reason": "session_closed"})
+
+        def completed(task: asyncio.Task[None]) -> None:
+            close_tasks.discard(task)
+            if not task.cancelled() and (error := task.exception()) is not None:
+                logger.critical(
+                    "caller-context close failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task = asyncio.create_task(close())
+        close_tasks.add(task)
+        task.add_done_callback(completed)
 
 
 def _attach_turn_metrics_logger(session: AgentSession) -> None:

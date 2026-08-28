@@ -22,6 +22,7 @@ from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
 )
+from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.commerce.verification import RiskProvider
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
@@ -43,6 +44,13 @@ from agnostic_market.dtos.state import (
 _FACTS = TurnFacts()
 _OTP = "482913"
 _CUST1 = BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119")
+
+
+def _assert_checkpoint_thread_retired(engine, config) -> None:
+    with pytest.raises(CheckpointScopeError, match="namespace"):
+        engine._graph.get_state(config)
+
+
 _CUST2 = BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
 
 
@@ -316,6 +324,7 @@ async def test_identity_apply_failure_after_coherent_publish_rotates_and_continu
 ) -> None:
     harness = _identity_harness(config_root, thread_id="transition-after-publish")
     old_thread = harness.engine.thread_id
+    old_config = harness.engine._config
     await _events(harness, "list my account orders")
 
     real_write = identity_flow.write_event
@@ -332,7 +341,7 @@ async def test_identity_apply_failure_after_coherent_publish_rotates_and_continu
     assert harness.caller_context.pending_transition() is None
     assert harness.identity.current() == _CUST1
     assert len(harness.verification.grants) == 1
-    assert harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values == {}
+    _assert_checkpoint_thread_retired(harness.engine, old_config)
     lines = [event.text for event in _spoken(recovered)]
     assert len(lines) == 1
     assert "ORD-1001" in lines[0] and "ORD-1003" in lines[0]
@@ -364,6 +373,7 @@ async def test_switch_apply_failure_after_coherent_publish_preserves_acknowledge
     assert harness.verification.verify_otp(_OTP)
     harness.identity.bind(_CUST1)
     old_thread = harness.engine.thread_id
+    old_config = harness.engine._config
     warning = await _events(harness, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in warning)
     dispatched = await _events(harness, "yes")
@@ -384,7 +394,7 @@ async def test_switch_apply_failure_after_coherent_publish_preserves_acknowledge
     assert harness.engine.thread_id != old_thread
     assert harness.identity.current() == _CUST2
     assert harness.caller_context.pending_transition() is None
-    assert harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values == {}
+    _assert_checkpoint_thread_retired(harness.engine, old_config)
 
 
 async def test_verify_apply_failure_after_coherent_publish_preserves_acknowledgement(
@@ -407,6 +417,7 @@ async def test_verify_apply_failure_after_coherent_publish_preserves_acknowledge
         as_node="__start__",
     )
     old_thread = harness.engine.thread_id
+    old_config = harness.engine._config
     dispatched = await _events(harness, "continue")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
     real_write = identity_flow.write_event
@@ -423,7 +434,7 @@ async def test_verify_apply_failure_after_coherent_publish_preserves_acknowledge
     assert harness.engine.thread_id != old_thread
     assert harness.identity.current() == _CUST1
     assert harness.caller_context.pending_transition() is None
-    assert harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values == {}
+    _assert_checkpoint_thread_retired(harness.engine, old_config)
     new_state = harness.engine._graph.get_state(harness.engine._config)
     assert new_state.next == ()
     assert new_state.values.get("active_invocation") is None
@@ -444,6 +455,7 @@ async def test_cancelled_identity_apply_resolves_principal_publication_fail_clos
     old_proof = harness.verification.grants[-1]
     harness.identity.bind(_CUST1)
     old_thread = harness.engine.thread_id
+    old_config = harness.engine._config
     warning = await _events(harness, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in warning)
     dispatched = await _events(harness, "yes")
@@ -504,10 +516,7 @@ async def test_cancelled_identity_apply_resolves_principal_publication_fail_clos
         assert harness.identity.current() == _CUST2
         assert harness.caller_context.pending_transition() is None
         assert harness.engine._graph.get_state(harness.engine._config).next == ()
-        assert (
-            harness.engine._graph.get_state({"configurable": {"thread_id": old_thread}}).values
-            == {}
-        )
+        _assert_checkpoint_thread_retired(harness.engine, old_config)
     else:
         terminal = await _events(harness, "continue")
         assert [event.text for event in _spoken(terminal)] == [AUTOMATION_TERMINAL_LINE]
@@ -671,7 +680,8 @@ async def test_deferred_terminal_cleanup_yields_to_session_close_without_recreat
     with pytest.raises(asyncio.CancelledError):
         await applying
 
-    harness.caller_context.close_session()
+    closing = asyncio.create_task(harness.caller_context.aclose_session())
+    await asyncio.sleep(0)
     assert harness.engine._node_execution_tracker.active_node_names == frozenset({"identity_apply"})
     assert harness.engine._graph.get_state(harness.engine._config).values
 
@@ -679,15 +689,16 @@ async def test_deferred_terminal_cleanup_yields_to_session_close_without_recreat
     harness.engine._node_execution_tracker.defer_until_fully_idle(close_complete.set)
     release.set()
     assert await asyncio.to_thread(close_complete.wait, 5)
+    await closing
 
     assert harness.identity.current() is None
     assert not harness.identity.has_residual_order_authority()
     assert harness.verification.current_level() == 1
     assert harness.caller_context.pending_transition() is None
-    assert harness.engine._graph.get_state(harness.engine._config).values == {}
+    _assert_checkpoint_thread_retired(harness.engine, harness.engine._config)
     terminal = await _events(harness, "continue")
     assert _spoken(terminal) == []
-    assert harness.engine._graph.get_state(harness.engine._config).values == {}
+    _assert_checkpoint_thread_retired(harness.engine, harness.engine._config)
 
 
 async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
@@ -731,15 +742,15 @@ async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
     completing = asyncio.create_task(_events(harness, _OTP))
     assert await asyncio.to_thread(published.wait, 5)
     queued_arrived = asyncio.Event()
-    real_get_state = engine._graph.get_state
+    real_get_state = engine._graph.aget_state
 
-    def observe_queued_arrival(config):
+    async def observe_queued_arrival(config):
         task = asyncio.current_task()
         if task is not None and task.get_name() == "queued-old-thread":
             queued_arrived.set()
-        return real_get_state(config)
+        return await real_get_state(config)
 
-    monkeypatch.setattr(engine._graph, "get_state", observe_queued_arrival)
+    monkeypatch.setattr(engine._graph, "aget_state", observe_queued_arrival)
     queued = asyncio.create_task(_events(harness, "yes"), name="queued-old-thread")
     await asyncio.wait_for(queued_arrived.wait(), timeout=5)
     release_apply.set()
@@ -755,7 +766,7 @@ async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
     assert len(first_prompts) == 1 and "ORD-1002" in first_prompts[0]
     assert len(prompts) == 1 and "ORD-1002" in prompts[0]
     assert prompts == first_prompts
-    assert engine.pending_interrupt()
+    assert await engine.apending_interrupt()
     assert tuple(engine._graph.get_state(engine._config).values["consumed_turn_ids"]) == (
         "test-turn-1",
         "test-turn-2",
@@ -786,19 +797,19 @@ async def test_checkpointer_and_takeover_failure_latches_terminal_without_later_
     read_calls = 0
     takeover_calls = 0
 
-    def fail_get_state(_config):
+    async def fail_get_state(_config):
         nonlocal read_calls
         read_calls += 1
         raise RuntimeError("injected checkpointer read failure")
 
-    def fail_takeover(_config, _values, *, as_node=None):
+    async def fail_takeover(_config, _values, *, as_node=None):
         nonlocal takeover_calls
         takeover_calls += 1
         assert as_node == "automation_terminal_response"
         raise RuntimeError("injected checkpoint takeover failure")
 
-    monkeypatch.setattr(harness.engine._graph, "get_state", fail_get_state)
-    monkeypatch.setattr(harness.engine._graph, "update_state", fail_takeover)
+    monkeypatch.setattr(harness.engine._graph, "aget_state", fail_get_state)
+    monkeypatch.setattr(harness.engine._graph, "aupdate_state", fail_takeover)
 
     first = await _events(harness, "hello")
     second = await _events(harness, "try again")
@@ -924,6 +935,7 @@ async def test_rotation_failure_is_one_shot_and_terminal(
     )
     engine = harness.engine
     old_thread = engine.thread_id
+    old_storage_thread = engine._config["configurable"]["thread_id"]
     assert harness.verification.verify_otp(_OTP)
     transition = harness.caller_context.transition_principal(
         _CUST1,
@@ -939,30 +951,30 @@ async def test_rotation_failure_is_one_shot_and_terminal(
 
     monkeypatch.setattr(engine_module, "_new_thread_id", one_thread_id)
     if failure_point in {"seed", "contamination"}:
-        real_update = engine._graph.update_state
+        real_update = engine._graph.aupdate_state
 
-        def intercept_seed(config, values, *, as_node=None):
-            if config["configurable"]["thread_id"].startswith("new-thread-"):
+        async def intercept_seed(config, values, *, as_node=None):
+            if config["configurable"]["thread_id"] != old_storage_thread:
                 if failure_point == "seed":
                     raise RuntimeError("injected rotation seed failure")
-                real_update(config, values, as_node=as_node)
-                return real_update(
+                await real_update(config, values, as_node=as_node)
+                return await real_update(
                     config,
                     {"identity_claim_misses": 1},
                     as_node="__start__",
                 )
-            return real_update(config, values, as_node=as_node)
+            return await real_update(config, values, as_node=as_node)
 
-        monkeypatch.setattr(engine._graph, "update_state", intercept_seed)
+        monkeypatch.setattr(engine._graph, "aupdate_state", intercept_seed)
     elif failure_point == "delete":
-        real_delete = engine._graph.checkpointer.delete_thread
+        real_delete = engine._graph.checkpointer.adelete_thread
 
-        def fail_old_delete(thread_id: str) -> None:
-            if thread_id == old_thread:
+        async def fail_old_delete(thread_id: str) -> None:
+            if thread_id == old_storage_thread:
                 raise RuntimeError("injected old-thread delete failure")
-            real_delete(thread_id)
+            await real_delete(thread_id)
 
-        monkeypatch.setattr(engine._graph.checkpointer, "delete_thread", fail_old_delete)
+        monkeypatch.setattr(engine._graph.checkpointer, "adelete_thread", fail_old_delete)
     else:
 
         def fail_completion(transition_id: str) -> None:
