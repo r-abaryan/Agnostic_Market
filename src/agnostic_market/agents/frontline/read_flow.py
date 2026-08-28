@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -21,6 +21,7 @@ from agnostic_market.agents.frontline.typed_prompt import (
 )
 from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.telemetry import write_capability_answered, write_event
+from agnostic_market.commerce.catalog import CatalogPort
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
@@ -31,9 +32,9 @@ from agnostic_market.commerce.identity import (
 from agnostic_market.commerce.orders import (
     BOUND_ORDER_READ_UNAVAILABLE_LINE,
     ORDER_CONTACT_NOT_FOUND_LINE,
+    GuestOrderScope,
     OrderStore,
     RecentOrderContext,
-    lookup_catalog,
     render_order_status_line,
 )
 from agnostic_market.commerce.spoken import caller_stated_order_ids
@@ -87,13 +88,13 @@ _ANSWER_UNSUPPORTED_RETRY = (
 class ReadFlowNodes:
     catalog_entry: Callable[[ReasoningState], Command]
     catalog_query_reject: Callable[[ReasoningState], dict[str, object]]
-    catalog_response: Callable[[ReasoningState], Command]
-    answer_response: Callable[[ReasoningState], Command]
+    catalog_response: Callable[[ReasoningState], Awaitable[Command]]
+    answer_response: Callable[[ReasoningState], Awaitable[Command]]
     answer_clarify: Callable[[ReasoningState], dict[str, object]]
     answer_unsupported: Callable[[ReasoningState], dict[str, object]]
     order_status_entry: Callable[[ReasoningState], Command]
     order_status_target_ask: Callable[[ReasoningState], dict[str, object]]
-    order_status_target_propose: Callable[[ReasoningState], Command]
+    order_status_target_propose: Callable[[ReasoningState], Awaitable[Command]]
     order_status_target_confirm: Callable[[ReasoningState], Command]
     order_status_target_reject: Callable[[ReasoningState], dict[str, object]]
     order_status_fulfill: Callable[[ReasoningState], Command]
@@ -104,6 +105,8 @@ class ReadFlowNodes:
 def build_read_flow_nodes(
     response_model: BaseChatModel,
     order_store: OrderStore,
+    catalog: CatalogPort,
+    guest_orders: GuestOrderScope,
     policy: PolicyContext,
     *,
     display_name: str,
@@ -159,7 +162,7 @@ def build_read_flow_nodes(
         )
         return {"messages": [AIMessage(line)]}
 
-    def order_status_target_propose_node(state: ReasoningState) -> Command:
+    async def order_status_target_propose_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
             raise TypeError("order-status proposer requires a verify-order-status invocation")
@@ -168,7 +171,9 @@ def build_read_flow_nodes(
         current = state.current_committed_user_message()
         if current is None or not isinstance(current.content, str):
             raise ValueError("order-status proposer requires committed caller text")
-        proposal = order_target_model.invoke([SystemMessage(ORDER_TARGET_PROPOSAL_PROMPT), current])
+        proposal = await order_target_model.ainvoke(
+            [SystemMessage(ORDER_TARGET_PROPOSAL_PROMPT), current]
+        )
         if not isinstance(proposal, OrderTargetProposal):
             raise TypeError("order-status proposer returned an incompatible result")
         refs = tuple(dict.fromkeys(ref.strip().upper() for ref in proposal.order_refs))
@@ -296,7 +301,12 @@ def build_read_flow_nodes(
         unresolved = tuple(
             order_id
             for order_id in order_ids
-            if not order_read_allowed(order_id, store=order_store, identity=identity_store)
+            if not order_read_allowed(
+                order_id,
+                store=order_store,
+                guest_orders=guest_orders,
+                identity=identity_store,
+            )
         )
         if unresolved:
             if identity_store.current() is not None:
@@ -341,7 +351,12 @@ def build_read_flow_nodes(
                 )
 
         if any(
-            not order_read_allowed(order_id, store=order_store, identity=identity_store)
+            not order_read_allowed(
+                order_id,
+                store=order_store,
+                guest_orders=guest_orders,
+                identity=identity_store,
+            )
             for order_id in order_ids
         ):
             raise RuntimeError("order-status authorization did not survive grant resolution")
@@ -399,7 +414,7 @@ def build_read_flow_nodes(
             raise TypeError("catalog query rejection requires the invocation to be cleared")
         return {"messages": [AIMessage(_CATALOG_QUERY_REJECTED)]}
 
-    def catalog_response_node(state: ReasoningState) -> Command:
+    async def catalog_response_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, SearchCatalog):
             raise TypeError("catalog response requires a search-catalog invocation")
@@ -412,8 +427,8 @@ def build_read_flow_nodes(
         if not isinstance(current.content, str):
             raise TypeError("catalog response requires plain committed caller text")
 
-        result = lookup_catalog(order_store.fixture, request.query)
-        response = response_model.invoke(
+        result = catalog.search(request.query)
+        response = await response_model.ainvoke(
             [
                 SystemMessage(compose_catalog_response_prompt(display_name, policy, result)),
                 current,
@@ -435,7 +450,7 @@ def build_read_flow_nodes(
             update={"active_invocation": None, "messages": [response]},
         )
 
-    def answer_response_node(state: ReasoningState) -> Command:
+    async def answer_response_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, AnswerQuestion):
             raise TypeError("answer response requires an answer-question invocation")
@@ -445,7 +460,7 @@ def build_read_flow_nodes(
         if not isinstance(current.content, str):
             raise TypeError("answer response requires plain committed caller text")
 
-        result = answer_model.invoke(
+        result = await answer_model.ainvoke(
             [
                 SystemMessage(
                     compose_answer_response_prompt(

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -210,17 +212,12 @@ class NodeExecutionTracker:
             self._condition.notify_all()
         return full_callbacks
 
-    def _run(
-        self,
-        node_name: str,
-        operation: Callable[..., Any],
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
+    @contextmanager
+    def _node_span(self, node_name: str) -> Iterator[None]:
         with self._condition:
             self._active_by_node[node_name] = self._active_by_node.get(node_name, 0) + 1
         try:
-            return operation(*args, **kwargs)
+            yield
         finally:
             with self._condition:
                 remaining = self._active_by_node[node_name] - 1
@@ -230,6 +227,26 @@ class NodeExecutionTracker:
                     del self._active_by_node[node_name]
                 full_callbacks = self._fully_idle_callbacks_locked()
             self._run_callbacks(full_callbacks)
+
+    def _run(
+        self,
+        node_name: str,
+        operation: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        with self._node_span(node_name):
+            return operation(*args, **kwargs)
+
+    async def _arun(
+        self,
+        node_name: str,
+        operation: Callable[..., Awaitable[Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        with self._node_span(node_name):
+            return await operation(*args, **kwargs)
 
     @contextmanager
     def turn_span(self) -> Iterator[bool]:
@@ -256,6 +273,13 @@ class NodeExecutionTracker:
                 raise RuntimeError(f"node is already tracked: {node_name!r}")
             self._tracked_node_names.add(node_name)
         runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
+
+        if _is_async_callable(node):
+
+            async def arun(state: object, config: RunnableConfig) -> Any:
+                return await self._arun(node_name, runnable.ainvoke, state, config)
+
+            return arun
 
         def run(state: object, config: RunnableConfig) -> Any:
             return self._run(node_name, runnable.invoke, state, config)
@@ -296,13 +320,45 @@ def _validate_node_result(node_name: str, result: object) -> object:
     return result
 
 
+def _is_async_callable(value: object) -> bool:
+    return inspect.iscoroutinefunction(value)
+
+
 def _wrap_state_node(node_name: str, node: object) -> Callable[[object, RunnableConfig], Any]:
     runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
+
+    if _is_async_callable(node):
+
+        async def arun(state: object, config: RunnableConfig) -> Any:
+            result = await runnable.ainvoke(state, config)
+            return _validate_node_result(node_name, result)
+
+        return arun
 
     def run(state: object, config: RunnableConfig) -> Any:
         return _validate_node_result(node_name, runnable.invoke(state, config))
 
     return run
+
+
+class _ModelNodeExecutionBoundary:
+    """Apply one application deadline to a complete native-async model node."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("model node timeout must be positive")
+        self._timeout_seconds = timeout_seconds
+
+    def wrap(self, node_name: str, node: object) -> Callable[[object, RunnableConfig], Any]:
+        if not _is_async_callable(node):
+            raise TypeError(f"model node {node_name!r} must be native async")
+        runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
+
+        async def run(state: object, config: RunnableConfig) -> Any:
+            async with asyncio.timeout(self._timeout_seconds):
+                return await runnable.ainvoke(state, config)
+
+        return run
 
 
 def _wrap_error_handler(node_name: str, handler: NodeErrorHandler) -> NodeErrorHandler:
@@ -322,9 +378,21 @@ class NodePolicyRegistry:
         graph: StateGraph,
         *,
         error_handler_factory: NodeErrorHandlerFactory | None = None,
+        model_node_timeouts: Mapping[str, float] | None = None,
     ) -> None:
+        resolved_model_timeouts = dict(model_node_timeouts or {})
+        model_node_names = frozenset(resolved_model_timeouts)
+        if any(not name for name in model_node_names):
+            raise ValueError("model node names must be non-empty")
+        if any(timeout <= 0 for timeout in resolved_model_timeouts.values()):
+            raise ValueError("model node timeouts must be positive")
         self._graph = graph
         self._error_handler_factory = error_handler_factory
+        self._model_node_names = model_node_names
+        self._model_boundaries = {
+            name: _ModelNodeExecutionBoundary(timeout)
+            for name, timeout in resolved_model_timeouts.items()
+        }
         self._policies: dict[str, NodeRecoveryPolicy] = {}
         self._infrastructure: set[str] = set()
         self._handled: set[str] = set()
@@ -379,10 +447,12 @@ class NodePolicyRegistry:
             if self._error_handler_factory is not None
             else None
         )
+        boundary = self._model_boundaries.get(name)
+        bounded_node = boundary.wrap(name, node) if boundary is not None else node
         registered_node = (
-            node
+            bounded_node
             if on_abandonment == AbandonmentKind.PURE_ABORT
-            else self._execution_tracker.wrap(name, node)
+            else self._execution_tracker.wrap(name, bounded_node)
         )
         self._add_node(
             name,
@@ -439,11 +509,13 @@ class NodePolicyRegistry:
         )
         actual_tracked = self._execution_tracker.tracked_node_names
         expected = registered | infrastructure
+        missing_model_nodes = self._model_node_names - registered
         if (
             expected != actual_regular
             or missing_handler_links
             or expected_handlers != actual_handlers
             or expected_tracked != actual_tracked
+            or missing_model_nodes
         ):
             raise RuntimeError(
                 "graph nodes bypassed the recovery-policy registry: "
@@ -453,7 +525,8 @@ class NodePolicyRegistry:
                 f"unexpected_handlers={sorted(actual_handlers - expected_handlers)!r}, "
                 f"missing_handlers={sorted(expected_handlers - actual_handlers)!r}, "
                 f"untracked_mutable={sorted(expected_tracked - actual_tracked)!r}, "
-                f"unexpected_tracked={sorted(actual_tracked - expected_tracked)!r}"
+                f"unexpected_tracked={sorted(actual_tracked - expected_tracked)!r}, "
+                f"missing_model_nodes={sorted(missing_model_nodes)!r}"
             )
         if self._validated is None:
             self._validated = MappingProxyType(dict(self._policies))

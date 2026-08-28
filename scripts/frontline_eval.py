@@ -46,12 +46,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.capabilities import CapabilityRegistry
-from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech, build_checkpointer
+from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
 from agnostic_market.agents.frontline import (
     FRONTLINE_SPEAKABLE_NODES,
     MODEL_SPEECH_NODES,
     NON_SPEAKING_MODEL_NODES,
-    build_frontline_graph,
 )
 from agnostic_market.agents.frontline.graph import _build_frontline_capability_registry
 from agnostic_market.agents.frontline.read_flow import (
@@ -69,7 +68,6 @@ from agnostic_market.agents.routing import (
     ProviderCallOutcome,
     RoutingAttempt,
     RoutingRecognizer,
-    RoutingSession,
     SemanticRouter,
     materialize_route,
     project_routing_context,
@@ -79,31 +77,22 @@ from agnostic_market.agents.routing import (
 from agnostic_market.agents.routing_activation import (
     SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
 )
+from agnostic_market.application import (
+    ApplicationModels,
+    ApplicationSession,
+    ApplicationSettings,
+    build_application_session,
+    build_fixture_tenant_services,
+    build_in_memory_session_state,
+)
+from agnostic_market.checkpoints import SchemaValidatedCheckpointSaver, build_checkpointer
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.identity import (
-    CallerIdentityStore,
-    CustomerDirectory,
-    assert_orders_have_customers,
-    load_customers_fixture,
-)
-from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
-from agnostic_market.commerce.payment_instruments import (
-    PaymentInstrumentDirectory,
-    assert_payment_instruments_have_customers,
-    load_payment_instruments_fixture,
-)
-from agnostic_market.commerce.profile import (
-    ProfileStore,
-    assert_profiles_have_customers,
-    load_profile_fixture,
-)
+from agnostic_market.commerce.identity import CallerIdentityStore
+from agnostic_market.commerce.orders import OrderStore, RecentOrderContext
+from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.spoken import caller_stated_order_ids
-from agnostic_market.commerce.verification import (
-    OtpProvider,
-    VerificationStore,
-    load_verification_fixture,
-)
-from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.config.loader import ConfigError, config_version, load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.config import MerchantConfig, ProviderModel
 from agnostic_market.dtos.events import (
@@ -144,7 +133,8 @@ from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.llm.providers import load_conformance_targets
 from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
-from agnostic_market.voice.context import CallerContext
+from agnostic_market.session import CallerContext
+from agnostic_market.tenancy.context import TenantContext
 
 if __package__:
     from .transport_fault_proxy import (
@@ -169,6 +159,7 @@ _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
 _SAFETY_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_safety.yaml"
 _READ_OWNER_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_read_owners.yaml"
 _READ_OWNER_EVAL_SCHEMA_VERSION = "1"
+_EVAL_DEPLOYMENT_ID = "frontline-eval"
 _ORDER_TARGET_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_order_targets.yaml"
 _ORDER_TARGET_EVAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_EVAL_PATH = _CONFIG_ROOT / "eval" / "frontline_semantic_routes.yaml"
@@ -1190,6 +1181,7 @@ class ScenarioObservation:
 
 @dataclass(frozen=True)
 class EvalRuntime:
+    application: ApplicationSession
     graph: CompiledStateGraph
     capability_registry: CapabilityRegistry
     engine: ReasoningEngine
@@ -1308,12 +1300,12 @@ def _commerce_observation(
     )
 
 
-def _checkpoint_observation(
+async def _checkpoint_observation(
     engine: ReasoningEngine,
 ) -> tuple[GraphObservation, int, tuple[str, ...]]:
     # Evaluator-only checkpoint inspection. Adding a production introspection API solely for
     # tests would widen ReasoningEngine's application contract.
-    snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
+    snapshot = await engine._graph.aget_state(engine._config)
     values = snapshot.values
     handover = values.get("handover")
     return (
@@ -1347,86 +1339,61 @@ def _build_eval_runtime(
     structured_output_method: StructuredOutputMethod,
     routing_structured_output_method: StructuredOutputMethod,
 ) -> EvalRuntime:
-    store = OrderStore(load_orders_fixture(_CONFIG_ROOT, config.merchant_id))
-    cart_store = CartStore()
-    customers_fixture = load_customers_fixture(_CONFIG_ROOT, config.merchant_id)
-    payment_instruments_fixture = load_payment_instruments_fixture(_CONFIG_ROOT, config.merchant_id)
-    profile_fixture = load_profile_fixture(_CONFIG_ROOT, config.merchant_id)
-    assert_orders_have_customers(store.fixture, customers_fixture)
-    assert_profiles_have_customers(profile_fixture, customers_fixture)
-    assert_payment_instruments_have_customers(payment_instruments_fixture, customers_fixture)
-    customers = CustomerDirectory(customers_fixture)
-    payment_instruments = PaymentInstrumentDirectory(payment_instruments_fixture)
-    profile_store = ProfileStore(profile_fixture)
-    identity_store = CallerIdentityStore()
-    policy = config.policies.to_policy_context()
-    recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
-    verification_fixture = load_verification_fixture(_CONFIG_ROOT, config.merchant_id)
-    otp = OtpProvider(valid_code=verification_fixture.otp_code)
-    verification = VerificationStore(otp)
-    caller_context = CallerContext(
-        verification_store=verification,
-        cart_store=cart_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        order_store=store,
-    )
-    assembly = build_frontline_graph(
-        response_model,
-        display_name=config.display_name,
+    tenant = TenantContext(
         tenant_id=config.merchant_id,
-        reasoning_model=reasoning_model,
-        store=store,
-        otp=otp,
-        verification_store=verification,
-        cart_store=cart_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        customers=customers,
-        payment_instruments=payment_instruments,
-        profile_store=profile_store,
-        policy=policy,
-        lifecycle=caller_context,
-        structured_output_method=structured_output_method,
-        caller_audible_model_text_max_chars=(config.runtime.caller_audible_model_text_max_chars),
+        config_version=config_version(config.model_dump(mode="json")),
+        policy=config.policies.to_policy_context(),
+    )
+    services = build_fixture_tenant_services(
+        _CONFIG_ROOT,
+        config.merchant_id,
         checkpointer=build_checkpointer(),
     )
-    engine = ReasoningEngine(
-        assembly.graph,
-        thread_id=thread_id,
-        cancellation_quiescence_timeout_seconds=(
-            config.runtime.cancellation_quiescence_timeout_seconds
+
+    def routing_factory(registry: CapabilityRegistry) -> RoutingRecognizer:
+        return routing_recognizer or SemanticRouter(
+            routing_model,
+            selection=config.llm.routing,
+            structured_output_method=routing_structured_output_method,
+            timeout_seconds=config.runtime.semantic_router_timeout_seconds,
+            input_max_chars=config.runtime.semantic_router_input_max_chars,
+            registry=registry,
+        )
+
+    def session_state_factory(tenant_context, tenant_services):
+        return build_in_memory_session_state(
+            tenant_context,
+            tenant_services,
+            thread_id=thread_id,
+        )
+
+    application = build_application_session(
+        tenant,
+        ApplicationSettings.from_merchant_config(config),
+        ApplicationModels(
+            response=response_model,
+            reasoning=reasoning_model,
+            response_structured_output_method=structured_output_method,
         ),
-        routing=RoutingSession(
-            routing_recognizer
-            or SemanticRouter(
-                routing_model,
-                selection=config.llm.routing,
-                structured_output_method=routing_structured_output_method,
-                timeout_seconds=config.runtime.semantic_router_timeout_seconds,
-                input_max_chars=config.runtime.semantic_router_input_max_chars,
-                registry=assembly.capability_registry,
-            ),
-            identity_store=identity_store,
-            cart_store=cart_store,
-            recent_orders=recent_orders,
-            registry=assembly.capability_registry,
-        ),
-        lifecycle=caller_context,
+        services,
+        deployment_id=_EVAL_DEPLOYMENT_ID,
+        routing_factory=routing_factory,
+        session_state_factory=session_state_factory,
     )
-    caller_context.attach_engine(engine)
+    state = application.state
     return EvalRuntime(
-        graph=assembly.graph,
-        capability_registry=assembly.capability_registry,
-        engine=engine,
-        store=store,
-        cart_store=cart_store,
-        profile_store=profile_store,
-        otp=otp,
-        verification=verification,
-        identity_store=identity_store,
-        recent_orders=recent_orders,
-        caller_context=caller_context,
+        application=application,
+        graph=application.assembly.graph,
+        capability_registry=application.assembly.capability_registry,
+        engine=application.engine,
+        store=services.order_store,
+        cart_store=state.cart_store,
+        profile_store=services.profile_store,
+        otp=services.otp,
+        verification=state.verification_store,
+        identity_store=state.identity_store,
+        recent_orders=state.recent_orders,
+        caller_context=state.caller_context,
     )
 
 
@@ -1450,7 +1417,7 @@ async def _observe_scenario(
             message_id=f"{scenario_key}:turn:{turn_index}",
         )
         events = tuple([event async for event in engine.stream_turn(turn, TurnFacts())])
-        state, completed_tool_calls, admitted_user_messages = _checkpoint_observation(engine)
+        state, completed_tool_calls, admitted_user_messages = await _checkpoint_observation(engine)
         turns.append(
             TurnObservation(
                 utterance=utterance,
@@ -3016,8 +2983,9 @@ async def _run_semantic_route_eval(
     )
     try:
         corpus = _load_semantic_route_corpus()
-        config_key = {"configurable": {"thread_id": runtime.engine.thread_id}}
-        state = ReasoningState.from_checkpoint(runtime.graph.get_state(config_key).values)
+        state = ReasoningState.from_checkpoint(
+            (await runtime.graph.aget_state(runtime.engine._config)).values
+        )
         projected = project_routing_context(
             corpus.projected_case.turn,
             state,
@@ -3151,7 +3119,7 @@ async def _run_semantic_route_eval(
         )
         return 0
     finally:
-        runtime.caller_context.close_session()
+        await runtime.caller_context.aclose_session()
 
 
 def _score_read_owner_output(
@@ -3192,9 +3160,13 @@ def _read_owner_disposition(
 
 
 async def _run_read_owner_cases(
-    graph: CompiledStateGraph,
+    engine: ReasoningEngine,
     corpus: ReadOwnerEvalCorpus,
 ) -> dict[str, tuple[str, ...]]:
+    graph = engine._graph
+    checkpointer = graph.checkpointer
+    if not isinstance(checkpointer, SchemaValidatedCheckpointSaver):
+        raise RuntimeError("read-owner evaluation requires the production checkpoint boundary")
     failures: dict[str, tuple[str, ...]] = {}
     for case in corpus.cases:
         request: IntentRequest
@@ -3203,6 +3175,12 @@ async def _run_read_owner_cases(
         else:
             request = AnswerQuestion(topic=case.topic)
         turn_id = f"read-owner:{case.case_id}:{uuid.uuid4().hex}"
+        binding = engine._checkpoint_binding.rotate(turn_id)
+        checkpointer.bind_checkpoint_contract(
+            graph.channels,
+            binding=binding,
+            io_timeout_seconds=engine._checkpoint_io_timeout_seconds,
+        )
         spoken: list[str] = []
         response_nodes: list[str] = []
         async for update in graph.astream(
@@ -3214,7 +3192,7 @@ async def _run_read_owner_cases(
                     consumed_turn_ids=(turn_id,),
                 ),
             },
-            {"configurable": {"thread_id": turn_id}},
+            binding.config,
             stream_mode="updates",
         ):
             for node, delta in update.items():
@@ -3387,13 +3365,12 @@ def _transport_case_matrix(
     return tuple(cases)
 
 
-def _seed_transport_request(runtime: EvalRuntime, scenario: TransportOwnerScenario) -> None:
+async def _seed_transport_request(runtime: EvalRuntime, scenario: TransportOwnerScenario) -> None:
     if scenario.initial_request is None:
         return
     opening_turn_ids = (f"transport:{scenario.scenario_id}:opening",)
-    config = {"configurable": {"thread_id": runtime.engine.thread_id}}
-    runtime.graph.update_state(
-        config,
+    await runtime.graph.aupdate_state(
+        runtime.engine._config,
         {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "consumed_turn_ids": opening_turn_ids,
@@ -3407,7 +3384,7 @@ def _seed_transport_request(runtime: EvalRuntime, scenario: TransportOwnerScenar
         # consumes the next message id without appending caller text.
         as_node=runtime.graph.principal_seed_complete_node,
     )
-    snapshot = runtime.graph.get_state(config)
+    snapshot = await runtime.graph.aget_state(runtime.engine._config)
     state = ReasoningState.from_checkpoint(snapshot.values)
     if (
         snapshot.next
@@ -3581,7 +3558,7 @@ async def _run_transport_case(
                     structured_output_method=gateway.structured_output_method(target),
                     routing_structured_output_method=gateway.structured_output_method(target),
                 )
-                _seed_transport_request(runtime, scenario)
+                await _seed_transport_request(runtime, scenario)
                 observation = await asyncio.wait_for(
                     _observe_scenario(
                         runtime.engine,
@@ -3639,7 +3616,7 @@ async def _run_transport_case(
         finally:
             try:
                 if runtime is not None:
-                    runtime.caller_context.close_session()
+                    await runtime.caller_context.aclose_session()
             finally:
                 telemetry._TELEMETRY_PATH = old_telemetry_path
 

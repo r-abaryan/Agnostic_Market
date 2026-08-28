@@ -1,26 +1,24 @@
-"""OrderStore (the SoR dedup arbiter) + resolve_candidates. Zero network."""
+"""OrderStore behavior and durable effect contracts. Zero network."""
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Lock
 
 import pytest
-from pydantic import ValidationError
 
+from agnostic_market.commerce import orders as orders_module
 from agnostic_market.commerce.orders import (
     CancelError,
-    Candidate,
-    OrdersFixture,
+    GuestOrderScope,
     OrderStore,
     RecentOrderContext,
     RefundError,
     ReturnError,
     load_orders_fixture,
-    lookup_catalog,
-    match_named_items,
-    number_candidates,
-    resolve_candidates,
 )
 from agnostic_market.dtos.state import CartLine
 
@@ -28,7 +26,18 @@ _ORIGINAL_INSTRUMENT = "original payment method"
 
 
 def _store(config_root: Path) -> OrderStore:
-    return OrderStore(load_orders_fixture(config_root, "acme_store"))
+    return OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+
+
+def _guest_scope(session_id: str = "orders-test") -> GuestOrderScope:
+    return GuestOrderScope(tenant_id="acme_store", session_id=session_id)
+
+
+def test_guest_order_scope_normalizes_its_identity_at_the_boundary() -> None:
+    scope = GuestOrderScope(tenant_id="  acme_store  ", session_id="  session-a  ")
+
+    assert scope.tenant_id == "acme_store"
+    assert scope.session_id == "session-a"
 
 
 def _line(sku: str, name: str, price: float, qty: int) -> CartLine:
@@ -80,6 +89,81 @@ def test_distinct_keys_place_distinct_orders(config_root: Path) -> None:
     assert store.placed_count == 2
 
 
+def test_shared_store_serializes_distinct_placements(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(config_root)
+    original = orders_module.PlacedOrder
+    constructor_lock = Lock()
+    constructor_calls = 0
+    start = Barrier(2)
+
+    def delayed_constructor(**kwargs):
+        nonlocal constructor_calls
+        with constructor_lock:
+            constructor_calls += 1
+        time.sleep(0.02)
+        return original(**kwargs)
+
+    monkeypatch.setattr(orders_module, "PlacedOrder", delayed_constructor)
+
+    def place(key: str):
+        start.wait(timeout=5)
+        return _place1(store, key, "SKU-GRN-15", "socks", 1, 14.5)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(place, "key-a")
+        second = pool.submit(place, "key-b")
+        placed = (first.result(timeout=5), second.result(timeout=5))
+
+    assert len({record.order_id for record in placed}) == 2
+    assert constructor_calls == 2
+
+
+def test_shared_store_serializes_same_key_placement(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(config_root)
+    original = orders_module.PlacedOrder
+    constructor_lock = Lock()
+    constructor_calls = 0
+    start = Barrier(2)
+
+    def delayed_constructor(**kwargs):
+        nonlocal constructor_calls
+        with constructor_lock:
+            constructor_calls += 1
+        time.sleep(0.02)
+        return original(**kwargs)
+
+    monkeypatch.setattr(orders_module, "PlacedOrder", delayed_constructor)
+
+    def place():
+        start.wait(timeout=5)
+        return _place1(store, "same-key", "SKU-GRN-15", "socks", 1, 14.5)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(place)
+        second = pool.submit(place)
+        placed = (first.result(timeout=5), second.result(timeout=5))
+
+    assert placed[0] is placed[1]
+    assert constructor_calls == 1
+    assert store.placed_count == 1
+
+
+def test_order_store_rejects_a_foreign_guest_scope(config_root: Path) -> None:
+    store = _store(config_root)
+    placed = _place1(store, "tenant-check", "SKU-GRN-15", "socks", 1, 14.5)
+    foreign_scope = GuestOrderScope(tenant_id="other_store", session_id="foreign")
+    foreign_scope.record(placed.order_id)
+
+    with pytest.raises(ValueError, match="guest order scope does not match"):
+        store.is_guest_order(placed.order_id, foreign_scope)
+
+
 def test_place_cart_places_one_multi_line_order(config_root: Path) -> None:
     # Group B: the whole cart becomes ONE order (one id, one total, multi-line summary).
     store = _store(config_root)
@@ -106,97 +190,6 @@ def test_placed_order_is_queryable_by_status_read_through(config_root: Path) -> 
     assert "rain jacket" in summary
     # Fixture orders still resolve too.
     assert "shipped" in (store.order_summary("ORD-1001") or "")
-
-
-# --- candidate resolution (the model picks a KEY, never a SKU) --------------------------
-
-
-def _candidate(key: str, name: str) -> Candidate:
-    return Candidate(key=key, sku=f"SKU-{key}", name=name, price_usd=1.0)
-
-
-def test_match_named_items_returns_only_actual_matches() -> None:
-    items = [_candidate("1", "trail running shoes"), _candidate("2", "rain jacket")]
-
-    assert match_named_items(items, "I want the trail running shoes") == [items[0]]
-
-
-@pytest.mark.parametrize("query", ("", "   ", "zzz-nothing"))
-def test_match_named_items_returns_empty_without_an_actual_match(query: str) -> None:
-    items = [_candidate("1", "trail running shoes"), _candidate("2", "rain jacket")]
-
-    assert match_named_items(items, query) == []
-
-
-def test_match_named_items_preserves_ambiguity_for_the_caller_to_narrow() -> None:
-    items = [_candidate("1", "trail running shoes"), _candidate("2", "trail hiking shoes")]
-
-    assert match_named_items(items, "trail") == items
-
-
-@pytest.mark.parametrize(
-    ("query", "matched_names"),
-    (
-        ("running", ("trail running shoes",)),
-        ("  RUNNING  ", ("trail running shoes",)),
-        ("I want the trail running shoes", ()),
-        ("", ()),
-        ("   ", ()),
-        ("zzz-nothing", ()),
-    ),
-)
-def test_catalog_lookup_preserves_the_legacy_one_way_match_contract(
-    config_root: Path,
-    query: str,
-    matched_names: tuple[str, ...],
-) -> None:
-    fixture = load_orders_fixture(config_root, "acme_store")
-
-    result = lookup_catalog(fixture, query)
-
-    assert tuple(product.name for product in result.matches) == matched_names
-    assert result.available == tuple(fixture.products)
-
-
-def test_number_candidates_is_shared_by_catalog_and_live_cart_items() -> None:
-    lines = (
-        _line("SKU-1", "trail shoes", 79.0, 2),
-        _line("SKU-2", "rain jacket", 129.0, 1),
-    )
-
-    assert number_candidates(lines) == [
-        Candidate(key="1", sku="SKU-1", name="trail shoes", price_usd=79.0),
-        Candidate(key="2", sku="SKU-2", name="rain jacket", price_usd=129.0),
-    ]
-
-
-def test_orders_fixture_requires_unique_skus_but_allows_duplicate_names() -> None:
-    products = [
-        {"sku": "SKU-1", "name": "trail runner", "price_usd": 80.0},
-        {"sku": "SKU-2", "name": "trail runner", "price_usd": 95.0},
-    ]
-
-    fixture = OrdersFixture.model_validate({"orders": {}, "products": products})
-    assert [product.sku for product in fixture.products] == ["SKU-1", "SKU-2"]
-
-    products[1]["sku"] = "SKU-1"
-    with pytest.raises(ValidationError, match="product SKUs must be unique"):
-        OrdersFixture.model_validate({"orders": {}, "products": products})
-
-
-def test_resolve_candidates_narrows_on_match(config_root: Path) -> None:
-    fixture = load_orders_fixture(config_root, "acme_store")
-    candidates = resolve_candidates(fixture, "rain jacket")
-    assert [c.sku for c in candidates] == ["SKU-BLU-07"]
-    assert candidates[0].key == "1"
-    assert candidates[0].price_usd == 129.00  # price comes from the fixture, never the model
-
-
-def test_resolve_candidates_returns_full_catalog_on_miss(config_root: Path) -> None:
-    fixture = load_orders_fixture(config_root, "acme_store")
-    candidates = resolve_candidates(fixture, "zzz-nothing")
-    assert len(candidates) == len(fixture.products)
-    assert [c.key for c in candidates] == [str(i) for i in range(1, len(candidates) + 1)]
 
 
 # --- cancel-order (Group A): eligibility + idempotent void ------------------------------
@@ -248,22 +241,31 @@ def test_identical_cart_order_lookup_ignores_cancelled(config_root: Path) -> Non
     # The placement guardrail's duplicate probe: the same LINE SET this session flips the
     # readback to the "SECOND order" form; a cancelled match must NOT count (re-order normal).
     store = _store(config_root)
+    guest_orders = _guest_scope("identical-cart")
     lines = [_line("SKU-BLU-07", "rain jacket", 129.0, 3)]
     placed = store.place_cart("k1", lines=lines, total_usd=387.0)
-    assert store.identical_cart_order(lines) is placed
-    assert store.identical_cart_order([_line("SKU-BLU-07", "rain jacket", 129.0, 2)]) is None
-    assert store.identical_cart_order([_line("SKU-RED-42", "shoes", 89.99, 3)]) is None
+    guest_orders.record(placed.order_id)
+    assert store.identical_cart_order(lines, guest_orders) is placed
+    assert (
+        store.identical_cart_order([_line("SKU-BLU-07", "rain jacket", 129.0, 2)], guest_orders)
+        is None
+    )
+    assert (
+        store.identical_cart_order([_line("SKU-RED-42", "shoes", 89.99, 3)], guest_orders) is None
+    )
     store.cancel_order("ck-1", order_id=placed.order_id)
-    assert store.identical_cart_order(lines) is None
+    assert store.identical_cart_order(lines, guest_orders) is None
 
 
 def test_identical_cart_order_is_order_independent(config_root: Path) -> None:
     # Same two lines in either add-order are the SAME cart (dedup is by sku->qty, not sequence).
     store = _store(config_root)
+    guest_orders = _guest_scope("identical-order")
     a = _line("SKU-BLU-07", "rain jacket", 129.0, 2)
     b = _line("SKU-GRN-15", "socks", 14.5, 1)
     placed = store.place_cart("k1", lines=[a, b], total_usd=272.5)
-    assert store.identical_cart_order([b, a]) is placed
+    guest_orders.record(placed.order_id)
+    assert store.identical_cart_order([b, a], guest_orders) is placed
 
 
 def test_cancel_record_carries_the_reversed_amount(config_root: Path) -> None:
@@ -299,14 +301,16 @@ def test_cancel_refuses_an_order_with_refunds_issued(config_root: Path) -> None:
 
 def test_actionable_orders_carry_effective_status(config_root: Path) -> None:
     store = _store(config_root)
+    guest_orders = _guest_scope("actionable")
     placed = _place1(store, "k1", "SKU-BLU-07", "rain jacket", 2, 258.0)
-    by_id = {o.order_id: o for o in store.actionable_orders()}
+    guest_orders.record(placed.order_id)
+    by_id = {o.order_id: o for o in store.actionable_orders(guest_orders)}
     assert by_id["ORD-1001"].status == "shipped"
     assert by_id["ORD-1002"].status == "processing"
     assert by_id["ORD-1003"].status == "delivered"
     assert by_id[placed.order_id].status == "processing"
     store.cancel_order("ck-1", order_id=placed.order_id)
-    by_id = {o.order_id: o for o in store.actionable_orders()}
+    by_id = {o.order_id: o for o in store.actionable_orders(guest_orders)}
     assert by_id[placed.order_id].status == "cancelled"  # the overlay wins
 
 
@@ -594,20 +598,44 @@ def test_order_eta_accessor_forks_fixture_placed_and_unknown(config_root: Path) 
 from agnostic_market.commerce.orders import render_order_list_line  # noqa: E402
 
 
-def test_order_owner_and_is_session_placed_fork(config_root: Path) -> None:
+def test_order_owner_and_guest_scope_fork(config_root: Path) -> None:
     store = _store(config_root)
+    guest_orders = _guest_scope("owner-fork")
     assert store.order_owner("ord-1001") == "CUST-001"  # fixture, normalized
     assert store.order_owner("ORD-9999") is None  # unknown
-    _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    placed = _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    guest_orders.record(placed.order_id)
     assert store.order_owner("ORD-9001") is None  # placed: session-owned, no fixture ref
-    assert store.is_session_placed("ord-9001")
-    assert not store.is_session_placed("ORD-1001")
+    assert guest_orders.contains("ord-9001")
+    assert not guest_orders.contains("ORD-1001")
+
+
+def test_guest_order_visibility_is_session_owned_not_store_owned(config_root: Path) -> None:
+    store = _store(config_root)
+    placed = _place1(store, "guest-scope", "SKU-GRN-15", "merino hiking socks", 1, 14.50)
+    first = GuestOrderScope(tenant_id="acme_store", session_id="session-a")
+    second = GuestOrderScope(tenant_id="acme_store", session_id="session-b")
+
+    first.record(placed.order_id)
+
+    assert first.contains(placed.order_id)
+    assert not second.contains(placed.order_id)
+    assert [candidate.order_id for candidate in store.guest_orders(first)] == [placed.order_id]
+    assert store.guest_orders(second) == []
+
+    first.clear()
+    replay = _place1(store, "guest-scope", "SKU-GRN-15", "merino hiking socks", 1, 14.50)
+    assert replay is placed
+    assert not first.contains(placed.order_id)
+    assert store.guest_orders(first) == []
 
 
 def test_owned_orders_filters_by_ref_and_includes_placed(config_root: Path) -> None:
     store = _store(config_root)
-    _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
-    owned = store.owned_orders("CUST-001")
+    guest_orders = _guest_scope("owned")
+    placed = _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    guest_orders.record(placed.order_id)
+    owned = store.owned_orders("CUST-001", guest_orders)
     ids = [c.order_id for c in owned]
     assert "ORD-1001" in ids and "ORD-1003" in ids  # theirs
     assert "ORD-1002" not in ids  # CUST-002's, never listed
@@ -618,10 +646,14 @@ def test_owned_orders_carries_the_effective_status(config_root: Path) -> None:
     # The cancelled overlay wins — an identified caller must hear the truth about a voided
     # order, not the stale fixture status.
     store = _store(config_root)
-    _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    guest_orders = _guest_scope("owned-status")
+    placed = _place1(store, "k1", "SKU-GRN-15", "merino hiking socks", 2, 14.50)
+    guest_orders.record(placed.order_id)
     store.cancel_order("c1", order_id="ORD-9001")
-    placed = next(c for c in store.owned_orders("CUST-001") if c.order_id == "ORD-9001")
-    assert placed.status == "cancelled"
+    candidate = next(
+        c for c in store.owned_orders("CUST-001", guest_orders) if c.order_id == "ORD-9001"
+    )
+    assert candidate.status == "cancelled"
 
 
 def test_owned_cancellable_orders_filters_to_cancellable_and_is_bounded(config_root: Path) -> None:
@@ -629,8 +661,10 @@ def test_owned_cancellable_orders_filters_to_cancellable_and_is_bounded(config_r
     # CUST-001's fixture orders are shipped (ORD-1001) + delivered (ORD-1003), neither
     # cancellable; a placed session order IS. So exactly one cancellable, no overflow at limit 5.
     store = _store(config_root)
-    _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)  # ORD-9001, processing
-    items, has_more = store.owned_cancellable_orders("CUST-001", limit=5)
+    guest_orders = _guest_scope("owned-cancellable")
+    placed = _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)
+    guest_orders.record(placed.order_id)
+    items, has_more = store.owned_cancellable_orders("CUST-001", guest_orders, limit=5)
     assert [c.order_id for c in items] == ["ORD-9001"]  # the shipped/delivered ones excluded
     assert has_more is False
 
@@ -640,9 +674,12 @@ def test_owned_cancellable_orders_flags_overflow_without_truncating_silently(
 ) -> None:
     # limit = cap; a third cancellable order trips has_more (the resolver asks to narrow).
     store = _store(config_root)
-    _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)  # ORD-9001
-    _place1(store, "k2", "SKU-BLU-07", "jacket", 1, 60.0)  # ORD-9002
-    items, has_more = store.owned_cancellable_orders("CUST-001", limit=1)
+    guest_orders = _guest_scope("owned-overflow")
+    first = _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)
+    second = _place1(store, "k2", "SKU-BLU-07", "jacket", 1, 60.0)
+    guest_orders.record(first.order_id)
+    guest_orders.record(second.order_id)
+    items, has_more = store.owned_cancellable_orders("CUST-001", guest_orders, limit=1)
     assert len(items) == 1 and has_more is True
 
 
@@ -650,20 +687,24 @@ def test_owned_cancellable_orders_does_not_materialize_owned_orders(
     config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(config_root)
-    _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)
+    guest_orders = _guest_scope("owned-bounded")
+    placed = _place1(store, "k1", "SKU-GRN-15", "socks", 1, 14.50)
+    guest_orders.record(placed.order_id)
 
     def forbidden(_customer_ref: str) -> list:
         raise AssertionError("bounded query must not build the full owned_orders list")
 
     monkeypatch.setattr(store, "owned_orders", forbidden)
-    items, has_more = store.owned_cancellable_orders("CUST-001", limit=1)
+    items, has_more = store.owned_cancellable_orders("CUST-001", guest_orders, limit=1)
     assert [item.order_id for item in items] == ["ORD-9001"]
     assert has_more is False
 
 
 def test_owned_cancellable_orders_rejects_non_positive_limit(config_root: Path) -> None:
     with pytest.raises(ValueError, match="at least 1"):
-        _store(config_root).owned_cancellable_orders("CUST-001", limit=0)
+        _store(config_root).owned_cancellable_orders(
+            "CUST-001", _guest_scope("invalid-limit"), limit=0
+        )
 
 
 def test_order_entry_requires_customer_ref() -> None:
@@ -720,31 +761,39 @@ def test_render_order_list_line_session_scope_discloses_this_call() -> None:
     assert "You've got 1 order" in render_order_list_line(one)  # account default unchanged
 
 
-def test_session_placed_orders_lists_only_placed_keyed_effective_status(config_root: Path) -> None:
+def test_guest_orders_lists_only_scoped_placed_effective_status(config_root: Path) -> None:
     # Fix 3: the GUEST enumeration view — placed records only (never a fixture/account order),
     # keyed 1..N, effective (cancelled-overlay) status.
     store = _store(config_root)
-    _place1(store, "k1", "SKU-BLU-07", "jacket", 2, 129.0)  # ORD-9001
-    _place1(store, "k2", "SKU-RED-42", "shoes", 1, 89.99)  # ORD-9002
-    placed = store.session_placed_orders()
+    guest_orders = _guest_scope("guest-list")
+    first = _place1(store, "k1", "SKU-BLU-07", "jacket", 2, 129.0)
+    second = _place1(store, "k2", "SKU-RED-42", "shoes", 1, 89.99)
+    guest_orders.record(first.order_id)
+    guest_orders.record(second.order_id)
+    placed = store.guest_orders(guest_orders)
     assert [c.order_id for c in placed] == ["ORD-9001", "ORD-9002"]
     assert [c.key for c in placed] == ["1", "2"]
     assert not any(c.order_id.startswith("ORD-100") for c in placed)  # NO fixture orders
     store.cancel_order("c1", order_id="ORD-9001")
-    assert next(c for c in store.session_placed_orders() if c.order_id == "ORD-9001").status == (
-        "cancelled"
+    assert (
+        next(c for c in store.guest_orders(guest_orders) if c.order_id == "ORD-9001").status
+        == "cancelled"
     )
 
 
 def test_placed_candidate_mapper_keeps_listings_consistent(config_root: Path) -> None:
     # The extracted _placed_candidate mapper is the ONE placed->OrderCandidate mapping: the placed
-    # tail of owned_orders, the placed rows of actionable_orders, and session_placed_orders must
+    # tail of owned_orders, the placed rows of actionable_orders, and guest_orders must
     # agree on the same (order_id, summary, status) for a given placed record (no drift).
     store = _store(config_root)
-    _place1(store, "k1", "SKU-BLU-07", "jacket", 2, 129.0)  # ORD-9001
-    sess = {c.order_id: (c.summary, c.status) for c in store.session_placed_orders()}
-    owned = {c.order_id: (c.summary, c.status) for c in store.owned_orders("CUST-001")}
-    action = {c.order_id: (c.summary, c.status) for c in store.actionable_orders()}
+    guest_orders = _guest_scope("listing-consistency")
+    placed = _place1(store, "k1", "SKU-BLU-07", "jacket", 2, 129.0)
+    guest_orders.record(placed.order_id)
+    sess = {c.order_id: (c.summary, c.status) for c in store.guest_orders(guest_orders)}
+    owned = {
+        c.order_id: (c.summary, c.status) for c in store.owned_orders("CUST-001", guest_orders)
+    }
+    action = {c.order_id: (c.summary, c.status) for c in store.actionable_orders(guest_orders)}
     assert sess["ORD-9001"] == owned["ORD-9001"] == action["ORD-9001"]
 
 
@@ -763,18 +812,22 @@ def test_render_order_list_line_empty_and_unknown_status() -> None:
     assert "returned" in line  # fail-closed: the raw status word, no invented phrase
 
 
-# --- Fix 5: session-placed teardown drops caller-ephemeral, keeps durable business state ----
+# --- Guest-scope teardown drops caller visibility and keeps durable business state ----------
 
 
-def test_clear_session_placed_drops_view_but_keeps_placement_ledger(config_root: Path) -> None:
+def test_clearing_guest_scope_drops_view_but_keeps_placement_ledger(config_root: Path) -> None:
     store = _store(config_root)
+    guest_orders = _guest_scope("clear-view")
     placed = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)  # ORD-9001
-    assert store.is_session_placed("ORD-9001")
-    store.clear_session_placed()
-    assert not store.is_session_placed("ORD-9001")
-    assert store.session_placed_orders() == []
-    assert "ORD-9001" not in {candidate.order_id for candidate in store.actionable_orders()}
-    assert store.identical_cart_order(list(placed.lines)) is None
+    guest_orders.record(placed.order_id)
+    assert guest_orders.contains("ORD-9001")
+    guest_orders.clear()
+    assert not guest_orders.contains("ORD-9001")
+    assert store.guest_orders(guest_orders) == []
+    assert "ORD-9001" not in {
+        candidate.order_id for candidate in store.actionable_orders(guest_orders)
+    }
+    assert store.identical_cart_order(list(placed.lines), guest_orders) is None
     # The committed placement/idempotency ledger remains: a principal rotation must not erase
     # the order or let a stale replay create it again, even though the new caller cannot see it.
     assert store.placed_count == 1
@@ -783,19 +836,25 @@ def test_clear_session_placed_drops_view_but_keeps_placement_ledger(config_root:
     replay = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)
     assert replay is placed
     assert store.placed_count == 1
-    assert not store.is_session_placed("ORD-9001")  # replay never restores prior authority
+    assert not guest_orders.contains("ORD-9001")  # replay never restores prior authority
     # Fixture/account orders are durable-SoR state — untouched.
     assert store.order_status("ORD-1001") == "shipped"
-    assert [c.order_id for c in store.owned_orders("CUST-001")] == ["ORD-1001", "ORD-1003"]
+    assert [c.order_id for c in store.owned_orders("CUST-001", guest_orders)] == [
+        "ORD-1001",
+        "ORD-1003",
+    ]
 
 
-def test_clear_session_placed_never_undoes_committed_effects(config_root: Path) -> None:
+def test_clearing_guest_scope_never_undoes_committed_effects(config_root: Path) -> None:
     # A guest placed orders this call and had one cancelled + a (partial) refund on another. On a
     # principal switch the guest VIEW drops, but the committed cancel/refund records + status
     # overlay are durable business outcomes and must survive (never undo a completed action).
     store = _store(config_root)
+    guest_orders = _guest_scope("clear-effects")
     voided = _place1(store, "k1", "SKU-BLU-07", "jacket", 1, 129.0)  # ORD-9001 -> cancelled
     refunded = _place1(store, "k2", "SKU-RED-42", "shoes", 1, 89.99)  # ORD-9002 -> refunded
+    guest_orders.record(voided.order_id)
+    guest_orders.record(refunded.order_id)
     store.cancel_order("c1", order_id=voided.order_id)
     store.issue_refund(
         "r1",
@@ -805,7 +864,7 @@ def test_clear_session_placed_never_undoes_committed_effects(config_root: Path) 
         instrument_ref=_ORIGINAL_INSTRUMENT,
     )
     before_cancels, before_refunds = store.cancel_count, store.refund_count
-    store.clear_session_placed()
+    guest_orders.clear()
     assert store.cancel_count == before_cancels  # committed cancel record retained
     assert store.refund_count == before_refunds  # committed refund record retained
     assert store.placed_count == 2  # committed placement records retained

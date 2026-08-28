@@ -1,6 +1,14 @@
 """Commerce plane — order SoR access (Phase 3b: fixture-backed stub; real SoR Phase 4)."""
 
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.catalog import (
+    Candidate,
+    CatalogFixture,
+    CatalogPort,
+    CatalogProduct,
+    CatalogProductSet,
+    FixtureCatalog,
+)
 from agnostic_market.commerce.identity import (
     BoundIdentity,
     CallerIdentityStore,
@@ -12,12 +20,10 @@ from agnostic_market.commerce.identity import (
     order_read_allowed,
 )
 from agnostic_market.commerce.orders import (
-    Candidate,
     OrdersFixture,
     OrderStore,
     PlacedOrder,
     load_orders_fixture,
-    resolve_candidates,
     speak_lines,
     speak_quantity,
 )
@@ -34,8 +40,13 @@ __all__ = [
     "CallerIdentityStore",
     "Candidate",
     "CartStore",
+    "CatalogFixture",
+    "CatalogPort",
+    "CatalogProduct",
+    "CatalogProductSet",
     "CustomerDirectory",
     "CustomersFixture",
+    "FixtureCatalog",
     "OrderStore",
     "OrdersFixture",
     "PaymentInstrumentDirectory",
@@ -49,7 +60,6 @@ __all__ = [
     "load_payment_instruments_fixture",
     "order_mutation_allowed",
     "order_read_allowed",
-    "resolve_candidates",
     "speak_lines",
     "speak_quantity",
 ]

@@ -3,6 +3,8 @@ and the refund ledger on OrderStore. Zero network, no graph."""
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,7 +29,7 @@ _ORIGINAL_INSTRUMENT = "original payment method"
 
 
 def _store(config_root: Path) -> OrderStore:
-    return OrderStore(load_orders_fixture(config_root, "acme_store"))
+    return OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
 
 
 def test_verification_fixture_loads_the_temporary_merchant_code(config_root: Path) -> None:
@@ -41,6 +43,33 @@ def test_verification_fixture_rejects_a_non_six_digit_code(tmp_path: Path) -> No
     (fixture_dir / "broken.yaml").write_text('otp_code: "12345"\n', encoding="utf-8")
     with pytest.raises(ConfigError, match="failed validation"):
         load_verification_fixture(tmp_path, "broken")
+
+
+def test_concurrent_otp_replay_dispatches_one_attempt() -> None:
+    class _SlowMissSet(set[str]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.add_calls = 0
+
+        def __contains__(self, value: object) -> bool:
+            present = super().__contains__(value)
+            if not present:
+                time.sleep(0.05)
+            return present
+
+        def add(self, value: str) -> None:
+            self.add_calls += 1
+            super().add(value)
+
+    provider = OtpProvider(valid_code=_TEST_OTP)
+    dispatched = _SlowMissSet()
+    provider._dispatched = dispatched
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tuple(executor.map(provider.dispatch, ("same-attempt", "same-attempt")))
+
+    assert dispatched.add_calls == 1
+    assert provider.dispatch_count == 1
 
 
 # --- the destination -> level FLOOR (§A4b) ---------------------------------------------

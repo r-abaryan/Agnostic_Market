@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from agnostic_market.agents._shared_prompt import compose_shared_context
-from agnostic_market.commerce.orders import CatalogLookup
+from agnostic_market.commerce.catalog import CatalogProductSet
 from agnostic_market.dtos.orchestration import AnswerQuestion
 from agnostic_market.dtos.state import PolicyContext
 
@@ -19,22 +19,21 @@ Normalize a clear labelled numeric reference to ORD-<digits>."""
 def compose_catalog_response_prompt(
     display_name: str,
     policy: PolicyContext,
-    result: CatalogLookup,
+    result: CatalogProductSet,
 ) -> str:
     """Bound a product answer to one current catalog lookup."""
 
-    if result.matches:
+    if result.products:
         catalog_facts = "\n".join(
             f"- {product.name}; SKU {product.sku}; price ${product.price_usd:.2f}"
-            for product in result.matches
+            for product in result.products
         )
         lookup_instruction = "Answer using only the matching catalog facts below."
     else:
-        catalog_facts = "\n".join(f"- {product.name}" for product in result.available)
+        catalog_facts = "- No matching catalog products."
         lookup_instruction = (
-            "Say that no catalog name matched the request. You may mention names from the bounded "
-            "catalog list below, but do not claim they match the request, share requested "
-            "attributes, or are relevant alternatives."
+            "Say that no catalog product matched the request. Do not claim that other products "
+            "match or list products absent from the result."
         )
     return "\n".join(
         (

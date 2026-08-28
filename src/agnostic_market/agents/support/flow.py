@@ -40,7 +40,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
@@ -77,6 +77,7 @@ from agnostic_market.commerce.orders import (
     CANCELLED_STATUS,
     FULFILLED_STATUSES,
     CancelError,
+    GuestOrderScope,
     OrderCandidate,
     OrderStore,
     RecentOrderContext,
@@ -362,7 +363,7 @@ class SupportNodes:
     Wiring is the graph builder's job (frontline/graph.py); this module owns only behavior.
     """
 
-    capability_entry: Callable[[ReasoningState], dict[str, object]]
+    capability_entry: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     capability_render: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
@@ -421,6 +422,7 @@ class SupportNodes:
 def build_support_nodes(
     reasoning_model: BaseChatModel,
     order_store: OrderStore,
+    guest_orders: GuestOrderScope,
     verification_store: VerificationStore,
     otp: OtpProvider,
     risk: RiskProvider,
@@ -513,11 +515,16 @@ def build_support_nodes(
         dict[str, OrderCandidate],
         dict[str, OrderCandidate],
     ]:
-        full = order_store.actionable_orders()
+        full = order_store.actionable_orders(guest_orders)
         authorized = [
             order
             for order in full
-            if order_read_allowed(order.order_id, store=order_store, identity=identity_store)
+            if order_read_allowed(
+                order.order_id,
+                store=order_store,
+                guest_orders=guest_orders,
+                identity=identity_store,
+            )
         ]
         return (
             authorized,
@@ -567,13 +574,13 @@ def build_support_nodes(
             raise TypeError("support capability render requires a list-orders invocation")
         request = invocation.request
         if request.scope == "session":
-            orders = order_store.session_placed_orders()
+            orders = order_store.guest_orders(guest_orders)
             close = guest_list_close()
         else:
             bound = identity_store.current()
             if bound is None:
                 raise TypeError("account order rendering requires a bound identity")
-            orders = order_store.owned_orders(bound.customer_ref)
+            orders = order_store.owned_orders(bound.customer_ref, guest_orders)
             close = warm_close()
         if orders:
             recent_orders.record([order.order_id for order in orders], operation="list")
@@ -592,7 +599,7 @@ def build_support_nodes(
             "messages": [AIMessage(line)],
         }
 
-    def capability_entry_node(state: ReasoningState) -> dict[str, object]:
+    async def capability_entry_node(state: ReasoningState) -> dict[str, object]:
         """Prepare one typed Support request; downstream nodes retain effect authority.
 
         An incomplete request gathers its ONE missing slot through a tool-only model that cannot
@@ -844,7 +851,7 @@ def build_support_nodes(
             messages: list = [prompt, *state.messages]
             expected_tool = proposal_tool.name
             for _attempt in range(2):
-                response = capability_model.invoke(messages)
+                response = await capability_model.ainvoke(messages)
                 if not response.tool_calls:
                     return clarify(missing_detail(request), new_messages)
                 new_messages.append(response)
@@ -1070,7 +1077,8 @@ def build_support_nodes(
     ) -> SupportAuthorizationDetail | Literal["<needs-identity>"] | None:
         """The support-selection AUTHORIZATION DECISION (SECURITY §7d): may THIS caller act on
         THAT order? A mutation (cancel/refund/return) requires RUNG-2 — the target is
-        session-placed OR owned by the OTP-bound identity (`order_mutation_allowed`). A rung-1
+        visible in the guest scope OR owned by the OTP-bound identity
+        (`order_mutation_allowed`). A rung-1
         contact-match grant authorizes READS only; the account contact is guessable, so it must
         never let one caller mutate another's order. Three closed outcomes (no ToolMessage
         appended here, so a batch from ONE propose call aggregates every target into ONE
@@ -1093,7 +1101,10 @@ def build_support_nodes(
         `_record_authorized` at the mint site, so re-checking costs nothing.
         """
         if order_known and order_mutation_allowed(
-            order_ref, store=order_store, identity=identity_store
+            order_ref,
+            store=order_store,
+            guest_orders=guest_orders,
+            identity=identity_store,
         ):
             return None
         known_fields: dict[str, object] = {"order_id_known": order_known}
@@ -1764,13 +1775,16 @@ def build_support_nodes(
                 ],
             }
         candidates, has_more = order_store.owned_cancellable_orders(
-            bound.customer_ref, limit=policy.cancel_batch_max + 1
+            bound.customer_ref, guest_orders, limit=policy.cancel_batch_max + 1
         )
         unauthorized = [
             candidate.order_id
             for candidate in candidates
             if not order_read_allowed(
-                candidate.order_id, store=order_store, identity=identity_store
+                candidate.order_id,
+                store=order_store,
+                guest_orders=guest_orders,
+                identity=identity_store,
             )
         ]
         if unauthorized:

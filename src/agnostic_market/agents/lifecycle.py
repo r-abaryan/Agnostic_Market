@@ -24,7 +24,12 @@ class ExecutionQuiescence(Protocol):
 
 
 class PrincipalTransitionLifecycle(Protocol):
-    def attach_execution_quiescence(self, tracker: ExecutionQuiescence) -> None: ...
+    def attach_execution_quiescence(
+        self,
+        tracker: ExecutionQuiescence,
+        *,
+        timeout_seconds: float,
+    ) -> None: ...
 
     def cancellation_takeover_lease(self) -> AbstractContextManager[bool]: ...
 

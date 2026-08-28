@@ -46,6 +46,9 @@ def _valid_merchant_dict() -> dict:
         "isolation": {"tier": "shared"},
         "runtime": {
             "cancellation_quiescence_timeout_seconds": 2.0,
+            "checkpoint_io_timeout_seconds": 2.0,
+            "response_model_node_timeout_seconds": 2.0,
+            "reasoning_model_node_timeout_seconds": 6.0,
             "caller_audible_model_text_max_chars": 500,
             "semantic_router_input_max_chars": 2048,
             "semantic_router_timeout_seconds": 2.0,
@@ -60,6 +63,9 @@ def test_valid_config_validates() -> None:
     assert config.merchant_id == "m1"
     assert config.isolation.tier == "shared"
     assert config.runtime.cancellation_quiescence_timeout_seconds == 2.0
+    assert config.runtime.checkpoint_io_timeout_seconds == 2.0
+    assert config.runtime.response_model_node_timeout_seconds == 2.0
+    assert config.runtime.reasoning_model_node_timeout_seconds == 6.0
     assert config.runtime.caller_audible_model_text_max_chars == 500
     assert config.runtime.semantic_router_input_max_chars == 2048
     assert config.runtime.semantic_router_timeout_seconds == 2.0
@@ -74,6 +80,16 @@ def test_runtime_quiescence_timeout_is_required_and_positive() -> None:
     invalid = _valid_merchant_dict()
     invalid["runtime"]["cancellation_quiescence_timeout_seconds"] = 0
     with pytest.raises(ValidationError, match="cancellation_quiescence_timeout_seconds"):
+        MerchantConfig.model_validate(invalid)
+
+    invalid = _valid_merchant_dict()
+    invalid["runtime"]["checkpoint_io_timeout_seconds"] = 0
+    with pytest.raises(ValidationError, match="checkpoint_io_timeout_seconds"):
+        MerchantConfig.model_validate(invalid)
+
+    invalid = _valid_merchant_dict()
+    invalid["runtime"]["reasoning_model_node_timeout_seconds"] = 0
+    with pytest.raises(ValidationError, match="reasoning_model_node_timeout_seconds"):
         MerchantConfig.model_validate(invalid)
 
     invalid = _valid_merchant_dict()

@@ -46,7 +46,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agnostic_market.commerce.orders import OrdersFixture, OrderStore
+from agnostic_market.commerce.orders import GuestOrderScope, OrdersFixture, OrderStore
 from agnostic_market.commerce.spoken import scan_contact_candidates, spoken_digits, spoken_email
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 
@@ -221,9 +221,6 @@ class CallerIdentityStore:
     def __init__(self) -> None:
         self._bound: BoundIdentity | None = None
         self._granted_orders: set[str] = set()
-        # TEST-ONLY rung-2 grants (see `grant_mutation_for_test`). Empty in production — no
-        # production writer exists, so `order_mutation_allowed`'s check of it is inert at runtime.
-        self._mutation_granted_for_test: set[str] = set()
 
     def bind(self, identity: BoundIdentity) -> None:
         self._bound = identity
@@ -241,30 +238,22 @@ class CallerIdentityStore:
     def order_granted(self, order_id: str) -> bool:
         return order_id.strip().upper() in self._granted_orders
 
-    def grant_mutation_for_test(self, order_id: str) -> None:
-        """TEST SEAM ONLY — pretend this session is rung-2-authorized to MUTATE that order,
-        without a real OTP bind. Exists so the money-logic suites can pin post-authorization
-        cancel/refund/return math without re-driving the identity flow (and without binding,
-        which can't span the two customers the fixture orders belong to). NEVER call this from
-        production code: a real mutation authority comes only from a session-placed order or an
-        OTP-bound identity (`order_mutation_allowed`). Enforced by grep in CI review — the only
-        callers are `tests/support_helpers.py:authorize_fixture_orders` and scoping-suite pins."""
-        self._mutation_granted_for_test.add(order_id.strip().upper())
-
-    def mutation_granted_for_test(self, order_id: str) -> bool:
-        return order_id.strip().upper() in self._mutation_granted_for_test
-
     def has_residual_order_authority(self) -> bool:
         """Whether per-order authority survived a principal boundary."""
-        return bool(self._granted_orders or self._mutation_granted_for_test)
+        return bool(self._granted_orders)
 
     def clear(self) -> None:
         self._bound = None
         self._granted_orders.clear()
-        self._mutation_granted_for_test.clear()
 
 
-def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIdentityStore) -> bool:
+def order_read_allowed(
+    order_id: str,
+    *,
+    store: OrderStore,
+    guest_orders: GuestOrderScope,
+    identity: CallerIdentityStore,
+) -> bool:
     """May this session read that order? The ONE order-read authorization check — the
     Voice tool, Frontline render/forced-status paths, and Support candidate filters all call
     THIS (the shared-predicate stance: two independent computations would drift, and a drifted
@@ -275,7 +264,7 @@ def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIden
     principal is bound, that principal is authoritative and residual guest grants cannot
     widen it. PURE read — the contact-match GRANT mutation stays in the tool body.
     """
-    if store.is_session_placed(order_id):
+    if store.is_guest_order(order_id, guest_orders):
         return True
     bound = identity.current()
     if bound is not None:
@@ -285,7 +274,11 @@ def order_read_allowed(order_id: str, *, store: OrderStore, identity: CallerIden
 
 
 def order_mutation_allowed(
-    order_id: str, *, store: OrderStore, identity: CallerIdentityStore
+    order_id: str,
+    *,
+    store: OrderStore,
+    guest_orders: GuestOrderScope,
+    identity: CallerIdentityStore,
 ) -> bool:
     """May this session ACT irreversibly on that order (cancel/refund/return)? The rung-2
     authorization check — deliberately STRICTER than `order_read_allowed`: a rung-1
@@ -295,12 +288,7 @@ def order_mutation_allowed(
     that the caller either placed the order THIS session (per-session store — no cross-caller
     path) or is OTP-BOUND to the customer that owns it (SECURITY §7d). An unbound caller who
     fails this is routed into the identity OTP flow, not granted (support/flow.py)."""
-    if store.is_session_placed(order_id):
-        return True
-    # Test seam (inert in production — no prod writer, see `grant_mutation_for_test`): lets the
-    # money-logic suites pin post-authorization math without an OTP bind that can't span the
-    # fixture's two customers.
-    if identity.mutation_granted_for_test(order_id):
+    if store.is_guest_order(order_id, guest_orders):
         return True
     bound = identity.current()
     if bound is None:

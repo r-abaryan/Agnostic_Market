@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from langchain_core.language_models import BaseChatModel
@@ -110,7 +110,7 @@ class IdentityNodes:
     """
 
     capability_entry: Callable[[ReasoningState], dict[str, object]]
-    assemble: Callable[[ReasoningState], dict[str, object]]
+    assemble: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     ask_contact: Callable[[ReasoningState], dict[str, object]]
     reask: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
@@ -216,7 +216,7 @@ def build_identity_nodes(
             "clarification_liveness": step.liveness,
         }
 
-    def assemble_node(state: ReasoningState) -> dict[str, object]:
+    async def assemble_node(state: ReasoningState) -> dict[str, object]:
         """Model turn INSIDE identity: collect the claimed contact, or clarify, or leave.
         The claim is code-matched HERE (never model-judged); a match mints PendingIdentity
         with the grants-at-mint snapshot (the binding invariant's baseline)."""
@@ -239,7 +239,7 @@ def build_identity_nodes(
         messages: list = [prompt, *state.messages]
         new_messages: list = []
         for _attempt in range(2):  # one invalid proposal gets ONE corrective re-prompt
-            response = model.invoke(messages)
+            response = await model.ainvoke(messages)
             if not response.tool_calls:
                 return _clarification_result(state, new_messages)
             new_messages.append(response)

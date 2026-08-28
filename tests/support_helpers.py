@@ -14,15 +14,24 @@ from llm_fakes import (
 from routing_helpers import make_routing_session
 from turn_helpers import TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS
 
-from agnostic_market.agents.engine import ReasoningEngine, build_checkpointer
+from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.checkpoints import build_checkpointer
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
+    BoundIdentity,
     CallerIdentityStore,
     CustomerDirectory,
     load_customers_fixture,
 )
-from agnostic_market.commerce.orders import OrderStore, RecentOrderContext, load_orders_fixture
+from agnostic_market.commerce.orders import (
+    GuestOrderScope,
+    OrdersFixture,
+    OrderStore,
+    RecentOrderContext,
+    load_orders_fixture,
+)
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentDirectory,
     PaymentInstrumentsFixture,
@@ -32,7 +41,7 @@ from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.orchestration import RouteResolution
 from agnostic_market.dtos.state import PolicyContext
-from agnostic_market.voice.context import CallerContext
+from agnostic_market.session import CallerContext
 
 
 class SupportHarness(NamedTuple):
@@ -47,25 +56,19 @@ class SupportHarness(NamedTuple):
     identity: CallerIdentityStore
     customers: CustomerDirectory
     payment_instruments: PaymentInstrumentDirectory
+    guest_orders: GuestOrderScope
     caller_context: CallerContext
 
 
-_FIXTURE_ORDERS = ("ORD-1001", "ORD-1002", "ORD-1003")
 TEST_OTP = "482913"
 
 
-def authorize_fixture_orders(harness: SupportHarness) -> SupportHarness:
-    """Pre-authorize the fixture orders as if the caller had fully verified, so suites pinning
-    post-authorization MONEY logic aren't re-testing the auth gate (the gate's OWN tests build
-    unauthorized harnesses and never call this). Grants BOTH rungs:
-      - rung-1 read grant (`grant_orders`) so each order appears in the model's scoped candidate
-        list (`order_read_allowed`);
-      - the TEST-ONLY rung-2 mutation grant (`grant_mutation_for_test`) so cancel/refund/return
-        proceed (Fix 2: rung-1 alone no longer authorizes a mutation; a real bind can't span the
-        two customers the fixture orders belong to — this is the sanctioned test seam)."""
-    for order_id in _FIXTURE_ORDERS:
-        harness.identity.grant_orders(order_id)
-        harness.identity.grant_mutation_for_test(order_id)
+def authorize_customer(harness: SupportHarness, customer_ref: str) -> SupportHarness:
+    """Bind one real fixture principal for tests below the identity-flow boundary."""
+    masked_contact = harness.customers.masked_contact(customer_ref)
+    if masked_contact is None:
+        raise ValueError(f"test customer does not exist: {customer_ref}")
+    harness.identity.bind(BoundIdentity(customer_ref=customer_ref, masked_contact=masked_contact))
     return harness
 
 
@@ -78,6 +81,7 @@ def build_support_engine(
     risk_flagged: bool = False,
     thread_id: str = "support-1",
     payment_instruments_fixture: PaymentInstrumentsFixture | None = None,
+    orders_fixture: OrdersFixture | None = None,
     routing_resolution: RouteResolution | None = None,
 ) -> SupportHarness:
     """The production graph shape behind a ReasoningEngine, with fakes + per-test stores.
@@ -86,10 +90,13 @@ def build_support_engine(
     (the split-brain rule); the neutral reasoning default clarifies — suites pass their
     own force_tool/scripted fakes.
     """
-    store = OrderStore(load_orders_fixture(config_root, "acme_store"))
+    fixture = orders_fixture or load_orders_fixture(config_root, "acme_store")
+    catalog = FixtureCatalog("acme_store", fixture)
+    store = OrderStore("acme_store", fixture.orders)
     recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
     cart = CartStore()
     identity = CallerIdentityStore()
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id=thread_id)
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     instrument_fixture = (
         payment_instruments_fixture
@@ -105,7 +112,7 @@ def build_support_engine(
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
-        order_store=store,
+        guest_orders=guest_orders,
     )
     assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -113,6 +120,8 @@ def build_support_engine(
         tenant_id="acme_store",
         reasoning_model=reasoning or FakeChatModel(emit_tool_calls=False),
         store=store,
+        catalog=catalog,
+        guest_orders=guest_orders,
         policy=policy,
         verification_store=verification,
         otp=otp,
@@ -126,11 +135,16 @@ def build_support_engine(
         lifecycle=caller_context,
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+        response_model_node_timeout_seconds=2.0,
+        reasoning_model_node_timeout_seconds=6.0,
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(
         assembly.graph,
+        tenant_id="acme_store",
+        deployment_id="test-deployment",
         thread_id=thread_id,
+        checkpoint_io_timeout_seconds=2.0,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         routing=make_routing_session(
             assembly.capability_registry,
@@ -153,5 +167,6 @@ def build_support_engine(
         identity,
         customers,
         payment_instruments,
+        guest_orders,
         caller_context,
     )

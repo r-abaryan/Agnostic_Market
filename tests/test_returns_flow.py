@@ -13,7 +13,7 @@ from policy_helpers import make_policy
 from support_helpers import (
     TEST_OTP,
     SupportHarness,
-    authorize_fixture_orders,
+    authorize_customer,
     build_support_engine,
 )
 from turn_helpers import engine_events
@@ -47,7 +47,8 @@ def _return_harness(
 ) -> SupportHarness:
     # Fixture orders pre-authorized (rung-1): this suite pins the returns money logic;
     # the selection gate has its own suite (test_support_scoping.py).
-    return authorize_fixture_orders(
+    customer_ref = "CUST-002" if order_key == "2" else "CUST-001"
+    return authorize_customer(
         build_support_engine(
             config_root,
             policy=policy,
@@ -56,7 +57,8 @@ def _return_harness(
             routing_resolution=RouteDecision.direct(
                 ReturnOrder(target=ExplicitOrderTarget(order_ref=f"ORD-100{order_key}"))
             ),
-        )
+        ),
+        customer_ref,
     )
 
 
@@ -150,7 +152,7 @@ async def test_return_on_cancelled_order_declines(config_root: Path) -> None:
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("nothing to return" in e.text for e in spoken)
     assert h.store.return_count == 0
-    assert not h.engine.pending_interrupt()
+    assert not await h.engine.apending_interrupt()
 
 
 async def test_second_return_names_the_open_rma(config_root: Path) -> None:
@@ -210,7 +212,7 @@ async def test_steered_refund_out_of_window_declines_before_promising(
     # when the return guardrail would decline — eligibility is checked BEFORE the promise.
     monkeypatch.setattr(support_flow.time, "time", lambda: _DELIVERED_EPOCH + 40 * _DAY)
     tight = _POLICY.model_copy(update={"refund_returnless_under_usd": 10.0})
-    h = authorize_fixture_orders(
+    h = authorize_customer(
         build_support_engine(
             config_root,
             policy=tight,
@@ -223,7 +225,8 @@ async def test_steered_refund_out_of_window_declines_before_promising(
                     destination="original",
                 )
             ),
-        )
+        ),
+        "CUST-001",
     )
     events = await _events(h.engine, "I want a refund for my socks order")
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
@@ -235,7 +238,7 @@ async def test_steered_refund_out_of_window_declines_before_promising(
 
 
 async def test_refund_with_open_return_points_at_it(config_root: Path) -> None:
-    h = authorize_fixture_orders(
+    h = authorize_customer(
         build_support_engine(
             config_root,
             policy=_POLICY,
@@ -248,7 +251,8 @@ async def test_refund_with_open_return_points_at_it(config_root: Path) -> None:
                     destination="original",
                 )
             ),
-        )
+        ),
+        "CUST-001",
     )
     existing = h.store.create_return(
         "rk-0", order_id="ORD-1001", refund_due_usd=179.98, destination="original"
@@ -272,7 +276,7 @@ async def test_stale_return_readback_expires_before_creating(
     monkeypatch.setattr(support_flow.time, "time", lambda: future)
     events = await _events(h.engine, "yes")
     assert h.store.return_count == 0
-    assert not h.engine.pending_interrupt()  # cleared (clear-before-speak)
+    assert not await h.engine.apending_interrupt()  # cleared (clear-before-speak)
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("sat for a while" in e.text for e in spoken)
 
@@ -282,7 +286,7 @@ async def test_no_at_readback_creates_nothing(config_root: Path) -> None:
     await _events(h.engine, "I need to return this order")
     events = await _events(h.engine, "no, leave it")
     assert h.store.return_count == 0
-    assert not h.engine.pending_interrupt()
+    assert not await h.engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("won't set up a return" in e.text for e in spoken)
 
@@ -294,7 +298,7 @@ async def test_human_at_readback_escapes_with_onramp_package(
     await _events(h.engine, "I need to return this order")
     events = await _events(h.engine, "just get me a real person")
     assert h.store.return_count == 0
-    assert not h.engine.pending_interrupt()  # §A9: never trapped
+    assert not await h.engine.apending_interrupt()  # §A9: never trapped
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any(
         e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
@@ -324,7 +328,7 @@ async def test_human_at_readback_escapes_with_onramp_package(
 
 
 async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path: Path) -> None:
-    h = authorize_fixture_orders(
+    h = authorize_customer(
         build_support_engine(
             config_root,
             policy=_POLICY,
@@ -337,7 +341,8 @@ async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path
                     destination="new_instrument",
                 )
             ),
-        )
+        ),
+        "CUST-002",
     )
     await _events(h.engine, "I'd like a refund to a different card")  # pauses at OTP
     await _events(h.engine, TEST_OTP)

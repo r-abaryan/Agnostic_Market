@@ -12,6 +12,9 @@ _safety_locked:
   - schema_version       # structural — merchant may not fork the schema version
   - policies.cancel_batch_max   # safety bound (fits the LangGraph step budget), not a merchant knob
   - runtime.cancellation_quiescence_timeout_seconds
+  - runtime.checkpoint_io_timeout_seconds
+  - runtime.response_model_node_timeout_seconds
+  - runtime.reasoning_model_node_timeout_seconds
   - runtime.caller_audible_model_text_max_chars
   - runtime.semantic_router_input_max_chars
   - runtime.semantic_router_timeout_seconds
@@ -67,6 +70,13 @@ schema_version: "0.2"
 # survive resolution because runtime owners consume them; the safety lock prevents tenant tuning.
 runtime:
   cancellation_quiescence_timeout_seconds: 2.0
+  # Per-operation deadline for checkpoint reads, writes, and deletion. Durable adapters must
+  # expose native async methods; this deadline contains backend stalls on the voice event loop.
+  checkpoint_io_timeout_seconds: 2.0
+  # Whole-node containment deadlines. Reasoning owners can make one bounded corrective
+  # provider pass, so they need a distinct ceiling from caller-response nodes.
+  response_model_node_timeout_seconds: 2.0
+  reasoning_model_node_timeout_seconds: 6.0
   # Hard containment for completed model prose sent to TTS. Prompts remain shorter by design;
   # this ceiling rejects runaway output rather than truncating a caller-facing claim.
   caller_audible_model_text_max_chars: 500

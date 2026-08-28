@@ -9,6 +9,7 @@ with_structured_output schema-tool gets selected), then emits the canned args fo
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -246,6 +247,24 @@ class FakeChatModel(BaseChatModel):
         size = max(len(text) // self.stream_chunks, 1)
         for start in range(0, len(text), size):
             yield ChatGenerationChunk(message=AIMessageChunk(content=text[start : start + size]))
+
+
+class NativeAsyncOnlyFakeChatModel(FakeChatModel):
+    """Fake that fails if production falls back to the synchronous model surface."""
+
+    def _generate(self, *_args: Any, **_kwargs: Any) -> ChatResult:
+        raise AssertionError("model node used the synchronous provider API")
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        del stop, run_manager
+        await asyncio.sleep(0)
+        return ChatResult(generations=[ChatGeneration(message=self._respond(messages, **kwargs))])
 
 
 class ExplodingOnceFakeChatModel(FakeChatModel):

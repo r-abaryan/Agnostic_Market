@@ -3,7 +3,7 @@ cases:
   - case_id: catalog_grounded_match
     owner: catalog
     utterance: "Tell me about your trail running shoes."
-    query: "trail running shoes"
+    query: "Tell me about your trail running shoes."
     expected_disposition: answer
     required_facts: ["trail running shoes", "$89.99"]
     forbidden_facts: ["in stock", "ships today", "SKU-BLU-07"]

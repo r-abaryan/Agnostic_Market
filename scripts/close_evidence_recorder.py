@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from livekit import rtc
 from livekit.agents import (
@@ -36,12 +36,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from agnostic_market.agents import telemetry
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
+from agnostic_market.checkpoints import SchemaValidatedCheckpointSaver
 from agnostic_market.config.loader import load_yaml_layer
-from agnostic_market.voice.context import CallerContext
+from agnostic_market.session import CallerContext
 
 logger = logging.getLogger("close_evidence_recorder")
 
-CLOSE_CERTIFICATION_CONTRACT_VERSION = "1"
+CLOSE_CERTIFICATION_CONTRACT_VERSION = "2"
 CLOSE_CERTIFICATION_CASE_ENV = "VOICE_CLOSE_CERTIFICATION_CASE"
 CLOSE_CERTIFICATION_REPORT_ENV = "VOICE_CLOSE_CERTIFICATION_REPORT"
 _SUITE_PATH = Path("eval") / "close_lifecycle.yaml"
@@ -79,8 +80,8 @@ FailureReason = Literal[
     "cart_not_cleared",
     "authority_not_cleared",
     "principal_transition_not_cleared",
-    "checkpoint_inspection_failed",
-    "retired_checkpoint_not_empty",
+    "checkpoint_authorization_inspection_failed",
+    "reasoning_thread_not_retired",
     "telemetry_unavailable",
     "caller_context_close_count_invalid",
 ]
@@ -212,7 +213,7 @@ class CloseEvidenceReport(BaseModel):
     before_caller_state: CallerStateEvidence
     after_caller_state: CallerStateEvidence
     observed_reasoning_thread_count: int = Field(ge=1)
-    all_observed_reasoning_threads_empty: bool
+    all_observed_reasoning_threads_retired: bool
 
 
 def load_close_certification_request(
@@ -269,12 +270,26 @@ def _release_active_recorder(token: int) -> None:
             _ACTIVE_RECORDER = None
 
 
-def _effect_counts(context: CallerContext) -> EffectCounts:
+class EffectCountSource(Protocol):
+    @property
+    def placed_count(self) -> int: ...
+
+    @property
+    def refund_count(self) -> int: ...
+
+    @property
+    def cancel_count(self) -> int: ...
+
+    @property
+    def return_count(self) -> int: ...
+
+
+def _effect_counts(source: EffectCountSource) -> EffectCounts:
     return EffectCounts(
-        placements=context.order_store.placed_count,
-        refunds=context.order_store.refund_count,
-        cancellations=context.order_store.cancel_count,
-        returns=context.order_store.return_count,
+        placements=source.placed_count,
+        refunds=source.refund_count,
+        cancellations=source.cancel_count,
+        returns=source.return_count,
     )
 
 
@@ -355,11 +370,13 @@ class CloseEvidenceRecorder:
         self._released = False
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._completion: asyncio.Future[Path] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._finalize_task: asyncio.Task[None] | None = None
         self._session: AgentSession | None = None
         self._room: rtc.Room | None = None
         self._engine: ReasoningEngine | None = None
         self._context: CallerContext | None = None
+        self._effect_source: EffectCountSource | None = None
         self._linked_participant_identity: str | None = None
         self._telemetry_path: Path | None = None
         self._telemetry_start = 0
@@ -380,6 +397,7 @@ class CloseEvidenceRecorder:
         session: AgentSession,
         room: rtc.Room,
         engine: ReasoningEngine,
+        effect_source: EffectCountSource,
         linked_participant_identity: str,
     ) -> None:
         """Attach before AgentSession.start; private inspection is intentionally version-pinned."""
@@ -408,21 +426,12 @@ class CloseEvidenceRecorder:
             self._room = room
             self._engine = engine
             self._context = lifecycle
+            self._effect_source = effect_source
             self._linked_participant_identity = linked_participant_identity
             self._telemetry_path, self._telemetry_start = _telemetry_offset()
-            self._before_effects = _effect_counts(lifecycle)
+            self._before_effects = _effect_counts(effect_source)
             self._before_caller_state = _caller_state(lifecycle)
             self._observe_current_thread()
-
-            # Certification must finalize behind the lifecycle's actual close completion, not
-            # merely graph-idle: a cancellation-takeover lease can keep teardown pending after
-            # the tracker reaches zero. This opt-in, version-pinned wrapper preserves the original
-            # method and adds one notification after its return/failure.
-            if "_complete_close" in lifecycle.__dict__:
-                raise CloseCertificationError(
-                    "caller lifecycle close completion is already instrumented"
-                )
-            lifecycle._complete_close = self._complete_close_and_notify  # type: ignore[method-assign]
 
             session.on("conversation_item_added", self._on_conversation_item)
             session.on("agent_state_changed", self._on_agent_state_changed)
@@ -430,14 +439,12 @@ class CloseEvidenceRecorder:
             room.on("participant_disconnected", self._on_participant_disconnected)
             self._attached = True
         except Exception:
-            if self._context is not None and "_complete_close" in self._context.__dict__:
-                del self._context.__dict__["_complete_close"]
             _release_active_recorder(self._token)
             raise
 
     def _observe_current_thread(self) -> None:
         if self._engine is not None:
-            self._observed_thread_ids.add(self._engine.thread_id)
+            self._observed_thread_ids.add(self._engine._checkpoint_binding.storage_thread_id)
 
     def _on_conversation_item(self, event: ConversationItemAddedEvent) -> None:
         item = event.item
@@ -479,20 +486,15 @@ class CloseEvidenceRecorder:
             return
         self._close_handled = True
         assert self._context is not None
+        self._close_task = asyncio.create_task(self._close_and_notify())
+
+    async def _close_and_notify(self) -> None:
+        assert self._context is not None
         try:
-            self._context.close_session()
+            await self._context.aclose_session()
         except Exception:
             self._lifecycle_close_failed = True
             logger.exception("close certification lifecycle teardown failed")
-            self._on_fully_idle()
-
-    def _complete_close_and_notify(self) -> None:
-        assert self._context is not None
-        try:
-            CallerContext._complete_close(self._context)
-        except Exception:
-            self._lifecycle_close_failed = True
-            raise
         finally:
             self._on_fully_idle()
 
@@ -523,34 +525,32 @@ class CloseEvidenceRecorder:
 
     def _checkpoint_evidence(self) -> tuple[bool, bool]:
         assert self._engine is not None
-        all_empty = True
         try:
-            for thread_id in self._observed_thread_ids:
-                snapshot = self._engine._graph.get_state({"configurable": {"thread_id": thread_id}})
-                all_empty = bool(
-                    all_empty
-                    and not snapshot.values
-                    and not snapshot.next
-                    and not snapshot.tasks
-                    and not snapshot.interrupts
-                )
+            checkpointer = self._engine._graph.checkpointer
+            if not isinstance(checkpointer, SchemaValidatedCheckpointSaver):
+                return False, False
+            all_retired = all(
+                not checkpointer.thread_authorized(thread_id)
+                for thread_id in self._observed_thread_ids
+            )
         except Exception:
             return False, False
-        return all_empty, True
+        return all_retired, True
 
-    def _build_report(self) -> CloseEvidenceReport:
+    async def _build_report(self) -> CloseEvidenceReport:
         assert self._context is not None
+        assert self._effect_source is not None
         assert self._telemetry_path is not None
         assert self._before_effects is not None
         assert self._before_caller_state is not None
 
-        after_effects = _effect_counts(self._context)
+        after_effects = _effect_counts(self._effect_source)
         after_state = _caller_state(self._context)
         telemetry_counts, telemetry_available = _telemetry_counts(
             self._telemetry_path,
             self._telemetry_start,
         )
-        checkpoints_empty, checkpoint_available = self._checkpoint_evidence()
+        threads_retired, checkpoint_authorization_available = self._checkpoint_evidence()
         failures: list[FailureReason] = []
         if self._lifecycle_close_failed:
             failures.append("lifecycle_close_failed")
@@ -583,10 +583,10 @@ class CloseEvidenceRecorder:
             failures.append("authority_not_cleared")
         if after_state.principal_transition_disposition != "none":
             failures.append("principal_transition_not_cleared")
-        if not checkpoint_available:
-            failures.append("checkpoint_inspection_failed")
-        elif not checkpoints_empty:
-            failures.append("retired_checkpoint_not_empty")
+        if not checkpoint_authorization_available:
+            failures.append("checkpoint_authorization_inspection_failed")
+        elif not threads_retired:
+            failures.append("reasoning_thread_not_retired")
         if not telemetry_available:
             failures.append("telemetry_unavailable")
         elif telemetry_counts.caller_context_closed != 1:
@@ -619,13 +619,13 @@ class CloseEvidenceRecorder:
             before_caller_state=self._before_caller_state,
             after_caller_state=after_state,
             observed_reasoning_thread_count=len(self._observed_thread_ids),
-            all_observed_reasoning_threads_empty=checkpoints_empty,
+            all_observed_reasoning_threads_retired=threads_retired,
         )
 
     async def _finalize(self) -> None:
         assert self._completion is not None
         try:
-            report = self._build_report()
+            report = await self._build_report()
             await asyncio.to_thread(_write_report_atomic, self._request.report_path, report)
             if report.status == "failed":
                 self._completion.set_exception(
@@ -649,8 +649,6 @@ class CloseEvidenceRecorder:
     def _release(self) -> None:
         if not self._released:
             self._released = True
-            if self._context is not None and "_complete_close" in self._context.__dict__:
-                del self._context.__dict__["_complete_close"]
             _release_active_recorder(self._token)
 
     async def wait_for_completion(self, _shutdown_reason: str | None = None) -> Path:

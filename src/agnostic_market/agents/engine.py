@@ -33,16 +33,13 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Collection, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Literal
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.base import CheckpointTuple
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
 from pydantic import ValidationError
@@ -62,6 +59,12 @@ from agnostic_market.agents.recovery import (
 )
 from agnostic_market.agents.routing import RoutingSession
 from agnostic_market.agents.telemetry import write_event
+from agnostic_market.checkpoints import (
+    CheckpointBinding,
+    CheckpointScopeError,
+    SchemaValidatedCheckpointSaver,
+    graph_contract_fingerprint,
+)
 from agnostic_market.dtos.events import (
     CommittedTurn,
     InterruptEvent,
@@ -72,9 +75,7 @@ from agnostic_market.dtos.events import (
 )
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
-    CancellableOrderScope,
     CapabilityDispatchEnvelope,
-    CapabilityId,
     InvocationClarificationOwner,
     PrincipalTransition,
     RequestPerson,
@@ -86,28 +87,29 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
-    CartClarification,
     CheckpointSchemaError,
-    ClarificationLiveness,
-    HandoffRequest,
     HandoffSource,
-    IdentityClarification,
-    PendingCancelBatch,
-    PendingCartMutation,
-    PendingIdentity,
-    PendingPlacement,
-    PendingProfileChange,
-    PendingRefund,
-    PendingReturn,
     ReasoningState,
     StateSchemaError,
-    SupportClarification,
     merge_consumed_turn_ids,
     open_active_invocation,
     validate_reasoning_state_keys,
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
+
+
+async def _await_resisting_cancellation[T](
+    task: asyncio.Task[T],
+) -> tuple[T, asyncio.CancelledError | None]:
+    deferred_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancellation:
+            if deferred_cancellation is None:
+                deferred_cancellation = cancellation
+    return task.result(), deferred_cancellation
 
 
 def _new_thread_id() -> str:
@@ -121,76 +123,6 @@ def _write_ingress_rejection(
         write_event({"event": "ingress_turn_rejected", "reason": reason})
     except Exception:
         logger.critical("ingress-rejection telemetry failed", exc_info=True)
-
-
-# The custom Pydantic types that can occupy a top-level ReasoningState channel. LangGraph
-# serializes channel values directly, so these are the trust boundary. Nested Pydantic values
-# are reconstructed by their validated outer channel model and do not need an independent serde
-# grant. LangChain messages remain covered by the serializer's built-in safe types.
-_CHECKPOINT_CHANNEL_DTOS = (
-    ActiveInvocation,
-    CapabilityDispatchEnvelope,
-    RouterNoActionEnvelope,
-    PendingCartMutation,
-    PendingPlacement,
-    PendingRefund,
-    CancellableOrderScope,
-    PendingCancelBatch,
-    PendingReturn,
-    PendingProfileChange,
-    PendingIdentity,
-    PendingRecovery,
-    IdentityClarification,
-    SupportClarification,
-    CartClarification,
-    ClarificationLiveness,
-    HandoffRequest,
-)
-# Pydantic's Python-mode model_dump flattens nested models but retains custom enum values.
-# LangGraph therefore sees these constructors independently while decoding otherwise valid
-# channel DTOs. Keep them separate from the schema-derived channel boundary and exact-pinned.
-_CHECKPOINT_NESTED_ENUMS = (CapabilityId, ExceptionAction, HandoffSource)
-
-
-class SchemaValidatedInMemorySaver(InMemorySaver):
-    """In-memory saver that rejects channels outside its compiled graph contract."""
-
-    _allowed_checkpoint_channels: frozenset[str] | None = None
-
-    def bind_checkpoint_channels(self, channels: Collection[str]) -> None:
-        allowed = frozenset(channels)
-        missing = frozenset(ReasoningState.model_fields) - allowed
-        if missing:
-            raise ValueError(f"compiled graph omits reasoning-state fields: {sorted(missing)!r}")
-        if self._allowed_checkpoint_channels not in (None, allowed):
-            raise ValueError("checkpointer is already bound to a different graph schema")
-        self._allowed_checkpoint_channels = allowed
-
-    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
-        saved = super().get_tuple(config)
-        if saved is None or self._allowed_checkpoint_channels is None:
-            return saved
-        channel_values = saved.checkpoint.get("channel_values")
-        if not isinstance(channel_values, Mapping):
-            raise CheckpointSchemaError("persisted checkpoint channels are malformed")
-        try:
-            validate_reasoning_state_keys(
-                channel_values,
-                allowed_keys=self._allowed_checkpoint_channels,
-                source="persisted checkpoint",
-            )
-        except StateSchemaError as exc:
-            raise CheckpointSchemaError("persisted checkpoint has unknown channels") from exc
-        return saved
-
-
-def build_checkpointer() -> SchemaValidatedInMemorySaver:
-    """Build the strict saver for custom channel DTOs and their serialized enum values."""
-    return SchemaValidatedInMemorySaver(
-        serde=JsonPlusSerializer(
-            allowed_msgpack_modules=[*_CHECKPOINT_CHANNEL_DTOS, *_CHECKPOINT_NESTED_ENUMS]
-        )
-    )
 
 
 @dataclass
@@ -447,7 +379,10 @@ class ReasoningEngine:
         self,
         graph: CompiledStateGraph,
         *,
+        tenant_id: str,
+        deployment_id: str,
         thread_id: str,
+        checkpoint_io_timeout_seconds: float,
         cancellation_quiescence_timeout_seconds: float,
         routing: RoutingSession,
         lifecycle: PrincipalTransitionLifecycle | None = None,
@@ -457,13 +392,24 @@ class ReasoningEngine:
                 "ReasoningEngine requires a checkpointer-backed graph "
                 "(interrupt/resume needs a durable thread)"
             )
-        bind_checkpoint_channels = getattr(graph.checkpointer, "bind_checkpoint_channels", None)
-        if not callable(bind_checkpoint_channels):
+        if not isinstance(graph.checkpointer, SchemaValidatedCheckpointSaver):
             raise ValueError("ReasoningEngine requires a schema-validating checkpointer")
-        bind_checkpoint_channels(graph.channels)
+        binding = CheckpointBinding(
+            tenant_id=tenant_id,
+            deployment_id=deployment_id,
+            graph_contract=graph_contract_fingerprint(graph),
+            thread_id=thread_id,
+        )
+        graph.checkpointer.bind_checkpoint_contract(
+            graph.channels,
+            binding=binding,
+            io_timeout_seconds=checkpoint_io_timeout_seconds,
+        )
         self._graph = graph
+        self._checkpoint_io_timeout_seconds = checkpoint_io_timeout_seconds
+        self._checkpoint_binding = binding
         self._thread_id = thread_id
-        self._config = {"configurable": {"thread_id": thread_id}}
+        self._config = binding.config
         self._speakable: frozenset[str] = getattr(graph, "speakable_nodes", frozenset())
         self._model_speech: frozenset[str] = getattr(graph, "model_speech_nodes", frozenset())
         model_execution_nodes = getattr(graph, "model_execution_nodes", None)
@@ -526,24 +472,32 @@ class ReasoningEngine:
         if not isinstance(execution_tracker, NodeExecutionTracker):
             raise ValueError("ReasoningEngine requires a graph-declared node execution tracker")
         self._node_execution_tracker = execution_tracker
+        self._background_tasks: set[asyncio.Task[None]] = set()
         if lifecycle is not None:
-            lifecycle.attach_execution_quiescence(execution_tracker)
+            lifecycle.attach_execution_quiescence(
+                execution_tracker,
+                timeout_seconds=cancellation_quiescence_timeout_seconds,
+            )
         self._terminal_latched = False
 
     @property
     def thread_id(self) -> str:
         return self._thread_id
 
-    def pending_interrupt(self) -> bool:
-        """True if the thread is paused at a HITL interrupt (next turn must resume it)."""
+    async def apending_interrupt(self) -> bool:
+        """Async voice-path check for a pending confirmation interrupt."""
         if not self._node_execution_tracker.turn_admission_open or self._terminal_latched:
             return False
+        return await self.acheckpoint_has_pending_interrupt()
+
+    async def acheckpoint_has_pending_interrupt(self) -> bool:
+        """Inspect persisted interruption state without implying that a turn may resume it."""
         try:
-            return bool(self._graph.get_state(self._config).interrupts)
-        except CheckpointSchemaError:
+            return bool((await self._graph.aget_state(self._config)).interrupts)
+        except (CheckpointSchemaError, CheckpointScopeError):
             return False
 
-    def _update_state(
+    async def _aupdate_state(
         self,
         config: RunnableConfig,
         values: Mapping[str, object],
@@ -551,7 +505,7 @@ class ReasoningEngine:
         as_node: str,
     ) -> None:
         validate_reasoning_state_keys(values, source=f"engine update from {as_node!r}")
-        self._graph.update_state(config, dict(values), as_node=as_node)
+        await self._graph.aupdate_state(config, dict(values), as_node=as_node)
 
     @staticmethod
     def _validate_graph_input(value: object) -> None:
@@ -562,7 +516,7 @@ class ReasoningEngine:
             raise StateSchemaError("engine graph input contains a non-mapping state update")
         validate_reasoning_state_keys(update, source="engine graph input")
 
-    def _rotate_pending_transition(
+    async def _arotate_pending_transition(
         self,
         arriving_message_id: str,
     ) -> PrincipalTransition | None:
@@ -573,7 +527,7 @@ class ReasoningEngine:
             return None
         transition = inspection.transition
         assert transition is not None
-        current = self._graph.get_state(self._config)
+        current = await self._graph.aget_state(self._config)
         current_state = ReasoningState.from_checkpoint(current.values)
         if current_state.automation_terminal:
             self._lifecycle.invalidate_principal_transition(transition.transition_id)
@@ -582,9 +536,16 @@ class ReasoningEngine:
             self._lifecycle.invalidate_principal_transition(transition.transition_id)
             raise RuntimeError("principal transition is inconsistent")
 
-        old_thread_id = self._thread_id
         new_thread_id = _new_thread_id()
-        new_config = {"configurable": {"thread_id": new_thread_id}}
+        old_binding = self._checkpoint_binding
+        new_binding = old_binding.rotate(new_thread_id)
+        assert isinstance(self._graph.checkpointer, SchemaValidatedCheckpointSaver)
+        self._graph.checkpointer.bind_checkpoint_contract(
+            self._graph.channels,
+            binding=new_binding,
+            io_timeout_seconds=self._checkpoint_io_timeout_seconds,
+        )
+        new_config = new_binding.config
         carried_turn_ids = merge_consumed_turn_ids(
             current_state.consumed_turn_ids,
             (arriving_message_id,),
@@ -605,8 +566,8 @@ class ReasoningEngine:
                 seed_author = "__start__"
             else:
                 seed_author = self._principal_seed_complete_node
-            self._update_state(new_config, seed, as_node=seed_author)
-            seeded = self._graph.get_state(new_config)
+            await self._aupdate_state(new_config, seed, as_node=seed_author)
+            seeded = await self._graph.aget_state(new_config)
             seeded_state = ReasoningState.from_checkpoint(seeded.values)
             expected_clear = clear_automation_state()
             expected_next = ("entry",) if transition.continuation is not None else ()
@@ -627,8 +588,9 @@ class ReasoningEngine:
             rechecked = self._lifecycle.inspect_principal_transition()
             if rechecked.outcome != "coherent" or rechecked.transition != transition:
                 raise RuntimeError("principal transition changed during rotation")
-            self._graph.checkpointer.delete_thread(old_thread_id)
+            await self._graph.checkpointer.adelete_thread(old_binding.storage_thread_id)
             self._thread_id = new_thread_id
+            self._checkpoint_binding = new_binding
             self._config = new_config
             switched = True
             self._lifecycle.complete_transition(transition.transition_id)
@@ -636,7 +598,7 @@ class ReasoningEngine:
             self._lifecycle.invalidate_principal_transition(transition.transition_id)
             if not switched:
                 try:
-                    self._graph.checkpointer.delete_thread(new_thread_id)
+                    await self._graph.checkpointer.adelete_thread(new_binding.storage_thread_id)
                 except Exception:
                     logger.critical(
                         "failed to discard an incomplete principal-rotation seed",
@@ -674,14 +636,6 @@ class ReasoningEngine:
                     exc_info=True,
                 )
 
-    def _enter_last_resort(self, *, replace_checkpoint: bool = False) -> SpokenMessageEvent:
-        self._latch_last_resort()
-        self._finalize_last_resort_state(replace_checkpoint=replace_checkpoint)
-        return SpokenMessageEvent(
-            text=AUTOMATION_TERMINAL_LINE,
-            node=self._terminal_takeover_node,
-        )
-
     def _latch_last_resort(self) -> None:
         if self._terminal_latched:
             return
@@ -691,7 +645,19 @@ class ReasoningEngine:
         except Exception:
             logger.critical("last-resort telemetry failed", exc_info=True)
 
-    def _finalize_last_resort_state(self, *, replace_checkpoint: bool = False) -> None:
+    async def _aenter_last_resort(
+        self,
+        *,
+        replace_checkpoint: bool = False,
+    ) -> SpokenMessageEvent:
+        self._latch_last_resort()
+        await self._afinalize_last_resort_state(replace_checkpoint=replace_checkpoint)
+        return SpokenMessageEvent(
+            text=AUTOMATION_TERMINAL_LINE,
+            node=self._terminal_takeover_node,
+        )
+
+    async def _afinalize_last_resort_state(self, *, replace_checkpoint: bool = False) -> None:
         self._invalidate_pending_transition_for_terminal()
         terminal_update: dict[str, object] = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -705,10 +671,10 @@ class ReasoningEngine:
             ],
         }
         if replace_checkpoint:
-            self._replace_with_terminal_checkpoint(terminal_update)
+            await self._areplace_with_terminal_checkpoint(terminal_update)
             return
         try:
-            self._update_state(
+            await self._aupdate_state(
                 self._config,
                 terminal_update,
                 as_node=self._terminal_takeover_node,
@@ -722,17 +688,15 @@ class ReasoningEngine:
         except Exception:
             logger.critical("last-resort checkpoint takeover failed", exc_info=True)
             return
+        await self._areplace_with_terminal_checkpoint(terminal_update)
 
-        self._replace_with_terminal_checkpoint(terminal_update)
-
-    def _replace_with_terminal_checkpoint(self, terminal_update: dict[str, object]) -> None:
+    async def _areplace_with_terminal_checkpoint(
+        self,
+        terminal_update: dict[str, object],
+    ) -> None:
         try:
-            # A schema-incoherent checkpoint cannot accept even a total-clear update because
-            # LangGraph validates the old state before applying the delta. The session is
-            # already terminal-latched, so replace that unusable thread with one terminal
-            # checkpoint rather than retaining corrupt continuation or authority state.
-            self._graph.checkpointer.delete_thread(self._thread_id)
-            self._update_state(
+            await self._graph.checkpointer.aclear_thread(self._checkpoint_binding.storage_thread_id)
+            await self._aupdate_state(
                 self._config,
                 terminal_update,
                 as_node=self._terminal_takeover_node,
@@ -740,18 +704,27 @@ class ReasoningEngine:
         except Exception:
             logger.critical("last-resort checkpoint replacement failed", exc_info=True)
 
-    def _defer_last_resort_until_idle(self) -> None:
+    def _adefer_last_resort_until_idle(self) -> None:
         self._latch_last_resort()
+        loop = asyncio.get_running_loop()
 
         def finalize() -> None:
-            lease = (
-                self._lifecycle.cancellation_takeover_lease()
-                if self._lifecycle is not None
-                else nullcontext(True)
-            )
-            with lease as acquired:
-                if acquired:
-                    self._finalize_last_resort_state()
+            def schedule() -> None:
+                async def run() -> None:
+                    lease = (
+                        self._lifecycle.cancellation_takeover_lease()
+                        if self._lifecycle is not None
+                        else nullcontext(True)
+                    )
+                    with lease as acquired:
+                        if acquired:
+                            await self._afinalize_last_resort_state()
+
+                task = asyncio.create_task(run())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+
+            loop.call_soon_threadsafe(schedule)
 
         try:
             self._node_execution_tracker.defer_until_fully_idle(finalize)
@@ -957,13 +930,13 @@ class ReasoningEngine:
         )
         return payload
 
-    def _seed_stream_recovery(
+    async def _aseed_stream_recovery(
         self,
         marker: PendingRecovery,
     ) -> None:
         abandoned_message_id = marker.abandoned_message_id
         assert abandoned_message_id is not None
-        self._update_state(
+        await self._aupdate_state(
             self._config,
             {
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -972,7 +945,7 @@ class ReasoningEngine:
             },
             as_node="__start__",
         )
-        seeded = self._graph.get_state(self._config)
+        seeded = await self._graph.aget_state(self._config)
         seeded_state = ReasoningState.from_checkpoint(seeded.values)
         if (
             seeded_state.pending_recovery != marker
@@ -998,12 +971,20 @@ class ReasoningEngine:
                 self._cancellation_quiescence_timeout_seconds,
             )
         )
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                continue
-        return cleanup_task.result()
+        result, _deferred_cancellation = await _await_resisting_cancellation(cleanup_task)
+        return result
+
+    async def _afinalize_stream_transition(self, message_id: str) -> None:
+        try:
+            await self._arotate_pending_transition(message_id)
+        except CheckpointSchemaError:
+            logger.exception("close-stream checkpoint schema rejected")
+            await self._aenter_last_resort(replace_checkpoint=True)
+        except Exception:
+            logger.exception("close-stream principal rotation failed")
+            # Generator close has no remaining consumer for a yielded event.
+            # Last resort persists and latches the terminal response for a later turn.
+            await self._aenter_last_resort()
 
     async def _take_over_cancelled_stream(
         self,
@@ -1017,16 +998,16 @@ class ReasoningEngine:
             idle = await self._await_mutable_quiescence()
         except asyncio.CancelledError:
             logger.critical("cancellation quiescence task was itself cancelled", exc_info=True)
-            self._defer_last_resort_until_idle()
+            self._adefer_last_resort_until_idle()
             return
         except Exception:
             logger.critical("cancellation quiescence task failed", exc_info=True)
-            self._defer_last_resort_until_idle()
+            self._adefer_last_resort_until_idle()
             return
 
         if not idle:
             logger.error("mutable graph work did not become quiescent before timeout")
-            self._defer_last_resort_until_idle()
+            self._adefer_last_resort_until_idle()
             return
 
         lease = (
@@ -1038,10 +1019,10 @@ class ReasoningEngine:
             if not acquired:
                 return
             try:
-                self._rotate_pending_transition(abandoned_message_id)
+                await self._arotate_pending_transition(abandoned_message_id)
                 if owned_thread_id != self._thread_id:
                     return
-                snapshot = self._graph.get_state(self._config)
+                snapshot = await self._graph.aget_state(self._config)
                 disposition = _classify_cancelled_checkpoint(
                     snapshot,
                     policies=self._node_recovery_policies,
@@ -1053,17 +1034,17 @@ class ReasoningEngine:
                 if disposition.outcome in {"complete", "interrupt"}:
                     return
                 if disposition.outcome != "recover" or disposition.marker is None:
-                    self._enter_last_resort()
+                    await self._aenter_last_resort()
                     return
-                self._seed_stream_recovery(disposition.marker)
+                await self._aseed_stream_recovery(disposition.marker)
             except CheckpointSchemaError:
                 logger.exception(
                     "cancelled-stream checkpoint is schema-incoherent; terminalizing the session"
                 )
-                self._enter_last_resort(replace_checkpoint=True)
+                await self._aenter_last_resort(replace_checkpoint=True)
             except Exception:
                 logger.exception("cancelled-stream takeover failed; terminalizing the session")
-                self._enter_last_resort()
+                await self._aenter_last_resort()
 
     async def stream_turn(
         self,
@@ -1114,14 +1095,14 @@ class ReasoningEngine:
             return
         arrived_thread_id = self._thread_id
         try:
-            arrived = self._graph.get_state(self._config)
+            arrived = await self._graph.aget_state(self._config)
         except CheckpointSchemaError:
             logger.exception("initial checkpoint schema rejected; terminalizing the session")
-            yield self._enter_last_resort(replace_checkpoint=True)
+            yield await self._aenter_last_resort(replace_checkpoint=True)
             return
         except Exception:
             logger.exception("initial checkpoint read failed; terminalizing the session")
-            yield self._enter_last_resort()
+            yield await self._aenter_last_resort()
             return
         arrived_interrupt_ids = frozenset(interrupt.id for interrupt in arrived.interrupts)
         async with self._turn_lock:
@@ -1138,8 +1119,8 @@ class ReasoningEngine:
                         node=self._terminal_takeover_node,
                     )
                     return
-                self._rotate_pending_transition(message_id)
-                snapshot = self._graph.get_state(self._config)
+                await self._arotate_pending_transition(message_id)
+                snapshot = await self._graph.aget_state(self._config)
                 snapshot_state = ReasoningState.from_checkpoint(snapshot.values)
                 cross_thread = arrived_thread_id != self._thread_id
                 marker = (
@@ -1183,11 +1164,11 @@ class ReasoningEngine:
                         return
                     elif snapshot.interrupts:
                         if not self._checkpoint_has_valid_interrupt(snapshot):
-                            yield self._enter_last_resort()
+                            yield await self._aenter_last_resort()
                             return
                         payload = Command(update={"consumed_turn_ids": (message_id,)})
                     elif not snapshot.next and not snapshot.tasks:
-                        self._update_state(
+                        await self._aupdate_state(
                             self._config,
                             {"consumed_turn_ids": (message_id,)},
                             as_node=self._principal_seed_complete_node,
@@ -1200,7 +1181,7 @@ class ReasoningEngine:
                     elif self._is_pristine_principal_continuation(snapshot, snapshot_state):
                         payload = Command(update={"consumed_turn_ids": (message_id,)})
                     else:
-                        yield self._enter_last_resort()
+                        yield await self._aenter_last_resort()
                         return
                 elif marker is not None:
                     already_consumed = message_id in snapshot_state.consumed_turn_ids
@@ -1234,7 +1215,7 @@ class ReasoningEngine:
                         return
                 elif snapshot.interrupts:
                     if not self._checkpoint_has_valid_interrupt(snapshot):
-                        yield self._enter_last_resort()
+                        yield await self._aenter_last_resort()
                         return
                     interrupt_id = snapshot.interrupts[0].id
                     # The graph's confirm node classifies consent; the engine only relays facts.
@@ -1244,7 +1225,7 @@ class ReasoningEngine:
                             self._node_recovery_policies,
                         )
                         if resumed_interrupt_node is None:
-                            yield self._enter_last_resort()
+                            yield await self._aenter_last_resort()
                             return
                         resume_payload: dict[str, object] = {
                             "text": turn.text,
@@ -1265,11 +1246,11 @@ class ReasoningEngine:
                         payload = Command(update={"consumed_turn_ids": (message_id,)})
                 elif snapshot.next:
                     if not self._is_pristine_principal_continuation(snapshot, snapshot_state):
-                        yield self._enter_last_resort()
+                        yield await self._aenter_last_resort()
                         return
                     payload = Command(update={"consumed_turn_ids": (message_id,)})
                 elif snapshot.tasks:
-                    yield self._enter_last_resort()
+                    yield await self._aenter_last_resort()
                     return
                 else:
                     payload = await self._ordinary_turn_payload(turn, snapshot_state)
@@ -1304,7 +1285,7 @@ class ReasoningEngine:
                                     yield event
                     owned_stream_thread_id = None
                     owned_resumed_interrupt_node = None
-                    transition = self._rotate_pending_transition(message_id)
+                    transition = await self._arotate_pending_transition(message_id)
                     if transition is None or transition.continuation is None:
                         break
                     payload = None
@@ -1312,41 +1293,34 @@ class ReasoningEngine:
                 cancelled_stream = True
                 if owned_stream_thread_id is not None:
                     active_node_names = self._node_execution_tracker.active_node_names
-                    await self._take_over_cancelled_stream(
-                        owned_thread_id=owned_stream_thread_id,
-                        abandoned_message_id=message_id,
-                        active_node_names=active_node_names,
-                        resumed_interrupt_node=owned_resumed_interrupt_node,
+                    takeover = asyncio.create_task(
+                        self._take_over_cancelled_stream(
+                            owned_thread_id=owned_stream_thread_id,
+                            abandoned_message_id=message_id,
+                            active_node_names=active_node_names,
+                            resumed_interrupt_node=owned_resumed_interrupt_node,
+                        )
                     )
+                    await _await_resisting_cancellation(takeover)
                 raise original_cancellation
             except CheckpointSchemaError:
                 logger.exception("checkpoint schema rejected; terminalizing the session")
-                yield self._enter_last_resort(replace_checkpoint=True)
+                yield await self._aenter_last_resort(replace_checkpoint=True)
                 return
             except Exception:
                 logger.exception("unhandled turn failure; terminalizing the session")
-                yield self._enter_last_resort()
+                yield await self._aenter_last_resort()
                 return
             finally:
                 if not cancelled_stream and not self._terminal_latched:
-                    try:
-                        self._rotate_pending_transition(message_id)
-                    except CheckpointSchemaError:
-                        logger.exception("close-stream checkpoint schema rejected")
-                        self._enter_last_resort(replace_checkpoint=True)
-                    except Exception:
-                        logger.exception("close-stream principal rotation failed")
-                        # Generator close has no remaining consumer for a yielded event.
-                        # Last resort persists and latches the terminal response for a later turn.
-                        self._enter_last_resort()
+                    cleanup = asyncio.create_task(self._afinalize_stream_transition(message_id))
+                    _result, deferred_cancellation = await _await_resisting_cancellation(cleanup)
+                    if deferred_cancellation is not None:
+                        raise deferred_cancellation
             for flushed in speech.flush():
                 yield flushed
             spans.log()
 
-    def delete_thread(self) -> None:
-        """Remove this session's thread from the checkpointer.
-
-        The engine EXPOSES the reap but never decides when — session lifecycle (Clock B)
-        belongs to the voice plane's teardown hook.
-        """
-        self._graph.checkpointer.delete_thread(self._thread_id)
+    async def adelete_thread(self) -> None:
+        """Asynchronously remove this session's tenant-scoped reasoning thread."""
+        await self._graph.checkpointer.adelete_thread(self._checkpoint_binding.storage_thread_id)

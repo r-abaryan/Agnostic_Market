@@ -56,8 +56,10 @@ from agnostic_market.agents.recovery import (
 from agnostic_market.agents.support import build_support_nodes
 from agnostic_market.agents.telemetry import write_capability_answered, write_event
 from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.catalog import CatalogPort
 from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.orders import (
+    GuestOrderScope,
     OrderStore,
     RecentOrderContext,
     render_cart_line,
@@ -223,6 +225,8 @@ def build_frontline_graph(
     tenant_id: str,
     reasoning_model: BaseChatModel,
     store: OrderStore,
+    catalog: CatalogPort,
+    guest_orders: GuestOrderScope,
     policy: PolicyContext,
     cart_store: CartStore,
     otp: OtpProvider,
@@ -236,6 +240,8 @@ def build_frontline_graph(
     lifecycle: PrincipalTransitionLifecycle,
     structured_output_method: StructuredOutputMethod,
     caller_audible_model_text_max_chars: int,
+    response_model_node_timeout_seconds: float,
+    reasoning_model_node_timeout_seconds: float,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> FrontlineGraphAssembly:
     """Compile the reasoning graph (frontline routing tier + the cart, support, and identity
@@ -249,6 +255,22 @@ def build_frontline_graph(
     The stores are session-owned dependencies shared by routing context projection and typed
     capability owners.
     """
+    if not tenant_id.strip():
+        raise ValueError("frontline graph requires a tenant id")
+    tenant_dependencies = {
+        "catalog": catalog.tenant_id,
+        "order store": store.tenant_id,
+        "guest-order scope": guest_orders.tenant_id,
+    }
+    mismatched_tenants = [
+        name
+        for name, dependency_tenant in tenant_dependencies.items()
+        if dependency_tenant != tenant_id
+    ]
+    if mismatched_tenants:
+        raise ValueError(
+            "frontline tenant dependencies do not match: " + ", ".join(mismatched_tenants)
+        )
     # A defaulted VerificationStore shares the SAME provider the dispatch node uses (else
     # dispatch and verify would talk to different fakes).
     verification_store = verification_store or VerificationStore(otp)
@@ -465,11 +487,19 @@ def build_frontline_graph(
         return END  # declined / expired (node spoke its line, clear-before-speak)
 
     cart = build_cart_nodes(
-        reasoning_model, store, cart_store, policy, recent_orders, display_name=display_name
+        reasoning_model,
+        store,
+        catalog,
+        guest_orders,
+        cart_store,
+        policy,
+        recent_orders,
+        display_name=display_name,
     )
     support = build_support_nodes(
         reasoning_model,
         store,
+        guest_orders,
         verification_store,
         otp,
         risk,
@@ -494,6 +524,8 @@ def build_frontline_graph(
     reads = build_read_flow_nodes(
         chat_model,
         store,
+        catalog,
+        guest_orders,
         policy,
         display_name=display_name,
         structured_output_method=structured_output_method,
@@ -858,6 +890,10 @@ def build_frontline_graph(
     node_registry = NodePolicyRegistry(
         graph,
         error_handler_factory=build_node_error_handler,
+        model_node_timeouts={
+            **dict.fromkeys(MODEL_SPEECH_NODES, response_model_node_timeout_seconds),
+            **dict.fromkeys(NON_SPEAKING_MODEL_NODES, reasoning_model_node_timeout_seconds),
+        },
     )
     entry_node_name = "entry"
     node_registry.register(

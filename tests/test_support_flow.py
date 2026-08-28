@@ -18,13 +18,14 @@ from langchain_core.messages import AIMessage, ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from pydantic import ValidationError
-from support_helpers import authorize_fixture_orders, build_support_engine
+from support_helpers import authorize_customer, build_support_engine
 from turn_helpers import engine_events
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME
 from agnostic_market.agents.support import flow as support_flow
-from agnostic_market.commerce.orders import OrderStore
+from agnostic_market.checkpoints import CheckpointScopeError
+from agnostic_market.commerce.orders import OrdersFixture, OrderStore, load_orders_fixture
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentsFixture,
     load_payment_instruments_fixture,
@@ -78,12 +79,13 @@ def _engine(
     policy: PolicyContext = _POLICY,
     thread_id: str = "support-1",
     routing_resolution: RouteResolution | None = None,
+    authorized_customer_ref: str = "CUST-002",
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
     """Thin wrapper over the shared harness (support_helpers) preserving this file's
     4-tuple unpacking + its propose_refund default. Fixture orders are PRE-AUTHORIZED
     (rung-1) — this suite pins the post-authorization money logic; the selection gate has
     its own suite (test_support_scoping.py)."""
-    harness = authorize_fixture_orders(
+    harness = authorize_customer(
         build_support_engine(
             config_root,
             policy=policy,
@@ -99,7 +101,8 @@ def _engine(
                     destination="new_instrument",
                 )
             ),
-        )
+        ),
+        authorized_customer_ref,
     )
     return harness.engine, harness.store, harness.verification, harness.otp
 
@@ -119,7 +122,7 @@ def _telemetry_events(tmp_path: Path) -> list[dict]:
     ]
 
 
-def _assert_refund_destination_failed_closed(
+async def _assert_refund_destination_failed_closed(
     *,
     engine: ReasoningEngine,
     store: OrderStore,
@@ -132,9 +135,9 @@ def _assert_refund_destination_failed_closed(
     spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
     assert [event.node for event in spoken] == ["automation_terminal_response"]
     assert "contact the store" in spoken[0].text.lower()
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
 
-    snapshot = engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}})
+    snapshot = engine._graph.get_state(engine._config)
     assert snapshot.next == ()
     assert snapshot.values.get("automation_terminal") is True
     assert snapshot.values.get("execution_owner") is None
@@ -197,7 +200,7 @@ async def test_yes_after_stepup_issues_exactly_one_refund(config_root: Path) -> 
     events = await _events(engine, "yes please")
     assert store.refund_count == 1
     assert store.refunded_so_far("ORD-1002") == 129.0
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any(e.node == "support_place" and "refund" in e.text.lower() for e in spoken)
 
@@ -233,7 +236,7 @@ async def test_wrong_otp_twice_stays_l1_and_never_refunds(config_root: Path) -> 
     await _events(engine, "111111")  # wrong again -> exhausted
     assert verification.current_level() == 1
     assert store.refund_count == 0
-    assert not engine.pending_interrupt()  # not trapped
+    assert not await engine.apending_interrupt()  # not trapped
 
 
 async def test_otp_attempt_budget_tracks_the_policy_knob(config_root: Path) -> None:
@@ -251,7 +254,7 @@ async def test_otp_attempt_budget_tracks_the_policy_knob(config_root: Path) -> N
     await _events(engine, "222222")  # wrong #3 -> exhausted
     assert verification.current_level() == 1
     assert store.refund_count == 0
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
 
 
 async def test_live_read_blocks_a_lapsed_grant_at_place(config_root: Path) -> None:
@@ -305,7 +308,7 @@ async def test_refund_accepts_supported_natural_affirmation(config_root: Path) -
     await _events(engine, "sure")
 
     assert store.refund_count == 1
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
 
 
 async def test_no_at_readback_cancels_without_refunding(config_root: Path) -> None:
@@ -314,7 +317,7 @@ async def test_no_at_readback_cancels_without_refunding(config_root: Path) -> No
     await _events(engine, _VALID_OTP)
     events = await _events(engine, "no, don't")
     assert store.refund_count == 0
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("nothing has changed" in e.text.lower() for e in spoken)
 
@@ -325,8 +328,8 @@ async def test_no_at_readback_cancels_without_refunding(config_root: Path) -> No
 async def test_kill_mid_stepup_leaves_no_ghost_refund_and_no_free_level(config_root: Path) -> None:
     engine, store, verification, _ = _engine(config_root)
     await _pause_at_otp(engine)  # paused at the OTP collect interrupt
-    assert engine.pending_interrupt()
-    engine.delete_thread()  # Clock-B teardown
+    assert await engine.apending_interrupt()
+    await engine.adelete_thread()  # Clock-B teardown
     verification.clear()  # pipeline reaper also clears the grant
     assert store.refund_count == 0
     assert verification.current_level() == 1
@@ -355,15 +358,18 @@ _ORDER_BY_KEY = {
     "2": "ORD-1002",
     "3": "ORD-1003",
     "4": "ORD-9001",
+    "5": "ORD-1004",
 }
 
 
 def _cancel_engine(config_root, args, *, thread_id, risk_flagged=False):
     keys = args["propose_cancel"]["order_keys"]
+    customer_ref = "CUST-001" if keys and keys[0] in {"1", "3"} else "CUST-002"
     return _engine(
         config_root,
         risk_flagged=risk_flagged,
         thread_id=thread_id,
+        authorized_customer_ref=customer_ref,
         routing_resolution=RouteDecision.direct(
             CancelOrders(
                 target=ExplicitOrderSet(order_refs=tuple(_ORDER_BY_KEY[key] for key in keys))
@@ -472,8 +478,8 @@ async def test_cancel_is_idempotent_across_double_resume(config_root: Path) -> N
 async def test_kill_mid_cancel_leaves_no_ghost(config_root: Path) -> None:
     engine, store, _, _ = _cancel_engine(config_root, _CANCEL_PROCESSING, thread_id="cx-7")
     await _events(engine, "cancel my rain jacket order")  # paused at the cancel readback
-    assert engine.pending_interrupt()
-    engine.delete_thread()
+    assert await engine.apending_interrupt()
+    await engine.adelete_thread()
     assert store.cancel_count == 0
     assert store.order_status("ORD-1002") == "processing"  # nothing voided on the drop
 
@@ -524,7 +530,7 @@ async def test_stale_scalar_cancel_call_cannot_widen_to_account_scope(
     harness.identity.bind(
         BoundIdentity(customer_ref="CUST-002", masked_contact="email ending example dot com")
     )
-    _place_second_cancellable(harness.store)
+    _place_second_cancellable(harness)
 
     events = await _events(harness.engine, "cancel my order")
     assert not any(isinstance(event, InterruptEvent) for event in events)
@@ -532,48 +538,68 @@ async def test_stale_scalar_cancel_call_cannot_widen_to_account_scope(
     assert _pending_cancel(harness, "batch-stale-scalar") is None
 
 
-def _place_second_cancellable(store: OrderStore) -> str:
+def _place_second_cancellable(harness) -> str:
     """Place a session cart order (ORD-9001, 'processing' => cancellable, session-authorized
     with no grant needed) so a batch has TWO cancellable targets. Its candidate KEY is '4'
     (after the three fixture orders in actionable_orders). Returns the order id."""
     from agnostic_market.dtos.state import CartLine
 
-    placed = store.place_cart(
+    placed = harness.store.place_cart(
         "seed-batch",
         lines=[CartLine(sku="SKU-BLU-07", name="rain jacket", price_usd=60.0, quantity=1)],
         total_usd=60.0,
     )
+    harness.guest_orders.record(placed.order_id)
     return placed.order_id
 
 
-def _place_second_cancellable_extra(store: OrderStore) -> str:
+def _place_second_cancellable_extra(harness) -> str:
     """A THIRD cancellable session order (ORD-9002) — for the 'both' >2 clarify test."""
     from agnostic_market.dtos.state import CartLine
 
-    placed = store.place_cart(
+    placed = harness.store.place_cart(
         "seed-batch-2",
         lines=[CartLine(sku="SKU-GRN-15", name="socks", price_usd=14.5, quantity=1)],
         total_usd=14.5,
     )
+    harness.guest_orders.record(placed.order_id)
     return placed.order_id
 
 
-def _batch_engine(config_root, keys, *, thread_id, policy=_POLICY, place_second=False):
+def _batch_engine(
+    config_root,
+    keys,
+    *,
+    thread_id,
+    policy=_POLICY,
+    place_second=False,
+    same_customer_shipped=False,
+):
     """Build a typed cancellation engine and optionally seed another cancellable order."""
-    harness = authorize_fixture_orders(
+    orders_fixture: OrdersFixture | None = None
+    if same_customer_shipped:
+        loaded = load_orders_fixture(config_root, "acme_store")
+        shipped = loaded.orders["ORD-1001"].model_copy(update={"customer_ref": "CUST-002"})
+        orders_fixture = loaded.model_copy(
+            update={"orders": {**loaded.orders, "ORD-1004": shipped}}
+        )
+    customer_ref = "CUST-002" if any(key in {"2", "4", "5"} for key in keys) else "CUST-001"
+    harness = authorize_customer(
         build_support_engine(
             config_root,
             policy=policy,
+            orders_fixture=orders_fixture,
             routing_resolution=RouteDecision.direct(
                 CancelOrders(
                     target=ExplicitOrderSet(order_refs=tuple(_ORDER_BY_KEY[key] for key in keys))
                 )
             ),
             thread_id=thread_id,
-        )
+        ),
+        customer_ref,
     )
     if place_second:
-        _place_second_cancellable(harness.store)
+        _place_second_cancellable(harness)
     return harness.engine, harness.store
 
 
@@ -595,9 +621,14 @@ async def test_cancel_both_voids_both_in_one_flow(config_root: Path) -> None:
 
 
 async def test_batch_cancel_mixes_eligible_and_shipped(config_root: Path) -> None:
-    # Mixed batch: ORD-1002 processing + ORD-1001 shipped. The readback names ONLY the
-    # eligible one, states the shipped one needs a return; yes voids only the eligible one.
-    engine, store = _batch_engine(config_root, ["2", "1"], thread_id="batch-2")
+    # Mixed batch under one principal: ORD-1002 processing + ORD-1004 shipped.
+    # The readback names only the eligible order; yes voids only that order.
+    engine, store = _batch_engine(
+        config_root,
+        ["2", "5"],
+        thread_id="batch-2",
+        same_customer_shipped=True,
+    )
     events = await _events(engine, "cancel both")
     interrupts = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1
@@ -606,7 +637,7 @@ async def test_batch_cancel_mixes_eligible_and_shipped(config_root: Path) -> Non
     events = await _events(engine, "yes")
     assert store.cancel_count == 1
     assert store.order_status("ORD-1002") == "cancelled"
-    assert store.order_status("ORD-1001") == "shipped"  # untouched
+    assert store.order_status("ORD-1004") == "shipped"  # untouched
     spoken = " ".join(e.text for e in events if isinstance(e, SpokenMessageEvent))
     assert "ORD-1002" in spoken and "already shipped" in spoken.lower()
 
@@ -664,10 +695,16 @@ async def test_batch_cancel_checkpoints_between_voids(config_root: Path) -> None
 
 async def test_cancel_effect_revalidates_status_changed_after_readback(
     config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, store = _batch_engine(config_root, ["2"], thread_id="batch-stale-status")
     await _events(engine, "cancel my order")
-    store.fixture.orders["ORD-1002"].status = "shipped"
+    current_status = store.order_status
+
+    def changed_status(order_id: str) -> str | None:
+        return "shipped" if order_id.strip().upper() == "ORD-1002" else current_status(order_id)
+
+    monkeypatch.setattr(store, "order_status", changed_status)
 
     events = await _events(engine, "yes")
     assert store.cancel_count == 0
@@ -703,7 +740,7 @@ async def test_engine_recovers_cancel_after_write_before_checkpoint(
         if isinstance(event, SpokenMessageEvent) and event.node == RECOVERY_NODE_NAME
     ]
     assert len(result_lines) == 1 and "cancelled" in result_lines[0].text.lower()
-    assert engine._graph.get_state({"configurable": {"thread_id": engine.thread_id}}).next == ()
+    assert engine._graph.get_state(engine._config).next == ()
 
 
 async def test_concurrent_double_resume_has_n_effects_and_one_result_line(
@@ -760,7 +797,7 @@ def _scope_engine(
             CancelOrders(target=CancellableOrderScope(scope=scope))
         ),
     )
-    _place_second_cancellable(harness.store)  # ORD-9001, session-owned, cancellable
+    _place_second_cancellable(harness)  # ORD-9001, session-owned, cancellable
     if bound:
         from agnostic_market.commerce.identity import BoundIdentity
 
@@ -771,12 +808,14 @@ def _scope_engine(
 
 
 def _pending_cancel(harness, thread_id):
-    snap = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert harness.engine.thread_id == thread_id
+    snap = harness.engine._graph.get_state(harness.engine._config)
     return snap.values.get("pending_cancel")
 
 
 def _validated_state(harness, thread_id) -> ReasoningState:
-    snap = harness.engine._graph.get_state({"configurable": {"thread_id": thread_id}})
+    assert harness.engine.thread_id == thread_id
+    snap = harness.engine._graph.get_state(harness.engine._config)
     return ReasoningState.model_validate(snap.values)
 
 
@@ -815,7 +854,7 @@ async def test_guest_context_warning_decline_preserves_guest_state(config_root: 
     )
     assert h.engine.thread_id == old_thread_id
     assert h.identity.current() is None
-    assert h.store.session_placed_orders()
+    assert h.store.guest_orders(h.guest_orders)
     assert _active_request(h, old_thread_id) is None
     assert h.store.cancel_count == 0
 
@@ -839,6 +878,7 @@ async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root:
     # both voided. Identity establishes the binding; support re-resolves + authorizes live.
     h = _scope_engine(config_root, thread_id="mb-1")
     old_thread_id = h.engine.thread_id
+    old_config = h.engine._config
     await _enter_unbound_cancel_scope(h)
     e1 = await _events(h.engine, "casey@example.com")  # -> OTP dispatched
     assert any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in e1)
@@ -851,14 +891,15 @@ async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root:
     assert "ORD-1002" in interrupts[0].prompt
     assert "ORD-9001" not in interrupts[0].prompt
     assert h.engine.thread_id != old_thread_id
-    assert h.engine.pending_interrupt()
-    assert h.engine._graph.get_state({"configurable": {"thread_id": old_thread_id}}).values == {}
+    assert await h.engine.apending_interrupt()
+    with pytest.raises(CheckpointScopeError, match="namespace"):
+        h.engine._graph.get_state(old_config)
     assert h.store.cancel_count == 0  # nothing voided before consent
     await _events(h.engine, "yes")
     assert h.store.cancel_count == 1
     assert h.store.order_status("ORD-1002") == "cancelled"
     assert h.store.order_status("ORD-9001") == "processing"
-    assert h.store.session_placed_orders() == []
+    assert h.store.guest_orders(h.guest_orders) == []
 
 
 async def test_bound_cancel_all_skips_identity(config_root: Path) -> None:
@@ -890,7 +931,7 @@ async def test_cancel_both_scope_with_more_than_two_asks_to_narrow(config_root: 
     # "cancel both" is only unambiguous with exactly two cancellable orders. With three
     # (ORD-1002 + two placed), the resolver asks which — no readback, nothing voided.
     h = _scope_engine(config_root, scope="both_cancellable", thread_id="mb-4", bound=True)
-    _place_second_cancellable_extra(h.store)  # a THIRD cancellable order
+    _place_second_cancellable_extra(h)  # a THIRD cancellable order
     events = await _events(h.engine, "cancel both of my orders")
     assert not any(isinstance(e, InterruptEvent) for e in events)  # no readback
     assert h.store.cancel_count == 0
@@ -987,6 +1028,7 @@ def _refund_engine(config_root, amount, dest, *, thread_id, policy=_POLICY):
         config_root,
         policy=policy,
         thread_id=thread_id,
+        authorized_customer_ref="CUST-001",
         routing_resolution=RouteDecision.direct(
             RefundOrder(
                 target=ExplicitOrderTarget(order_ref="ORD-1001"),
@@ -1030,7 +1072,7 @@ async def test_unmodelled_refund_destination_fails_closed(
         thread_id="refund-new-address",
     )
     events = await _events(engine, "refund my order to a different address")
-    _assert_refund_destination_failed_closed(
+    await _assert_refund_destination_failed_closed(
         engine=engine,
         store=store,
         events=events,
@@ -1040,7 +1082,7 @@ async def test_unmodelled_refund_destination_fails_closed(
 
 
 async def test_missing_new_instrument_fails_closed(config_root: Path, tmp_path: Path) -> None:
-    harness = authorize_fixture_orders(
+    harness = authorize_customer(
         build_support_engine(
             config_root,
             policy=_POLICY,
@@ -1064,11 +1106,12 @@ async def test_missing_new_instrument_fails_closed(config_root: Path, tmp_path: 
                     destination="new_instrument",
                 )
             ),
-        )
+        ),
+        "CUST-001",
     )
 
     events = await _events(harness.engine, "refund $100 for order ORD-1001 to a different card")
-    _assert_refund_destination_failed_closed(
+    await _assert_refund_destination_failed_closed(
         engine=harness.engine,
         store=harness.store,
         events=events,
@@ -1116,13 +1159,14 @@ async def test_session_order_without_account_owner_cannot_select_new_instrument(
         ],
         total_usd=20.0,
     )
+    harness.guest_orders.record(placed.order_id)
     assert placed.order_id == "ORD-9001"
 
     events = await _events(
         harness.engine,
         "refund $20 for order ORD-9001 to a different card",
     )
-    _assert_refund_destination_failed_closed(
+    await _assert_refund_destination_failed_closed(
         engine=harness.engine,
         store=harness.store,
         events=events,
@@ -1177,7 +1221,7 @@ async def test_stale_refund_readback_expires_before_placing(
     monkeypatch.setattr(support_flow.time, "time", lambda: future)
     events = await _events(engine, "yes")  # a stale yes must NOT refund
     assert store.refund_count == 0
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("sat for a while" in e.text for e in spoken)
 
@@ -1192,7 +1236,7 @@ async def test_stale_cancel_readback_expires_before_voiding(
     events = await _events(engine, "yes")  # a stale yes must NOT void
     assert store.cancel_count == 0
     assert store.order_status("ORD-1002") == "processing"
-    assert not engine.pending_interrupt()
+    assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert any("sat for a while" in e.text for e in spoken)
 
@@ -1406,6 +1450,7 @@ async def test_delivered_order_is_return_first_too(
         config_root,
         policy=tight,
         thread_id="ret-4",
+        authorized_customer_ref="CUST-001",
         routing_resolution=RouteDecision.direct(
             RefundOrder(
                 target=ExplicitOrderTarget(order_ref="ORD-1003"),
@@ -1496,6 +1541,12 @@ async def test_incomplete_typed_support_request_selects_one_code_authored_line(
         config_root,
         reasoning=reasoning,
         thread_id=f"support-clarify-{detail}",
+        authorized_customer_ref=(
+            "CUST-001"
+            if isinstance(typed_request, RefundOrder)
+            and isinstance(typed_request.target, ExplicitOrderTarget)
+            else "CUST-002"
+        ),
         routing_resolution=RouteDecision.direct(typed_request),
     )
 
@@ -1506,9 +1557,7 @@ async def test_incomplete_typed_support_request_selects_one_code_authored_line(
     assert [(e.node, e.text) for e in events if isinstance(e, SpokenMessageEvent)] == [
         ("support_clarify", line)
     ]
-    state = engine._graph.get_state(
-        {"configurable": {"thread_id": f"support-clarify-{detail}"}}
-    ).values
+    state = engine._graph.get_state(engine._config).values
     assert state["execution_owner"] == "support"
     assert state.get("pending_clarification") is None
     assert store.refund_count == store.return_count == store.cancel_count == 0
@@ -1538,9 +1587,7 @@ async def test_typed_support_model_prose_falls_back_to_the_missing_slot_question
             "What is the order number, for example ORD-1234?",
         )
     ]
-    state = engine._graph.get_state(
-        {"configurable": {"thread_id": "support-clarify-no-tool"}}
-    ).values
+    state = engine._graph.get_state(engine._config).values
     assert not any(
         isinstance(message, AIMessage) and message.content == reasoning.text_response
         for message in state["messages"]
@@ -1576,7 +1623,7 @@ async def test_unknown_support_tool_uses_bounded_correction_without_an_effect(
 
     events = await _events(engine, "I need a refund")
 
-    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = engine._graph.get_state(engine._config).values
     assert reasoning.invoke_count == 2
     assert (
         sum(
@@ -1628,9 +1675,7 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
     assert [event.node for event in exhausted if isinstance(event, SpokenMessageEvent)] == [
         "automation_terminal_response"
     ]
-    state = ReasoningState.model_validate(
-        engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
-    )
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
     assert state.automation_terminal is True
     assert state.execution_owner is None
     assert state.active_invocation is None
@@ -1676,7 +1721,7 @@ async def test_changing_support_clarification_detail_does_not_reset_the_budget(
     assert [event.node for event in exhausted if isinstance(event, SpokenMessageEvent)] == [
         "automation_terminal_response"
     ]
-    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = engine._graph.get_state(engine._config).values
     assert state.get("clarification_liveness") is None
     assert store.refund_count == store.return_count == store.cancel_count == 0
     telemetry = (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8")
@@ -1717,7 +1762,7 @@ async def test_support_two_malformed_clarification_calls_are_paired_then_fall_ba
             "What is the order number, for example ORD-1234?",
         ),
     ]
-    state = engine._graph.get_state({"configurable": {"thread_id": thread_id}}).values
+    state = engine._graph.get_state(engine._config).values
     tool_use_ids = {
         call["id"]
         for message in state["messages"]
@@ -1802,7 +1847,7 @@ async def test_support_double_tool_call_is_acked_in_thread_history(config_root: 
     # Structural: EVERY persisted tool_use has a tool_result (a dangling pair fails
     # provider-side history validation on every later model call in the session). The
     # fakes never validate history, so this must be asserted on the thread state itself.
-    state = engine._graph.get_state({"configurable": {"thread_id": "multi-1"}})
+    state = engine._graph.get_state(engine._config)
     tool_use_ids = {
         c["id"] for m in state.values["messages"] if isinstance(m, AIMessage) for c in m.tool_calls
     }

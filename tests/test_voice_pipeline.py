@@ -7,6 +7,7 @@ disclosure-first (on_enter), engine/adapter wiring, and the credential seam.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -15,9 +16,11 @@ from livekit.plugins import cartesia, deepgram
 from livekit.plugins import langchain as lk_langchain
 from llm_fakes import FakeChatModel, RecordingResolver
 from routing_helpers import ArchitectureRoutingRecognizer
+from turn_helpers import engine_events
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
+from agnostic_market.application import build_fixture_tenant_services
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentEntry,
     PaymentInstrumentsFixture,
@@ -37,7 +40,8 @@ async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
         resolved,
         credentials,
         resolver,
-        config_root=config_root,
+        deployment_id="test-voice-artifact",
+        tenant_services=build_fixture_tenant_services(config_root, "acme_store"),
         routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
     )
 
@@ -139,11 +143,12 @@ async def test_engine_seam_wiring(config_root: Path) -> None:
     adapter = loop.session.llm._graph
     assert isinstance(adapter, GraphVoiceAdapter)
     assert adapter.engine is loop.engine
+    assert loop.application.engine is loop.engine
     assert adapter._session is loop.session
     assert isinstance(loop.engine, ReasoningEngine)
     assert loop.engine._cancellation_quiescence_timeout_seconds == 2.0
     assert loop.engine._node_execution_tracker is loop.engine._graph.node_execution_tracker
-    assert not loop.engine.pending_interrupt()  # fresh thread
+    assert not await loop.engine.apending_interrupt()  # fresh thread
 
 
 async def test_voice_runtime_shares_the_graph_capability_registry(config_root: Path) -> None:
@@ -152,40 +157,33 @@ async def test_voice_runtime_shares_the_graph_capability_registry(config_root: P
     # expose THAT instance; a second availability list built alongside it would drift the
     # day a capability is registered, and the ids guard against sharing an empty one.
     assert loop.capability_registry is loop.engine._graph.capability_registry
+    assert loop.application.assembly.graph is loop.engine._graph
     assert loop.capability_registry.capability_ids
 
 
 async def test_session_build_rejects_profile_for_unknown_customer(
     config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from agnostic_market.voice import pipeline
+    from agnostic_market import application
 
     loaded = load_profile_fixture(config_root, "acme_store")
     profile = next(iter(loaded.profiles.values()))
     monkeypatch.setattr(
-        pipeline,
+        application,
         "load_profile_fixture",
         lambda _root, _merchant: ProfileFixture(profiles={"CUST-UNKNOWN": profile}),
     )
-    resolved = ConfigRegistry(config_root).load().get("acme_store")
-    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_voice_loop(
-            resolved,
-            credentials,
-            RecordingResolver(),
-            config_root=config_root,
-            routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
-        )
+        build_fixture_tenant_services(config_root, "acme_store")
 
 
 async def test_session_build_rejects_payment_instrument_for_unknown_customer(
     config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from agnostic_market.voice import pipeline
+    from agnostic_market import application
 
     monkeypatch.setattr(
-        pipeline,
+        application,
         "load_payment_instruments_fixture",
         lambda _root, _merchant: PaymentInstrumentsFixture(
             payment_instruments={
@@ -193,16 +191,8 @@ async def test_session_build_rejects_payment_instrument_for_unknown_customer(
             }
         ),
     )
-    resolved = ConfigRegistry(config_root).load().get("acme_store")
-    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_voice_loop(
-            resolved,
-            credentials,
-            RecordingResolver(),
-            config_root=config_root,
-            routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
-        )
+        build_fixture_tenant_services(config_root, "acme_store")
 
 
 class _FakeEngine:
@@ -210,11 +200,45 @@ class _FakeEngine:
         self.deletes = 0
         self._pending = pending
 
-    def pending_interrupt(self) -> bool:
+    async def apending_interrupt(self) -> bool:
         return self._pending
 
-    def delete_thread(self) -> None:
+    async def acheckpoint_has_pending_interrupt(self) -> bool:
+        return self._pending
+
+    async def adelete_thread(self) -> None:
         self.deletes += 1
+
+
+class _FailOnceDeleteEngine(_FakeEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_entered = asyncio.Event()
+        self.release_delete = asyncio.Event()
+
+    async def adelete_thread(self) -> None:
+        self.deletes += 1
+        if self.deletes == 1:
+            self.delete_entered.set()
+            await self.release_delete.wait()
+            raise TimeoutError("injected checkpoint deletion timeout")
+
+
+class _FailPendingProbeEngine(_FakeEngine):
+    async def acheckpoint_has_pending_interrupt(self) -> bool:
+        raise TimeoutError("injected pending-interrupt observation timeout")
+
+
+class _DelayedDeleteEngine(_FakeEngine):
+    def __init__(self) -> None:
+        super().__init__(pending=False)
+        self.delete_entered = asyncio.Event()
+        self.release_delete = asyncio.Event()
+
+    async def adelete_thread(self) -> None:
+        self.deletes += 1
+        self.delete_entered.set()
+        await self.release_delete.wait()
 
 
 class _FakeSession:
@@ -229,6 +253,14 @@ class _FakeSession:
         return _register
 
 
+class _FakeJobContext:
+    def __init__(self) -> None:
+        self.shutdown_callbacks = []
+
+    def add_shutdown_callback(self, callback) -> None:
+        self.shutdown_callbacks.append(callback)
+
+
 class _FakeClearable:
     def __init__(self) -> None:
         self.clears = 0
@@ -237,16 +269,8 @@ class _FakeClearable:
         self.clears += 1
 
 
-class _FakeOrderStore:
-    def __init__(self) -> None:
-        self.session_placed_clears = 0
-
-    def clear_session_placed(self) -> None:
-        self.session_placed_clears += 1
-
-
 def _fake_caller_context(engine=None):
-    from agnostic_market.voice.context import CallerContext
+    from agnostic_market.session import CallerContext
 
     return CallerContext(
         engine=engine or _FakeEngine(),
@@ -254,76 +278,180 @@ def _fake_caller_context(engine=None):
         cart_store=_FakeClearable(),  # type: ignore[arg-type]
         recent_orders=_FakeClearable(),  # type: ignore[arg-type]
         identity_store=_FakeClearable(),  # type: ignore[arg-type]
-        order_store=_FakeOrderStore(),  # type: ignore[arg-type]
+        guest_orders=_FakeClearable(),  # type: ignore[arg-type]
     )
 
 
-def test_close_session_clears_every_caller_store_and_thread() -> None:
-    # Milestone A postcondition: close_session tears down ALL caller-ephemeral state (cart,
-    # recent context, session-placed orders, verification, identity, and reasoning thread.
+async def test_close_session_clears_every_caller_store_and_thread() -> None:
+    # Milestone A postcondition: aclose_session tears down all caller-ephemeral state (cart,
+    # recent context, guest-order scope, verification, identity, and reasoning thread.
     ctx = _fake_caller_context()
-    ctx.close_session()
+    await ctx.aclose_session()
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.recent_orders.clears == 1  # type: ignore[attr-defined]
-    assert ctx.order_store.session_placed_clears == 1  # type: ignore[attr-defined]
+    assert ctx.guest_orders.clears == 1  # type: ignore[attr-defined]
     assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.engine.deletes == 1  # type: ignore[attr-defined]
 
 
-def test_close_session_is_idempotent() -> None:
+async def test_close_session_is_idempotent() -> None:
     # A double close (a race, or a reaper firing after a future transition) is harmless.
     ctx = _fake_caller_context()
-    ctx.close_session()
-    ctx.close_session()
+    await asyncio.gather(ctx.aclose_session(), ctx.aclose_session())
     assert ctx.engine.deletes == 1
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
 
 
-def test_close_stops_turn_admission_and_waits_for_the_whole_turn() -> None:
+async def test_pending_interrupt_observation_failure_does_not_skip_teardown() -> None:
+    engine = _FailPendingProbeEngine()
+    ctx = _fake_caller_context(engine)
+
+    await ctx.aclose_session()
+
+    assert engine.deletes == 1
+    assert ctx._closed is True
+    assert ctx.close_had_pending_interrupt is False
+
+
+async def test_concurrent_close_retries_after_checkpoint_delete_failure() -> None:
+    engine = _FailOnceDeleteEngine()
+    ctx = _fake_caller_context(engine)
+
+    first = asyncio.create_task(ctx.aclose_session())
+    await engine.delete_entered.wait()
+    second = asyncio.create_task(ctx.aclose_session())
+    await asyncio.sleep(0)
+    engine.release_delete.set()
+
+    with pytest.raises(TimeoutError, match="checkpoint deletion timeout"):
+        await first
+    await second
+
+    assert engine.deletes == 2
+    assert ctx._closed is True
+    assert ctx.cart_store.clears == 2  # type: ignore[attr-defined]
+
+
+async def test_close_stops_turn_admission_and_waits_for_the_whole_turn() -> None:
     ctx = _fake_caller_context()
     tracker = NodeExecutionTracker()
-    ctx.attach_execution_quiescence(tracker)
+    ctx.attach_execution_quiescence(tracker, timeout_seconds=1.0)
 
     with tracker.turn_span() as admitted:
         assert admitted is True
-        ctx.close_session()
+        closing = asyncio.create_task(ctx.aclose_session())
+        await asyncio.sleep(0)
         assert tracker.turn_admission_open is False
         with tracker.turn_span() as rejected:
             assert rejected is False
         assert ctx.engine.deletes == 0
 
+    await closing
     assert ctx.engine.deletes == 1
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
 
 
-def test_close_waits_for_the_cancellation_takeover_lease_without_double_firing() -> None:
+async def test_close_captures_abandonment_after_the_active_turn_becomes_idle() -> None:
+    engine = _FakeEngine(pending=False)
+    ctx = _fake_caller_context(engine)
+    tracker = NodeExecutionTracker()
+    ctx.attach_execution_quiescence(tracker, timeout_seconds=1.0)
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        closing = asyncio.create_task(ctx.aclose_session())
+        await asyncio.sleep(0)
+        engine._pending = True
+
+    await closing
+    assert ctx.close_had_pending_interrupt is True
+
+
+async def test_close_quiescence_timeout_fails_without_clearing_live_state() -> None:
+    ctx = _fake_caller_context()
+    tracker = NodeExecutionTracker()
+    ctx.attach_execution_quiescence(tracker, timeout_seconds=0.01)
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        with pytest.raises(TimeoutError):
+            await ctx.aclose_session()
+        assert ctx.engine.deletes == 0
+        assert ctx.cart_store.clears == 0  # type: ignore[attr-defined]
+        assert ctx._closed is False
+
+
+async def test_takeover_wait_never_occupies_a_pool_thread(monkeypatch) -> None:
+    ctx = _fake_caller_context()
+    tracker = NodeExecutionTracker()
+    ctx.attach_execution_quiescence(tracker, timeout_seconds=0.01)
+
+    async def forbidden_to_thread(*_args, **_kwargs):
+        raise AssertionError("close must not block a worker thread on takeover quiescence")
+
+    monkeypatch.setattr(asyncio, "to_thread", forbidden_to_thread)
+    with ctx.cancellation_takeover_lease() as acquired:
+        assert acquired is True
+        with pytest.raises(TimeoutError):
+            await ctx.aclose_session()
+        assert ctx.engine.deletes == 0
+
+
+async def test_close_waits_for_the_cancellation_takeover_lease_without_double_firing() -> None:
     ctx = _fake_caller_context()
 
     with ctx.cancellation_takeover_lease() as acquired:
         assert acquired is True
-        ctx.close_session()
-        ctx.close_session()
+        closings = (
+            asyncio.create_task(ctx.aclose_session()),
+            asyncio.create_task(ctx.aclose_session()),
+        )
+        await asyncio.sleep(0)
         assert ctx.engine.deletes == 0
         assert ctx.cart_store.clears == 0  # type: ignore[attr-defined]
 
+    await asyncio.gather(*closings)
     assert ctx.engine.deletes == 1
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
 
 
-def test_cancellation_takeover_lease_is_rejected_after_close_starts() -> None:
+async def test_cancellation_takeover_lease_is_rejected_after_close_starts() -> None:
     ctx = _fake_caller_context()
 
     with ctx.cancellation_takeover_lease() as acquired:
         assert acquired is True
-        ctx.close_session()
+        closing = asyncio.create_task(ctx.aclose_session())
+        await asyncio.sleep(0)
         with ctx.cancellation_takeover_lease() as rejected:
             assert rejected is False
 
+    await closing
     assert ctx.engine.deletes == 1
 
 
-def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
+async def test_voice_loop_registers_awaited_caller_teardown_for_job_shutdown(
+    config_root: Path,
+) -> None:
+    loop = await _loop(config_root, RecordingResolver())
+    engine = _DelayedDeleteEngine()
+    loop.application.state.caller_context.engine = engine  # type: ignore[assignment]
+    job = _FakeJobContext()
+
+    loop.register_shutdown(job)  # type: ignore[arg-type]
+    assert len(job.shutdown_callbacks) == 1
+
+    shutdown = asyncio.create_task(job.shutdown_callbacks[0]())
+    await engine.delete_entered.wait()
+    assert shutdown.done() is False
+
+    engine.release_delete.set()
+    await shutdown
+    assert engine.deletes == 1
+
+
+@pytest.mark.asyncio
+async def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
     # Clock B: a double-fired session close runs the teardown + emits the abandoned event AT
     # MOST once (the reaper's own re-entrant guard; the teardown itself is idempotent too).
     import json
@@ -338,15 +466,62 @@ def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
     _attach_thread_reaper(session, ctx)  # type: ignore[arg-type]
     session.handlers["close"](object())
     session.handlers["close"](object())  # double fire
+    for _ in range(100):
+        if ctx.engine.deletes:
+            break
+        await asyncio.sleep(0)
     assert ctx.engine.deletes == 1  # type: ignore[attr-defined]  # reaped once despite double fire
     assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.recent_orders.clears == 1  # type: ignore[attr-defined]
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
-    assert ctx.order_store.session_placed_clears == 1  # type: ignore[attr-defined]
+    assert ctx.guest_orders.clears == 1  # type: ignore[attr-defined]
     lines = [
         json.loads(line)
         for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    # flow_abandoned (reaper, pending interrupt) then caller_context_closed (close_session), once.
-    assert [rec["event"] for rec in lines] == ["flow_abandoned", "caller_context_closed"]
+    assert [rec["event"] for rec in lines] == ["caller_context_closed", "flow_abandoned"]
+
+
+async def test_abandoned_interrupt_is_recorded_when_another_close_path_runs_first(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import json
+
+    from agnostic_market.agents import telemetry
+    from agnostic_market.voice.pipeline import _attach_thread_reaper
+
+    monkeypatch.setattr(telemetry, "_TELEMETRY_PATH", tmp_path / "telemetry.jsonl")
+    loop = await _loop(config_root, RecordingResolver())
+    context = loop.application.state.caller_context
+    loop.application.state.cart_store.add_item(
+        sku="SKU-GRN-15",
+        name="merino hiking socks",
+        price_usd=14.50,
+        quantity=1,
+    )
+    await engine_events(loop.engine, "place my order")
+    assert bool((await loop.engine._graph.aget_state(loop.engine._config)).interrupts)
+
+    session = _FakeSession()
+    _attach_thread_reaper(session, context)  # type: ignore[arg-type]
+    with context.cancellation_takeover_lease() as acquired:
+        assert acquired is True
+        first_close = asyncio.create_task(context.aclose_session())
+        await asyncio.sleep(0)
+        session.handlers["close"](object())
+        await asyncio.sleep(0)
+
+    await first_close
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if context._closed:
+            break
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["event"] for record in records].count("flow_abandoned") == 1

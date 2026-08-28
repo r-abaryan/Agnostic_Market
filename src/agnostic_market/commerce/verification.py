@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -133,16 +134,18 @@ class OtpProvider:
 
     valid_code: str
     _dispatched: set[str] = field(default_factory=set)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if re.fullmatch(r"\d{6}", self.valid_code) is None:
             raise ValueError("fake OTP code must contain exactly 6 digits")
 
     def dispatch(self, attempt_key: str) -> None:
-        if attempt_key in self._dispatched:
-            logger.debug("otp dispatch replay for %s - not re-sending", attempt_key)
-            return
-        self._dispatched.add(attempt_key)
+        with self._lock:
+            if attempt_key in self._dispatched:
+                logger.debug("otp dispatch replay for %s - not re-sending", attempt_key)
+                return
+            self._dispatched.add(attempt_key)
 
     def verify(self, code: str) -> bool:
         return code.strip() == self.valid_code
@@ -150,7 +153,8 @@ class OtpProvider:
     @property
     def dispatch_count(self) -> int:
         """Distinct step-up attempts a code was sent for (test/verification surface)."""
-        return len(self._dispatched)
+        with self._lock:
+            return len(self._dispatched)
 
 
 @dataclass

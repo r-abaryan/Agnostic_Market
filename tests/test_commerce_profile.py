@@ -8,6 +8,8 @@ store data); the only populated customer is CUST-001.
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -75,6 +77,38 @@ def test_update_is_idempotent_by_customer_and_key(config_root: Path) -> None:
         "k1", customer_ref=_OWNER, field="address", new_value="7 Elm St, Dover"
     )
     assert replay is first  # the ORIGINAL record, not an equal copy
+    assert store.change_count == 1
+
+
+def test_conflicting_concurrent_profile_replay_has_one_authoritative_result(
+    config_root: Path,
+) -> None:
+    class _SlowMissDict(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if value is default:
+                time.sleep(0.05)
+            return value
+
+    store = _store(config_root)
+    store._changes_by_key = _SlowMissDict()
+
+    def update(value: str):
+        try:
+            return store.update_profile(
+                "shared-key",
+                customer_ref=_OWNER,
+                field="address",
+                new_value=value,
+            )
+        except ProfileError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(update, ("1 First Road", "2 Second Road")))
+
+    assert sum(not isinstance(result, Exception) for result in results) == 1
+    assert sum(isinstance(result, ProfileError) for result in results) == 1
     assert store.change_count == 1
 
 

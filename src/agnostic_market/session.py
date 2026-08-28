@@ -1,12 +1,12 @@
-"""Caller-context lifecycle owner (Fix 5) — the ONE place that tears down per-call caller state.
+"""Application-session lifecycle owner for caller-scoped state.
 
-`close_session()` destroys the caller context. `transition_principal()` retires the old
+`aclose_session()` destroys the caller context. `transition_principal()` retires the old
 principal, then installs only a newly proven binding and its fresh proof. Their postconditions
 differ, but both clear the non-authority ephemeral state through `_clear_ephemeral()`.
 
 State ownership (the durable-vs-ephemeral line this module must respect so it survives the Phase-4
 shared-SoR swap): caller-ephemeral state (identity binding + rung-1 grants, verification level +
-grants, cart, recent-order context, the placed-order visibility set, and the reasoning checkpoint)
+grants, cart, recent-order context, the guest-order scope, and the reasoning checkpoint)
 is cleared here;
 merchant/durable-SoR state (fixture/account orders, committed placement/idempotency records,
 cancel/refund/return records + status overlays, customer directory, policy) is NEVER cleared on a
@@ -16,8 +16,9 @@ the call and is not this module's job.
 
 from __future__ import annotations
 
+import asyncio
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -26,7 +27,7 @@ from agnostic_market.agents.lifecycle import ExecutionQuiescence
 from agnostic_market.agents.telemetry import write_event
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore
-from agnostic_market.commerce.orders import OrderStore, RecentOrderContext
+from agnostic_market.commerce.orders import GuestOrderScope, RecentOrderContext
 from agnostic_market.commerce.verification import VerificationStore
 from agnostic_market.dtos.orchestration import (
     IntentRequest,
@@ -39,7 +40,7 @@ from agnostic_market.dtos.orchestration import (
 @dataclass
 class CallerContext:
     """Owns the per-call caller-ephemeral stores + the reasoning engine, and the operations that
-    tear them down. Built once at session assembly (voice/pipeline.py), where all these
+    tear them down. Built once at application-session assembly, where all these
     instances already converge. The engine attaches after graph construction because identity
     nodes need this lifecycle callback while the graph itself must exist before the engine."""
 
@@ -47,50 +48,41 @@ class CallerContext:
     cart_store: CartStore
     recent_orders: RecentOrderContext
     identity_store: CallerIdentityStore
-    order_store: OrderStore
+    guest_orders: GuestOrderScope
     engine: ReasoningEngine | None = None
     _pending_transition: PrincipalTransition | None = field(default=None, init=False)
     _execution_quiescence: ExecutionQuiescence | None = field(default=None, init=False, repr=False)
+    _close_quiescence_timeout_seconds: float | None = field(default=None, init=False, repr=False)
+    _close_had_pending_interrupt: bool | None = field(default=None, init=False, repr=False)
     _close_started: bool = field(default=False, init=False, repr=False)
-    _close_completion_scheduled: bool = field(default=False, init=False, repr=False)
     _active_cancellation_takeovers: int = field(default=0, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _async_close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _takeover_idle_callbacks: list[Callable[[], None]] = field(
+        default_factory=list, init=False, repr=False
+    )
 
-    def attach_execution_quiescence(self, tracker: ExecutionQuiescence) -> None:
+    def attach_execution_quiescence(
+        self,
+        tracker: ExecutionQuiescence,
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("close quiescence timeout must be positive")
         with self._close_lock:
             if self._close_started:
                 raise RuntimeError("cannot attach graph execution tracking after close starts")
             if self._execution_quiescence is not None and self._execution_quiescence is not tracker:
                 raise RuntimeError("caller context already has a different execution tracker")
             self._execution_quiescence = tracker
+            self._close_quiescence_timeout_seconds = timeout_seconds
 
     def attach_engine(self, engine: ReasoningEngine) -> None:
         if self.engine is not None and self.engine is not engine:
             raise RuntimeError("caller context already has a different reasoning engine")
         self.engine = engine
-
-    def _claim_close_completion_locked(
-        self,
-    ) -> tuple[bool, ExecutionQuiescence | None]:
-        if (
-            not self._close_started
-            or self._active_cancellation_takeovers
-            or self._close_completion_scheduled
-            or self._closed
-        ):
-            return False, None
-        self._close_completion_scheduled = True
-        return True, self._execution_quiescence
-
-    def _schedule_close_completion(
-        self,
-        tracker: ExecutionQuiescence | None,
-    ) -> None:
-        if tracker is None:
-            self._complete_close()
-            return
-        tracker.defer_until_fully_idle(self._complete_close)
 
     @contextmanager
     def cancellation_takeover_lease(self) -> Iterator[bool]:
@@ -102,11 +94,14 @@ class CallerContext:
             yield acquired
         finally:
             if acquired:
+                callbacks: tuple[Callable[[], None], ...] = ()
                 with self._close_lock:
                     self._active_cancellation_takeovers -= 1
-                    schedule, tracker = self._claim_close_completion_locked()
-                if schedule:
-                    self._schedule_close_completion(tracker)
+                    if not self._active_cancellation_takeovers:
+                        callbacks = tuple(self._takeover_idle_callbacks)
+                        self._takeover_idle_callbacks.clear()
+                for callback in callbacks:
+                    callback()
 
     def _clear_ephemeral(self) -> None:
         """Clear the non-identity, non-verification caller-ephemeral state — the part a close
@@ -116,12 +111,12 @@ class CallerContext:
         NOT touched here."""
         self.cart_store.clear()
         self.recent_orders.clear()
-        self.order_store.clear_session_placed()
+        self.guest_orders.clear()
 
     def has_discardable_state(self) -> bool:
         return bool(
             not self.cart_store.is_empty()
-            or self.order_store.session_placed_orders()
+            or self.guest_orders.order_refs
             or self.recent_orders.snapshot().order_refs
         )
 
@@ -177,7 +172,7 @@ class CallerContext:
             and self.verification_store.grants == [transition.fresh_proof]
             and self.cart_store.is_empty()
             and not self.recent_orders.snapshot().order_refs
-            and not self.order_store.session_placed_orders()
+            and not self.guest_orders.order_refs
         )
         return PrincipalTransitionInspection(
             outcome="coherent" if coherent else "inconsistent",
@@ -203,32 +198,81 @@ class CallerContext:
             raise RuntimeError("principal transition completion does not match pending marker")
         self._pending_transition = None
 
-    def _complete_close(self) -> None:
+    async def _await_callback(self, register: Callable[[Callable[[], None]], None]) -> None:
+        loop = asyncio.get_running_loop()
+        idle = loop.create_future()
+
+        def mark_idle() -> None:
+            def complete() -> None:
+                if not idle.done():
+                    idle.set_result(None)
+
+            loop.call_soon_threadsafe(complete)
+
+        register(mark_idle)
+        await idle
+
+    async def _await_fully_idle(self, tracker: ExecutionQuiescence | None) -> None:
+        if tracker is not None:
+            await self._await_callback(tracker.defer_until_fully_idle)
+
+    def _defer_until_takeovers_idle(self, callback: Callable[[], None]) -> None:
         with self._close_lock:
-            if self._closed:
+            if self._active_cancellation_takeovers:
+                self._takeover_idle_callbacks.append(callback)
                 return
+        callback()
+
+    async def _await_takeovers_idle(self) -> None:
+        await self._await_callback(self._defer_until_takeovers_idle)
+
+    @property
+    def close_had_pending_interrupt(self) -> bool:
+        return self._close_had_pending_interrupt is True
+
+    async def _acomplete_close(self) -> None:
         self._clear_ephemeral()
         self.verification_store.clear()
         self.identity_store.clear()
         self._pending_transition = None
         if self.engine is not None:
-            self.engine.delete_thread()
+            await self.engine.adelete_thread()
         write_event({"event": "caller_context_closed"})
         with self._close_lock:
             self._closed = True
 
-    def close_session(self) -> None:
-        """Total teardown at session end (Clock B, AGENTS §A10 rule 4): every caller-scoped
-        store is cleared and the reasoning thread deleted, so a reattaching session can never
-        inherit a stale level, cart, recent-order context, verified identity, or guest order.
-        Idempotent: a double-fired close schedules or runs the total teardown exactly once.
-        Durable business outcomes (committed cancels/refunds/returns) are NOT cleared (see
-        `OrderStore.clear_session_placed`)."""
+    async def aclose_session(self) -> None:
+        """Stop admission, await quiescence, and delete the checkpoint asynchronously."""
         with self._close_lock:
             if not self._close_started:
                 self._close_started = True
                 if self._execution_quiescence is not None:
                     self._execution_quiescence.stop_turn_admission()
-            schedule, tracker = self._claim_close_completion_locked()
-        if schedule:
-            self._schedule_close_completion(tracker)
+            tracker = self._execution_quiescence
+        async with self._async_close_lock:
+            with self._close_lock:
+                if self._closed:
+                    return
+            timeout_seconds = self._close_quiescence_timeout_seconds
+            if timeout_seconds is None:
+                await self._await_fully_idle(tracker)
+                await self._await_takeovers_idle()
+            else:
+                async with asyncio.timeout(timeout_seconds):
+                    await self._await_fully_idle(tracker)
+                    await self._await_takeovers_idle()
+            if self._close_had_pending_interrupt is None:
+                try:
+                    self._close_had_pending_interrupt = bool(
+                        self.engine is not None
+                        and await self.engine.acheckpoint_has_pending_interrupt()
+                    )
+                except Exception:
+                    self._close_had_pending_interrupt = False
+                    write_event(
+                        {
+                            "event": "flow_abandonment_observation_failed",
+                            "reason": "checkpoint_unavailable",
+                        }
+                    )
+            await self._acomplete_close()

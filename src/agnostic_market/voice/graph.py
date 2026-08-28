@@ -82,11 +82,7 @@ class GraphVoiceAdapter:
             if turn is None:
                 logger.warning("voice adapter: no user message in transport input; empty turn")
                 return
-            facts = TurnFacts(
-                readback_interrupted=(
-                    self._engine.pending_interrupt() and self._readback_interrupted()
-                )
-            )
+            facts = TurnFacts(readback_interrupted=self._readback_interrupted())
             async for event in self._engine.stream_turn(turn, facts):
                 # Token / spoken-message / interrupt prompt — all graph-authored text.
                 yield event.text if event.kind != "interrupt" else event.prompt

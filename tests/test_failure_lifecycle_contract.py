@@ -14,6 +14,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import NodeError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -28,7 +29,6 @@ from livekit.plugins.langchain import LLMAdapter
 from llm_fakes import RecordingResolver
 from routing_helpers import ArchitectureRoutingRecognizer
 
-from agnostic_market.agents.engine import build_checkpointer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.orchestration import ViewCart
 from agnostic_market.dtos.state import (
@@ -216,7 +216,7 @@ def test_node_error_handler_receives_typed_context_and_completes() -> None:
     builder = StateGraph(_ContractState)
     builder.add_node("explode", explode, error_handler=recover)
     builder.add_edge(START, "explode")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("exception-handler")
 
     result = graph.invoke({}, config)
@@ -239,7 +239,7 @@ async def test_node_error_handler_completes_under_update_streaming() -> None:
     builder = StateGraph(_ContractState)
     builder.add_node("explode", explode, error_handler=recover)
     builder.add_edge(START, "explode")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("exception-handler-streaming")
 
     updates = [
@@ -267,7 +267,7 @@ async def test_message_stream_rethrows_a_handled_error_on_langgraph_1_2_7() -> N
     builder = StateGraph(_ContractState)
     builder.add_node("explode", explode, error_handler=recover)
     builder.add_edge(START, "explode")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
 
     with pytest.raises(RuntimeError, match="contract failure"):
         async for _ in graph.astream(
@@ -295,7 +295,7 @@ async def test_external_stream_cancellation_bypasses_node_error_handler() -> Non
     builder = StateGraph(_ContractState)
     builder.add_node("slow", slow, error_handler=recover, destinations=(END,))
     builder.add_edge(START, "slow")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("external-cancellation")
 
     async def drain() -> None:
@@ -485,13 +485,16 @@ class _RecorderRoom:
 
 
 async def _recorder_loop(config_root: Path) -> VoiceLoop:
+    from agnostic_market.application import build_fixture_tenant_services
+
     resolved = ConfigRegistry(config_root).load().get("acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     return build_voice_loop(
         resolved,
         credentials,
         RecordingResolver(),
-        config_root=config_root,
+        deployment_id="test-close-evidence-artifact",
+        tenant_services=build_fixture_tenant_services(config_root, "acme_store"),
         routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
     )
 
@@ -533,6 +536,7 @@ async def _attached_recorder(
         session=loop.session,
         room=cast(rtc.Room, room),
         engine=loop.engine,
+        effect_source=loop.application.services.order_store,
         linked_participant_identity="contract-caller",
     )
     return loop, recorder, room
@@ -601,6 +605,7 @@ async def test_close_recorder_permits_only_one_active_certification_job(
             session=second_loop.session,
             room=cast(rtc.Room, _RecorderRoom()),
             engine=second_loop.engine,
+            effect_source=second_loop.application.services.order_store,
             linked_participant_identity="other-contract-caller",
         )
 
@@ -630,11 +635,11 @@ async def test_close_recorder_is_independent_of_lifecycle_listener_order_and_red
     event = CloseEvent(reason=CloseReason.PARTICIPANT_DISCONNECTED)
 
     if lifecycle_first:
-        context.close_session()
+        await context.aclose_session()
         recorder._on_close(event)
     else:
         recorder._on_close(event)
-        context.close_session()
+        await context.aclose_session()
 
     assert await recorder.wait_for_completion() == report_path
     raw_report = report_path.read_text(encoding="utf-8")
@@ -643,7 +648,7 @@ async def test_close_recorder_is_independent_of_lifecycle_listener_order_and_red
     report = json.loads(raw_report)
     assert report["status"] == "complete"
     assert report["telemetry"]["caller_context_closed"] == 1
-    assert report["all_observed_reasoning_threads_empty"] is True
+    assert report["all_observed_reasoning_threads_retired"] is True
     assert [message["message_id"] for message in report["messages"]] == [
         "user-contract-id",
         "assistant-contract-id",
@@ -796,7 +801,7 @@ async def test_cancelled_sync_node_continues_after_the_astream_task_unwinds() ->
     builder = StateGraph(_ContractState)
     builder.add_node("slow_write", slow_write)
     builder.add_edge(START, "slow_write")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("sync-worker-outlives-cancel")
 
     async def drain() -> None:
@@ -840,7 +845,7 @@ async def test_in_worker_tracker_remains_active_until_the_sync_node_exits() -> N
     builder = StateGraph(_ContractState)
     builder.add_node("slow", _tracked_sync_node(tracker, slow))
     builder.add_edge(START, "slow")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("in-worker-tracker")
 
     async def drain() -> None:
@@ -877,7 +882,7 @@ def test_in_worker_tracker_wraps_a_real_tool_node() -> None:
     builder = StateGraph(_ContractState)
     builder.add_node("tools", _tracked_sync_node(tracker, tools))
     builder.add_edge(START, "tools")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
 
     result = graph.invoke(
         {
@@ -926,7 +931,7 @@ async def test_runnable_error_listener_fires_before_the_sync_worker_exits() -> N
     builder = StateGraph(_ContractState)
     builder.add_node("slow", listened)
     builder.add_edge(START, "slow")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("listener-is-not-quiescence")
 
     async def drain() -> None:
@@ -985,7 +990,7 @@ async def test_start_takeover_waits_for_tracked_sync_work_to_be_quiescent() -> N
     )
     builder.add_edge("slow_write", END)
     builder.add_edge("recover", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("takeover-after-quiescence")
 
     async def drain() -> None:
@@ -1038,7 +1043,7 @@ async def test_cancellation_after_external_write_leaves_ambiguous_checkpoint() -
     builder = StateGraph(_ContractState)
     builder.add_node("effect", write_then_wait)
     builder.add_edge(START, "effect")
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("write-cancellation")
 
     async def drain() -> None:
@@ -1146,7 +1151,7 @@ async def test_pending_route_survives_cancellation_before_its_consumer_commits()
         lambda state: "no_action" if state.get("pending_route") else END,
         {"no_action": "no_action", END: END},
     )
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("pending-route-cancellation")
     graph.update_state(config, {"pending_route": "clarify"}, as_node="__start__")
 
@@ -1230,7 +1235,7 @@ def _recovery_contract_graph(
     )
     builder.add_edge("normal", END)
     builder.add_edge("old_work", END)
-    return builder.compile(checkpointer=build_checkpointer())
+    return builder.compile(checkpointer=InMemorySaver())
 
 
 def _human_texts(snapshot) -> tuple[str, ...]:
@@ -1369,7 +1374,7 @@ def test_interrupt_is_not_intercepted_by_node_error_handler() -> None:
     builder.add_edge(START, "confirm")
     builder.add_edge("confirm", "effect")
     builder.add_edge("effect", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("interrupt-contract")
 
     graph.invoke({}, config)
@@ -1403,7 +1408,7 @@ def test_interrupt_resume_atomically_updates_the_consumed_turn_ledger() -> None:
     builder.add_edge(START, "confirm")
     builder.add_edge("confirm", "effect")
     builder.add_edge("effect", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("interrupt-ledger-update")
 
     graph.invoke({"consumed_turn_ids": ("transport-turn-1",)}, config)
@@ -1434,7 +1439,7 @@ def test_principal_seed_can_atomically_open_an_invocation_on_the_merged_ledger()
     builder.add_node("entry", lambda _state: {})
     builder.add_edge(START, "entry")
     builder.add_edge("entry", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("active-invocation-seed")
     consumed_turn_ids = ("identity-completion-turn",)
     invocation = open_active_invocation(
@@ -1477,7 +1482,7 @@ def test_resume_turn_opens_an_invocation_from_the_ledger_not_message_history() -
     builder.add_edge(START, "confirm")
     builder.add_edge("confirm", "open_invocation")
     builder.add_edge("open_invocation", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("active-invocation-resume")
 
     graph.invoke(
@@ -1512,7 +1517,7 @@ def test_interrupt_update_without_resume_consumes_id_and_preserves_interrupt() -
     builder.add_node("confirm", confirm)
     builder.add_edge(START, "confirm")
     builder.add_edge("confirm", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("interrupt-ledger-only-update")
 
     graph.invoke({"consumed_turn_ids": ("transport-turn-1",)}, config)
@@ -1546,7 +1551,7 @@ def test_terminal_node_takeover_supersedes_a_failed_checkpoint() -> None:
     builder.add_node("terminal", terminal)
     builder.add_edge(START, "explode")
     builder.add_edge("terminal", END)
-    graph = builder.compile(checkpointer=build_checkpointer())
+    graph = builder.compile(checkpointer=InMemorySaver())
     config = _config("terminal-takeover")
 
     with pytest.raises(RuntimeError, match="contract failure"):
