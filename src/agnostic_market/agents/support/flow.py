@@ -67,7 +67,7 @@ from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.support.prompt import (
     compose_support_capability_prompt,
 )
-from agnostic_market.agents.telemetry import write_capability_answered, write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder, record_capability_answered
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     order_mutation_allowed,
@@ -433,6 +433,8 @@ def build_support_nodes(
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
+    telemetry: TelemetryRecorder,
+    routing_telemetry: TelemetryRecorder,
 ) -> SupportNodes:
     """Build Support around session-bound stores, providers, and policy.
 
@@ -534,7 +536,7 @@ def build_support_nodes(
 
     def _leave(new_messages: list, call_id: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left support", tool_call_id=call_id))
-        write_event({"event": "support_left", "reason": "left_flow"})
+        telemetry.record({"event": "support_left", "reason": "left_flow"})
         return {
             "messages": new_messages,
             "execution_owner": None,
@@ -551,7 +553,7 @@ def build_support_nodes(
         *,
         messages: list | None = None,
     ) -> dict[str, object]:
-        write_event({"event": "profile_change_denied", "reason": "no_profile"})
+        telemetry.record({"event": "profile_change_denied", "reason": "no_profile"})
         result: dict[str, object] = {
             "active_invocation": None,
             "execution_owner": None,
@@ -586,12 +588,15 @@ def build_support_nodes(
             recent_orders.record([order.order_id for order in orders], operation="list")
         else:
             recent_orders.clear()
-        write_event({"event": "order_list_rendered", "order_scope": request.scope})
+        telemetry.record({"event": "order_list_rendered", "order_scope": request.scope})
         line = f"{render_order_list_line(orders, scope=request.scope)} {close}"
         # This node ENDs, bypassing the frontline's finalize sink, so the answered-turn record
         # is written here rather than there.
-        write_capability_answered(
-            state.last_user_text(), request.kind.value, answer_source="code_authored_read"
+        record_capability_answered(
+            routing_telemetry,
+            state.last_user_text(),
+            request.kind.value,
+            answer_source="code_authored_read",
         )
         return {
             "active_invocation": None,
@@ -966,7 +971,7 @@ def build_support_nodes(
                 destination=request.destination,
             )
             if pending is None:
-                write_event(
+                telemetry.record(
                     {"event": "refund_destination_unavailable", "reason": request.destination}
                 )
                 return {
@@ -1032,7 +1037,7 @@ def build_support_nodes(
         transcript and graph-node-pointer replay are forbidden.
         """
         project_principal_transition(request)
-        write_event({"event": "support_action_needs_identity"})
+        telemetry.record({"event": "support_action_needs_identity"})
         next_invocation = (
             open_active_invocation(
                 request,
@@ -1114,13 +1119,13 @@ def build_support_nodes(
         # This is the guest path; it reveals nothing about the order (an unresolved and a real
         # but unowned reference are indistinguishable to the caller — both just "verify you").
         if identity_store.current() is None:
-            write_event({"event": "support_auth_needs_identity", **known_fields})
+            telemetry.record({"event": "support_auth_needs_identity", **known_fields})
             return _NEEDS_IDENTITY
         # Bound, but the order is not this identity's (or doesn't resolve): fail closed with the
         # combined not-found (existence-oracle) — never reveal that another account owns it.
         counter_key = order_ref.strip().upper() if order_known else _UNRESOLVED_ORDER
         attempt = _auth_denials[counter_key] = _auth_denials.get(counter_key, 0) + 1
-        write_event({"event": "support_auth_denied", "attempt": attempt})
+        telemetry.record({"event": "support_auth_denied", "attempt": attempt})
         return (
             "order_match_human_help"
             if attempt >= policy.auth_denials_before_human_offer
@@ -1135,7 +1140,9 @@ def build_support_nodes(
         checks rather than granted authority. Callers emit once, immediately before minting
         pending state, so a check that ends in clarification leaves no grant row behind.
         """
-        write_event({"event": "support_action_authorized", "order_id": order_ref.strip().upper()})
+        telemetry.record(
+            {"event": "support_action_authorized", "order_id": order_ref.strip().upper()}
+        )
 
     def _mint_refund(
         chosen: OrderCandidate, *, amount_usd: UsdAmount, destination: RefundDestination
@@ -1207,6 +1214,7 @@ def build_support_nodes(
             state,
             owner=invocation_clarification_owner(state),
             max_reasks=policy.support_clarification_reask_max,
+            telemetry=telemetry,
         )
         if step.exhausted:
             return {
@@ -1276,7 +1284,7 @@ def build_support_nodes(
         pending = state.pending_refund
         assert pending is not None  # only reached with a proposal minted
         if order_store.order_status(pending.order_id) == CANCELLED_STATUS:
-            write_event({"event": "refund_denied", "reason": "order_cancelled"})
+            telemetry.record({"event": "refund_denied", "reason": "order_cancelled"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1294,7 +1302,7 @@ def build_support_nodes(
             # re-gating the amount here would speak a contradictory second line. Placed
             # before the steer/amount tiers; disjoint from the cancel steer by construction
             # (open returns exist only on fulfilled orders; the steer needs cancellable).
-            write_event({"event": "refund_denied", "reason": "return_already_open"})
+            telemetry.record({"event": "refund_denied", "reason": "return_already_open"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1314,7 +1322,7 @@ def build_support_nodes(
             and order_store.refunded_so_far(pending.order_id) == 0
             and order_store.is_cancellable(pending.order_id)
         ):
-            write_event({"event": "refund_steered_to_cancel", "order_id": pending.order_id})
+            telemetry.record({"event": "refund_steered_to_cancel", "order_id": pending.order_id})
             return {
                 "pending_refund": None,
                 # Remedy steer mints through the ONE batch helper (a one-target batch).
@@ -1333,7 +1341,7 @@ def build_support_nodes(
             # return-first (a person handling the amount also arranges the return). Speak the
             # specific reason and END (no generic deferral over it), same one-voice pattern
             # as the shipped-cancel decline.
-            write_event(
+            telemetry.record(
                 {
                     "event": "refund_needs_human",
                     "reason": "over_amount_threshold",
@@ -1362,7 +1370,7 @@ def build_support_nodes(
             # ineligible reason here is out_of_window (cancelled/unshipped can't be
             # FULFILLED; already_open was caught by the earlier tier).
             if _return_eligibility(pending.order_id) == "out_of_window":
-                write_event({"event": "refund_needs_return", "reason": "out_of_window"})
+                telemetry.record({"event": "refund_needs_return", "reason": "out_of_window"})
                 return {
                     "pending_refund": None,
                     "execution_owner": None,
@@ -1379,7 +1387,7 @@ def build_support_nodes(
             # Eligible: convert the refund into a return (the tier-2 mint-and-route
             # pattern). Amount/summary carried; destination deliberately NOT carried —
             # v1 returns refund to the ORIGINAL payment method (PendingReturn docstring).
-            write_event({"event": "refund_steered_to_return", "order_id": pending.order_id})
+            telemetry.record({"event": "refund_steered_to_return", "order_id": pending.order_id})
             return {
                 "pending_refund": None,
                 "pending_return": PendingReturn(
@@ -1399,7 +1407,7 @@ def build_support_nodes(
             }
         required = refund_required_level(pending.amount_usd, pending.destination)
         if verification_store.current_level() < required:
-            write_event({"event": "refund_stepup_required", "required_level": required})
+            telemetry.record({"event": "refund_stepup_required", "required_level": required})
         return {}
 
     # The T3 step-up chain (risk_check -> dispatch -> collect) — extracted VERBATIM to the
@@ -1414,6 +1422,7 @@ def build_support_nodes(
         required_level=lambda p: refund_required_level(p.amount_usd, p.destination),
         event_prefix="refund",
         max_otp_attempts=policy.otp_max_attempts,
+        telemetry=telemetry,
     )
 
     def confirm_node(state: ReasoningState) -> dict[str, object]:
@@ -1424,7 +1433,7 @@ def build_support_nodes(
         pending = state.pending_refund
         assert pending is not None
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
-            write_event({"event": "refund_expired", "reason": "pending_ttl"})
+            telemetry.record({"event": "refund_expired", "reason": "pending_ttl"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1444,7 +1453,7 @@ def build_support_nodes(
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
             assert decision.handoff_source is not None
-            write_event({"event": "refund_cancelled", "reason": "human_requested"})
+            telemetry.record({"event": "refund_cancelled", "reason": "human_requested"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1455,7 +1464,7 @@ def build_support_nodes(
                 ),
             }
         if verdict == "no":
-            write_event({"event": "refund_cancelled", "reason": "declined"})
+            telemetry.record({"event": "refund_cancelled", "reason": "declined"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1477,7 +1486,7 @@ def build_support_nodes(
         }
         verification = [grant.method for grant in verification_store.grants]
         recent_orders.record([record.order_id], operation="refund")
-        write_event(
+        telemetry.record(
             {
                 "event": "refund_confirmed",
                 "refund_id": record.refund_id,
@@ -1497,7 +1506,7 @@ def build_support_nodes(
         if verification_store.current_level() < required:
             # Belt-and-suspenders: the level was lost between apply and place (revoked). Do
             # NOT move money; drop back to a human. (Not reachable in the happy path.)
-            write_event({"event": "refund_stepup_failed", "reason": "level_lapsed_at_place"})
+            telemetry.record({"event": "refund_stepup_failed", "reason": "level_lapsed_at_place"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1517,7 +1526,7 @@ def build_support_nodes(
             )
         except RefundError as exc:
             logger.warning("refund refused by store: %s", exc)
-            write_event({"event": "refund_denied", "reason": "store_refused"})
+            telemetry.record({"event": "refund_denied", "reason": "store_refused"})
             return {
                 "pending_refund": None,
                 "execution_owner": None,
@@ -1574,7 +1583,7 @@ def build_support_nodes(
         pending = state.pending_cancel
         assert isinstance(pending, PendingCancelBatch)
         if risk.check_sim_swap():
-            write_event({"event": "cancel_stepup_to_human", "reason": "risk_flagged"})
+            telemetry.record({"event": "cancel_stepup_to_human", "reason": "risk_flagged"})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1585,7 +1594,7 @@ def build_support_nodes(
                 ),
             }
         if len(pending.targets) > policy.cancel_batch_max:
-            write_event({"event": "cancel_batch_over_cap", "count": len(pending.targets)})
+            telemetry.record({"event": "cancel_batch_over_cap", "count": len(pending.targets)})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1606,7 +1615,7 @@ def build_support_nodes(
             else:
                 ineligible.append(verdict)
         if not eligible:
-            write_event(
+            telemetry.record(
                 {
                     "event": "cancel_declined",
                     "reason": "batch_none_eligible",
@@ -1631,7 +1640,7 @@ def build_support_nodes(
         pending = state.pending_cancel
         assert isinstance(pending, PendingCancelBatch)
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
-            write_event({"event": "cancel_expired", "reason": "pending_ttl"})
+            telemetry.record({"event": "cancel_expired", "reason": "pending_ttl"})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1653,7 +1662,7 @@ def build_support_nodes(
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
             assert decision.handoff_source is not None
-            write_event({"event": "cancel_declined", "reason": "human_requested"})
+            telemetry.record({"event": "cancel_declined", "reason": "human_requested"})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1664,7 +1673,7 @@ def build_support_nodes(
                 ),
             }
         if verdict == "no":
-            write_event({"event": "cancel_declined", "reason": "declined"})
+            telemetry.record({"event": "cancel_declined", "reason": "declined"})
             decline_line = (
                 "Okay, I'll leave that order as it is - nothing changed."
                 if len(pending.targets) == 1
@@ -1717,9 +1726,9 @@ def build_support_nodes(
                 outcomes=[(result.order_id, result.outcome) for result in all_outcomes],
             )
         if outcome.outcome == "cancelled":
-            write_event({"event": "cancel_confirmed", "order_id": outcome.order_id})
+            telemetry.record({"event": "cancel_confirmed", "order_id": outcome.order_id})
         elif outcome.outcome == "store_refused":
-            write_event(
+            telemetry.record(
                 {"event": "cancel_denied", "reason": "store_refused", "order_id": outcome.order_id}
             )
         return update
@@ -1766,7 +1775,7 @@ def build_support_nodes(
         bound = identity_store.current()
         if bound is None:
             # Unreachable in the happy path (resolve is only routed to post-bind); fail closed.
-            write_event({"event": "cancel_resolve_declined", "reason": "not_bound"})
+            telemetry.record({"event": "cancel_resolve_declined", "reason": "not_bound"})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1790,7 +1799,7 @@ def build_support_nodes(
         if unauthorized:
             # The query narrows candidates; it is not an authorization authority. Reject
             # the whole semantic scope when even one result falls outside the live binding.
-            write_event(
+            telemetry.record(
                 {
                     "event": "cancel_resolve_declined",
                     "reason": "authorization_mismatch",
@@ -1808,7 +1817,7 @@ def build_support_nodes(
                 ],
             }
         if not candidates:
-            write_event({"event": "cancel_resolve_declined", "reason": "none_cancellable"})
+            telemetry.record({"event": "cancel_resolve_declined", "reason": "none_cancellable"})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1819,7 +1828,7 @@ def build_support_nodes(
         if selection.scope == "both_cancellable" and len(candidates) != 2:
             # "both" is only unambiguous with exactly two cancellable orders. Keep the
             # response truthful on either side of two.
-            write_event(
+            telemetry.record(
                 {
                     "event": "cancel_resolve_declined",
                     "reason": "both_ambiguous",
@@ -1842,7 +1851,7 @@ def build_support_nodes(
         if len(candidates) > policy.cancel_batch_max or has_more:
             # Over the batch cap: ask to narrow, never silently take the first N (mirrors the
             # guardrail's over-cap line; here the caller never named specifics).
-            write_event({"event": "cancel_resolve_over_cap"})
+            telemetry.record({"event": "cancel_resolve_over_cap"})
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -1854,7 +1863,7 @@ def build_support_nodes(
                 ],
             }
         batch = _mint_cancel_batch([(c.order_id, c.summary) for c in candidates])
-        write_event(
+        telemetry.record(
             {
                 "event": "cancel_resolved_from_scope",
                 "scope": selection.scope,
@@ -1881,7 +1890,7 @@ def build_support_nodes(
         assert pending is not None
         reason = _return_eligibility(pending.order_id)
         if reason == "order_cancelled":
-            write_event({"event": "return_denied", "reason": "order_cancelled"})
+            telemetry.record({"event": "return_denied", "reason": "order_cancelled"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -1897,7 +1906,7 @@ def build_support_nodes(
             # cancel — nothing has been sent, so nothing can go back. Mint the cancel and
             # route into its path; its guardrail re-validates eligibility.
             captured = order_store.captured_total(pending.order_id)
-            write_event({"event": "return_steered_to_cancel", "order_id": pending.order_id})
+            telemetry.record({"event": "return_steered_to_cancel", "order_id": pending.order_id})
             return {
                 "pending_return": None,
                 # Remedy steer mints through the ONE batch helper (a one-target batch).
@@ -1913,7 +1922,7 @@ def build_support_nodes(
         if reason == "already_open":
             existing = order_store.return_for_order(pending.order_id)
             assert existing is not None  # the eligibility helper just saw it
-            write_event({"event": "return_denied", "reason": "already_open"})
+            telemetry.record({"event": "return_denied", "reason": "already_open"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -1926,7 +1935,7 @@ def build_support_nodes(
                 ],
             }
         if reason == "out_of_window":
-            write_event({"event": "return_denied", "reason": "out_of_window"})
+            telemetry.record({"event": "return_denied", "reason": "out_of_window"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -1942,7 +1951,7 @@ def build_support_nodes(
             # DIRECT proposals only (a steered return already passed the refund amount
             # gate): an oversized refund promise needs a person, same authorization ceiling
             # as the refund flow's tier 3.
-            write_event(
+            telemetry.record(
                 {
                     "event": "return_needs_human",
                     "reason": "over_amount_threshold",
@@ -1970,7 +1979,7 @@ def build_support_nodes(
         pending = state.pending_return
         assert pending is not None
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
-            write_event({"event": "return_expired", "reason": "pending_ttl"})
+            telemetry.record({"event": "return_expired", "reason": "pending_ttl"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -1990,7 +1999,7 @@ def build_support_nodes(
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
             assert decision.handoff_source is not None
-            write_event({"event": "return_cancelled", "reason": "human_requested"})
+            telemetry.record({"event": "return_cancelled", "reason": "human_requested"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -2001,7 +2010,7 @@ def build_support_nodes(
                 ),
             }
         if verdict == "no":
-            write_event({"event": "return_cancelled", "reason": "declined"})
+            telemetry.record({"event": "return_cancelled", "reason": "declined"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -2023,7 +2032,7 @@ def build_support_nodes(
             ],
         }
         recent_orders.record([record.order_id], operation="return")
-        write_event(
+        telemetry.record(
             {
                 "event": "return_confirmed",
                 "rma_id": record.rma_id,
@@ -2050,7 +2059,7 @@ def build_support_nodes(
             )
         except ReturnError as exc:
             logger.warning("return refused by store: %s", exc)
-            write_event({"event": "return_denied", "reason": "store_refused"})
+            telemetry.record({"event": "return_denied", "reason": "store_refused"})
             return {
                 "pending_return": None,
                 "execution_owner": None,
@@ -2077,6 +2086,7 @@ def build_support_nodes(
         required_level=lambda p: profile_change_required_level(p.field),
         event_prefix="profile",
         max_otp_attempts=policy.otp_max_attempts,
+        telemetry=telemetry,
     )
 
     def profile_guardrail_node(state: ReasoningState) -> dict[str, object]:
@@ -2088,7 +2098,7 @@ def build_support_nodes(
         pending = state.pending_profile_change
         assert pending is not None
         if verification_store.current_level() < profile_change_required_level(pending.field):
-            write_event(
+            telemetry.record(
                 {"event": "profile_stepup_required", "required_level": 2, "field": pending.field}
             )
         return {}
@@ -2106,7 +2116,7 @@ def build_support_nodes(
         pending = state.pending_profile_change
         assert pending is not None
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
-            write_event({"event": "profile_expired", "reason": "pending_ttl"})
+            telemetry.record({"event": "profile_expired", "reason": "pending_ttl"})
             return {
                 "pending_profile_change": None,
                 "execution_owner": None,
@@ -2126,7 +2136,7 @@ def build_support_nodes(
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
             assert decision.handoff_source is not None
-            write_event({"event": "profile_change_cancelled", "reason": "human_requested"})
+            telemetry.record({"event": "profile_change_cancelled", "reason": "human_requested"})
             return {
                 "pending_profile_change": None,
                 "execution_owner": None,
@@ -2139,7 +2149,7 @@ def build_support_nodes(
                 ),
             }
         if verdict == "no":
-            write_event({"event": "profile_change_cancelled", "reason": "declined"})
+            telemetry.record({"event": "profile_change_cancelled", "reason": "declined"})
             return {
                 "pending_profile_change": None,
                 "execution_owner": None,
@@ -2160,7 +2170,7 @@ def build_support_nodes(
             ],
         }
         verification = [grant.method for grant in verification_store.grants]
-        write_event(
+        telemetry.record(
             {
                 "event": "profile_change_confirmed",
                 "field": record.field,
@@ -2186,7 +2196,7 @@ def build_support_nodes(
         binding_holds = bound is not None and bound.customer_ref == pending.customer_ref
         if verification_store.current_level() < required or not binding_holds:
             reason = "level_lapsed_at_place" if binding_holds else "binding_lapsed_at_place"
-            write_event({"event": "profile_stepup_failed", "reason": reason})
+            telemetry.record({"event": "profile_stepup_failed", "reason": reason})
             return {
                 "pending_profile_change": None,
                 "execution_owner": None,
@@ -2205,7 +2215,7 @@ def build_support_nodes(
             )
         except ProfileError as exc:
             logger.warning("profile change refused by store: %s", type(exc).__name__)
-            write_event({"event": "profile_change_denied", "reason": "store_refused"})
+            telemetry.record({"event": "profile_change_denied", "reason": "store_refused"})
             return {
                 "pending_profile_change": None,
                 "execution_owner": None,

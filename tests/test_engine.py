@@ -31,6 +31,7 @@ from llm_fakes import (
 )
 from policy_helpers import make_policy
 from pydantic import BaseModel, PrivateAttr, ValidationError
+from telemetry_helpers import make_session_telemetry
 from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
     engine_events,
@@ -57,6 +58,7 @@ from agnostic_market.agents.routing import (
     RoutingSession,
     SemanticRouter,
 )
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink
 from agnostic_market.checkpoints import (
     _CHECKPOINT_CHANNEL_DTOS,
     _CHECKPOINT_NESTED_ENUMS,
@@ -287,12 +289,14 @@ def _engine(
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     otp = OtpProvider(valid_code=_TEST_OTP)
     verification = VerificationStore(otp)
+    telemetry = make_session_telemetry("acme_store", thread_id)
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
         guest_orders=guest_orders,
+        telemetry=telemetry.operational,
     )
     assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -318,6 +322,8 @@ def _engine(
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         response_model_node_timeout_seconds=response_model_node_timeout_seconds,
         reasoning_model_node_timeout_seconds=reasoning_model_node_timeout_seconds,
+        telemetry=telemetry.operational,
+        routing_telemetry=telemetry.routing_evidence,
         checkpointer=checkpointer if checkpointer is not None else build_checkpointer(),
     )
     if routing_recognizer is not None and routing_model is not None:
@@ -340,6 +346,7 @@ def _engine(
         cart_store=cart,
         recent_orders=recent_orders,
         registry=assembly.capability_registry,
+        telemetry=telemetry.routing_evidence,
     )
     engine = ReasoningEngine(
         assembly.graph,
@@ -350,6 +357,7 @@ def _engine(
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         lifecycle=caller_context,
         routing=routing,
+        telemetry=telemetry.operational,
     )
     caller_context.attach_engine(engine)
     return engine, store
@@ -385,6 +393,12 @@ def _checkout_cart() -> CartStore:
 
 async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS) -> list:
     return await engine_events(engine, text, facts)
+
+
+def _telemetry_records(engine: ReasoningEngine) -> list[dict[str, object]]:
+    sink = engine._telemetry.sink
+    assert isinstance(sink, InMemoryTelemetrySink)
+    return [{"event": record.event, **record.attributes} for record in sink.records]
 
 
 async def _adapter_turn(
@@ -591,9 +605,6 @@ def _block_placement(
 async def test_failed_turn_recovers_with_the_fallback_never_silence(
     config_root: Path,
 ) -> None:
-    import json
-
-    from agnostic_market.agents import telemetry
     from agnostic_market.dtos.events import SpokenMessageEvent
 
     engine, _ = _engine(
@@ -604,10 +615,7 @@ async def test_failed_turn_recovers_with_the_fallback_never_silence(
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
     assert len(spoken) == 1 and spoken[0].node == "recover_node_exception"
     assert "say that again" in spoken[0].text  # ...but the caller hears the fallback
-    lines = [
-        json.loads(line)
-        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
-    ]
+    lines = _telemetry_records(engine)
     assert any(rec.get("event") == "turn_failed" for rec in lines)  # loud, not swallowed
     # The session SURVIVES: the next turn runs normally on the same thread.
     retry = await _events(engine, "hi again")
@@ -996,10 +1004,7 @@ async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_rout
 
 async def test_duplicate_typed_cart_dispatch_cannot_resume_mutation_confirmation(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
-    import json
-
     product = load_orders_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     frontline = FakeChatModel(raise_transport=True)
@@ -1061,10 +1066,7 @@ async def test_duplicate_typed_cart_dispatch_cannot_resume_mutation_confirmation
         quantity=pending.quantity,
         pre_confirm_quantity=pending.pre_confirm_quantity,
     )
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    records = _telemetry_records(engine)
 
     assert cart.view()[0].quantity == 1
     assert receipt.kind == "committed"
@@ -1151,7 +1153,6 @@ async def test_duplicate_list_turn_cannot_open_an_invocation(config_root: Path) 
 
 async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     frontline = FakeChatModel(emit_tool_calls=False)
     engine, _ = _engine(
@@ -1192,12 +1193,8 @@ async def test_duplicate_abandoned_turn_advances_safe_recovery_with_one_retry(
     assert snapshot.values.get("active_invocation") is None
     assert snapshot.next == ()
     assert frontline.invoke_count == 0
-    import json
 
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    records = _telemetry_records(engine)
     assert [
         record
         for record in records
@@ -1224,10 +1221,6 @@ def test_committed_turn_requires_an_explicit_nonblank_transport_identity() -> No
 async def test_missing_transport_id_rejects_before_checkpoint_or_model_work(
     config_root: Path,
 ) -> None:
-    import json
-
-    from agnostic_market.agents import telemetry
-
     frontline = FakeChatModel(emit_tool_calls=False)
     engine, store = _engine(
         config_root,
@@ -1247,10 +1240,7 @@ async def test_missing_transport_id_rejects_before_checkpoint_or_model_work(
     assert frontline.invoke_count == 0
     assert store.placed_count == 0
     assert engine._graph.get_state(engine._config).values == {}
-    records = [
-        json.loads(line)
-        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
-    ]
+    records = _telemetry_records(engine)
     assert records == [{"event": "ingress_turn_rejected", "reason": "missing_message_id"}]
 
 
@@ -2526,10 +2516,7 @@ async def test_close_during_pure_abort_model_waits_then_deletes_permanently(
 
 async def test_queued_turn_is_rejected_once_when_close_starts(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
-    import json
-
     frontline = _BlockingFirstResponseModel(emit_tool_calls=False)
     reasoning = FakeChatModel()
     engine, store = _engine(
@@ -2572,10 +2559,7 @@ async def test_queued_turn_is_rejected_once_when_close_starts(
     assert reasoning.invoke_count == 0
     assert store.placed_count == 0
     _assert_checkpoint_thread_retired(engine)
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    records = _telemetry_records(engine)
     assert [record for record in records if record.get("event") == "ingress_turn_rejected"] == [
         {"event": "ingress_turn_rejected", "reason": "session_closed"}
     ]
@@ -2586,12 +2570,9 @@ async def test_queued_turn_is_rejected_once_when_close_starts(
 @pytest.mark.parametrize("terminal_latched", (False, True))
 async def test_post_close_turn_stops_before_every_engine_boundary(
     config_root: Path,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     terminal_latched: bool,
 ) -> None:
-    import json
-
     frontline = FakeChatModel(emit_tool_calls=False)
     reasoning = FakeChatModel()
     engine, store = _engine(
@@ -2641,10 +2622,7 @@ async def test_post_close_turn_stops_before_every_engine_boundary(
     assert store.placed_count == 0
     with pytest.raises(CheckpointScopeError, match="namespace"):
         await real_get_state(engine._config)
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
+    records = _telemetry_records(engine)
     assert [record for record in records if record.get("event") == "ingress_turn_rejected"] == [
         {"event": "ingress_turn_rejected", "reason": "session_closed"}
     ]

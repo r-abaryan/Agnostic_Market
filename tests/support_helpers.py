@@ -16,6 +16,7 @@ from turn_helpers import TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
 from agnostic_market.checkpoints import build_checkpointer
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import FixtureCatalog
@@ -58,6 +59,7 @@ class SupportHarness(NamedTuple):
     payment_instruments: PaymentInstrumentDirectory
     guest_orders: GuestOrderScope
     caller_context: CallerContext
+    telemetry: InMemoryTelemetrySink
 
 
 TEST_OTP = "482913"
@@ -107,12 +109,17 @@ def build_support_engine(
     otp = OtpProvider(valid_code=TEST_OTP)
     verification = VerificationStore(otp)
     profile = ProfileStore(load_profile_fixture(config_root, "acme_store"))
+    telemetry_sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", telemetry_sink, telemetry_sink).bind_session(
+        thread_id
+    )
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
         guest_orders=guest_orders,
+        telemetry=telemetry.operational,
     )
     assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -137,6 +144,8 @@ def build_support_engine(
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         response_model_node_timeout_seconds=2.0,
         reasoning_model_node_timeout_seconds=6.0,
+        telemetry=telemetry.operational,
+        routing_telemetry=telemetry.routing_evidence,
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(
@@ -153,7 +162,9 @@ def build_support_engine(
             recent_orders=recent_orders,
             resolution=routing_resolution,
             continue_active=routing_resolution is not None,
+            telemetry=telemetry.routing_evidence,
         ),
+        telemetry=telemetry.operational,
         lifecycle=caller_context,
     )
     caller_context.attach_engine(engine)
@@ -169,4 +180,5 @@ def build_support_engine(
         payment_instruments,
         guest_orders,
         caller_context,
+        telemetry_sink,
     )

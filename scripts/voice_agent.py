@@ -23,6 +23,12 @@ from dotenv import load_dotenv
 from livekit import agents
 
 from agnostic_market.agents.routing_activation import QualifiedSemanticRouterFactory
+from agnostic_market.agents.telemetry import (
+    DisabledTelemetrySink,
+    InMemoryTelemetrySink,
+    TelemetryStore,
+    TenantTelemetry,
+)
 from agnostic_market.application import build_fixture_tenant_services
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
@@ -97,13 +103,25 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         max_report_age_days=targets.max_report_age_days,
         expected_corpus_fingerprint=expected_corpus_fingerprint,
     )
+    operational_telemetry: TelemetryStore = (
+        InMemoryTelemetrySink() if close_certification is not None else DisabledTelemetrySink()
+    )
+    routing_evidence = DisabledTelemetrySink()
 
     loop = build_voice_loop(
         resolved,
         credentials,
         secrets,
         deployment_id=_deployment_id(),
-        tenant_services=build_fixture_tenant_services(_CONFIG_ROOT, _MERCHANT_ID),
+        tenant_services=build_fixture_tenant_services(
+            _CONFIG_ROOT,
+            _MERCHANT_ID,
+            telemetry=TenantTelemetry(
+                _MERCHANT_ID,
+                operational_telemetry,
+                routing_evidence,
+            ),
+        ),
         routing_recognizer_factory=routing_factory,
     )
     loop.register_shutdown(ctx)
@@ -120,6 +138,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         close_recorder = CloseEvidenceRecorder(
             close_certification,
             merchant_id=_MERCHANT_ID,
+            telemetry=operational_telemetry,
         )
         close_recorder.attach(
             session=loop.session,

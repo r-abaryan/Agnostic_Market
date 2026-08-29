@@ -9,7 +9,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from llm_fakes import TEST_STRUCTURED_OUTPUT_METHOD, FakeChatModel
 
-from agnostic_market.agents import routing as routing_module
 from agnostic_market.agents.capabilities import (
     CapabilityEntry,
     CapabilityRegistry,
@@ -29,6 +28,7 @@ from agnostic_market.agents.routing import (
     registry_fingerprint,
     resolve_route,
 )
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore
 from agnostic_market.commerce.orders import RecentOrderContext
@@ -234,11 +234,9 @@ def test_projector_rejects_terminal_state_before_reading_live_stores(
     assert result == RoutingFailure(reason="context_invalid")
 
 
-async def test_routing_session_resolves_and_emits_only_closed_route_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    records: list[dict[str, object]] = []
-    monkeypatch.setattr(routing_module, "write_event", records.append)
+async def test_routing_session_resolves_and_emits_only_closed_route_fields() -> None:
+    sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("route-session")
     registry = _registry(SearchCatalog)
     recognizer: RoutingRecognizer = _RecordingRecognizer(
         _attempt(RouteDecision.direct(SearchCatalog(query="private product wording")))
@@ -249,6 +247,7 @@ async def test_routing_session_resolves_and_emits_only_closed_route_fields(
         cart_store=CartStore(),
         recent_orders=RecentOrderContext(max_refs=1),
         registry=registry,
+        telemetry=telemetry.routing_evidence,
     )
     turn = CommittedTurn(
         text="find private product wording and call me on +44 7700 900123",
@@ -262,8 +261,13 @@ async def test_routing_session_resolves_and_emits_only_closed_route_fields(
     assert isinstance(recognizer, _RecordingRecognizer)
     assert recognizer.contexts == [projection]
     assert resolution == RouteDecision.direct(SearchCatalog(query="private product wording"))
+    records = [record.flattened() for record in sink.records]
     assert records == [
         {
+            "schema_version": 1,
+            "purpose": "routing_evidence",
+            "tenant_id": "acme_store",
+            "session_id": "route-session",
             "event": "semantic_route",
             "turn_id": "route-turn-1",
             "decision_source": "active",
@@ -301,6 +305,9 @@ async def test_routing_projection_failure_calls_no_recognizer() -> None:
         cart_store=CartStore(),
         recent_orders=RecentOrderContext(max_refs=1),
         registry=_registry(ViewCart),
+        telemetry=TenantTelemetry("acme_store", InMemoryTelemetrySink(), InMemoryTelemetrySink())
+        .bind_session("projection-failure")
+        .routing_evidence,
     )
 
     turn = CommittedTurn(text="show my cart", message_id="terminal-route-turn")
@@ -373,6 +380,9 @@ async def test_confirmation_escape_projects_its_scope_for_the_one_recognizer() -
         cart_store=CartStore(),
         recent_orders=RecentOrderContext(max_refs=1),
         registry=_registry(ViewCart, RequestPerson),
+        telemetry=TenantTelemetry("acme_store", InMemoryTelemetrySink(), InMemoryTelemetrySink())
+        .bind_session("confirmation-escape")
+        .routing_evidence,
     )
 
     result = await routing.resolve_confirmation_escape(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -13,14 +13,17 @@ from llm_fakes import (
 )
 from policy_helpers import make_policy
 from routing_helpers import ArchitectureRoutingRecognizer
+from telemetry_helpers import make_tenant_telemetry
 from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
     engine_events,
 )
 
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink, SessionTelemetry
 from agnostic_market.application import (
     ApplicationModels,
     ApplicationSettings,
+    TenantServices,
     build_application_session,
     build_fixture_tenant_services,
     build_in_memory_session_state,
@@ -67,11 +70,38 @@ def _routing_factory(_registry):
     return ArchitectureRoutingRecognizer()
 
 
+def test_tenant_services_fields_have_explicit_lifetime_and_mutability() -> None:
+    contracts = {
+        "tenant_id": ("tenant", "immutable"),
+        "catalog": ("tenant", "immutable"),
+        "order_store": ("tenant", "mutable"),
+        "customers": ("tenant", "immutable"),
+        "payment_instruments": ("tenant", "immutable"),
+        "profile_store": ("tenant", "mutable"),
+        "otp": ("tenant", "mutable"),
+        "risk": ("tenant", "immutable"),
+        "checkpointer": ("tenant", "mutable"),
+        "telemetry": ("tenant", "mutable"),
+    }
+
+    assert {field.name for field in fields(TenantServices)} == contracts.keys()
+    assert set(contracts.values()) <= {
+        ("tenant", "immutable"),
+        ("tenant", "mutable"),
+        ("session", "immutable"),
+        ("session", "mutable"),
+    }
+
+
 def test_application_uses_explicit_deployment_artifact_for_checkpoint_namespace(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     def fixed_state(context, dependencies):
         return build_in_memory_session_state(
@@ -112,7 +142,11 @@ def test_shared_tenant_services_keep_guest_visibility_session_isolated(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     def first_state(context, dependencies):
         return build_in_memory_session_state(
@@ -174,7 +208,11 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     def session_state(session_id: str, thread_id: str):
         def build_state(context, dependencies):
@@ -289,7 +327,11 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
     response = FakeChatModel(
         emit_tool_calls=False,
         text_response="Yes, we carry the waterproof rain jacket for $129.00.",
@@ -324,11 +366,25 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
     assert "trail running shoes" not in prompt
     assert application.state.cart_store.is_empty()
     assert services.order_store.placed_count == 0
+    operational_sink = services.telemetry.operational_sink
+    routing_sink = services.telemetry.routing_evidence_sink
+    assert isinstance(operational_sink, InMemoryTelemetrySink)
+    assert isinstance(routing_sink, InMemoryTelemetrySink)
+    assert not any(record.event == "capability_answered" for record in operational_sink.records)
+    assert [
+        record.attributes["capability"]
+        for record in routing_sink.records
+        if record.event == "capability_answered"
+    ] == ["search_catalog"]
 
 
 def test_application_rejects_services_from_another_tenant(config_root: Path) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     with pytest.raises(ValueError, match="services do not match"):
         build_application_session(
@@ -343,7 +399,11 @@ def test_application_rejects_services_from_another_tenant(config_root: Path) -> 
 
 def test_application_rejects_a_catalog_from_another_tenant(config_root: Path) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
     fixture = load_orders_fixture(config_root, tenant.tenant_id)
 
     with pytest.raises(ValueError, match="catalog service does not match"):
@@ -359,7 +419,11 @@ def test_application_rejects_a_catalog_from_another_tenant(config_root: Path) ->
 
 def test_application_rejects_an_order_store_from_another_tenant(config_root: Path) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
     fixture = load_orders_fixture(config_root, tenant.tenant_id)
 
     with pytest.raises(ValueError, match="order service does not match"):
@@ -375,7 +439,11 @@ def test_application_rejects_an_order_store_from_another_tenant(config_root: Pat
 
 def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     def mismatched_state(_context, dependencies):
         return build_in_memory_session_state(
@@ -399,7 +467,11 @@ def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> No
 
 def test_application_rejects_a_guest_scope_from_another_session(config_root: Path) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     def mismatched_state(context, dependencies):
         state = build_in_memory_session_state(
@@ -430,13 +502,100 @@ def test_application_rejects_a_guest_scope_from_another_session(config_root: Pat
 
 def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> None:
     tenant = _tenant()
-    services = build_fixture_tenant_services(config_root, tenant.tenant_id)
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
 
     def mismatched_state(context, dependencies):
         state = build_in_memory_session_state(context, dependencies)
         return replace(state, cart_store=CartStore())
 
     with pytest.raises(ValueError, match=r"lifecycle.*cart"):
+        build_application_session(
+            tenant,
+            _settings(),
+            _models(),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=mismatched_state,
+        )
+
+
+def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+
+    def mismatched_state(context, dependencies):
+        state = build_in_memory_session_state(context, dependencies)
+        other = make_tenant_telemetry(context.tenant_id).bind_session(state.session_id)
+        return replace(
+            state,
+            caller_context=replace(state.caller_context, telemetry=other.operational),
+        )
+
+    with pytest.raises(ValueError, match=r"lifecycle.*telemetry"):
+        build_application_session(
+            tenant,
+            _settings(),
+            _models(),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=mismatched_state,
+        )
+
+
+def test_application_rejects_session_telemetry_from_another_sink(config_root: Path) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+
+    def mismatched_state(context, dependencies):
+        state = build_in_memory_session_state(context, dependencies)
+        other = make_tenant_telemetry(context.tenant_id).bind_session(state.session_id)
+        return replace(state, telemetry=other)
+
+    with pytest.raises(ValueError, match="tenant telemetry service"):
+        build_application_session(
+            tenant,
+            _settings(),
+            _models(),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=mismatched_state,
+        )
+
+
+def test_application_rejects_swapped_telemetry_purposes(config_root: Path) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+
+    def mismatched_state(context, dependencies):
+        state = build_in_memory_session_state(context, dependencies)
+        return replace(
+            state,
+            telemetry=SessionTelemetry(
+                operational=state.telemetry.routing_evidence,
+                routing_evidence=state.telemetry.operational,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="telemetry purpose"):
         build_application_session(
             tenant,
             _settings(),

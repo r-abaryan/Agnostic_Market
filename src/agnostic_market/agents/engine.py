@@ -58,7 +58,7 @@ from agnostic_market.agents.recovery import (
     clear_automation_state,
 )
 from agnostic_market.agents.routing import RoutingSession
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.checkpoints import (
     CheckpointBinding,
     CheckpointScopeError,
@@ -118,9 +118,10 @@ def _new_thread_id() -> str:
 
 def _write_ingress_rejection(
     reason: Literal["missing_message_id", "session_closed"],
+    telemetry: TelemetryRecorder,
 ) -> None:
     try:
-        write_event({"event": "ingress_turn_rejected", "reason": reason})
+        telemetry.record({"event": "ingress_turn_rejected", "reason": reason})
     except Exception:
         logger.critical("ingress-rejection telemetry failed", exc_info=True)
 
@@ -385,6 +386,7 @@ class ReasoningEngine:
         checkpoint_io_timeout_seconds: float,
         cancellation_quiescence_timeout_seconds: float,
         routing: RoutingSession,
+        telemetry: TelemetryRecorder,
         lifecycle: PrincipalTransitionLifecycle | None = None,
     ) -> None:
         if graph.checkpointer is None:
@@ -425,6 +427,7 @@ class ReasoningEngine:
         if not isinstance(routing, RoutingSession):
             raise ValueError("ReasoningEngine requires an active RoutingSession")
         self._routing = routing
+        self._telemetry = telemetry
         if cancellation_quiescence_timeout_seconds <= 0:
             raise ValueError("cancellation quiescence timeout must be positive")
         self._cancellation_quiescence_timeout_seconds = cancellation_quiescence_timeout_seconds
@@ -606,7 +609,7 @@ class ReasoningEngine:
                     )
             raise
         try:
-            write_event(
+            self._telemetry.record(
                 {
                     "event": "reasoning_context_rotated",
                     "transition_id": transition.transition_id,
@@ -641,7 +644,7 @@ class ReasoningEngine:
             return
         self._terminal_latched = True
         try:
-            write_event({"event": "turn_failed", "reason": "engine_last_resort"})
+            self._telemetry.record({"event": "turn_failed", "reason": "engine_last_resort"})
         except Exception:
             logger.critical("last-resort telemetry failed", exc_info=True)
 
@@ -956,7 +959,7 @@ class ReasoningEngine:
             or not _task_matches(seeded, self._recovery_entry_node, interrupted=False)
         ):
             raise RuntimeError("stream recovery seed did not round-trip exactly")
-        write_event(
+        self._telemetry.record(
             {
                 "event": "turn_recovery_seeded",
                 "node": marker.origin_node,
@@ -1053,7 +1056,7 @@ class ReasoningEngine:
     ) -> AsyncIterator[TurnEvent]:
         with self._node_execution_tracker.turn_span() as admitted:
             if not admitted:
-                _write_ingress_rejection("session_closed")
+                _write_ingress_rejection("session_closed", self._telemetry)
                 return
             stream = self._stream_admitted_turn(turn, facts)
             try:
@@ -1077,7 +1080,7 @@ class ReasoningEngine:
         claiming that an unfinished checkpoint is safe to abandon.
         """
         if not self._node_execution_tracker.turn_admission_open:
-            _write_ingress_rejection("session_closed")
+            _write_ingress_rejection("session_closed", self._telemetry)
             return
         if self._terminal_latched:
             yield SpokenMessageEvent(
@@ -1087,7 +1090,7 @@ class ReasoningEngine:
             return
         message_id = turn.message_id
         if message_id is None:
-            _write_ingress_rejection("missing_message_id")
+            _write_ingress_rejection("missing_message_id", self._telemetry)
             yield SpokenMessageEvent(
                 text=TURN_FALLBACK_LINE,
                 node=TURN_FALLBACK_AUTHOR,
@@ -1111,7 +1114,7 @@ class ReasoningEngine:
             owned_resumed_interrupt_node: str | None = None
             try:
                 if not self._node_execution_tracker.turn_admission_open:
-                    _write_ingress_rejection("session_closed")
+                    _write_ingress_rejection("session_closed", self._telemetry)
                     return
                 if self._terminal_latched:
                     yield SpokenMessageEvent(
@@ -1131,7 +1134,7 @@ class ReasoningEngine:
                 resumed_interrupt_node: str | None = None
                 if snapshot_state.automation_terminal:
                     if message_id in snapshot_state.consumed_turn_ids:
-                        write_event(
+                        self._telemetry.record(
                             {
                                 "event": "duplicate_turn_ignored",
                                 "reason": "consumed_turn_id",
@@ -1143,7 +1146,7 @@ class ReasoningEngine:
                         "consumed_turn_ids": (message_id,),
                     }
                 elif cross_thread:
-                    write_event({"event": "cross_thread_turn_consumed"})
+                    self._telemetry.record({"event": "cross_thread_turn_consumed"})
                     if marker is not None:
                         payload: object = Command(
                             update={
@@ -1155,7 +1158,7 @@ class ReasoningEngine:
                             }
                         )
                     elif message_id in snapshot_state.consumed_turn_ids:
-                        write_event(
+                        self._telemetry.record(
                             {
                                 "event": "duplicate_turn_ignored",
                                 "reason": "consumed_turn_id",
@@ -1206,7 +1209,7 @@ class ReasoningEngine:
                     ):
                         payload = Command(update={"consumed_turn_ids": ()})
                     else:
-                        write_event(
+                        self._telemetry.record(
                             {
                                 "event": "duplicate_turn_ignored",
                                 "reason": "consumed_turn_id",

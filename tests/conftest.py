@@ -18,18 +18,6 @@ def config_root() -> Path:
     return _CONFIG_ROOT
 
 
-@pytest.fixture(autouse=True)
-def _telemetry_to_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Redirect agent telemetry to a per-test temp file.
-
-    The real config/telemetry/frontline.jsonl is the (local-only) classifier dataset;
-    test runs with fake models must never append to it.
-    """
-    from agnostic_market.agents import telemetry
-
-    monkeypatch.setattr(telemetry, "_TELEMETRY_PATH", tmp_path / "telemetry.jsonl")
-
-
 @pytest.fixture
 def registry(config_root: Path) -> ConfigRegistry:
     return ConfigRegistry(config_root).load()

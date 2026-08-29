@@ -16,10 +16,12 @@ from livekit.plugins import cartesia, deepgram
 from livekit.plugins import langchain as lk_langchain
 from llm_fakes import FakeChatModel, RecordingResolver
 from routing_helpers import ArchitectureRoutingRecognizer
+from telemetry_helpers import make_session_telemetry, make_tenant_telemetry
 from turn_helpers import engine_events
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink
 from agnostic_market.application import build_fixture_tenant_services
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentEntry,
@@ -41,7 +43,11 @@ async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
         credentials,
         resolver,
         deployment_id="test-voice-artifact",
-        tenant_services=build_fixture_tenant_services(config_root, "acme_store"),
+        tenant_services=build_fixture_tenant_services(
+            config_root,
+            "acme_store",
+            telemetry=make_tenant_telemetry("acme_store"),
+        ),
         routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
     )
 
@@ -174,7 +180,11 @@ async def test_session_build_rejects_profile_for_unknown_customer(
         lambda _root, _merchant: ProfileFixture(profiles={"CUST-UNKNOWN": profile}),
     )
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_fixture_tenant_services(config_root, "acme_store")
+        build_fixture_tenant_services(
+            config_root,
+            "acme_store",
+            telemetry=make_tenant_telemetry("acme_store"),
+        )
 
 
 async def test_session_build_rejects_payment_instrument_for_unknown_customer(
@@ -192,7 +202,11 @@ async def test_session_build_rejects_payment_instrument_for_unknown_customer(
         ),
     )
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
-        build_fixture_tenant_services(config_root, "acme_store")
+        build_fixture_tenant_services(
+            config_root,
+            "acme_store",
+            telemetry=make_tenant_telemetry("acme_store"),
+        )
 
 
 class _FakeEngine:
@@ -272,6 +286,7 @@ class _FakeClearable:
 def _fake_caller_context(engine=None):
     from agnostic_market.session import CallerContext
 
+    telemetry = make_session_telemetry("acme_store", "fake-caller")
     return CallerContext(
         engine=engine or _FakeEngine(),
         verification_store=_FakeClearable(),  # type: ignore[arg-type]
@@ -279,6 +294,7 @@ def _fake_caller_context(engine=None):
         recent_orders=_FakeClearable(),  # type: ignore[arg-type]
         identity_store=_FakeClearable(),  # type: ignore[arg-type]
         guest_orders=_FakeClearable(),  # type: ignore[arg-type]
+        telemetry=telemetry.operational,
     )
 
 
@@ -451,15 +467,10 @@ async def test_voice_loop_registers_awaited_caller_teardown_for_job_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> None:
+async def test_thread_reaper_is_reentrant_safe() -> None:
     # Clock B: a double-fired session close runs the teardown + emits the abandoned event AT
     # MOST once (the reaper's own re-entrant guard; the teardown itself is idempotent too).
-    import json
-
-    from agnostic_market.agents import telemetry
     from agnostic_market.voice.pipeline import _attach_thread_reaper
-
-    monkeypatch.setattr(telemetry, "_TELEMETRY_PATH", tmp_path / "telemetry.jsonl")
 
     session = _FakeSession()
     ctx = _fake_caller_context()
@@ -476,24 +487,19 @@ async def test_thread_reaper_is_reentrant_safe(tmp_path: Path, monkeypatch) -> N
     assert ctx.recent_orders.clears == 1  # type: ignore[attr-defined]
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.guest_orders.clears == 1  # type: ignore[attr-defined]
-    lines = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    sink = ctx.telemetry.sink
+    assert isinstance(sink, InMemoryTelemetrySink)
+    assert [record.event for record in sink.records] == [
+        "caller_context_closed",
+        "flow_abandoned",
     ]
-    assert [rec["event"] for rec in lines] == ["caller_context_closed", "flow_abandoned"]
 
 
 async def test_abandoned_interrupt_is_recorded_when_another_close_path_runs_first(
     config_root: Path,
-    tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    import json
-
-    from agnostic_market.agents import telemetry
     from agnostic_market.voice.pipeline import _attach_thread_reaper
 
-    monkeypatch.setattr(telemetry, "_TELEMETRY_PATH", tmp_path / "telemetry.jsonl")
     loop = await _loop(config_root, RecordingResolver())
     context = loop.application.state.caller_context
     loop.application.state.cart_store.add_item(
@@ -520,8 +526,6 @@ async def test_abandoned_interrupt_is_recorded_when_another_close_path_runs_firs
         if context._closed:
             break
 
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert [record["event"] for record in records].count("flow_abandoned") == 1
+    sink = loop.application.services.telemetry.operational_sink
+    assert isinstance(sink, InMemoryTelemetrySink)
+    assert [record.event for record in sink.records].count("flow_abandoned") == 1

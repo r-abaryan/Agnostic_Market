@@ -21,7 +21,7 @@ from langchain_core.runnables import Runnable
 from pydantic import ValidationError
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import CallerIdentityStore
 from agnostic_market.commerce.orders import RecentOrderContext
@@ -457,12 +457,14 @@ class RoutingSession:
         cart_store: CartStore,
         recent_orders: RecentOrderContext,
         registry: CapabilityRegistry,
+        telemetry: TelemetryRecorder,
     ) -> None:
         self._recognizer = recognizer
         self._identity_store = identity_store
         self._cart_store = cart_store
         self._recent_orders = recent_orders
         self._registry = registry
+        self._telemetry = telemetry
 
     def capability_available(self, capability: CapabilityId) -> bool:
         """Return whether this session can dispatch the capability."""
@@ -523,7 +525,7 @@ class RoutingSession:
             event = _routing_resolution_event(turn_id, projection)
             if routing_scope is not None:
                 event["routing_scope"] = routing_scope
-            write_event(event)
+            self._telemetry.record(event)
             return projection
         attempt = await self._recognizer.route(projection)
         resolution = attempt.resolution
@@ -534,7 +536,7 @@ class RoutingSession:
         event = _routing_attempt_event(turn_id, projection, attempt)
         if routing_scope is not None:
             event["routing_scope"] = routing_scope
-        write_event(event)
+        self._telemetry.record(event)
         return resolution
 
 

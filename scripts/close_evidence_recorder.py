@@ -33,9 +33,13 @@ from livekit.agents.llm import ChatMessage
 from livekit.agents.voice.room_io.types import DEFAULT_CLOSE_ON_DISCONNECT_REASONS
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agnostic_market.agents import telemetry
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
+from agnostic_market.agents.telemetry import (
+    OperationalTelemetryEvent,
+    TelemetryEvidenceSource,
+    TelemetryPurpose,
+)
 from agnostic_market.checkpoints import SchemaValidatedCheckpointSaver
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.session import CallerContext
@@ -49,20 +53,6 @@ _SUITE_PATH = Path("eval") / "close_lifecycle.yaml"
 _STRICT = ConfigDict(extra="forbid", frozen=True)
 _ALLOWED_DISCONNECT_REASONS = frozenset(
     rtc.DisconnectReason.Name(reason) for reason in DEFAULT_CLOSE_ON_DISCONNECT_REASONS
-)
-_TELEMETRY_FIELDS = (
-    "caller_context_closed",
-    "flow_abandoned",
-    "turn_failed",
-    "ingress_turn_rejected",
-    "checkout_confirmed",
-    "refund_confirmed",
-    "cancel_confirmed",
-    "return_confirmed",
-    "profile_change_confirmed",
-    "principal_transitioned",
-    "reasoning_context_rotated",
-    "automation_terminal_response",
 )
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_RECORDER: int | None = None
@@ -193,6 +183,17 @@ class TelemetryCounts(BaseModel):
     automation_terminal_response: int = Field(default=0, ge=0)
 
 
+_COUNTED_TELEMETRY_EVENTS = tuple(TelemetryCounts.model_fields)
+_UNKNOWN_COUNTED_TELEMETRY_EVENTS = set(_COUNTED_TELEMETRY_EVENTS) - {
+    event.value for event in OperationalTelemetryEvent
+}
+if _UNKNOWN_COUNTED_TELEMETRY_EVENTS:
+    raise RuntimeError(
+        "close certification counts unknown operational telemetry events: "
+        + ", ".join(sorted(_UNKNOWN_COUNTED_TELEMETRY_EVENTS))
+    )
+
+
 class CloseEvidenceReport(BaseModel):
     model_config = _STRICT
 
@@ -303,31 +304,30 @@ def _caller_state(context: CallerContext) -> CallerStateEvidence:
     )
 
 
-def _telemetry_offset() -> tuple[Path, int]:
-    path = telemetry._TELEMETRY_PATH
-    return path, path.stat().st_size if path.is_file() else 0
-
-
-def _telemetry_counts(path: Path, offset: int) -> tuple[TelemetryCounts, bool]:
-    try:
-        if not path.is_file():
-            return TelemetryCounts(), False
-        if path.stat().st_size < offset:
-            return TelemetryCounts(), False
-        counts: Counter[str] = Counter()
-        with path.open("rb") as stream:
-            stream.seek(offset)
-            for raw_line in stream:
-                record = json.loads(raw_line.decode("utf-8"))
-                event = record.get("event")
-                if event in _TELEMETRY_FIELDS:
-                    counts[event] += 1
-        return (
-            TelemetryCounts.model_validate({field: counts[field] for field in _TELEMETRY_FIELDS}),
-            True,
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+def _telemetry_counts(
+    source: TelemetryEvidenceSource,
+    mark: int,
+    *,
+    tenant_id: str,
+    session_id: str,
+) -> tuple[TelemetryCounts, bool]:
+    read = source.read_since(mark)
+    if not read.complete:
         return TelemetryCounts(), False
+    counts = Counter(
+        record.event
+        for record in read.records
+        if record.purpose is TelemetryPurpose.OPERATIONAL
+        and record.tenant_id == tenant_id
+        and record.session_id == session_id
+        and record.event in _COUNTED_TELEMETRY_EVENTS
+    )
+    return (
+        TelemetryCounts.model_validate(
+            {field: counts[field] for field in _COUNTED_TELEMETRY_EVENTS}
+        ),
+        True,
+    )
 
 
 def _write_report_atomic(path: Path, report: CloseEvidenceReport) -> None:
@@ -362,6 +362,7 @@ class CloseEvidenceRecorder:
         request: CloseCertificationRequest,
         *,
         merchant_id: str,
+        telemetry: TelemetryEvidenceSource,
     ) -> None:
         self._request = request
         self._merchant_id = merchant_id
@@ -378,8 +379,10 @@ class CloseEvidenceRecorder:
         self._context: CallerContext | None = None
         self._effect_source: EffectCountSource | None = None
         self._linked_participant_identity: str | None = None
-        self._telemetry_path: Path | None = None
+        self._telemetry = telemetry
         self._telemetry_start = 0
+        self._telemetry_tenant_id: str | None = None
+        self._telemetry_session_id: str | None = None
         self._before_effects: EffectCounts | None = None
         self._before_caller_state: CallerStateEvidence | None = None
         self._observed_thread_ids: set[str] = set()
@@ -419,6 +422,10 @@ class CloseEvidenceRecorder:
                 )
             if engine._graph.checkpointer is None:
                 raise CloseCertificationError("reasoning engine has no checkpointer")
+            if lifecycle.telemetry.sink is not self._telemetry:
+                raise CloseCertificationError(
+                    "close certification requires the session telemetry source"
+                )
 
             self._event_loop = asyncio.get_running_loop()
             self._completion = self._event_loop.create_future()
@@ -428,7 +435,9 @@ class CloseEvidenceRecorder:
             self._context = lifecycle
             self._effect_source = effect_source
             self._linked_participant_identity = linked_participant_identity
-            self._telemetry_path, self._telemetry_start = _telemetry_offset()
+            self._telemetry_start = self._telemetry.mark()
+            self._telemetry_tenant_id = lifecycle.telemetry.tenant_id
+            self._telemetry_session_id = lifecycle.telemetry.session_id
             self._before_effects = _effect_counts(effect_source)
             self._before_caller_state = _caller_state(lifecycle)
             self._observe_current_thread()
@@ -540,15 +549,18 @@ class CloseEvidenceRecorder:
     async def _build_report(self) -> CloseEvidenceReport:
         assert self._context is not None
         assert self._effect_source is not None
-        assert self._telemetry_path is not None
         assert self._before_effects is not None
         assert self._before_caller_state is not None
+        assert self._telemetry_tenant_id is not None
+        assert self._telemetry_session_id is not None
 
         after_effects = _effect_counts(self._effect_source)
         after_state = _caller_state(self._context)
         telemetry_counts, telemetry_available = _telemetry_counts(
-            self._telemetry_path,
+            self._telemetry,
             self._telemetry_start,
+            tenant_id=self._telemetry_tenant_id,
+            session_id=self._telemetry_session_id,
         )
         threads_retired, checkpoint_authorization_available = self._checkpoint_evidence()
         failures: list[FailureReason] = []

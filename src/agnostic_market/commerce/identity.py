@@ -19,7 +19,7 @@ is never spoken, never logged, never telemetered; `masked_contact` is the only s
 form. `match_contact` takes the caller's spoken claim and returns a verdict — the claim
 VALUE is never logged or telemetered by any identity/gate path (events carry closed slugs
 only). The frontline answered-turn utterance dataset (which DOES record raw text) is
-contact-redacted at the `write_event` chokepoint (`redact_contact`, telemetry.py) — the
+contact-redacted by `TelemetryRecorder` (`redact_contact`, telemetry.py) — the
 gap SECURITY §7d named is closed there. Honest residual: the claim still exists where the
 caller put it — the transcript (HumanMessage) and the model's tool-call args — neither of
 which is the persisted telemetry dataset.

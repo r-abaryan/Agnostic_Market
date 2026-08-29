@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from pathlib import Path
 
@@ -16,12 +15,12 @@ from turn_helpers import engine_events
 
 from agnostic_market.agents import engine as engine_module
 from agnostic_market.agents import recovery
-from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.identity import flow as identity_flow
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
 )
+from agnostic_market.agents.telemetry import TelemetryRecord
 from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.identity import BoundIdentity
 from agnostic_market.commerce.verification import RiskProvider
@@ -82,11 +81,8 @@ def _spoken(events: list) -> list[SpokenMessageEvent]:
     return [event for event in events if isinstance(event, SpokenMessageEvent)]
 
 
-def _telemetry(tmp_path: Path) -> list[dict[str, object]]:
-    path = tmp_path / "telemetry.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+def _telemetry(harness: SupportHarness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 def test_transition_inspection_requires_every_postcondition_and_invalidation_is_total(
@@ -299,6 +295,7 @@ def test_identity_apply_missing_invocation_fails_before_transition_publication(
         make_policy(refund_returnless_under_usd=50.0),
         harness.caller_context.transition_principal,
         display_name="Acme Store",
+        telemetry=harness.caller_context.telemetry,
     )
     state = ReasoningState(
         execution_owner="identity",
@@ -319,7 +316,6 @@ def test_identity_apply_missing_invocation_fails_before_transition_publication(
 
 async def test_identity_apply_failure_after_coherent_publish_rotates_and_continues_once(
     config_root: Path,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = _identity_harness(config_root, thread_id="transition-after-publish")
@@ -327,14 +323,14 @@ async def test_identity_apply_failure_after_coherent_publish_rotates_and_continu
     old_config = harness.engine._config
     await _events(harness, "list my account orders")
 
-    real_write = identity_flow.write_event
+    real_write = harness.telemetry.emit
 
-    def fail_after_publication(record: dict[str, object]) -> None:
-        if record.get("event") == "identity_bound":
+    def fail_after_publication(record: TelemetryRecord) -> None:
+        if record.event == "identity_bound":
             raise RuntimeError("injected failure after coherent publication")
         real_write(record)
 
-    monkeypatch.setattr(identity_flow, "write_event", fail_after_publication)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_after_publication)
     recovered = await _events(harness, _OTP)
 
     assert harness.engine.thread_id != old_thread
@@ -350,11 +346,11 @@ async def test_identity_apply_failure_after_coherent_publish_rotates_and_continu
     assert harness.engine._graph.get_state(harness.engine._config).next == ()
     reconciled = [
         event
-        for event in _telemetry(tmp_path)
+        for event in _telemetry(harness)
         if event.get("event") == "principal_transition_reconciled"
     ]
     rotated = [
-        event for event in _telemetry(tmp_path) if event.get("event") == "reasoning_context_rotated"
+        event for event in _telemetry(harness) if event.get("event") == "reasoning_context_rotated"
     ]
     assert [event["outcome"] for event in reconciled] == ["coherent"]
     assert len(rotated) == 1
@@ -378,14 +374,14 @@ async def test_switch_apply_failure_after_coherent_publish_preserves_acknowledge
     assert any(isinstance(event, InterruptEvent) for event in warning)
     dispatched = await _events(harness, "yes")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
-    real_write = identity_flow.write_event
+    real_write = harness.telemetry.emit
 
-    def fail_after_publication(record: dict[str, object]) -> None:
-        if record.get("event") == "identity_bound":
+    def fail_after_publication(record: TelemetryRecord) -> None:
+        if record.event == "identity_bound":
             raise RuntimeError("injected switch tail failure")
         real_write(record)
 
-    monkeypatch.setattr(identity_flow, "write_event", fail_after_publication)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_after_publication)
     recovered = await _events(harness, _OTP)
 
     assert [event.text for event in _spoken(recovered)] == [
@@ -420,14 +416,14 @@ async def test_verify_apply_failure_after_coherent_publish_preserves_acknowledge
     old_config = harness.engine._config
     dispatched = await _events(harness, "continue")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
-    real_write = identity_flow.write_event
+    real_write = harness.telemetry.emit
 
-    def fail_after_publication(record: dict[str, object]) -> None:
-        if record.get("event") == "identity_bound":
+    def fail_after_publication(record: TelemetryRecord) -> None:
+        if record.event == "identity_bound":
             raise RuntimeError("injected verification tail failure")
         real_write(record)
 
-    monkeypatch.setattr(identity_flow, "write_event", fail_after_publication)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_after_publication)
     recovered = await _events(harness, _OTP)
 
     assert [event.text for event in _spoken(recovered)] == ["You're now verified."]
@@ -477,16 +473,16 @@ async def test_cancelled_identity_apply_resolves_principal_publication_fail_clos
             pause_without_publication,
         )
     else:
-        real_write = identity_flow.write_event
+        real_write = harness.telemetry.emit
 
-        def pause_after_publication(record: dict[str, object]) -> None:
-            if record.get("event") == "identity_bound":
+        def pause_after_publication(record: TelemetryRecord) -> None:
+            if record.event == "identity_bound":
                 entered.set()
                 if not release.wait(timeout=5):
                     raise RuntimeError("test did not release identity_apply")
             real_write(record)
 
-        monkeypatch.setattr(identity_flow, "write_event", pause_after_publication)
+        monkeypatch.setattr(harness.telemetry, "emit", pause_after_publication)
 
     applying = asyncio.create_task(_events(harness, _OTP))
     assert await asyncio.to_thread(entered.wait, 5)
@@ -565,16 +561,16 @@ async def test_unquiescent_identity_apply_defers_terminal_cleanup_until_worker_e
             pause_before_publication,
         )
     else:
-        real_write = identity_flow.write_event
+        real_write = harness.telemetry.emit
 
-        def pause_after_publication(record: dict[str, object]) -> None:
-            if record.get("event") == "identity_bound":
+        def pause_after_publication(record: TelemetryRecord) -> None:
+            if record.event == "identity_bound":
                 entered.set()
                 if not release.wait(timeout=5):
                     raise RuntimeError("test did not release identity_apply")
             real_write(record)
 
-        monkeypatch.setattr(identity_flow, "write_event", pause_after_publication)
+        monkeypatch.setattr(harness.telemetry, "emit", pause_after_publication)
 
     if wait_outcome == "timeout":
         monkeypatch.setattr(
@@ -703,7 +699,6 @@ async def test_deferred_terminal_cleanup_yields_to_session_close_without_recreat
 
 async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
     config_root: Path,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = _identity_harness(
@@ -729,16 +724,16 @@ async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
 
     published = threading.Event()
     release_apply = threading.Event()
-    real_write = identity_flow.write_event
+    real_write = harness.telemetry.emit
 
-    def pause_after_publication(record: dict[str, object]) -> None:
-        if record.get("event") == "identity_bound":
+    def pause_after_publication(record: TelemetryRecord) -> None:
+        if record.event == "identity_bound":
             published.set()
             if not release_apply.wait(timeout=5):
                 raise RuntimeError("test did not release identity_apply")
         real_write(record)
 
-    monkeypatch.setattr(identity_flow, "write_event", pause_after_publication)
+    monkeypatch.setattr(harness.telemetry, "emit", pause_after_publication)
     completing = asyncio.create_task(_events(harness, _OTP))
     assert await asyncio.to_thread(published.wait, 5)
     queued_arrived = asyncio.Event()
@@ -782,9 +777,7 @@ async def test_old_thread_yes_cannot_resume_new_thread_confirmation(
         "test-turn-4",
     )
     consumed = [
-        event
-        for event in _telemetry(tmp_path)
-        if event.get("event") == "cross_thread_turn_consumed"
+        event for event in _telemetry(harness) if event.get("event") == "cross_thread_turn_consumed"
     ]
     assert len(consumed) == 1
 
@@ -827,18 +820,19 @@ async def test_recovery_node_failure_terminalizes_and_invalidates_coherent_trans
     harness = _identity_harness(config_root, thread_id="recovery-node-failure")
     old_thread = harness.engine.thread_id
     await _events(harness, "list my account orders")
-    real_identity_write = identity_flow.write_event
+    real_identity_write = harness.telemetry.emit
+    identity_failed = False
 
-    def fail_identity_tail(record: dict[str, object]) -> None:
-        if record.get("event") == "identity_bound":
+    def fail_identity_tail(record: TelemetryRecord) -> None:
+        nonlocal identity_failed
+        if record.event == "identity_bound":
+            identity_failed = True
             raise RuntimeError("injected identity tail failure")
+        if identity_failed:
+            raise RuntimeError("injected recovery infrastructure failure")
         real_identity_write(record)
 
-    def fail_recovery_event(_record: dict[str, object]) -> None:
-        raise RuntimeError("injected recovery infrastructure failure")
-
-    monkeypatch.setattr(identity_flow, "write_event", fail_identity_tail)
-    monkeypatch.setattr(recovery, "write_event", fail_recovery_event)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_identity_tail)
     events = await _events(harness, _OTP)
     snapshot = harness.engine._graph.get_state(harness.engine._config)
 
@@ -858,17 +852,17 @@ async def test_terminalizer_failure_escapes_once_to_engine_takeover(
 ) -> None:
     harness = _identity_harness(config_root, thread_id="terminalizer-failure")
     await _events(harness, "list my account orders")
-    real_identity_write = identity_flow.write_event
+    real_identity_write = harness.telemetry.emit
 
-    def fail_identity_tail(record: dict[str, object]) -> None:
-        if record.get("event") == "identity_bound":
+    def fail_identity_tail(record: TelemetryRecord) -> None:
+        if record.event == "identity_bound":
             raise RuntimeError("injected identity tail failure")
         real_identity_write(record)
 
     def fail_clear() -> dict[str, object]:
         raise RuntimeError("injected terminalizer failure")
 
-    monkeypatch.setattr(identity_flow, "write_event", fail_identity_tail)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_identity_tail)
     monkeypatch.setattr(recovery, "clear_automation_state", fail_clear)
     events = await _events(harness, _OTP)
     snapshot = harness.engine._graph.get_state(harness.engine._config)
@@ -895,14 +889,14 @@ async def test_terminal_response_failure_escapes_once_to_engine_takeover(
         },
         as_node="entry",
     )
-    real_write = frontline_graph.write_event
+    real_write = harness.telemetry.emit
 
-    def fail_terminal_response(record: dict[str, object]) -> None:
-        if record.get("event") == "automation_terminal_response":
+    def fail_terminal_response(record: TelemetryRecord) -> None:
+        if record.event == "automation_terminal_response":
             raise RuntimeError("injected terminal response failure")
         real_write(record)
 
-    monkeypatch.setattr(frontline_graph, "write_event", fail_terminal_response)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_terminal_response)
     events = await _events(harness, "try again")
     snapshot = harness.engine._graph.get_state(harness.engine._config)
     repeated = await _events(harness, "still there")

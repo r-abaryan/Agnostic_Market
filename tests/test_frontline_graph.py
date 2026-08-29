@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from pathlib import Path
 from types import MappingProxyType
@@ -21,8 +20,8 @@ from llm_fakes import (
     NativeAsyncOnlyFakeChatModel,
 )
 from policy_helpers import make_policy
+from telemetry_helpers import make_session_telemetry
 
-from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.frontline import build_frontline_graph, read_flow
 from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
@@ -32,6 +31,11 @@ from agnostic_market.agents.recovery import (
     clear_automation_state,
 )
 from agnostic_market.agents.support import flow as support_flow
+from agnostic_market.agents.telemetry import (
+    InMemoryTelemetrySink,
+    TelemetryPurpose,
+    TenantTelemetry,
+)
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
@@ -130,14 +134,18 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     guest_orders = kwargs.pop("guest_orders", None) or GuestOrderScope(
         tenant_id="acme_store", session_id="frontline-graph"
     )
+    telemetry = kwargs.pop("telemetry", None) or make_session_telemetry(
+        "acme_store", "frontline-graph"
+    )
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
         guest_orders=guest_orders,
+        telemetry=telemetry.operational,
     )
-    return build_frontline_graph(
+    assembly = build_frontline_graph(
         fake,
         display_name="Acme Store",
         tenant_id="acme_store",
@@ -169,8 +177,16 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         reasoning_model_node_timeout_seconds=kwargs.pop(
             "reasoning_model_node_timeout_seconds", 6.0
         ),
+        telemetry=telemetry.operational,
+        routing_telemetry=telemetry.routing_evidence,
         **kwargs,
-    ).graph
+    )
+    graph = assembly.graph
+    graph._test_telemetry_sinks = (
+        telemetry.operational.sink,
+        telemetry.routing_evidence.sink,
+    )
+    return graph
 
 
 @pytest.mark.parametrize("dependency", ("catalog", "store", "guest_orders"))
@@ -220,7 +236,6 @@ def test_frontline_has_no_broad_model_or_tool_routing_surface(config_root: Path)
 )
 async def test_typed_answer_owner_rejects_invalid_caller_audible_text(
     config_root: Path,
-    tmp_path: Path,
     model_text: str,
     max_chars: int,
 ) -> None:
@@ -237,10 +252,10 @@ async def test_typed_answer_owner_rejects_invalid_caller_audible_text(
         text="Tell me a joke about shoes.",
     )
 
-    assert _failed_nodes(tmp_path) == ["answer_response"]
+    assert _failed_nodes(graph) == ["answer_response"]
     assert "hit a snag" in _only_spoken(result)
     assert model_text not in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 def test_support_capability_registry_and_dispatch_topology_are_closed(
@@ -504,12 +519,11 @@ def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
 )
 def test_invalid_dispatch_envelope_closes_without_executing_an_owner(
     config_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    records: list[dict[str, object]] = []
-    monkeypatch.setattr(frontline_graph, "write_event", records.append)
-    graph = _graph(config_root, FakeChatModel())
+    sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("invalid-dispatch")
+    graph = _graph(config_root, FakeChatModel(), telemetry=telemetry)
     invocation = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
     envelope: object = (
         CapabilityDispatchEnvelope(
@@ -548,6 +562,7 @@ def test_invalid_dispatch_envelope_closes_without_executing_an_owner(
         **clear_automation_state(),
         "messages": [AIMessage(_DISPATCH_REJECTION_LINE)],
     }
+    records = [{"event": record.event, **record.attributes} for record in sink.records]
     assert records == [
         {
             "event": "capability_dispatch_rejected",
@@ -566,7 +581,8 @@ async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_cal
     store = OrderStore("acme_store", fixture.orders)
     cart = CartStore()
     reasoning = FakeChatModel(emit_tool_calls=False)
-    records: list[dict[str, object]] = []
+    sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("typed-cart-add")
     searches: list[str] = []
     resolutions: list[tuple[str, ...]] = []
     search = catalog.search
@@ -580,7 +596,6 @@ async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_cal
         resolutions.append(skus)
         return resolve_products(skus)
 
-    monkeypatch.setattr(cart_flow, "write_event", records.append)
     monkeypatch.setattr(catalog, "search", observed_search)
     monkeypatch.setattr(catalog, "resolve_products", observed_resolution)
     graph = _graph(
@@ -590,6 +605,7 @@ async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_cal
         catalog=catalog,
         cart_store=cart,
         reasoning_model=reasoning,
+        telemetry=telemetry,
     )
     product = fixture.products[0]
     turn_id = "typed-cart-add"
@@ -622,7 +638,7 @@ async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_cal
     assert result["__interrupt__"][0].value == (
         f"Just to confirm: add 1 of {product.name} to your cart?"
     )
-    assert records == []
+    assert sink.records == ()
 
 
 async def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effect(
@@ -726,7 +742,6 @@ async def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path)
 )
 async def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
     config_root: Path,
-    monkeypatch: pytest.MonkeyPatch,
     operation: str,
     quantity: int | None,
 ) -> None:
@@ -740,14 +755,15 @@ async def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
         quantity=1,
     )
     reasoning = FakeChatModel(emit_tool_calls=False)
-    records: list[dict[str, object]] = []
-    monkeypatch.setattr(cart_flow, "write_event", records.append)
+    sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("typed-cart-update")
     graph = _graph(
         config_root,
         FakeChatModel(),
         store=store,
         cart_store=cart,
         reasoning_model=reasoning,
+        telemetry=telemetry,
     )
     turn_id = f"typed-cart-{operation}-{quantity}"
     request = ModifyCart(
@@ -772,7 +788,7 @@ async def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
     assert pending.operation == operation
     assert pending.quantity == quantity
     assert pending.pre_confirm_quantity == 1
-    assert records == []
+    assert sink.records == ()
 
 
 async def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root: Path) -> None:
@@ -1226,7 +1242,6 @@ async def test_each_typed_cart_exit_clears_the_invocation_in_compiled_state(
 async def test_typed_place_order_snapshot_failure_recovers_without_effect_or_model(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     product = load_orders_fixture(config_root, "acme_store").products[0]
@@ -1262,7 +1277,7 @@ async def test_typed_place_order_snapshot_failure_recovers_without_effect_or_mod
         )
     )
 
-    assert _failed_nodes(tmp_path) == ["cart_capability_entry"]
+    assert _failed_nodes(graph) == ["cart_capability_entry"]
     assert _only_spoken(result).endswith("Please review your cart before trying again.")
     assert cart.line_count == 1
     assert store.placed_count == 0
@@ -1574,7 +1589,6 @@ async def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
 
 async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     graph = _graph(
         config_root,
@@ -1596,7 +1610,7 @@ async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
     )
 
     assert _only_spoken(result) == "We carry trail running shoes."
-    assert _answered_rows(tmp_path) == [
+    assert _answered_rows(graph) == [
         {
             "utterance": "Tell me about running shoes.",
             "outcome": "answered",
@@ -1609,7 +1623,6 @@ async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
 
 async def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     response_model = FakeChatModel(emit_tool_calls=False, text_response="We carry everyday socks.")
     graph = _graph(config_root, response_model)
@@ -1623,7 +1636,7 @@ async def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn
     assert response_model.invoke_count == 1
     assert opening["active_invocation"] is None
     assert _only_spoken(opening) == "We carry everyday socks."
-    assert _answered_rows(tmp_path) == [
+    assert _answered_rows(graph) == [
         {
             "utterance": "What do you sell?",
             "outcome": "answered",
@@ -1661,7 +1674,6 @@ async def test_catalog_owner_rejects_a_blank_followup_without_a_model_call(
 @pytest.mark.parametrize("text_response", ("", "   "))
 async def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_response(
     config_root: Path,
-    tmp_path: Path,
     text_response: str,
 ) -> None:
     graph = _graph(
@@ -1676,14 +1688,13 @@ async def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_
         text="Tell me about running shoes.",
     )
 
-    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert _failed_nodes(graph) == ["catalog_response"]
     assert "hit a snag" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 async def test_catalog_owner_rejects_model_text_over_the_platform_limit(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     limit = 40
     graph = _graph(
@@ -1699,9 +1710,9 @@ async def test_catalog_owner_rejects_model_text_over_the_platform_limit(
         text="Tell me about running shoes.",
     )
 
-    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert _failed_nodes(graph) == ["catalog_response"]
     assert "hit a snag" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 class _UnexpectedCatalogToolCall(FakeChatModel):
@@ -1724,7 +1735,6 @@ class _UnexpectedCatalogToolCall(FakeChatModel):
 
 async def test_catalog_owner_rejects_an_unexpected_tool_call_before_speech_or_telemetry(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     graph = _graph(config_root, _UnexpectedCatalogToolCall())
 
@@ -1735,14 +1745,13 @@ async def test_catalog_owner_rejects_an_unexpected_tool_call_before_speech_or_te
         text="Tell me about running shoes.",
     )
 
-    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert _failed_nodes(graph) == ["catalog_response"]
     assert _only_spoken(result) != "I changed something."
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 async def test_catalog_owner_fails_closed_when_the_admitted_turn_has_no_matching_message(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     response_model = FakeChatModel(emit_tool_calls=False)
     graph = _graph(config_root, response_model)
@@ -1759,9 +1768,9 @@ async def test_catalog_owner_fails_closed_when_the_admitted_turn_has_no_matching
     )
 
     assert response_model.invoke_count == 0
-    assert _failed_nodes(tmp_path) == ["catalog_response"]
+    assert _failed_nodes(graph) == ["catalog_response"]
     assert "hit a snag" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 def test_catalog_speech_authority_is_owned_by_the_response_and_code_rejection_nodes(
@@ -1786,7 +1795,6 @@ def test_catalog_speech_authority_is_owned_by_the_response_and_code_rejection_no
 )
 async def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_provenance(
     config_root: Path,
-    tmp_path: Path,
     topic: str,
     answer_source: str,
     answer: str,
@@ -1819,7 +1827,7 @@ async def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_pro
         assert "may give a low-risk explanation" in prompt
         assert "answer only from the approved merchant policy facts" not in prompt
         assert "unsupported takes precedence" in prompt
-    assert _answered_rows(tmp_path) == [
+    assert _answered_rows(graph) == [
         {
             "utterance": utterance,
             "outcome": "answered",
@@ -1832,7 +1840,6 @@ async def test_answer_owner_uses_one_bounded_model_call_and_records_truthful_pro
 
 async def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     line = "That policy detail is not available."
     graph = _graph(
@@ -1850,8 +1857,8 @@ async def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
     )
 
     assert _only_spoken(result) == line
-    assert _failed_nodes(tmp_path) == []
-    assert _answered_rows(tmp_path)[0]["answer_source"] == "grounded_model_response"
+    assert _failed_nodes(graph) == []
+    assert _answered_rows(graph)[0]["answer_source"] == "grounded_model_response"
 
 
 @pytest.mark.parametrize(
@@ -1868,7 +1875,6 @@ async def test_unknown_policy_detail_is_an_answer_not_a_context_clarification(
 )
 async def test_answer_no_answer_decisions_use_only_their_code_authored_destination(
     config_root: Path,
-    tmp_path: Path,
     decision: str,
     line: str,
     node: str,
@@ -1888,14 +1894,13 @@ async def test_answer_no_answer_decisions_use_only_their_code_authored_destinati
     assert response_model.invoke_count == 1
     assert result["active_invocation"] is None
     assert _only_spoken(result) == line
-    assert _answered_rows(tmp_path) == []
-    assert _failed_nodes(tmp_path) == []
+    assert _answered_rows(graph) == []
+    assert _failed_nodes(graph) == []
     assert node in graph.speakable_nodes
 
 
 async def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     graph = _graph(config_root, FakeChatModel(raise_transport=True))
 
@@ -1910,8 +1915,8 @@ async def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
     assert "hit a snag" in spoken
     assert "specific store request" not in spoken
     assert result["active_invocation"] is None
-    assert _failed_nodes(tmp_path) == ["answer_response"]
-    assert _answered_rows(tmp_path) == []
+    assert _failed_nodes(graph) == ["answer_response"]
+    assert _answered_rows(graph) == []
 
 
 @pytest.mark.parametrize(
@@ -1923,7 +1928,6 @@ async def test_answer_model_failure_uses_safe_abort_not_the_unsupported_line(
 )
 async def test_answer_owner_rejects_model_text_without_lexical_content(
     config_root: Path,
-    tmp_path: Path,
     answer: str,
 ) -> None:
     graph = _graph(
@@ -1941,13 +1945,12 @@ async def test_answer_owner_rejects_model_text_without_lexical_content(
     )
 
     assert "hit a snag" in _only_spoken(result)
-    assert _failed_nodes(tmp_path) == ["answer_response"]
-    assert _answered_rows(tmp_path) == []
+    assert _failed_nodes(graph) == ["answer_response"]
+    assert _answered_rows(graph) == []
 
 
 async def test_answer_owner_rejects_model_text_over_the_platform_limit(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     limit = 40
     graph = _graph(
@@ -1968,8 +1971,8 @@ async def test_answer_owner_rejects_model_text_over_the_platform_limit(
     )
 
     assert "hit a snag" in _only_spoken(result)
-    assert _failed_nodes(tmp_path) == ["answer_response"]
-    assert _answered_rows(tmp_path) == []
+    assert _failed_nodes(graph) == ["answer_response"]
+    assert _answered_rows(graph) == []
 
 
 class _RawAnswerMappingModel(FakeChatModel):
@@ -1979,7 +1982,6 @@ class _RawAnswerMappingModel(FakeChatModel):
 
 async def test_answer_owner_rejects_a_raw_mapping_from_the_structured_wrapper(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     graph = _graph(config_root, _RawAnswerMappingModel())
 
@@ -1991,8 +1993,8 @@ async def test_answer_owner_rejects_a_raw_mapping_from_the_structured_wrapper(
     )
 
     assert "hit a snag" in _only_spoken(result)
-    assert _failed_nodes(tmp_path) == ["answer_response"]
-    assert _answered_rows(tmp_path) == []
+    assert _failed_nodes(graph) == ["answer_response"]
+    assert _answered_rows(graph) == []
 
 
 def test_answer_speech_authority_is_split_between_model_and_code_nodes(
@@ -2017,7 +2019,6 @@ def test_answer_owner_uses_the_required_configured_structured_transport(config_r
 
 async def test_order_status_owner_grants_and_renders_one_explicit_order_without_model_speech(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     model = FakeChatModel()
     graph = _graph(config_root, model)
@@ -2032,7 +2033,7 @@ async def test_order_status_owner_grants_and_renders_one_explicit_order_without_
     assert model.invoke_count == 0
     assert result["active_invocation"] is None
     assert "Your order ORD-1001" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == [
+    assert _answered_rows(graph) == [
         {
             "utterance": "ORD-1001, my phone is [phone]",
             "outcome": "answered",
@@ -2087,7 +2088,6 @@ async def _pause_unwitnessed_order_status_target(config_root: Path, *, thread_id
 
 async def test_unwitnessed_router_target_requires_caller_confirmation_before_guest_grant(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     graph, identity, config, paused = await _pause_unwitnessed_order_status_target(
         config_root,
@@ -2097,7 +2097,7 @@ async def test_unwitnessed_router_target_requires_caller_confirmation_before_gue
     assert "I heard ORD-1002" in str(paused["__interrupt__"][0].value)
     assert paused["active_invocation"].request.explicit_target_turn_id == "status-router-confirm"
     assert not identity.order_granted("ORD-1002")
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
     result = await graph.ainvoke(
         Command(
@@ -2114,7 +2114,6 @@ async def test_unwitnessed_router_target_requires_caller_confirmation_before_gue
 
 async def test_model_only_order_status_target_cannot_grant_before_confirmation(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     identity = CallerIdentityStore()
     model = FakeChatModel(
@@ -2148,7 +2147,7 @@ async def test_model_only_order_status_target_cannot_grant_before_confirmation(
     assert "I heard ORD-1002" in str(paused["__interrupt__"][0].value)
     assert paused["active_invocation"].request.explicit_target_turn_id == "status-followup"
     assert not identity.order_granted("ORD-1002")
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 async def test_confirmed_order_status_target_can_collect_contact_on_a_later_turn(
@@ -2318,7 +2317,6 @@ async def test_order_status_target_confirmation_human_escape_uses_terminal_hando
 
 async def test_order_status_target_confirmation_failure_safe_aborts_before_grant(
     config_root: Path,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graph, identity, config, _paused = await _pause_unwitnessed_order_status_target(
@@ -2341,7 +2339,7 @@ async def test_order_status_target_confirmation_failure_safe_aborts_before_grant
     assert not identity.order_granted("ORD-1002")
     assert result["active_invocation"] is None
     assert "hit a snag" in _only_spoken(result)
-    assert _failed_nodes(tmp_path) == ["order_status_target_confirm"]
+    assert _failed_nodes(graph) == ["order_status_target_confirm"]
 
 
 async def test_order_status_owner_gathers_target_then_uses_one_non_speaking_proposal(
@@ -2400,7 +2398,6 @@ async def test_order_status_focused_selector_fails_closed_without_live_focus(
 
 async def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     recent = RecentOrderContext(max_refs=3)
     identity = CallerIdentityStore()
@@ -2418,7 +2415,7 @@ async def test_order_status_plural_grant_is_atomic_and_does_not_invent_focus(
     assert identity.order_granted("ORD-1001") and identity.order_granted("ORD-1003")
     assert recent.snapshot().order_refs == ("ORD-1001", "ORD-1003")
     assert recent.snapshot().focused_order_ref is None
-    assert len(_answered_rows(tmp_path)) == 1
+    assert len(_answered_rows(graph)) == 1
 
 
 async def test_order_status_bound_principal_cannot_widen_with_a_foreign_contact(
@@ -2623,26 +2620,33 @@ async def test_identity_status_owner_reports_the_live_binding_only(config_root: 
     assert "CUST-001" not in bound and "0119" not in bound
 
 
-def _rows(tmp_path: Path) -> list[dict]:
-    path = tmp_path / "telemetry.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+def _telemetry_records(graph):
+    records = []
+    for sink in graph._test_telemetry_sinks:
+        assert isinstance(sink, InMemoryTelemetrySink)
+        records.extend(sink.records)
+    return records
 
 
-def _answered_rows(tmp_path: Path) -> list[dict]:
-    return [row for row in _rows(tmp_path) if row.get("outcome") == "answered"]
+def _rows(graph) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in _telemetry_records(graph)]
 
 
-def _failed_nodes(tmp_path: Path) -> list[str]:
-    return [str(row["node"]) for row in _rows(tmp_path) if row.get("event") == "turn_failed"]
+def _answered_rows(graph) -> list[dict[str, object]]:
+    return [
+        {key: value for key, value in row.items() if key != "event"}
+        for row in _rows(graph)
+        if row.get("outcome") == "answered"
+    ]
 
 
-async def test_every_capability_answer_owner_records_one_answered_turn(
-    config_root: Path, tmp_path: Path
-) -> None:
+def _failed_nodes(graph) -> list[str]:
+    return [str(row["node"]) for row in _rows(graph) if row.get("event") == "turn_failed"]
+
+
+async def test_every_capability_answer_owner_records_one_answered_turn(config_root: Path) -> None:
     # These nodes END, bypassing finalize_node, so without their own record a typed read would
-    # leave no negative in the classifier dataset. All THREE owners, because the parity is the
+    # leave no negative in the classifier dataset. All FOUR owners, because the parity is the
     # point: one missing call is invisible in any test that only asserts a row's absence.
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
@@ -2663,7 +2667,7 @@ async def test_every_capability_answer_owner_records_one_answered_turn(
         text="what running shoes do you have?",
     )
 
-    assert _answered_rows(tmp_path) == [
+    assert _answered_rows(graph) == [
         {
             "utterance": "what's in my cart?",
             "outcome": "answered",
@@ -2695,12 +2699,15 @@ async def test_every_capability_answer_owner_records_one_answered_turn(
         },
     ]
     # No tool ran on any path, so claiming one would corrupt any tool-usage analysis.
-    assert all("tool" not in row for row in _answered_rows(tmp_path))
+    assert all("tool" not in row for row in _answered_rows(graph))
+    assert all(
+        record.purpose is TelemetryPurpose.ROUTING_EVIDENCE
+        for record in _telemetry_records(graph)
+        if record.event == "capability_answered"
+    )
 
 
-async def test_rotated_read_continuation_records_no_blank_utterance(
-    config_root: Path, tmp_path: Path
-) -> None:
+async def test_rotated_read_continuation_records_no_blank_utterance(config_root: Path) -> None:
     # An ACCOUNT list is the only read `project_principal_transition` lets survive rotation
     # (view_cart, view_identity_status and even a SESSION list are refused), and the engine seeds
     # that fresh thread with no messages. No in-thread utterance means no label, and an
@@ -2721,7 +2728,7 @@ async def test_rotated_read_continuation_records_no_blank_utterance(
 
     # Non-vacuous: the owner really did run and answer, it just recorded nothing.
     assert "ORD-1001" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 def _failing_render(*_args: object, **_kwargs: object) -> NoReturn:
@@ -2729,7 +2736,7 @@ def _failing_render(*_args: object, **_kwargs: object) -> NoReturn:
 
 
 async def test_a_failed_cart_render_records_no_answered_turn(
-    config_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The record must FOLLOW the line it reports, as the tool path's does. Written first it
     # would claim "answered" for a turn whose render blew up and whose caller heard the snag.
@@ -2741,13 +2748,13 @@ async def test_a_failed_cart_render_records_no_answered_turn(
     result = await _typed_read(graph, ViewCart(), turn_id="cart-fail", text="what's in my cart?")
 
     # Pinned to the owner: "hit a snag" alone would also pass if some EARLIER node had broken.
-    assert _failed_nodes(tmp_path) == ["cart_view_render"]
+    assert _failed_nodes(graph) == ["cart_view_render"]
     assert "hit a snag" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 async def test_a_failed_order_list_render_records_no_answered_turn(
-    config_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    config_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(support_flow, "render_order_list_line", _failing_render)
     identity = CallerIdentityStore()
@@ -2758,9 +2765,9 @@ async def test_a_failed_order_list_render_records_no_answered_turn(
         graph, ListOrders(scope="account"), turn_id="list-fail", text="what are my orders?"
     )
 
-    assert _failed_nodes(tmp_path) == ["support_capability_render"]
+    assert _failed_nodes(graph) == ["support_capability_render"]
     assert "hit a snag" in _only_spoken(result)
-    assert _answered_rows(tmp_path) == []
+    assert _answered_rows(graph) == []
 
 
 def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) -> None:

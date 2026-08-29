@@ -21,11 +21,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from langgraph.types import interrupt
 
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import OperationalTelemetryEvent, TelemetryRecorder
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.state import HandoffRequest, HandoffSource, ReasoningState
 
@@ -50,6 +50,31 @@ class StepupNodes:
     route_after_collect: Callable[[ReasoningState], str]
 
 
+type StepupEventFamily = Literal["identity", "profile", "refund"]
+
+
+@dataclass(frozen=True)
+class _StepupTelemetryEvents:
+    succeeded: OperationalTelemetryEvent
+    failed: OperationalTelemetryEvent
+
+
+_STEPUP_TELEMETRY_EVENTS: dict[StepupEventFamily, _StepupTelemetryEvents] = {
+    "identity": _StepupTelemetryEvents(
+        succeeded=OperationalTelemetryEvent.IDENTITY_STEPUP_OK,
+        failed=OperationalTelemetryEvent.IDENTITY_STEPUP_FAILED,
+    ),
+    "profile": _StepupTelemetryEvents(
+        succeeded=OperationalTelemetryEvent.PROFILE_STEPUP_OK,
+        failed=OperationalTelemetryEvent.PROFILE_STEPUP_FAILED,
+    ),
+    "refund": _StepupTelemetryEvents(
+        succeeded=OperationalTelemetryEvent.REFUND_STEPUP_OK,
+        failed=OperationalTelemetryEvent.REFUND_STEPUP_FAILED,
+    ),
+}
+
+
 def build_stepup_nodes(
     verification_store: VerificationStore,
     otp: OtpProvider,
@@ -57,18 +82,20 @@ def build_stepup_nodes(
     *,
     pending_field: str,
     required_level: Callable[[object], int],
-    event_prefix: str,
+    event_prefix: StepupEventFamily,
     max_otp_attempts: int,
+    telemetry: TelemetryRecorder,
 ) -> StepupNodes:
     """Build one family's chain, closed over the stores + the family's state field.
 
-    `pending_field` names the ReasoningState field the chain reads/clears/updates
-    ("pending_refund" | "pending_profile_change"); `required_level` computes the level the
-    pending demands (the platform floor functions); `event_prefix` keys the telemetry
-    family (f"{event_prefix}_stepup_*" — refund events stay byte-identical to pre-factory).
+    `pending_field` names the ReasoningState field the chain reads or updates.
+    `required_level` computes the platform floor, and `event_prefix` selects the closed
+    telemetry event family.
     `max_otp_attempts` is the committed-miss budget before the human handover (§A9,
     merchant-tuned within the platform ceiling — was the hardcoded `_MAX_OTP_ATTEMPTS`).
     """
+
+    telemetry_events = _STEPUP_TELEMETRY_EVENTS[event_prefix]
 
     def _pending(state: ReasoningState) -> _SteppablePending | None:
         return getattr(state, pending_field)
@@ -77,7 +104,7 @@ def build_stepup_nodes(
         """SIM-swap / port-out check on the number-on-file (§A4a). Flagged -> do NOT trust an
         OTP; escalate to a person. ANI is never the authenticator."""
         if risk.check_sim_swap():
-            write_event({"event": f"{event_prefix}_stepup_failed", "reason": "sim_swap_risk"})
+            telemetry.record({"event": telemetry_events.failed, "reason": "sim_swap_risk"})
             return {
                 pending_field: None,
                 "execution_owner": None,
@@ -111,11 +138,11 @@ def build_stepup_nodes(
         assert pending is not None
         answer = interrupt("For security, please read me the 6-digit code we just sent you.")
         if verification_store.verify_otp(str(answer.get("text", ""))):
-            write_event({"event": f"{event_prefix}_stepup_ok", "raised_to": 2})
+            telemetry.record({"event": telemetry_events.succeeded, "raised_to": 2})
             return {}  # level now L2 in the store; router -> confirm
         tries = pending.otp_tries + 1
         if tries >= max_otp_attempts:
-            write_event({"event": f"{event_prefix}_stepup_failed", "reason": "otp_exhausted"})
+            telemetry.record({"event": telemetry_events.failed, "reason": "otp_exhausted"})
             return {
                 pending_field: None,
                 "execution_owner": None,

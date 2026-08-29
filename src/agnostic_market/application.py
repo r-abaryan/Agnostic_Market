@@ -14,6 +14,11 @@ from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import FrontlineGraphAssembly, build_frontline_graph
 from agnostic_market.agents.routing import RoutingRecognizer, RoutingSession
+from agnostic_market.agents.telemetry import (
+    SessionTelemetry,
+    TelemetryPurpose,
+    TenantTelemetry,
+)
 from agnostic_market.checkpoints import SchemaValidatedCheckpointSaver, build_checkpointer
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
@@ -98,6 +103,7 @@ class TenantServices:
     otp: OtpProvider
     risk: RiskProvider
     checkpointer: SchemaValidatedCheckpointSaver
+    telemetry: TenantTelemetry
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +116,7 @@ class ApplicationSessionState:
     identity_store: CallerIdentityStore
     guest_orders: GuestOrderScope
     caller_context: CallerContext
+    telemetry: SessionTelemetry
 
 
 type SessionStateFactory = Callable[[TenantContext, TenantServices], ApplicationSessionState]
@@ -127,6 +134,7 @@ class ApplicationSession:
 
 def _validate_session_state(
     tenant: TenantContext,
+    services: TenantServices,
     state: ApplicationSessionState,
 ) -> None:
     if not state.session_id.strip() or not state.thread_id.strip():
@@ -135,6 +143,24 @@ def _validate_session_state(
         raise ValueError("session guest-order scope does not match the application tenant")
     if state.guest_orders.session_id != state.session_id:
         raise ValueError("guest-order scope does not match the application session")
+    recorders = (state.telemetry.operational, state.telemetry.routing_evidence)
+    if any(
+        recorder.tenant_id != tenant.tenant_id or recorder.session_id != state.session_id
+        for recorder in recorders
+    ):
+        raise ValueError("telemetry scope does not match the application session")
+    if (
+        state.telemetry.operational.purpose is not TelemetryPurpose.OPERATIONAL
+        or state.telemetry.routing_evidence.purpose is not TelemetryPurpose.ROUTING_EVIDENCE
+    ):
+        raise ValueError("telemetry purpose does not match the application boundary")
+    if (
+        state.telemetry.operational.sink is not services.telemetry.operational_sink
+        or state.telemetry.routing_evidence.sink is not services.telemetry.routing_evidence_sink
+    ):
+        raise ValueError("session telemetry does not use the tenant telemetry service")
+    if state.caller_context.telemetry is not state.telemetry.operational:
+        raise ValueError("caller lifecycle does not own the application session telemetry")
 
     lifecycle_stores = (
         ("cart", state.caller_context.cart_store, state.cart_store),
@@ -156,9 +182,12 @@ def build_fixture_tenant_services(
     config_root: Path,
     tenant_id: str,
     *,
+    telemetry: TenantTelemetry,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> TenantServices:
     """Load validated development adapters behind the production composition boundary."""
+    if telemetry.tenant_id != tenant_id:
+        raise ValueError("telemetry service does not match the fixture tenant")
     orders_fixture = load_orders_fixture(config_root, tenant_id)
     customers_fixture = load_customers_fixture(config_root, tenant_id)
     profile_fixture = load_profile_fixture(config_root, tenant_id)
@@ -182,6 +211,7 @@ def build_fixture_tenant_services(
         otp=OtpProvider(valid_code=verification_fixture.otp_code),
         risk=RiskProvider(),
         checkpointer=checkpoint_boundary,
+        telemetry=telemetry,
     )
 
 
@@ -203,12 +233,14 @@ def build_in_memory_session_state(
         tenant_id=tenant.tenant_id,
         session_id=resolved_session_id,
     )
+    telemetry = services.telemetry.bind_session(resolved_session_id)
     caller_context = CallerContext(
         verification_store=verification_store,
         cart_store=cart_store,
         recent_orders=recent_orders,
         identity_store=identity_store,
         guest_orders=guest_orders,
+        telemetry=telemetry.operational,
     )
     return ApplicationSessionState(
         session_id=resolved_session_id,
@@ -219,6 +251,7 @@ def build_in_memory_session_state(
         identity_store=identity_store,
         guest_orders=guest_orders,
         caller_context=caller_context,
+        telemetry=telemetry,
     )
 
 
@@ -239,8 +272,10 @@ def build_application_session(
         raise ValueError("catalog service does not match the application tenant")
     if services.order_store.tenant_id != tenant.tenant_id:
         raise ValueError("order service does not match the application tenant")
+    if services.telemetry.tenant_id != tenant.tenant_id:
+        raise ValueError("telemetry service does not match the application tenant")
     state = session_state_factory(tenant, services)
-    _validate_session_state(tenant, state)
+    _validate_session_state(tenant, services, state)
     assembly = build_frontline_graph(
         models.response,
         display_name=settings.display_name,
@@ -264,6 +299,8 @@ def build_application_session(
         caller_audible_model_text_max_chars=settings.caller_audible_model_text_max_chars,
         response_model_node_timeout_seconds=settings.response_model_node_timeout_seconds,
         reasoning_model_node_timeout_seconds=settings.reasoning_model_node_timeout_seconds,
+        telemetry=state.telemetry.operational,
+        routing_telemetry=state.telemetry.routing_evidence,
         checkpointer=services.checkpointer,
     )
     routing = RoutingSession(
@@ -272,6 +309,7 @@ def build_application_session(
         cart_store=state.cart_store,
         recent_orders=state.recent_orders,
         registry=assembly.capability_registry,
+        telemetry=state.telemetry.routing_evidence,
     )
     engine = ReasoningEngine(
         assembly.graph,
@@ -281,6 +319,7 @@ def build_application_session(
         checkpoint_io_timeout_seconds=settings.checkpoint_io_timeout_seconds,
         cancellation_quiescence_timeout_seconds=(settings.cancellation_quiescence_timeout_seconds),
         routing=routing,
+        telemetry=state.telemetry.operational,
         lifecycle=state.caller_context,
     )
     state.caller_context.attach_engine(engine)

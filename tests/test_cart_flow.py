@@ -25,6 +25,7 @@ from llm_fakes import (
 from policy_helpers import make_policy
 from pydantic import ValidationError
 from routing_helpers import make_routing_session
+from telemetry_helpers import make_session_telemetry
 from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
     engine_events,
@@ -33,6 +34,7 @@ from turn_helpers import (
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
 from agnostic_market.commerce.cart import CartMutationError, CartStore
 from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
@@ -85,6 +87,7 @@ def _build(
     reasoning: FakeChatModel | None = None,
     cart: CartStore | None = None,
     recent_orders: RecentOrderContext | None = None,
+    telemetry=None,
 ):
     fixture = load_orders_fixture(config_root, "acme_store")
     catalog = FixtureCatalog("acme_store", fixture)
@@ -96,12 +99,14 @@ def _build(
     customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
     otp = OtpProvider(valid_code=_TEST_OTP)
     verification = VerificationStore(otp)
+    telemetry = telemetry or make_session_telemetry("acme_store", "t1")
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
         guest_orders=guest_orders,
+        telemetry=telemetry.operational,
     )
     assembly = build_frontline_graph(
         frontline or FakeChatModel(emit_tool_calls=False),
@@ -127,6 +132,8 @@ def _build(
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         response_model_node_timeout_seconds=2.0,
         reasoning_model_node_timeout_seconds=6.0,
+        telemetry=telemetry.operational,
+        routing_telemetry=telemetry.routing_evidence,
         checkpointer=InMemorySaver(),
     )
     return assembly.graph, store, cart
@@ -145,6 +152,7 @@ async def _events(engine: ReasoningEngine, text: str) -> list:
 
 
 def _reasoning_engine(graph) -> ReasoningEngine:
+    telemetry = make_session_telemetry("acme_store", "t1")
     return ReasoningEngine(
         graph,
         tenant_id="acme_store",
@@ -157,7 +165,9 @@ def _reasoning_engine(graph) -> ReasoningEngine:
             identity_store=CallerIdentityStore(),
             cart_store=CartStore(),
             recent_orders=RecentOrderContext(max_refs=_POLICY.cancel_batch_max),
+            telemetry=telemetry.routing_evidence,
         ),
+        telemetry=telemetry.operational,
     )
 
 
@@ -533,9 +543,9 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
     event: str,
     action: str,
 ) -> None:
-    records: list[dict[str, object]] = []
-    monkeypatch.setattr(cart_flow, "write_event", records.append)
-    graph, _store, cart = _build(config_root)
+    sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("typed-cart-mutation")
+    graph, _store, cart = _build(config_root, telemetry=telemetry)
     product = load_orders_fixture(config_root, "acme_store").products[0]
     if starting_quantity:
         cart.add_item(
@@ -571,13 +581,15 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
         assert cart.view()[0].quantity == starting_quantity
     else:
         assert cart.is_empty()
-    assert records == []
+    assert sink.records == ()
 
     out = await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
 
     lines = cart.view()
     assert (lines[0].quantity if lines else 0) == final_quantity
-    assert records == [{"event": event, "sku": product.sku}]
+    assert [{"event": record.event, **record.attributes} for record in sink.records] == [
+        {"event": event, "sku": product.sku}
+    ]
     assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
     assert graph.get_state(_CFG).values.get("execution_owner") is None
     assert len(_ai_texts(out)) == 1

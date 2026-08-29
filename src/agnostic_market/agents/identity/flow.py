@@ -64,7 +64,7 @@ from agnostic_market.agents.clarification import (
 )
 from agnostic_market.agents.identity.prompt import compose_identity_prompt
 from agnostic_market.agents.support._stepup import build_stepup_nodes
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore, CustomerDirectory
 from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.confirmation import identity_required_level
@@ -154,6 +154,7 @@ def build_identity_nodes(
     ],
     *,
     display_name: str,
+    telemetry: TelemetryRecorder,
 ) -> IdentityNodes:
     """Build the identity flow's nodes, closed over the session's stores + providers +
     policy (§A5: everything bound in code at build time — never carried in state)."""
@@ -186,7 +187,7 @@ def build_identity_nodes(
 
     def _leave(new_messages: list, call_id: str, reason: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left identity", tool_call_id=call_id))
-        write_event({"event": "identity_left", "reason": reason})
+        telemetry.record({"event": "identity_left", "reason": reason})
         return _flow_exit({"messages": new_messages, "execution_owner": None})
 
     def _human_handover(update: dict[str, object]) -> dict[str, object]:
@@ -207,6 +208,7 @@ def build_identity_nodes(
             state,
             owner=invocation_clarification_owner(state),
             max_reasks=policy.identity_clarification_reask_max,
+            telemetry=telemetry,
         )
         if step.exhausted:
             return _human_handover({"messages": new_messages})
@@ -291,7 +293,7 @@ def build_identity_nodes(
                     # hardcoded ONE) — spoken by the reask node, not here (a speakable
                     # assemble double-speaks its streamed clarifies). contact_reask_max=0
                     # skips this entirely: the first miss hands over.
-                    write_event({"event": "identity_reask", "reason": "no_match"})
+                    telemetry.record({"event": "identity_reask", "reason": "no_match"})
                     return {
                         "messages": new_messages,
                         "identity_claim_misses": state.identity_claim_misses + 1,
@@ -299,7 +301,7 @@ def build_identity_nodes(
                 # Budget exhausted: SILENT human handover — the handover deferral is the single
                 # voice (the cancel-risk pattern); no flow-authored line to distinguish
                 # outcomes for a probing caller.
-                write_event({"event": "identity_stepup_failed", "reason": "no_match"})
+                telemetry.record({"event": "identity_stepup_failed", "reason": "no_match"})
                 return _human_handover({"messages": new_messages})
 
             if call["name"] not in bound_tool_names:
@@ -338,7 +340,7 @@ def build_identity_nodes(
             and verification_store.current_level() >= identity_required_level()
         )
         if not already_proven:
-            write_event({"event": "identity_stepup_required", "required_level": 2})
+            telemetry.record({"event": "identity_stepup_required", "required_level": 2})
         return {}
 
     def route_after_guardrail(state: ReasoningState) -> str:
@@ -361,6 +363,7 @@ def build_identity_nodes(
         required_level=lambda p: identity_required_level(),
         event_prefix="identity",
         max_otp_attempts=policy.otp_max_attempts,
+        telemetry=telemetry,
     )
 
     def route_after_collect(state: ReasoningState) -> str:
@@ -398,14 +401,18 @@ def build_identity_nodes(
         needs_bind = bound is None or bound.customer_ref != pending.customer_ref
         if needs_bind:
             if verification_store.current_level() < identity_required_level():
-                write_event({"event": "identity_stepup_failed", "reason": "level_lapsed_at_apply"})
+                telemetry.record(
+                    {"event": "identity_stepup_failed", "reason": "level_lapsed_at_apply"}
+                )
                 return _human_handover({})
             if len(verification_store.grants) <= pending.grants_at_mint:
-                write_event({"event": "identity_stepup_failed", "reason": "unproven_binding"})
+                telemetry.record({"event": "identity_stepup_failed", "reason": "unproven_binding"})
                 return _human_handover({})
             fresh_proof = verification_store.fresh_proof_since(pending.grants_at_mint)
             if fresh_proof is None:
-                write_event({"event": "identity_stepup_failed", "reason": "missing_fresh_proof"})
+                telemetry.record(
+                    {"event": "identity_stepup_failed", "reason": "missing_fresh_proof"}
+                )
                 return _human_handover({})
             new_identity = BoundIdentity(
                 customer_ref=pending.customer_ref, masked_contact=pending.masked_contact
@@ -414,7 +421,7 @@ def build_identity_nodes(
             projection = transition.projection
             continuation = projection.continuation
             completion_line = principal_completion_line(projection.completion_kind)
-            write_event(
+            telemetry.record(
                 {
                     "event": "identity_bound",
                     "customer_ref": pending.customer_ref,
@@ -422,7 +429,7 @@ def build_identity_nodes(
                 }
             )
             if continuation is not None:
-                write_event(
+                telemetry.record(
                     {
                         "event": "identity_bound_for_action",
                         "customer_ref": pending.customer_ref,
@@ -437,7 +444,7 @@ def build_identity_nodes(
                 "messages": [AIMessage(completion_line)] if completion_line is not None else [],
             }
         if isinstance(request, SwitchAccount):
-            write_event({"event": "principal_transition_skipped", "reason": "same_customer"})
+            telemetry.record({"event": "principal_transition_skipped", "reason": "same_customer"})
             return _flow_exit(
                 {
                     "execution_owner": None,
@@ -458,7 +465,9 @@ def build_identity_nodes(
                     "messages": [AIMessage(line)],
                 }
             )
-        write_event({"event": "identity_bound_for_action", "customer_ref": pending.customer_ref})
+        telemetry.record(
+            {"event": "identity_bound_for_action", "customer_ref": pending.customer_ref}
+        )
         return {
             "pending_identity": None,
             "identity_claim_misses": 0,

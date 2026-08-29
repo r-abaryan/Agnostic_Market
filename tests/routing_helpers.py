@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from llm_fakes import TEST_STRUCTURED_OUTPUT_METHOD
+from telemetry_helpers import make_session_telemetry
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.routing import RoutingAttempt, RoutingSession
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import CallerIdentityStore
 from agnostic_market.commerce.orders import RecentOrderContext
@@ -170,6 +172,7 @@ def make_routing_session(
     recent_orders: RecentOrderContext,
     resolution: RouteResolution | None = None,
     continue_active: bool = False,
+    telemetry: TelemetryRecorder | None = None,
 ) -> RoutingSession:
     if resolution is None:
         recognizer = ArchitectureRoutingRecognizer()
@@ -183,4 +186,6 @@ def make_routing_session(
         cart_store=cart_store,
         recent_orders=recent_orders,
         registry=registry,
+        telemetry=telemetry
+        or make_session_telemetry("acme_store", "routing-helper").routing_evidence,
     )

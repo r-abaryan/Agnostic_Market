@@ -22,7 +22,6 @@ that helper exists for suites pinning post-authorization money logic).
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -352,7 +351,6 @@ async def test_profile_owner_checks_availability_before_requesting_new_pii(
 
 async def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
     config_root: Path,
-    tmp_path: Path,
 ) -> None:
     reasoning = FakeChatModel(scripted_calls=[[("provide_refund_amount", {"amount_usd": 20.0})]])
     h = _harness(config_root, reasoning, thread_id="refund-one-authorization-row")
@@ -376,7 +374,7 @@ async def test_refund_owner_emits_one_authorization_grant_after_slot_gathering(
     assert update["pending_refund"] is not None
     assert [
         event
-        for event in _telemetry(tmp_path)
+        for event in _telemetry(h)
         if event["event"] == "support_action_authorized" and event["order_id"] == "ORD-1001"
     ] == [{"event": "support_action_authorized", "order_id": "ORD-1001"}]
 
@@ -455,14 +453,8 @@ async def _events(engine, text: str) -> list:
     return await engine_events(engine, text, _FACTS)
 
 
-def _telemetry(tmp_path: Path) -> list[dict]:
-    """Event-shaped telemetry lines only (the file also carries gate-decision records with
-    no 'event' key; normalizing here keeps every assertion a plain e["event"] compare)."""
-    path = tmp_path / "telemetry.jsonl"
-    if not path.exists():
-        return []
-    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    return [e for e in lines if "event" in e]
+def _telemetry(harness: SupportHarness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 def _state_values(harness: SupportHarness, thread_id: str) -> dict:
@@ -562,7 +554,7 @@ async def test_bound_caller_prompt_lists_only_owned_orders(config_root: Path) ->
 
 
 async def test_unbound_cancel_detours_to_identity_without_leaking_details(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # A guest states an order id and asks to cancel it. The rung-1 contact path is GONE — the
     # flow can't authorize a mutation for an unbound caller, so it routes into the identity OTP
@@ -579,7 +571,7 @@ async def test_unbound_cancel_detours_to_identity_without_leaking_details(
     assert _no_pendings(h, "scope-1")
     assert _execution_owner(h, "scope-1") == "identity"  # the detour is in flight
     assert isinstance(_fresh_active_request(h, "scope-1"), CancelOrders)
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     assert any(e["event"] == "support_action_needs_identity" for e in tel)
     # The rung-1 grant path never runs: no order was granted, no auth-denial recorded.
     assert not any(e["event"] == "support_order_granted" for e in tel)
@@ -606,7 +598,7 @@ async def test_model_only_order_reference_cannot_cross_identity(config_root: Pat
 
 
 async def test_guest_cancel_verifies_then_resumes_and_commits(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # THE Fix 2 happy path (the live-trace scenario, now SAFE): a guest asks to cancel ORD-1002,
     # detours into identity, verifies via OTP to CUST-002's on-file contact, then resumes from
@@ -634,7 +626,7 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
     await _events(h.engine, "yes")
     assert h.store.cancel_count == 1
     assert h.store.order_status("ORD-1002") == "cancelled"
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     assert any(e["event"] == "identity_bound_for_action" for e in tel)
 
 
@@ -1059,7 +1051,7 @@ async def test_failed_otp_on_action_detour_leaves_zero_resume_intent(
     assert _state_values(h, "scope-fail").get("pending_cancel") is None
 
 
-async def test_guest_batch_detours_to_identity(config_root: Path, tmp_path: Path) -> None:
+async def test_guest_batch_detours_to_identity(config_root: Path) -> None:
     # A guest explicit batch ("cancel ORD-1002 and this placed one") also detours — no target is
     # rung-2 authorized, so the whole proposal enters identity; nothing voided.
     args = {"propose_cancel": {"order_keys": ["ORD-1002", "ORD-9001"]}}
@@ -1080,14 +1072,14 @@ async def test_guest_batch_detours_to_identity(config_root: Path, tmp_path: Path
     assert any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
     assert _execution_owner(h, "scope-batch-guest") == "identity"
-    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(h))
 
 
 # --- a BOUND caller targeting a non-owned / unknown order: fail closed (existence-oracle) ----
 
 
 async def test_bound_cross_customer_target_is_combined_not_found(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # A caller BOUND to CUST-002 targets ORD-1001 (CUST-001). Bound, so no detour — but not
     # theirs, so the ONE combined not-found (never reveals another account owns it), no void.
@@ -1102,13 +1094,13 @@ async def test_bound_cross_customer_target_is_combined_not_found(
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
     assert _no_pendings(h, "scope-xcust")
-    denied = [e for e in _telemetry(tmp_path) if e["event"] == "support_auth_denied"]
+    denied = [e for e in _telemetry(h) if e["event"] == "support_auth_denied"]
     assert denied == [{"event": "support_auth_denied", "attempt": 1}]
     assert _spoken(events) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
 
 
 async def test_bound_unknown_order_id_is_combined_not_found_and_never_logged(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # A BOUND caller probes an unknown id: unknown-order collapses into the same combined
     # not-found as a cross-customer order, and the raw stated id (caller free text) never reaches
@@ -1123,7 +1115,7 @@ async def test_bound_unknown_order_id_is_combined_not_found_and_never_logged(
     events = await _events(h.engine, "cancel order ORD-9999")
     assert _no_details_spoken(events)
     assert _no_pendings(h, "scope-4")
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     denied = [e for e in tel if e["event"] == "support_auth_denied"]
     assert denied == [{"event": "support_auth_denied", "attempt": 1}]
     for event in tel:
@@ -1131,7 +1123,7 @@ async def test_bound_unknown_order_id_is_combined_not_found_and_never_logged(
     assert _spoken(events) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
 
 
-async def test_bound_second_denial_offers_human(config_root: Path, tmp_path: Path) -> None:
+async def test_bound_second_denial_offers_human(config_root: Path) -> None:
     # The deterministic escalation on-ramp: a BOUND caller's 2nd failed target for the same order
     # switches the corrective to one that OFFERS a person (the caller accepting is routed to the
     # semantic RequestPerson owner). Unbound callers never reach this — they detour.
@@ -1144,7 +1136,7 @@ async def test_bound_second_denial_offers_human(config_root: Path, tmp_path: Pat
     _bind_cust2(h)
     first = await _events(h.engine, "cancel order ORD-1001")
     second = await _events(h.engine, "yes really cancel it")
-    attempts = [e["attempt"] for e in _telemetry(tmp_path) if e["event"] == "support_auth_denied"]
+    attempts = [e["attempt"] for e in _telemetry(h) if e["event"] == "support_auth_denied"]
     assert attempts == [1, 2]
     assert _spoken(first) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
     assert _spoken(second) == [("support_clarify", _SUPPORT_NOT_FOUND_OFFER_HUMAN)]
@@ -1195,7 +1187,6 @@ async def test_bound_denial_offer_threshold_tracks_the_policy_knob(config_root: 
 )
 async def test_one_caller_turn_consumes_at_most_one_order_denial(
     config_root: Path,
-    tmp_path: Path,
     tool_name: str,
     arguments: dict[str, object],
     utterance: str,
@@ -1214,9 +1205,7 @@ async def test_one_caller_turn_consumes_at_most_one_order_denial(
 
     assert reasoning.invoke_count == 0
     assert [
-        event["attempt"]
-        for event in _telemetry(tmp_path)
-        if event["event"] == "support_auth_denied"
+        event["attempt"] for event in _telemetry(harness) if event["event"] == "support_auth_denied"
     ] == [1]
     assert _spoken(first) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
     assert not any(isinstance(event, TokenEvent) for event in first)
@@ -1230,9 +1219,7 @@ async def test_one_caller_turn_consumes_at_most_one_order_denial(
 
     assert reasoning.invoke_count == 0
     assert [
-        event["attempt"]
-        for event in _telemetry(tmp_path)
-        if event["event"] == "support_auth_denied"
+        event["attempt"] for event in _telemetry(harness) if event["event"] == "support_auth_denied"
     ] == [1, 2]
     assert _spoken(second) == [("support_clarify", _SUPPORT_NOT_FOUND_OFFER_HUMAN)]
 
@@ -1298,7 +1285,7 @@ async def test_unbound_model_only_order_target_asks_for_caller_stated_number(
 
 
 async def test_cancel_batch_authorizes_all_targets_before_minting_any_pending(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
         force_tool="propose_cancel",
@@ -1317,9 +1304,7 @@ async def test_cancel_batch_authorizes_all_targets_before_minting_any_pending(
     assert reasoning.invoke_count == 1
     assert _spoken(events) == [("support_clarify", _SUPPORT_COMBINED_NOT_FOUND)]
     assert [
-        event["attempt"]
-        for event in _telemetry(tmp_path)
-        if event["event"] == "support_auth_denied"
+        event["attempt"] for event in _telemetry(harness) if event["event"] == "support_auth_denied"
     ] == [1]
     assert _state_values(harness, thread_id).get("pending_cancel") is None
     assert harness.store.cancel_count == 0
@@ -1329,7 +1314,7 @@ async def test_cancel_batch_authorizes_all_targets_before_minting_any_pending(
 
 
 async def test_session_placed_order_needs_no_verification(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # Key "4" = the first PLACED order (3 fixture orders precede it in the full list); a
     # session-placed order IS rung-2 by construction, so it cancels with no detour.
@@ -1358,7 +1343,7 @@ async def test_session_placed_order_needs_no_verification(
     interrupts = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1
     assert placed.order_id in interrupts[0].prompt
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     assert not any(e["event"].startswith("support_auth_") for e in tel)
     assert not any(e["event"] == "support_action_needs_identity" for e in tel)
     assert any(
@@ -1367,7 +1352,7 @@ async def test_session_placed_order_needs_no_verification(
 
 
 async def test_bound_identity_owned_sails_non_owned_detours_or_denies(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     bound = BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119")
     # Owned: ORD-1001 (key "1", CUST-001, shipped) is LISTED — a return proposal by key reaches
@@ -1383,11 +1368,11 @@ async def test_bound_identity_owned_sails_non_owned_detours_or_denies(
     h1.identity.bind(bound)
     e1 = await _events(h1.engine, "I need to return this order")
     assert any(isinstance(e, InterruptEvent) for e in e1)
-    assert not any(e["event"].startswith("support_auth_") for e in _telemetry(tmp_path))
+    assert not any(e["event"].startswith("support_auth_") for e in _telemetry(h1))
 
 
 async def test_rung1_read_grant_does_not_authorize_a_mutation(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # THE crux pin: a rung-1 grant earned earlier this session (an order_status guest lookup)
     # authorizes READS — the order is LISTED (key "2") — but NOT a mutation. A cancel on it
@@ -1405,14 +1390,14 @@ async def test_rung1_read_grant_does_not_authorize_a_mutation(
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert h.store.cancel_count == 0
     assert _execution_owner(h, "scope-11") == "identity"
-    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(h))
 
 
 # --- the KEY steer-leak pins (the reason the gate sits at assemble) -----------------------
 
 
 async def test_unshipped_refund_steer_does_not_leak_for_unauthorized_order(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # A FULL refund-to-original on the unauthorized processing ORD-1002 would trip the
     # cancel-steer, whose line speaks "the full $129.00 goes back". The gate must hold
@@ -1434,14 +1419,14 @@ async def test_unshipped_refund_steer_does_not_leak_for_unauthorized_order(
     assert _no_details_spoken(events)
     assert _no_pendings(h, "scope-12")
     assert isinstance(_fresh_active_request(h, "scope-12"), RefundOrder)
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     assert not any(e["event"] == "refund_steered_to_cancel" for e in tel)
     assert any(e["event"] == "support_action_needs_identity" for e in tel)
     assert h.store.cancel_count == 0 and h.store.refund_count == 0
 
 
 async def test_shipped_refund_return_steer_does_not_leak_for_unauthorized_order(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # A $150 refund on the unauthorized shipped ORD-1001, over a tightened returnless line,
     # would trip the return-first steer ("the $150.00 refund is issued once the return is
@@ -1467,12 +1452,12 @@ async def test_shipped_refund_return_steer_does_not_leak_for_unauthorized_order(
     assert not any(isinstance(e, InterruptEvent) for e in events)
     assert not any("$" in e.text for e in events if isinstance(e, SpokenMessageEvent))
     assert _no_pendings(h, "scope-13")
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     assert not any(e["event"] == "refund_steered_to_return" for e in tel)
     assert h.store.return_count == 0 and h.store.refund_count == 0
 
 
-async def test_return_gated_at_assemble(config_root: Path, tmp_path: Path) -> None:
+async def test_return_gated_at_assemble(config_root: Path) -> None:
     # An unbound return proposal detours to identity (no rung-2), nothing minted, nothing done.
     h = _harness(
         config_root,
@@ -1488,7 +1473,7 @@ async def test_return_gated_at_assemble(config_root: Path, tmp_path: Path) -> No
     assert _no_pendings(h, "scope-14")
     assert isinstance(_fresh_active_request(h, "scope-14"), ReturnOrder)
     assert h.store.return_count == 0
-    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(h))
 
 
 # --- scope boundaries + PII ----------------------------------------------------------------
@@ -1513,7 +1498,7 @@ def _profile_harness(
     )
 
 
-async def test_profile_change_not_gated_by_order_scope(config_root: Path, tmp_path: Path) -> None:
+async def test_profile_change_not_gated_by_order_scope(config_root: Path) -> None:
     # Profile changes target the ACCOUNT (L2 step-up on the old factor), not an order — the
     # ORDER gate never runs. A BOUND caller (Fix 5 M-B: profile requires a bound identity) whose
     # customer has a profile proceeds; the OTP dispatch proves the flow was not order-gated.
@@ -1521,13 +1506,13 @@ async def test_profile_change_not_gated_by_order_scope(config_root: Path, tmp_pa
     h.identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
     await _events(h.engine, "Change my phone number to 555 111 2222")
     assert h.otp.dispatch_count == 1  # the step-up chain ran — the flow was not order-gated
-    tel = _telemetry(tmp_path)
+    tel = _telemetry(h)
     assert not any(e["event"].startswith("support_auth_") for e in tel)
     assert not any(e["event"] == "support_action_authorized" for e in tel)
 
 
 async def test_unbound_profile_change_detours_to_identity(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # Fix 5 M-B: a profile change is account-scoped, so an UNBOUND caller cannot mutate — it
     # detours into the identity OTP flow (no profile step-up dispatched, nothing changed).
@@ -1537,7 +1522,7 @@ async def test_unbound_profile_change_detours_to_identity(
     assert isinstance(_fresh_active_request(h, "scope-prof-unbound"), ChangeProfile)
     assert h.otp.dispatch_count == 0  # no profile OTP — we're verifying identity first
     assert h.profile.change_count == 0
-    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(tmp_path))
+    assert any(e["event"] == "support_action_needs_identity" for e in _telemetry(h))
 
 
 async def test_model_only_profile_value_cannot_cross_identity(config_root: Path) -> None:
@@ -1580,7 +1565,7 @@ async def test_order_number_cannot_become_a_model_proposed_contact(
 
 
 async def test_bound_customer_without_profile_fails_closed(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # A caller bound to a customer with NO profile on file (CUST-002) is refused with the
     # neutral not-available line — never a fallback to CUST-001's profile, never an oracle.
@@ -1600,13 +1585,13 @@ async def test_bound_customer_without_profile_fails_closed(
     assert state.get("pending_profile_change") is None
     assert state.get("handover") is None
     assert state.get("automation_terminal") is True
-    telemetry = _telemetry(tmp_path)
+    telemetry = _telemetry(h)
     assert sum(e["event"] == "profile_change_denied" for e in telemetry) == 1
     assert sum(e["event"] == "human_onramp" for e in telemetry) == 1
 
 
 async def test_needs_identity_detour_never_echoes_a_contact(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     # The honest PII invariant, now trivial by construction: the contact claim is no longer a
     # mutation credential (account_contact is gone from propose_cancel), so a guest cancel that
@@ -1621,7 +1606,7 @@ async def test_needs_identity_detour_never_echoes_a_contact(
         thread_id="scope-16",
     )
     await _events(h.engine, "cancel order ORD-1002")
-    for event in _telemetry(tmp_path):
+    for event in _telemetry(h):
         assert not any(isinstance(v, str) and _CONTACT_1002 in v for v in event.values())
     tool_msgs = _tool_messages(h, "scope-16")
     assert not any(_CONTACT_1002 in str(m.content) for m in tool_msgs)
