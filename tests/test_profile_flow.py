@@ -4,7 +4,6 @@ no-crossover claim of the shared step-up factory. Zero network."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -68,9 +67,8 @@ async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
     return await engine_events(engine, text, facts)
 
 
-def _telemetry(tmp_path: Path) -> str:
-    path = tmp_path / "telemetry.jsonl"
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+def _telemetry(harness: SupportHarness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 # --- the happy path: OTP on the old factor BEFORE any change ------------------------------
@@ -124,7 +122,7 @@ async def test_contact_change_updates_the_factor_reference(config_root: Path) ->
 
 
 async def test_wrong_otp_twice_hands_to_human_without_changing(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     h = _profile_harness(config_root)
     await _events(h.engine, _REQUEST)
@@ -135,12 +133,10 @@ async def test_wrong_otp_twice_hands_to_human_without_changing(
     assert h.verification.current_level() == 1  # no free level
     assert not await h.engine.apending_interrupt()  # not trapped
     # The on-ramp package fired (2nd converging path besides the consent-"human" exit).
-    onramps = [
-        json.loads(line) for line in _telemetry(tmp_path).splitlines() if '"human_onramp"' in line
-    ]
+    onramps = [event for event in _telemetry(h) if event["event"] == "human_onramp"]
     assert len(onramps) == 1
     assert onramps[0]["reason_code"] == "verification_required"
-    assert onramps[0]["schema_version"] == 2
+    assert onramps[0]["handover_schema_version"] == 2
 
 
 async def test_sim_swap_flag_blocks_the_otp_entirely(config_root: Path) -> None:
@@ -237,15 +233,15 @@ async def test_payment_change_still_defers_honestly(config_root: Path) -> None:
 # --- PII discipline (value spoken, never persisted to observability) -----------------------
 
 
-async def test_new_value_never_reaches_telemetry(config_root: Path, tmp_path: Path) -> None:
+async def test_new_value_never_reaches_telemetry(config_root: Path) -> None:
     h = _profile_harness(config_root)
     await _events(h.engine, _REQUEST)
     await _events(h.engine, _VALID_OTP)
     await _events(h.engine, "yes")
     assert h.profile.change_count == 1
-    raw = _telemetry(tmp_path)
-    assert "Elm" not in raw  # the address value must NEVER be logged/telemetered
-    confirmed = [json.loads(x) for x in raw.splitlines() if '"profile_change_confirmed"' in x]
+    telemetry = _telemetry(h)
+    assert "Elm" not in str(telemetry)
+    confirmed = [event for event in telemetry if event["event"] == "profile_change_confirmed"]
     assert len(confirmed) == 1
     assert confirmed[0]["field"] == "address"  # the slug only
     assert "new_value" not in confirmed[0]
@@ -262,14 +258,13 @@ def test_profile_error_string_carries_no_value(config_root: Path) -> None:
 
 
 async def test_profile_stepup_failure_never_touches_refund_state(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     h = _profile_harness(config_root)
     await _events(h.engine, _REQUEST)
     await _events(h.engine, "000000")
     await _events(h.engine, "111111")  # exhausted -> human
-    raw = _telemetry(tmp_path)
-    events = [json.loads(x) for x in raw.splitlines()]
+    events = _telemetry(h)
     assert any(e.get("event") == "profile_stepup_failed" for e in events)
     assert not any(e.get("event", "").startswith("refund_") for e in events)
     assert h.store.refund_count == 0

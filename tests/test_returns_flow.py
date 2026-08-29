@@ -4,7 +4,6 @@ and the refund interplay. Zero network (fake models + InMemorySaver)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +18,7 @@ from support_helpers import (
 from turn_helpers import engine_events
 
 from agnostic_market.agents.support import flow as support_flow
+from agnostic_market.agents.telemetry import TelemetryPurpose
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnFacts
 from agnostic_market.dtos.orchestration import (
@@ -66,11 +66,8 @@ async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
     return await engine_events(engine, text, facts)
 
 
-def _telemetry_events(tmp_path: Path) -> list[dict]:
-    path = tmp_path / "telemetry.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+def _telemetry_events(harness: SupportHarness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 # --- the direct door: propose_return -> readback -> RMA ----------------------------------
@@ -292,7 +289,7 @@ async def test_no_at_readback_creates_nothing(config_root: Path) -> None:
 
 
 async def test_human_at_readback_escapes_with_onramp_package(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     h = _return_harness(config_root)
     await _events(h.engine, "I need to return this order")
@@ -304,22 +301,23 @@ async def test_human_at_readback_escapes_with_onramp_package(
         e.node == "automation_terminal_response" and "contact the store" in e.text.lower()
         for e in spoken
     )
-    # The warm-transfer context package (Group C on-ramp): closed slugs, exact keys, no PII.
-    onramps = [e for e in _telemetry_events(tmp_path) if e.get("event") == "human_onramp"]
+    # The on-ramp package carries only closed attributes; scope comes from its envelope.
+    onramps = [record for record in h.telemetry.records if record.event == "human_onramp"]
     assert len(onramps) == 1
-    assert set(onramps[0]) == {
-        "event",
-        "schema_version",
-        "tenant",
+    onramp = onramps[0]
+    assert onramp.tenant_id == "acme_store"
+    assert onramp.session_id == "ret-1"
+    assert onramp.purpose is TelemetryPurpose.OPERATIONAL
+    assert set(onramp.attributes) == {
+        "handover_schema_version",
         "verification_level",
         "execution_owner",
         "reason_code",
         "source",
     }
-    assert onramps[0]["schema_version"] == 2
-    assert onramps[0]["tenant"] == "acme_store"
+    assert onramp.attributes["handover_schema_version"] == 2
     responses = [
-        e for e in _telemetry_events(tmp_path) if e.get("event") == "automation_terminal_response"
+        e for e in _telemetry_events(h) if e.get("event") == "automation_terminal_response"
     ]
     assert responses == [{"event": "automation_terminal_response"}]
 
@@ -327,7 +325,7 @@ async def test_human_at_readback_escapes_with_onramp_package(
 # --- crossover isolation (the step-up factory shares bodies, never state) ------------------
 
 
-async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path: Path) -> None:
+async def test_refund_stepup_emits_no_profile_events(config_root: Path) -> None:
     h = authorize_customer(
         build_support_engine(
             config_root,
@@ -348,7 +346,7 @@ async def test_refund_stepup_emits_no_profile_events(config_root: Path, tmp_path
     await _events(h.engine, TEST_OTP)
     await _events(h.engine, "yes")
     assert h.store.refund_count == 1
-    events = _telemetry_events(tmp_path)
+    events = _telemetry_events(h)
     assert any(e.get("event", "").startswith("refund_stepup") for e in events)
     assert not any(e.get("event", "").startswith("profile_") for e in events)
     assert h.profile.change_count == 0

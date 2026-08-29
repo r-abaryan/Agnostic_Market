@@ -19,7 +19,7 @@ from langgraph.graph import StateGraph
 from langgraph.types import Command
 
 from agnostic_market.agents._copy import principal_completion_line
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.orders import (
     CancelRecord,
@@ -613,6 +613,7 @@ def build_recovery_node(
     finishers: CommerceEffectFinishers,
     inspect_principal_transition: Callable[[], PrincipalTransitionInspection],
     invalidate_principal_transition: Callable[[str | None], bool],
+    telemetry: TelemetryRecorder,
 ) -> Callable[[ReasoningState], dict[str, object] | Command]:
     def node_failure_event(marker: PendingRecovery) -> dict[str, object]:
         return {
@@ -623,7 +624,7 @@ def build_recovery_node(
         }
 
     def terminal_result(event: dict[str, object] | None = None) -> dict[str, object]:
-        write_event(
+        telemetry.record(
             event
             or {
                 "event": "turn_failed",
@@ -644,7 +645,7 @@ def build_recovery_node(
         line = _NOT_COMMITTED_LINES.get(marker.action)
         if line is None:
             return terminal_result(node_failure_event(marker))
-        write_event(node_failure_event(marker))
+        telemetry.record(node_failure_event(marker))
         return {**clear_automation_state(), "messages": [AIMessage(line)]}
 
     def reconcile_effect(marker: PendingRecovery, state: ReasoningState) -> dict[str, object]:
@@ -659,7 +660,7 @@ def build_recovery_node(
                 total_usd=pending.total_usd,
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, PlacedOrder):
-                write_event(node_failure_event(marker))
+                telemetry.record(node_failure_event(marker))
                 return complete(finishers.placement(receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
@@ -677,7 +678,7 @@ def build_recovery_node(
                 instrument_ref=pending.instrument_ref,
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, RefundRecord):
-                write_event(node_failure_event(marker))
+                telemetry.record(node_failure_event(marker))
                 return complete(finishers.refund(receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
@@ -708,7 +709,7 @@ def build_recovery_node(
                 )
             else:
                 return terminal_result(node_failure_event(marker))
-            write_event(node_failure_event(marker))
+            telemetry.record(node_failure_event(marker))
             return complete(finishers.cancel(pending, outcome, True))
 
         if action == ExceptionAction.RECONCILE_RETURN:
@@ -722,7 +723,7 @@ def build_recovery_node(
                 destination="original",
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, ReturnRecord):
-                write_event(node_failure_event(marker))
+                telemetry.record(node_failure_event(marker))
                 return complete(finishers.return_(receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
@@ -741,7 +742,7 @@ def build_recovery_node(
             if isinstance(receipt, CommittedReceipt) and isinstance(
                 receipt.record, ProfileChangeRecord
             ):
-                write_event(node_failure_event(marker))
+                telemetry.record(node_failure_event(marker))
                 return complete(finishers.profile_change(receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
@@ -761,7 +762,7 @@ def build_recovery_node(
         if transition is not None:
             event["transition_id"] = transition.transition_id
         if inspection.outcome == "none":
-            write_event(event)
+            telemetry.record(event)
             return {
                 **clear_automation_state(),
                 "messages": [AIMessage(PRINCIPAL_TRANSITION_FAILURE_LINE)],
@@ -778,7 +779,7 @@ def build_recovery_node(
             invocation is not None and invocation.request == transition.initiating_request
         )
         if inspection.outcome == "coherent" and identity_matches and request_matches:
-            write_event(event)
+            telemetry.record(event)
             update = clear_automation_state()
             completion_line = principal_completion_line(transition.projection.completion_kind)
             if completion_line is not None:
@@ -810,7 +811,7 @@ def build_recovery_node(
 
         update = clear_automation_state()
         if marker.action == ExceptionAction.TERMINAL:
-            write_event(node_failure_event(marker))
+            telemetry.record(node_failure_event(marker))
             return {
                 **update,
                 "automation_terminal": True,
@@ -831,7 +832,7 @@ def build_recovery_node(
                     and latest_message.id == turn_ids[-1]
                 )
                 if distinct_turn_admitted:
-                    write_event(node_failure_event(marker))
+                    telemetry.record(node_failure_event(marker))
                     return Command(update=update, goto=safe_abort_continue_node)
             line = TURN_FALLBACK_LINE
         elif marker.action == ExceptionAction.CART_REVIEW:
@@ -849,7 +850,7 @@ def build_recovery_node(
                 if isinstance(receipt, CommittedReceipt) and isinstance(
                     receipt.record, CartMutationRecord
                 ):
-                    write_event(node_failure_event(marker))
+                    telemetry.record(node_failure_event(marker))
                     return complete(finishers.cart_mutation(receipt.record))
                 if not isinstance(receipt, NotCommittedReceipt):
                     return terminal_result(node_failure_event(marker))
@@ -862,7 +863,7 @@ def build_recovery_node(
             line = _ACTION_LINES.get(marker.action)
             if line is None:
                 return terminal_result()
-        write_event(node_failure_event(marker))
+        telemetry.record(node_failure_event(marker))
         return {**update, "messages": [AIMessage(line)]}
 
     return recover

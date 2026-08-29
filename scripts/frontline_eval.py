@@ -44,7 +44,6 @@ from langchain_core.messages import (
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agnostic_market.agents import telemetry
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.engine import ReasoningEngine, _TurnSpeech
 from agnostic_market.agents.frontline import (
@@ -76,6 +75,12 @@ from agnostic_market.agents.routing import (
 )
 from agnostic_market.agents.routing_activation import (
     SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
+)
+from agnostic_market.agents.telemetry import (
+    DisabledTelemetrySink,
+    JsonlTelemetrySink,
+    TelemetrySink,
+    TenantTelemetry,
 )
 from agnostic_market.application import (
     ApplicationModels,
@@ -1338,6 +1343,8 @@ def _build_eval_runtime(
     thread_id: str,
     structured_output_method: StructuredOutputMethod,
     routing_structured_output_method: StructuredOutputMethod,
+    operational_telemetry_sink: TelemetrySink,
+    routing_evidence_sink: TelemetrySink,
 ) -> EvalRuntime:
     tenant = TenantContext(
         tenant_id=config.merchant_id,
@@ -1347,6 +1354,11 @@ def _build_eval_runtime(
     services = build_fixture_tenant_services(
         _CONFIG_ROOT,
         config.merchant_id,
+        telemetry=TenantTelemetry(
+            config.merchant_id,
+            operational_telemetry_sink,
+            routing_evidence_sink,
+        ),
         checkpointer=build_checkpointer(),
     )
 
@@ -2980,6 +2992,8 @@ async def _run_semantic_route_eval(
         thread_id=f"semantic-route-eval-{uuid.uuid4().hex}",
         structured_output_method=selection.response_structured_output_method,
         routing_structured_output_method=candidate_structured_output_method,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     try:
         corpus = _load_semantic_route_corpus()
@@ -3453,7 +3467,8 @@ def _score_transport_recovery(
             "node": scenario.origin_node,
             "action": expected_action,
         }
-        if turn_failed != (expected_failure,):
+        observed_failures = tuple(_telemetry_event_payload(record) for record in turn_failed)
+        if observed_failures != (expected_failure,):
             failures.append("typed recovery telemetry did not identify the owning model node")
         if final.completed_tool_calls != 0:
             failures.append("an incomplete provider response produced a completed tool call")
@@ -3475,6 +3490,29 @@ def _score_transport_recovery(
         if not final.audible:
             failures.append("successful retry produced no caller-audible response")
     return tuple(failures)
+
+
+def _telemetry_event_payload(record: dict[str, object]) -> dict[str, object] | None:
+    metadata = {
+        "schema_version": record.get("schema_version"),
+        "purpose": record.get("purpose"),
+        "tenant_id": record.get("tenant_id"),
+        "session_id": record.get("session_id"),
+    }
+    if (
+        metadata["schema_version"] != 1
+        or metadata["purpose"] != "operational"
+        or not isinstance(metadata["tenant_id"], str)
+        or not metadata["tenant_id"].strip()
+        or not isinstance(metadata["session_id"], str)
+        or not metadata["session_id"].strip()
+    ):
+        return None
+    return {
+        key: value
+        for key, value in record.items()
+        if key not in {"schema_version", "purpose", "tenant_id", "session_id"}
+    }
 
 
 def _failed_transport_case(
@@ -3527,10 +3565,8 @@ async def _run_transport_case(
 ) -> TransportCaseResult:
     mode = FaultMode.UNTIL_EXHAUSTED if tier == "offline" else FaultMode.RETRY_MASKED_ONCE
     runtime: EvalRuntime | None = None
-    old_telemetry_path = telemetry._TELEMETRY_PATH
     with tempfile.TemporaryDirectory(prefix="transport-cert-") as temp_dir:
         telemetry_path = Path(temp_dir) / "telemetry.jsonl"
-        telemetry._TELEMETRY_PATH = telemetry_path
         proxy = TransportFaultProxy(
             PROVIDER_TRANSPORT_CONTRACTS[provider],
             mode=mode,
@@ -3557,6 +3593,8 @@ async def _run_transport_case(
                     thread_id=f"transport-{uuid.uuid4().hex}",
                     structured_output_method=gateway.structured_output_method(target),
                     routing_structured_output_method=gateway.structured_output_method(target),
+                    operational_telemetry_sink=JsonlTelemetrySink(telemetry_path),
+                    routing_evidence_sink=DisabledTelemetrySink(),
                 )
                 await _seed_transport_request(runtime, scenario)
                 observation = await asyncio.wait_for(
@@ -3614,11 +3652,8 @@ async def _run_transport_case(
                 turn_failed=turn_failed,
             )
         finally:
-            try:
-                if runtime is not None:
-                    await runtime.caller_context.aclose_session()
-            finally:
-                telemetry._TELEMETRY_PATH = old_telemetry_path
+            if runtime is not None:
+                await runtime.caller_context.aclose_session()
 
 
 async def _run_transport_certification(

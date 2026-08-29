@@ -33,7 +33,7 @@ from agnostic_market.agents.clarification import (
     invocation_clarification_owner,
     with_clarification_lifecycle,
 )
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import OperationalTelemetryEvent, TelemetryRecorder
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.catalog import (
     Candidate,
@@ -164,6 +164,7 @@ def build_cart_nodes(
     recent_orders: RecentOrderContext,
     *,
     display_name: str,
+    telemetry: TelemetryRecorder,
 ) -> CartNodes:
     """Build the cart flow's nodes, closed over the session's stores + policy (§A5:
     tenant/policy bound in code at build time, never carried in conversation state)."""
@@ -246,6 +247,7 @@ def build_cart_nodes(
             state,
             owner=invocation_clarification_owner(state),
             max_reasks=policy.cart_clarification_reask_max,
+            telemetry=telemetry,
         )
         if step.exhausted:
             return {
@@ -263,7 +265,7 @@ def build_cart_nodes(
 
     def _leave_result(new_messages: list, call_id: str) -> dict[str, object]:
         new_messages.append(ToolMessage("left cart", tool_call_id=call_id))
-        write_event({"event": "cart_left", "reason": "left_flow"})
+        telemetry.record({"event": "cart_left", "reason": "left_flow"})
         return {
             "messages": new_messages,
             "execution_owner": None,
@@ -525,7 +527,7 @@ def build_cart_nodes(
         if not isinstance(pending, PendingCartMutation):
             raise TypeError("cart mutation confirmation requires a pending mutation")
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
-            write_event({"event": "cart_mutation_expired", "reason": "pending_ttl"})
+            telemetry.record({"event": "cart_mutation_expired", "reason": "pending_ttl"})
             return {
                 "pending_cart_mutation": None,
                 "execution_owner": None,
@@ -542,7 +544,7 @@ def build_cart_nodes(
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
             assert decision.handoff_source is not None
-            write_event({"event": "cart_mutation_cancelled", "reason": "human_requested"})
+            telemetry.record({"event": "cart_mutation_cancelled", "reason": "human_requested"})
             return {
                 "pending_cart_mutation": None,
                 "execution_owner": None,
@@ -553,7 +555,7 @@ def build_cart_nodes(
                 ),
             }
         if verdict == "no":
-            write_event({"event": "cart_mutation_cancelled", "reason": "declined"})
+            telemetry.record({"event": "cart_mutation_cancelled", "reason": "declined"})
             return {
                 "pending_cart_mutation": None,
                 "execution_owner": None,
@@ -612,12 +614,12 @@ def build_cart_nodes(
         else:
             update["pending_ack"] = ack
         if not reconciled and record.outcome == "applied":
-            event = {
-                "add": "cart_item_added",
-                "remove": "cart_item_removed",
-                "set_quantity": "cart_quantity_set",
+            event: OperationalTelemetryEvent = {
+                "add": OperationalTelemetryEvent.CART_ITEM_ADDED,
+                "remove": OperationalTelemetryEvent.CART_ITEM_REMOVED,
+                "set_quantity": OperationalTelemetryEvent.CART_QUANTITY_SET,
             }[record.operation]
-            write_event({"event": event, "sku": record.sku})
+            telemetry.record({"event": event, "sku": record.sku})
         return update
 
     def mutation_apply_node(state: ReasoningState) -> dict[str, object]:
@@ -684,7 +686,7 @@ def build_cart_nodes(
         pending = state.pending_placement
         assert pending is not None
         if pending.total_usd > policy.max_order_value_usd:
-            write_event(
+            telemetry.record(
                 {
                     "event": "checkout_denied",
                     "reason": "order_value_cap",
@@ -704,7 +706,7 @@ def build_cart_nodes(
             }
         dup = order_store.identical_cart_order(pending.lines, guest_orders)
         if dup is not None:
-            write_event({"event": "checkout_duplicate_flagged", "existing": dup.order_id})
+            telemetry.record({"event": "checkout_duplicate_flagged", "existing": dup.order_id})
             return {"pending_placement": pending.model_copy(update={"duplicate_of": dup.order_id})}
         return {}
 
@@ -715,7 +717,7 @@ def build_cart_nodes(
         pending = state.pending_placement
         assert pending is not None
         if time.time() - pending.created_at > policy.pending_ttl_seconds:
-            write_event({"event": "checkout_expired", "reason": "pending_ttl"})
+            telemetry.record({"event": "checkout_expired", "reason": "pending_ttl"})
             return {
                 "pending_placement": None,
                 "execution_owner": None,
@@ -735,7 +737,7 @@ def build_cart_nodes(
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
         if verdict == "human":
             assert decision.handoff_source is not None
-            write_event({"event": "checkout_cancelled", "reason": "human_requested"})
+            telemetry.record({"event": "checkout_cancelled", "reason": "human_requested"})
             return {
                 "pending_placement": None,
                 "execution_owner": None,
@@ -746,7 +748,7 @@ def build_cart_nodes(
                 ),
             }
         if verdict == "no":
-            write_event({"event": "checkout_cancelled", "reason": "declined"})
+            telemetry.record({"event": "checkout_cancelled", "reason": "declined"})
             return {
                 "pending_placement": None,
                 "execution_owner": None,
@@ -774,7 +776,7 @@ def build_cart_nodes(
         guest_orders.record(placed.order_id)
         cart_store.clear()
         recent_orders.record([placed.order_id], operation="place")
-        write_event(
+        telemetry.record(
             {
                 "event": "checkout_confirmed",
                 "order_id": placed.order_id,

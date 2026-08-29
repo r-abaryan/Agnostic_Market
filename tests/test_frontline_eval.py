@@ -20,7 +20,6 @@ from policy_helpers import make_policy
 from pydantic import ValidationError
 from support_helpers import authorize_customer, build_support_engine
 
-from agnostic_market.agents import telemetry
 from agnostic_market.agents.frontline import read_flow
 from agnostic_market.agents.routing import (
     RoutingAttempt,
@@ -28,6 +27,7 @@ from agnostic_market.agents.routing import (
     materialize_route,
     project_routing_context,
 )
+from agnostic_market.agents.telemetry import DisabledTelemetrySink
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.config import ProviderModel
@@ -397,6 +397,8 @@ def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Pat
         thread_id="eval-registry-identity",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     # The evaluator scores the production graph, so it must read availability from the same
     # registry the dispatcher resolves against, never rebuild its own alongside it.
@@ -422,6 +424,8 @@ def test_evaluator_runtime_uses_the_production_checkpointer(
         thread_id="eval-production-checkpointer",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
 
     assert runtime.graph.checkpointer is expected
@@ -453,6 +457,8 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         thread_id="eval-cart-catalog-provenance",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     product = runtime.application.services.catalog.browse().products[0]
     stale_price = round(product.price_usd / 2, 2)
@@ -522,6 +528,8 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
         thread_id="eval-typed-cart-execution-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     product = runtime.application.services.catalog.browse().products[0]
     opening_turn_ids = ("eval-typed-cart:opening",)
@@ -597,6 +605,8 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
         thread_id="eval-typed-catalog-execution-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     opening_turn_ids = ("eval-typed-catalog:opening",)
     await runtime.graph.aupdate_state(
@@ -663,6 +673,8 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
         thread_id="eval-typed-place-execution-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     product = runtime.application.services.catalog.browse().products[0]
     runtime.cart_store.add_item(
@@ -979,6 +991,8 @@ async def test_routing_data_contract_reuses_the_production_registry(config_root:
         thread_id="eval-routing-data-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
 
     try:
@@ -1442,6 +1456,8 @@ async def test_production_projector_matches_the_fixture_built_registry(config_ro
         thread_id="eval-routing-projector",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
 
     try:
@@ -1597,6 +1613,8 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
         thread_id="eval-routing-runner",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
     router = SemanticRouter(
         model,
@@ -2404,6 +2422,8 @@ async def test_read_owner_corpus_runs_through_the_production_graph_without_netwo
         thread_id="eval-read-owner-corpus",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
 
     try:
@@ -3095,6 +3115,8 @@ async def test_read_owner_eval_observes_the_executed_branch_not_matching_copy(
         thread_id=f"eval-copy-collision-{expected_disposition}",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
     )
 
     try:
@@ -3168,7 +3190,6 @@ async def test_offline_transport_cases_reach_and_recover_every_real_model_owner(
     providers = tuple(sorted(targets))
     config = ConfigRegistry(config_root).load().get("acme_store").config
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
-    original_telemetry_path = telemetry._TELEMETRY_PATH
 
     results = [
         await _run_transport_case(
@@ -3195,8 +3216,6 @@ async def test_offline_transport_cases_reach_and_recover_every_real_model_owner(
     assert all(result.passed for result in results), {
         result.case_id: result.failures for result in results if not result.passed
     }
-    assert original_telemetry_path == telemetry._TELEMETRY_PATH
-    assert not original_telemetry_path.exists()
 
 
 @pytest.mark.parametrize(

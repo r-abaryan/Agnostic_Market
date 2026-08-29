@@ -146,9 +146,8 @@ async def _events(engine, text: str, facts: TurnFacts = _FACTS) -> list:
     return await engine_events(engine, text, facts)
 
 
-def _telemetry(tmp_path: Path) -> str:
-    path = tmp_path / "telemetry.jsonl"
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+def _telemetry(harness: SupportHarness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 def _spoken(events: list) -> list[SpokenMessageEvent]:
@@ -266,7 +265,7 @@ async def test_unknown_identity_tool_uses_bounded_correction_without_authority(
 
 
 async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     thread_id = "ident-clarify-exhausted"
     h = _identity_harness(
@@ -291,13 +290,15 @@ async def test_repeated_identity_clarification_exhausts_to_one_terminal_handover
     assert h.otp.dispatch_count == 0
     assert h.store.cancel_count == h.store.refund_count == h.store.return_count == 0
     exhausted_events = [
-        line
-        for line in _telemetry(tmp_path).splitlines()
-        if '"event": "clarification_exhausted"' in line
+        event for event in _telemetry(h) if event["event"] == "clarification_exhausted"
     ]
     assert exhausted_events == [
-        '{"event": "clarification_exhausted", "owner_kind": "invocation", '
-        '"consumed_reasks": 1, "limit": 1}'
+        {
+            "event": "clarification_exhausted",
+            "owner_kind": "invocation",
+            "consumed_reasks": 1,
+            "limit": 1,
+        }
     ]
 
 
@@ -918,7 +919,7 @@ async def test_stale_l2_wrong_otp_twice_exhausts_to_human(config_root: Path) -> 
 # --- security branches ----------------------------------------------------------------------
 
 
-async def test_wrong_otp_twice_stays_unbound_at_l1(config_root: Path, tmp_path: Path) -> None:
+async def test_wrong_otp_twice_stays_unbound_at_l1(config_root: Path) -> None:
     h = _identity_harness(config_root, thread_id="ident-wrong-1")
     await _events(h.engine, _REQUEST)
     first = await _events(h.engine, "000000")
@@ -926,10 +927,14 @@ async def test_wrong_otp_twice_stays_unbound_at_l1(config_root: Path, tmp_path: 
     await _events(h.engine, "111111")
     assert h.identity.current() is None
     assert h.verification.current_level() == 1
-    telemetry = _telemetry(tmp_path)
-    assert "identity_stepup_failed" in telemetry and "otp_exhausted" in telemetry
-    assert _VALID_OTP not in telemetry  # no code value in telemetry
-    assert "000000" not in telemetry and "111111" not in telemetry
+    telemetry = _telemetry(h)
+    assert any(
+        event["event"] == "identity_stepup_failed" and event.get("reason") == "otp_exhausted"
+        for event in telemetry
+    )
+    captured = str(telemetry)
+    assert _VALID_OTP not in captured
+    assert "000000" not in captured and "111111" not in captured
 
 
 async def test_sim_swap_flag_escalates_before_any_dispatch(config_root: Path) -> None:
@@ -947,7 +952,7 @@ async def test_sim_swap_flag_escalates_before_any_dispatch(config_root: Path) ->
 
 
 async def test_no_match_first_claim_gets_one_softened_reask(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     h = _identity_harness(config_root, claim=_UNKNOWN_CLAIM, thread_id="ident-nomatch-1")
     events = await _events(h.engine, _REQUEST)
@@ -957,11 +962,11 @@ async def test_no_match_first_claim_gets_one_softened_reask(
     # The softened wording NEVER asserts absence (existence-oracle discipline).
     assert "find" not in reasks[0].text.lower() and "on file" not in reasks[0].text.lower()
     assert h.otp.dispatch_count == 0  # a doomed dispatch would grant L2 on the stub code
-    assert _UNKNOWN_CLAIM not in _telemetry(tmp_path)  # the claim is never persisted
+    assert _UNKNOWN_CLAIM not in str(_telemetry(h))
 
 
 async def test_no_match_second_claim_hands_to_human_silently(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     h = _identity_harness(config_root, claim=_UNKNOWN_CLAIM, thread_id="ident-nomatch-2")
     await _events(h.engine, _REQUEST)
@@ -971,9 +976,9 @@ async def test_no_match_second_claim_hands_to_human_silently(
     assert all(e.node == "automation_terminal_response" for e in spoken)
     assert any("contact the store" in e.text.lower() for e in spoken)
     assert h.identity.current() is None
-    telemetry = _telemetry(tmp_path)
-    assert "no_match" in telemetry
-    assert _UNKNOWN_CLAIM not in telemetry
+    telemetry = _telemetry(h)
+    assert any(event.get("reason") == "no_match" for event in telemetry)
+    assert _UNKNOWN_CLAIM not in str(telemetry)
 
 
 async def test_contact_reask_budget_tracks_the_policy_knob(config_root: Path) -> None:

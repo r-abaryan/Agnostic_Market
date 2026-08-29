@@ -20,7 +20,7 @@ from agnostic_market.agents.frontline.typed_prompt import (
     compose_catalog_response_prompt,
 )
 from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
-from agnostic_market.agents.telemetry import write_capability_answered, write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder, record_capability_answered
 from agnostic_market.commerce.catalog import CatalogPort
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
@@ -115,6 +115,8 @@ def build_read_flow_nodes(
     recent_orders: RecentOrderContext,
     identity_store: CallerIdentityStore,
     customers: CustomerDirectory,
+    telemetry: TelemetryRecorder,
+    routing_telemetry: TelemetryRecorder,
 ) -> ReadFlowNodes:
     """Build typed read owners over their shared session-bound dependencies."""
 
@@ -250,7 +252,7 @@ def build_read_flow_nodes(
 
     def _order_read_denied(order_ids: tuple[str, ...]) -> None:
         for order_id in order_ids:
-            write_event(
+            telemetry.record(
                 {
                     "event": "order_read_denied",
                     "order_id_known": order_store.order_owner(order_id) is not None,
@@ -342,7 +344,7 @@ def build_read_flow_nodes(
                     },
                 )
             for order_id in unresolved:
-                write_event(
+                telemetry.record(
                     {
                         "event": "order_read_granted",
                         "order_id": order_id,
@@ -372,7 +374,8 @@ def build_read_flow_nodes(
         )
         line = f"{line} {warm_close()}"
         recent_orders.record(order_ids, operation="read")
-        write_capability_answered(
+        record_capability_answered(
+            routing_telemetry,
             authorization_message.content,
             CapabilityId.VERIFY_ORDER_STATUS.value,
             answer_source="code_authored_read",
@@ -440,7 +443,8 @@ def build_read_flow_nodes(
             raise ValueError("catalog response model returned an unexpected tool call")
         model_text_policy.validate(response.text)
 
-        write_capability_answered(
+        record_capability_answered(
+            routing_telemetry,
             current.content,
             CapabilityId.SEARCH_CATALOG.value,
             answer_source="grounded_model_response",
@@ -483,7 +487,8 @@ def build_read_flow_nodes(
         if answer is None:
             raise RuntimeError("validated answer response omitted its answer")
         model_text_policy.validate(answer)
-        write_capability_answered(
+        record_capability_answered(
+            routing_telemetry,
             current.content,
             CapabilityId.ANSWER_QUESTION.value,
             answer_source=(

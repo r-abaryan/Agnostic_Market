@@ -19,7 +19,6 @@ from livekit.plugins import langchain as lk_langchain
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.routing_activation import RoutingRecognizerFactory
-from agnostic_market.agents.telemetry import write_event
 from agnostic_market.application import (
     ApplicationModels,
     ApplicationSession,
@@ -210,7 +209,9 @@ def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) 
         async def close() -> None:
             await caller_context.aclose_session()
             if caller_context.close_had_pending_interrupt:
-                write_event({"event": "flow_abandoned", "reason": "session_closed"})
+                caller_context.telemetry.record(
+                    {"event": "flow_abandoned", "reason": "session_closed"}
+                )
 
         def completed(task: asyncio.Task[None]) -> None:
             close_tasks.discard(task)

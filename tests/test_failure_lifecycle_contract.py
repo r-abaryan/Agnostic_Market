@@ -28,7 +28,13 @@ from livekit.agents.voice.room_io import RoomIO
 from livekit.plugins.langchain import LLMAdapter
 from llm_fakes import RecordingResolver
 from routing_helpers import ArchitectureRoutingRecognizer
+from telemetry_helpers import make_tenant_telemetry
 
+from agnostic_market.agents.telemetry import (
+    InMemoryTelemetrySink,
+    OperationalTelemetryEvent,
+    TenantTelemetry,
+)
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.orchestration import ViewCart
 from agnostic_market.dtos.state import (
@@ -45,10 +51,17 @@ from scripts.close_evidence_recorder import (
     CloseCertificationError,
     CloseCertificationRequest,
     CloseEvidenceRecorder,
+    TelemetryCounts,
     load_close_certification_request,
 )
 
 _WAIT_TIMEOUT_SECONDS = 5.0
+
+
+def test_close_telemetry_counts_are_registered_operational_events() -> None:
+    registered = {event.value for event in OperationalTelemetryEvent}
+
+    assert set(TelemetryCounts.model_fields) <= registered
 
 
 def _append(left: list[str] | None, right: list[str] | None) -> list[str]:
@@ -494,7 +507,11 @@ async def _recorder_loop(config_root: Path) -> VoiceLoop:
         credentials,
         RecordingResolver(),
         deployment_id="test-close-evidence-artifact",
-        tenant_services=build_fixture_tenant_services(config_root, "acme_store"),
+        tenant_services=build_fixture_tenant_services(
+            config_root,
+            "acme_store",
+            telemetry=make_tenant_telemetry("acme_store"),
+        ),
         routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
     )
 
@@ -531,6 +548,7 @@ async def _attached_recorder(
     recorder = CloseEvidenceRecorder(
         _recorder_request(report_path, shutdown_mode=shutdown_mode),
         merchant_id="acme_store",
+        telemetry=loop.application.services.telemetry.operational_sink,
     )
     recorder.attach(
         session=loop.session,
@@ -598,6 +616,7 @@ async def test_close_recorder_permits_only_one_active_certification_job(
     second_recorder = CloseEvidenceRecorder(
         _recorder_request(tmp_path / "second.json"),
         merchant_id="acme_store",
+        telemetry=InMemoryTelemetrySink(),
     )
 
     with pytest.raises(CloseCertificationError, match=r"another .* recorder is active"):
@@ -624,6 +643,10 @@ async def test_close_recorder_is_independent_of_lifecycle_listener_order_and_red
     loop, recorder, room = await _attached_recorder(config_root, report_path)
     context = loop.engine._lifecycle
     assert context is not None
+    sink = loop.application.services.telemetry.operational_sink
+    TenantTelemetry("other_store", sink, sink).bind_session("other-session").operational.record(
+        {"event": "caller_context_closed", "reason": "unrelated_session"}
+    )
     secret_text = "casey@example.com OTP 123456"
     loop.session._conversation_item_added(
         ChatMessage(id="user-contract-id", role="user", content=[secret_text])

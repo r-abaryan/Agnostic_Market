@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import wraps
 
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.dtos.orchestration import InvocationClarificationOwner
 from agnostic_market.dtos.state import (
     ClarificationLiveness,
@@ -38,6 +38,7 @@ def advance_clarification(
     *,
     owner: ClarificationOwner,
     max_reasks: int,
+    telemetry: TelemetryRecorder,
 ) -> ClarificationStep:
     """Admit the initial question/re-ask or report that the next one exceeds policy."""
 
@@ -48,7 +49,7 @@ def advance_clarification(
             liveness=ClarificationLiveness(owner=owner, reasks=0),
         )
     if current.reasks >= max_reasks:
-        write_event(
+        telemetry.record(
             {
                 "event": "clarification_exhausted",
                 "owner_kind": owner.kind,

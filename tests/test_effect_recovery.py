@@ -17,7 +17,6 @@ from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
 
-from agnostic_market.agents import telemetry
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
@@ -67,13 +66,8 @@ class _EffectCase:
     not_committed_text: str
 
 
-def _records() -> list[dict[str, object]]:
-    if not telemetry._TELEMETRY_PATH.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
-    ]
+def _records(harness: SupportHarness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 async def _run_seeded_effect(harness: SupportHarness) -> list[str]:
@@ -333,7 +327,7 @@ async def test_external_cancellation_reconciles_every_effect_without_replaying_m
     assert snapshot.values.get("pending_recovery") is None
     assert snapshot.next == ()
 
-    failures = [record for record in _records() if record["event"] == "turn_failed"]
+    failures = [record for record in _records(harness) if record["event"] == "turn_failed"]
     assert failures == [
         {
             "event": "turn_failed",
@@ -385,7 +379,7 @@ async def test_effect_failure_reconciles_from_receipt_without_replaying_mutator(
     assert snapshot.values.get("pending_recovery") is None
     assert snapshot.next == ()
 
-    records = _records()
+    records = _records(harness)
     failures = [record for record in records if record["event"] == "turn_failed"]
     successes = [record for record in records if record["event"] == case.success_event]
     assert failures == [
@@ -433,7 +427,9 @@ async def test_post_commit_projection_failure_reuses_finisher_and_logs_success_o
     if effect == "placement":
         assert harness.caller_context.cart_store.is_empty()
     assert any(case.committed_text in text for text in spoken)
-    assert len([record for record in _records() if record["event"] == case.success_event]) == 1
+    assert (
+        len([record for record in _records(harness) if record["event"] == case.success_event]) == 1
+    )
 
 
 @pytest.mark.parametrize("effect", _EFFECTS)

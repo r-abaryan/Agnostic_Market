@@ -54,7 +54,7 @@ from agnostic_market.agents.recovery import (
     validate_automation_state_clear,
 )
 from agnostic_market.agents.support import build_support_nodes
-from agnostic_market.agents.telemetry import write_capability_answered, write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder, record_capability_answered
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import CatalogPort
 from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
@@ -242,6 +242,8 @@ def build_frontline_graph(
     caller_audible_model_text_max_chars: int,
     response_model_node_timeout_seconds: float,
     reasoning_model_node_timeout_seconds: float,
+    telemetry: TelemetryRecorder,
+    routing_telemetry: TelemetryRecorder,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> FrontlineGraphAssembly:
     """Compile the reasoning graph (frontline routing tier + the cart, support, and identity
@@ -296,7 +298,8 @@ def build_frontline_graph(
         ):
             raise TypeError("cart view render requires a view-cart invocation")
         line = _cart_view_line(f" {warm_close()}")
-        write_capability_answered(
+        record_capability_answered(
+            routing_telemetry,
             state.last_user_text(),
             CapabilityId.VIEW_CART.value,
             answer_source="code_authored_read",
@@ -318,7 +321,8 @@ def build_frontline_graph(
         line = identity_status_line(verified=verified)
         if verified:
             line = f"{line} {warm_close()}"
-        write_capability_answered(
+        record_capability_answered(
+            routing_telemetry,
             state.last_user_text(),
             CapabilityId.VIEW_IDENTITY_STATUS.value,
             answer_source="code_authored_read",
@@ -330,11 +334,10 @@ def build_frontline_graph(
         if state.handover is None or state.handover.destination != "human":
             raise TypeError("handover requires a human destination")
         handover = state.handover
-        write_event(
+        telemetry.record(
             {
                 "event": "human_onramp",
-                "schema_version": 2,
-                "tenant": tenant_id,
+                "handover_schema_version": 2,
                 "verification_level": verification_store.current_level(),
                 "execution_owner": state.execution_owner,
                 "reason_code": handover.reason_code,
@@ -356,7 +359,7 @@ def build_frontline_graph(
         return update
 
     def automation_terminal_response_node(_state: ReasoningState) -> dict[str, object]:
-        write_event({"event": "automation_terminal_response"})
+        telemetry.record({"event": "automation_terminal_response"})
         return {
             **clear_automation_state(),
             "messages": [AIMessage(AUTOMATION_TERMINAL_LINE)],
@@ -366,7 +369,7 @@ def build_frontline_graph(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, RequestPerson):
             raise TypeError("request-person owner requires a request-person invocation")
-        write_event({"event": "semantic_human_requested"})
+        routing_telemetry.record({"event": "semantic_human_requested"})
         return {
             **clear_automation_state(),
             "handover": HandoffRequest(
@@ -380,14 +383,14 @@ def build_frontline_graph(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, AbortCurrent):
             raise TypeError("abort-current owner requires an abort-current invocation")
-        write_event({"event": "semantic_request_aborted"})
+        routing_telemetry.record({"event": "semantic_request_aborted"})
         return {
             **clear_automation_state(),
             "messages": [AIMessage("Okay. I've stopped that request.")],
         }
 
     def owner_declined_node(_state: ReasoningState) -> dict[str, object]:
-        write_event({"event": "capability_owner_declined", "disposition": "closed"})
+        routing_telemetry.record({"event": "capability_owner_declined", "disposition": "closed"})
         return {
             **clear_automation_state(),
             "messages": [AIMessage(_ROUTER_NO_ACTION_LINES["ambiguous_intent"])],
@@ -495,6 +498,7 @@ def build_frontline_graph(
         policy,
         recent_orders,
         display_name=display_name,
+        telemetry=telemetry,
     )
     support = build_support_nodes(
         reasoning_model,
@@ -509,6 +513,8 @@ def build_frontline_graph(
         payment_instruments,
         identity_store=identity_store,
         display_name=display_name,
+        telemetry=telemetry,
+        routing_telemetry=routing_telemetry,
     )
     identity = build_identity_nodes(
         reasoning_model,
@@ -520,6 +526,7 @@ def build_frontline_graph(
         policy,
         lifecycle.transition_principal,
         display_name=display_name,
+        telemetry=telemetry,
     )
     reads = build_read_flow_nodes(
         chat_model,
@@ -533,6 +540,8 @@ def build_frontline_graph(
         recent_orders=recent_orders,
         identity_store=identity_store,
         customers=customers,
+        telemetry=telemetry,
+        routing_telemetry=routing_telemetry,
     )
     capability_registry = _build_frontline_capability_registry()
 
@@ -545,7 +554,7 @@ def build_frontline_graph(
             return capability_registry.resolve(invocation.request).node_name
 
         def reject(reason: str) -> Command:
-            write_event(
+            telemetry.record(
                 {
                     "event": "capability_dispatch_rejected",
                     "reason": reason,
@@ -617,7 +626,7 @@ def build_frontline_graph(
         """Consume one admitted non-executable route and bound repeated no-action turns."""
 
         def reject(reason: str) -> Command:
-            write_event(
+            telemetry.record(
                 {
                     "event": "router_no_action_rejected",
                     "reason": reason,
@@ -653,8 +662,9 @@ def build_frontline_graph(
             state,
             owner=owner,
             max_reasks=policy.router_clarification_reask_max,
+            telemetry=telemetry,
         )
-        write_event(
+        routing_telemetry.record(
             {
                 "event": "semantic_route_no_action",
                 "reason": envelope.reason,
@@ -1307,6 +1317,7 @@ def build_frontline_graph(
             ),
             lifecycle.inspect_principal_transition,
             lifecycle.invalidate_principal_transition,
+            telemetry,
         ),
         error_handler=build_recovery_infrastructure_handler,
         destinations=(entry_node_name, END),

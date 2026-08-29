@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.lifecycle import ExecutionQuiescence
-from agnostic_market.agents.telemetry import write_event
+from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore
 from agnostic_market.commerce.orders import GuestOrderScope, RecentOrderContext
@@ -49,6 +49,7 @@ class CallerContext:
     recent_orders: RecentOrderContext
     identity_store: CallerIdentityStore
     guest_orders: GuestOrderScope
+    telemetry: TelemetryRecorder
     engine: ReasoningEngine | None = None
     _pending_transition: PrincipalTransition | None = field(default=None, init=False)
     _execution_quiescence: ExecutionQuiescence | None = field(default=None, init=False, repr=False)
@@ -145,7 +146,7 @@ class CallerContext:
         self.identity_store.clear()
         self.verification_store.retain_only(fresh_proof)
         self.identity_store.bind(new_identity)
-        write_event(
+        self.telemetry.record(
             {
                 "event": "principal_transitioned",
                 "customer_ref": new_identity.customer_ref,
@@ -237,7 +238,7 @@ class CallerContext:
         self._pending_transition = None
         if self.engine is not None:
             await self.engine.adelete_thread()
-        write_event({"event": "caller_context_closed"})
+        self.telemetry.record({"event": "caller_context_closed"})
         with self._close_lock:
             self._closed = True
 
@@ -269,7 +270,7 @@ class CallerContext:
                     )
                 except Exception:
                     self._close_had_pending_interrupt = False
-                    write_event(
+                    self.telemetry.record(
                         {
                             "event": "flow_abandonment_observation_failed",
                             "reason": "checkpoint_unavailable",

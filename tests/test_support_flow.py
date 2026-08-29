@@ -9,7 +9,6 @@ frontline gate trips on "refund ..." and enters the support flow.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from turn_helpers import engine_events
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME
 from agnostic_market.agents.support import flow as support_flow
+from agnostic_market.agents.telemetry import InMemoryTelemetrySink
 from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.orders import OrdersFixture, OrderStore, load_orders_fixture
 from agnostic_market.commerce.payment_instruments import (
@@ -111,15 +111,10 @@ async def _events(engine: ReasoningEngine, text: str, facts: TurnFacts = _FACTS)
     return await engine_events(engine, text, facts)
 
 
-def _telemetry_events(tmp_path: Path) -> list[dict]:
-    path = tmp_path / "telemetry.jsonl"
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if '"event"' in line
-    ]
+def _telemetry_events(engine: ReasoningEngine) -> list[dict[str, object]]:
+    sink = engine._telemetry.sink
+    assert isinstance(sink, InMemoryTelemetrySink)
+    return [{"event": record.event, **record.attributes} for record in sink.records]
 
 
 async def _assert_refund_destination_failed_closed(
@@ -127,7 +122,6 @@ async def _assert_refund_destination_failed_closed(
     engine: ReasoningEngine,
     store: OrderStore,
     events: list,
-    tmp_path: Path,
     reason: str,
 ) -> None:
     assert store.refund_count == 0
@@ -144,7 +138,7 @@ async def _assert_refund_destination_failed_closed(
     assert snapshot.values.get("handover") is None
     assert snapshot.values.get("pending_refund") is None
 
-    telemetry = _telemetry_events(tmp_path)
+    telemetry = _telemetry_events(engine)
     unavailable = [
         event for event in telemetry if event["event"] == "refund_destination_unavailable"
     ]
@@ -1063,7 +1057,7 @@ async def test_new_instrument_reference_follows_the_authorized_order_owner(
 
 
 async def test_unmodelled_refund_destination_fails_closed(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     engine, store, _, _ = _refund_engine(
         config_root,
@@ -1076,12 +1070,11 @@ async def test_unmodelled_refund_destination_fails_closed(
         engine=engine,
         store=store,
         events=events,
-        tmp_path=tmp_path,
         reason="new_address",
     )
 
 
-async def test_missing_new_instrument_fails_closed(config_root: Path, tmp_path: Path) -> None:
+async def test_missing_new_instrument_fails_closed(config_root: Path) -> None:
     harness = authorize_customer(
         build_support_engine(
             config_root,
@@ -1115,13 +1108,12 @@ async def test_missing_new_instrument_fails_closed(config_root: Path, tmp_path: 
         engine=harness.engine,
         store=harness.store,
         events=events,
-        tmp_path=tmp_path,
         reason="new_instrument",
     )
 
 
 async def test_session_order_without_account_owner_cannot_select_new_instrument(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
         force_tool="propose_refund",
@@ -1170,7 +1162,6 @@ async def test_session_order_without_account_owner_cannot_select_new_instrument(
         engine=harness.engine,
         store=harness.store,
         events=events,
-        tmp_path=tmp_path,
         reason="new_instrument",
     )
 
@@ -1648,7 +1639,7 @@ async def test_unknown_support_tool_uses_bounded_correction_without_an_effect(
 
 
 async def test_repeated_support_clarification_exhausts_without_an_effect(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     thread_id = "support-clarify-exhausted"
     engine, store, verification, otp = _engine(
@@ -1684,18 +1675,20 @@ async def test_repeated_support_clarification_exhausts_without_an_effect(
     assert otp.dispatch_count == 0
     assert store.refund_count == store.return_count == store.cancel_count == 0
     exhausted_events = [
-        line
-        for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
-        if '"event": "clarification_exhausted"' in line
+        event for event in _telemetry_events(engine) if event["event"] == "clarification_exhausted"
     ]
     assert exhausted_events == [
-        '{"event": "clarification_exhausted", "owner_kind": "invocation", '
-        '"consumed_reasks": 2, "limit": 2}'
+        {
+            "event": "clarification_exhausted",
+            "owner_kind": "invocation",
+            "consumed_reasks": 2,
+            "limit": 2,
+        }
     ]
 
 
 async def test_changing_support_clarification_detail_does_not_reset_the_budget(
-    config_root: Path, tmp_path: Path
+    config_root: Path,
 ) -> None:
     thread_id = "support-clarify-changing-detail"
     reasoning = FakeChatModel(
@@ -1724,8 +1717,8 @@ async def test_changing_support_clarification_detail_does_not_reset_the_budget(
     state = engine._graph.get_state(engine._config).values
     assert state.get("clarification_liveness") is None
     assert store.refund_count == store.return_count == store.cancel_count == 0
-    telemetry = (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8")
-    assert telemetry.count('"event": "clarification_exhausted"') == 1
+    telemetry = _telemetry_events(engine)
+    assert sum(event["event"] == "clarification_exhausted" for event in telemetry) == 1
 
 
 async def test_support_two_malformed_clarification_calls_are_paired_then_fall_back(

@@ -1,5 +1,4 @@
-"""commerce/spoken.py redaction units (SECURITY §7d transcript-telemetry gap) + the
-write_event chokepoint: persisted utterances never carry a contact span. Zero network.
+"""Contact redaction units and the telemetry-recorder persistence boundary. Zero network.
 (The listen-direction normalizers spoken_email/spoken_digits are pinned where they're
 consumed — test_commerce_identity / test_commerce_verification.)"""
 
@@ -124,25 +123,51 @@ def test_contact_scanner_does_not_turn_an_order_reference_into_a_phone() -> None
     ) == (("phone", "5550100119"),)
 
 
-def test_write_event_redacts_the_utterance_field(tmp_path: Path) -> None:
+def test_telemetry_recorder_redacts_the_utterance_field(tmp_path: Path) -> None:
     # The chokepoint: no telemetry writer can persist a raw contact, whatever the caller.
-    from agnostic_market.agents import telemetry
+    from agnostic_market.agents.telemetry import JsonlTelemetrySink, TenantTelemetry
 
-    telemetry.write_event({"utterance": "sure, casey@example.com", "outcome": "answered"})
-    telemetry.write_event({"event": "support_left", "reason": "left_flow"})  # no utterance
-    lines = [
+    telemetry = TenantTelemetry(
+        "acme_store",
+        JsonlTelemetrySink(tmp_path / "telemetry.jsonl"),
+        JsonlTelemetrySink(tmp_path / "routing-telemetry.jsonl"),
+    ).bind_session("spoken-test")
+    telemetry.routing_evidence.record(
+        {
+            "event": "capability_answered",
+            "utterance": "sure, casey@example.com",
+            "outcome": "answered",
+        }
+    )
+    telemetry.operational.record({"event": "support_left", "reason": "left_flow"})
+    routing_lines = [
+        json.loads(line)
+        for line in (tmp_path / "routing-telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    operational_lines = [
         json.loads(line)
         for line in (tmp_path / "telemetry.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert lines[0]["utterance"] == "sure, [email]"
-    assert lines[1] == {"event": "support_left", "reason": "left_flow"}
+    assert routing_lines[0]["utterance"] == "sure, [email]"
+    assert operational_lines[0]["event"] == "support_left"
+    assert operational_lines[0]["reason"] == "left_flow"
 
 
-def test_write_event_suppresses_profile_change_utterances(tmp_path: Path) -> None:
-    from agnostic_market.agents import telemetry
+def test_telemetry_recorder_suppresses_profile_change_utterances(tmp_path: Path) -> None:
+    from agnostic_market.agents.telemetry import JsonlTelemetrySink, TenantTelemetry
 
-    telemetry.write_event(
+    telemetry = (
+        TenantTelemetry(
+            "acme_store",
+            JsonlTelemetrySink(tmp_path / "telemetry.jsonl"),
+            JsonlTelemetrySink(tmp_path / "routing-telemetry.jsonl"),
+        )
+        .bind_session("spoken-test")
+        .operational
+    )
+    telemetry.record(
         {
+            "event": "human_onramp",
             "utterance": "send future orders to 7 Elm Street, Dover",
             "outcome": "handover",
             "reason_code": "address_change",

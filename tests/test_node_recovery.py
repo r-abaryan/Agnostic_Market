@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 import time
 from pathlib import Path
@@ -17,9 +16,7 @@ from pydantic import ValidationError
 from support_helpers import build_support_engine
 from turn_helpers import engine_events
 
-from agnostic_market.agents import telemetry
 from agnostic_market.agents.cart import flow as cart_flow
-from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     RECOVERY_NODE_NAME,
@@ -28,6 +25,7 @@ from agnostic_market.agents.recovery import (
     clear_automation_state,
 )
 from agnostic_market.agents.support import _stepup as support_stepup
+from agnostic_market.agents.telemetry import TelemetryRecord
 from agnostic_market.commerce.orders import render_cart_line
 from agnostic_market.dtos.events import SpokenMessageEvent
 from agnostic_market.dtos.orchestration import (
@@ -135,13 +133,8 @@ def test_stopped_turn_admission_rejects_without_changing_full_idle() -> None:
     assert callbacks == ["closed"]
 
 
-def _telemetry_records() -> list[dict[str, object]]:
-    if not telemetry._TELEMETRY_PATH.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in telemetry._TELEMETRY_PATH.read_text(encoding="utf-8").splitlines()
-    ]
+def _telemetry_records(harness) -> list[dict[str, object]]:
+    return [{"event": record.event, **record.attributes} for record in harness.telemetry.records]
 
 
 async def _events(engine, text: str) -> list:
@@ -218,7 +211,9 @@ def test_every_ordinary_recovery_action_has_one_closed_result(
     assert cart.view() == before_cart
     assert frontline.invoke_count == 0
     assert reasoning.invoke_count == 0
-    assert [record for record in _telemetry_records() if record["event"] == "turn_failed"] == [
+    assert [
+        record for record in _telemetry_records(harness) if record["event"] == "turn_failed"
+    ] == [
         {
             "event": "turn_failed",
             "reason": "node_exception",
@@ -267,7 +262,7 @@ def test_invalid_recovery_markers_fail_terminal_without_echoing_marker_data(
     assert update["automation_terminal"] is True
     assert update["pending_recovery"] is None
     assert update["messages"] == [AIMessage(AUTOMATION_TERMINAL_LINE)]
-    assert _telemetry_records() == [
+    assert _telemetry_records(harness) == [
         {
             "event": "turn_failed",
             "reason": "recovery_contract_invalid",
@@ -425,7 +420,7 @@ async def test_capability_entry_exception_is_owned_by_the_destination_not_the_di
 
     events = await _events(harness.engine, "cancel it")
     snapshot = harness.engine._graph.get_state(harness.engine._config)
-    records = _telemetry_records()
+    records = _telemetry_records(harness)
 
     # The dispatcher only hands off; the DESTINATION owns its own failure. Both nodes carry
     # the same SAFE_ABORT policy, so the origin node name (never the action) is what
@@ -745,10 +740,10 @@ async def test_terminal_node_exception_stays_terminal_without_reentry(
         as_node="__start__",
     )
 
-    def fail_terminal_event(_record: dict[str, object]) -> None:
+    def fail_terminal_event(_record: TelemetryRecord) -> None:
         raise RuntimeError("simulated terminal-node failure")
 
-    monkeypatch.setattr(frontline_graph, "write_event", fail_terminal_event)
+    monkeypatch.setattr(harness.telemetry, "emit", fail_terminal_event)
 
     events = await _events(harness.engine, "continue")
     snapshot = harness.engine._graph.get_state(harness.engine._config)
