@@ -16,7 +16,6 @@ from typing import Annotated, TypedDict, get_args, get_origin
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
-from langchain_core.outputs import ChatResult
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.event_hooks import register_serde_event_listener
@@ -27,7 +26,7 @@ from llm_fakes import (
     TEST_STRUCTURED_OUTPUT_METHOD,
     ExplodingOnceFakeChatModel,
     FakeChatModel,
-    NativeAsyncOnlyFakeChatModel,
+    NativeAsyncBlockingFakeChatModel,
 )
 from policy_helpers import make_policy
 from pydantic import BaseModel, PrivateAttr, ValidationError
@@ -83,7 +82,7 @@ from agnostic_market.commerce.payment_instruments import (
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.config import ProviderModel
 from agnostic_market.dtos.events import (
     CommittedTurn,
@@ -225,28 +224,6 @@ class _BlockingFirstResponseModel(FakeChatModel):
         return super()._respond(messages, **kwargs)
 
 
-class _NativeAsyncBlockingModel(NativeAsyncOnlyFakeChatModel):
-    _started: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
-    _cancelled: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
-
-    @property
-    def started(self) -> asyncio.Event:
-        return self._started
-
-    @property
-    def cancelled(self) -> asyncio.Event:
-        return self._cancelled
-
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
-        del messages, stop, run_manager, kwargs
-        self._started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            self._cancelled.set()
-            raise
-
-
 class _ObservedTurnLock:
     def __init__(self, lock: asyncio.Lock, *, task_name: str, arrived: asyncio.Event) -> None:
         self._lock = lock
@@ -286,8 +263,8 @@ def _engine(
     cart = cart if cart is not None else CartStore()
     identity = identity or CallerIdentityStore()
     guest_orders = GuestOrderScope(tenant_id="acme_store", session_id=thread_id)
-    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
-    otp = OtpProvider(valid_code=_TEST_OTP)
+    customers = CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store"))
+    otp = OtpProvider("acme_store", valid_code=_TEST_OTP)
     verification = VerificationStore(otp)
     telemetry = make_session_telemetry("acme_store", thread_id)
     caller_context = CallerContext(
@@ -306,24 +283,23 @@ def _engine(
         store=store,
         catalog=catalog,
         guest_orders=guest_orders,
-        otp=otp,
         verification_store=verification,
+        risk=RiskProvider("acme_store"),
         cart_store=cart,
         recent_orders=recent_orders,
         identity_store=identity,
         customers=customers,
         payment_instruments=PaymentInstrumentDirectory(
-            load_payment_instruments_fixture(config_root, "acme_store")
+            "acme_store", load_payment_instruments_fixture(config_root, "acme_store")
         ),
-        profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
+        profile_store=ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store")),
         policy=policy,
         lifecycle=caller_context,
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         response_model_node_timeout_seconds=response_model_node_timeout_seconds,
         reasoning_model_node_timeout_seconds=reasoning_model_node_timeout_seconds,
-        telemetry=telemetry.operational,
-        routing_telemetry=telemetry.routing_evidence,
+        session_telemetry=telemetry,
         checkpointer=checkpointer if checkpointer is not None else build_checkpointer(),
     )
     if routing_recognizer is not None and routing_model is not None:
@@ -433,7 +409,7 @@ async def test_first_admitted_turn_persists_checkpoint_schema_version(
 async def test_native_async_model_deadline_keeps_loop_live_and_recovers_in_code(
     config_root: Path,
 ) -> None:
-    model = _NativeAsyncBlockingModel()
+    model = NativeAsyncBlockingFakeChatModel()
     engine, store = _engine(
         config_root,
         frontline=model,
@@ -460,7 +436,7 @@ async def test_native_async_model_deadline_keeps_loop_live_and_recovers_in_code(
 async def test_reasoning_model_nodes_use_the_reasoning_deadline(
     config_root: Path,
 ) -> None:
-    model = _NativeAsyncBlockingModel()
+    model = NativeAsyncBlockingFakeChatModel()
     recognizer = _DeterministicRoutingRecognizer(
         _routing_attempt(RouteDecision.direct(ModifyCart(operation="add")))
     )
@@ -1784,7 +1760,7 @@ async def test_distinct_turn_after_safe_abort_respects_recovery_before_fresh_rou
 async def test_native_async_model_cancellation_reaches_the_cart_recovery_policy(
     config_root: Path,
 ) -> None:
-    reasoning = _NativeAsyncBlockingModel()
+    reasoning = NativeAsyncBlockingFakeChatModel()
     recognizer = _DeterministicRoutingRecognizer(
         _routing_attempt(RouteDecision.direct(ModifyCart(operation="add")))
     )

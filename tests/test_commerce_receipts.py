@@ -34,7 +34,7 @@ def _orders(config_root: Path) -> OrderStore:
 
 
 def _profiles(config_root: Path) -> ProfileStore:
-    return ProfileStore(load_profile_fixture(config_root, "acme_store"))
+    return ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store"))
 
 
 def _line(*, quantity: int = 1) -> CartLine:

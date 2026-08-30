@@ -54,19 +54,22 @@ from agnostic_market.agents.recovery import (
     validate_automation_state_clear,
 )
 from agnostic_market.agents.support import build_support_nodes
-from agnostic_market.agents.telemetry import TelemetryRecorder, record_capability_answered
+from agnostic_market.agents.telemetry import (
+    SessionTelemetry,
+    record_capability_answered,
+)
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import CatalogPort
-from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectory
+from agnostic_market.commerce.identity import CallerIdentityStore, CustomerDirectoryPort
 from agnostic_market.commerce.orders import (
     GuestOrderScope,
-    OrderStore,
+    OrderPort,
     RecentOrderContext,
     render_cart_line,
 )
-from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
-from agnostic_market.commerce.profile import ProfileStore
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.payment_instruments import PaymentInstrumentPort
+from agnostic_market.commerce.profile import ProfilePort
+from agnostic_market.commerce.verification import RiskPort, VerificationStore
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AbortCurrent,
@@ -224,35 +227,31 @@ def build_frontline_graph(
     display_name: str,
     tenant_id: str,
     reasoning_model: BaseChatModel,
-    store: OrderStore,
+    store: OrderPort,
     catalog: CatalogPort,
     guest_orders: GuestOrderScope,
     policy: PolicyContext,
     cart_store: CartStore,
-    otp: OtpProvider,
-    verification_store: VerificationStore | None = None,
-    risk: RiskProvider | None = None,
-    profile_store: ProfileStore,
+    verification_store: VerificationStore,
+    risk: RiskPort,
+    profile_store: ProfilePort,
     recent_orders: RecentOrderContext | None = None,
     identity_store: CallerIdentityStore,
-    customers: CustomerDirectory,
-    payment_instruments: PaymentInstrumentDirectory,
+    customers: CustomerDirectoryPort,
+    payment_instruments: PaymentInstrumentPort,
     lifecycle: PrincipalTransitionLifecycle,
     structured_output_method: StructuredOutputMethod,
     caller_audible_model_text_max_chars: int,
     response_model_node_timeout_seconds: float,
     reasoning_model_node_timeout_seconds: float,
-    telemetry: TelemetryRecorder,
-    routing_telemetry: TelemetryRecorder,
+    session_telemetry: SessionTelemetry,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> FrontlineGraphAssembly:
     """Compile the reasoning graph (frontline routing tier + the cart, support, and identity
     flows) and return it with the capability registry its dispatcher resolves against.
 
     `checkpointer` is required for interrupt/resume paths. None keeps the stateless mode used
-    by text evaluation. The support flow's step-up seams
-    (`verification_store`/`risk`) default to fresh fakes when omitted. `otp` is injected:
-    production loads the merchant verification fixture; tests declare their fake code.
+    by text evaluation. Verification and risk dependencies are injected explicitly.
 
     The stores are session-owned dependencies shared by routing context projection and typed
     capability owners.
@@ -263,6 +262,12 @@ def build_frontline_graph(
         "catalog": catalog.tenant_id,
         "order store": store.tenant_id,
         "guest-order scope": guest_orders.tenant_id,
+        "customer directory": customers.tenant_id,
+        "payment instrument directory": payment_instruments.tenant_id,
+        "profile store": profile_store.tenant_id,
+        "verification store": verification_store.tenant_id,
+        "risk provider": risk.tenant_id,
+        "session telemetry": session_telemetry.tenant_id,
     }
     mismatched_tenants = [
         name
@@ -273,10 +278,10 @@ def build_frontline_graph(
         raise ValueError(
             "frontline tenant dependencies do not match: " + ", ".join(mismatched_tenants)
         )
-    # A defaulted VerificationStore shares the SAME provider the dispatch node uses (else
-    # dispatch and verify would talk to different fakes).
-    verification_store = verification_store or VerificationStore(otp)
-    risk = risk or RiskProvider()
+    if session_telemetry.session_id != guest_orders.session_id:
+        raise ValueError("frontline session dependencies do not match: session telemetry")
+    telemetry = session_telemetry.operational
+    routing_telemetry = session_telemetry.routing_evidence
     model_text_policy = CallerAudibleModelTextPolicy(caller_audible_model_text_max_chars)
     # Production and tests pass the same session context used by routing projection.
     recent_orders = recent_orders or RecentOrderContext(max_refs=policy.cancel_batch_max)
@@ -505,7 +510,6 @@ def build_frontline_graph(
         store,
         guest_orders,
         verification_store,
-        otp,
         risk,
         policy,
         profile_store,
@@ -519,7 +523,6 @@ def build_frontline_graph(
     identity = build_identity_nodes(
         reasoning_model,
         verification_store,
-        otp,
         risk,
         customers,
         identity_store,
@@ -1597,16 +1600,18 @@ def build_frontline_graph(
     node_execution_tracker = node_registry.validated_execution_tracker()
     consent_interrupt_kinds = node_registry.validated_consent_interrupt_kinds()
     compiled = graph.compile(checkpointer=checkpointer)
-    # Stashed for tests/introspection + the engine (single source of truth for which
-    # node-authored messages are caller-facing — the voice side never hard-codes names).
-    compiled.speakable_nodes = (  # type: ignore[attr-defined]
+    speakable_nodes = (
         FRONTLINE_SPEAKABLE_NODES
         | cart.speakable_nodes
         | support.speakable_nodes
         | identity.speakable_nodes
         | reads.speakable_nodes
     )
-    compiled.model_speech_nodes = reads.model_speech_nodes  # type: ignore[attr-defined]
+    model_speech_nodes = reads.model_speech_nodes
+    # Stashed for tests/introspection + the engine (single source of truth for which
+    # node-authored messages are caller-facing — the voice side never hard-codes names).
+    compiled.speakable_nodes = speakable_nodes  # type: ignore[attr-defined]
+    compiled.model_speech_nodes = model_speech_nodes  # type: ignore[attr-defined]
     compiled.model_execution_nodes = (  # type: ignore[attr-defined]
         reads.model_speech_nodes | NON_SPEAKING_MODEL_NODES
     )
@@ -1622,14 +1627,12 @@ def build_frontline_graph(
     compiled.recovery_entry_node = entry_node_name  # type: ignore[attr-defined]
     compiled.node_execution_tracker = node_execution_tracker  # type: ignore[attr-defined]
     compiled.consent_interrupt_kinds = consent_interrupt_kinds  # type: ignore[attr-defined]
-    overlap = compiled.speakable_nodes & compiled.model_speech_nodes  # type: ignore[attr-defined]
+    overlap = speakable_nodes & model_speech_nodes
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")
     # A model-invoking node that is ALSO speakable could put model prose in front of the
     # caller without passing the code-authored path: the structural half of one-author.
-    non_speaking_overlap = (  # type: ignore[attr-defined]
-        compiled.speakable_nodes & NON_SPEAKING_MODEL_NODES
-    )
+    non_speaking_overlap = speakable_nodes & NON_SPEAKING_MODEL_NODES
     if non_speaking_overlap:
         raise RuntimeError(
             f"non-speaking model nodes cannot be caller-speakable: {sorted(non_speaking_overlap)!r}"

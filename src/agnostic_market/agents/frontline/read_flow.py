@@ -24,7 +24,7 @@ from agnostic_market.agents.telemetry import TelemetryRecorder, record_capabilit
 from agnostic_market.commerce.catalog import CatalogPort
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
-    CustomerDirectory,
+    CustomerDirectoryPort,
     classify_contact_claims,
     order_read_allowed,
     try_grant_orders_by_contact,
@@ -33,7 +33,7 @@ from agnostic_market.commerce.orders import (
     BOUND_ORDER_READ_UNAVAILABLE_LINE,
     ORDER_CONTACT_NOT_FOUND_LINE,
     GuestOrderScope,
-    OrderStore,
+    OrderPort,
     RecentOrderContext,
     render_order_status_line,
 )
@@ -104,7 +104,7 @@ class ReadFlowNodes:
 
 def build_read_flow_nodes(
     response_model: BaseChatModel,
-    order_store: OrderStore,
+    order_store: OrderPort,
     catalog: CatalogPort,
     guest_orders: GuestOrderScope,
     policy: PolicyContext,
@@ -114,7 +114,7 @@ def build_read_flow_nodes(
     model_text_policy: CallerAudibleModelTextPolicy,
     recent_orders: RecentOrderContext,
     identity_store: CallerIdentityStore,
-    customers: CustomerDirectory,
+    customers: CustomerDirectoryPort,
     telemetry: TelemetryRecorder,
     routing_telemetry: TelemetryRecorder,
 ) -> ReadFlowNodes:

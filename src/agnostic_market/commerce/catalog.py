@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agnostic_market.dtos.money import UsdAmount
+from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 CATALOG_RESULT_MAX_ITEMS = 10
@@ -75,10 +76,9 @@ class Candidate(BaseModel):
     price_usd: UsdAmount
 
 
-class CatalogPort(Protocol):
+@runtime_checkable
+class CatalogPort(TenantBound, Protocol):
     """The catalog reads required by graph capability owners."""
-
-    tenant_id: str
 
     def search(self, query: str) -> CatalogProductSet: ...
 
@@ -152,9 +152,7 @@ class FixtureCatalog:
     """Validated in-memory catalog used by development and offline evaluation."""
 
     def __init__(self, tenant_id: str, fixture: CatalogFixture) -> None:
-        if not tenant_id.strip():
-            raise ValueError("fixture catalog requires a tenant id")
-        self.tenant_id = tenant_id.strip()
+        self.tenant_id = normalize_tenant_id(tenant_id, boundary="fixture catalog")
         self._products = fixture.products
         self._by_sku = {product.sku: product for product in fixture.products}
 

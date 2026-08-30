@@ -248,7 +248,7 @@ async def test_new_value_never_reaches_telemetry(config_root: Path) -> None:
 
 
 def test_profile_error_string_carries_no_value(config_root: Path) -> None:
-    store = ProfileStore(load_profile_fixture(config_root, "acme_store"))
+    store = ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store"))
     with pytest.raises(ProfileError) as err:
         store.update_profile("k1", customer_ref="CUST-001", field="address", new_value="   ")
     assert "address" in str(err.value)  # the field slug, never a caller value

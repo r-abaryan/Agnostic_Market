@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Literal, Protocol
@@ -297,12 +297,24 @@ class TelemetryRecorder:
     session_id: str
     purpose: TelemetryPurpose
     sink: TelemetrySink
+    _recorded_once_keys: set[str] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _record_once_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _validate_scope_id("tenant", self.tenant_id)
         _validate_scope_id("session", self.session_id)
 
-    def record(self, event: dict[str, object]) -> None:
+    def _validated_record(self, event: dict[str, object]) -> TelemetryRecord:
         event_name = event.get("event")
         if not isinstance(event_name, str):
             raise ValueError("telemetry event requires a string event name")
@@ -319,7 +331,7 @@ class TelemetryRecorder:
                 if attributes.get("reason_code") in _SENSITIVE_UTTERANCE_REASONS
                 else redact_contact(utterance)
             )
-        record = TelemetryRecord.model_validate(
+        return TelemetryRecord.model_validate(
             {
                 "purpose": self.purpose,
                 "tenant_id": self.tenant_id,
@@ -328,13 +340,47 @@ class TelemetryRecorder:
                 "attributes": attributes,
             }
         )
-        self.sink.emit(record)
+
+    def record(self, event: dict[str, object]) -> None:
+        self.sink.emit(self._validated_record(event))
+
+    def record_once(self, key: str, event: dict[str, object]) -> None:
+        """Emit one replay-safe event per recorder-local idempotency key."""
+        normalized_key = key.strip()
+        if not normalized_key:
+            raise ValueError("replay-safe telemetry requires a non-empty key")
+        record = self._validated_record(event)
+        with self._record_once_lock:
+            if normalized_key in self._recorded_once_keys:
+                return
+            self.sink.emit(record)
+            self._recorded_once_keys.add(normalized_key)
 
 
 @dataclass(frozen=True, slots=True)
 class SessionTelemetry:
     operational: TelemetryRecorder
     routing_evidence: TelemetryRecorder
+
+    def __post_init__(self) -> None:
+        if (
+            self.operational.tenant_id != self.routing_evidence.tenant_id
+            or self.operational.session_id != self.routing_evidence.session_id
+        ):
+            raise ValueError("session telemetry scope is split")
+        if (
+            self.operational.purpose is not TelemetryPurpose.OPERATIONAL
+            or self.routing_evidence.purpose is not TelemetryPurpose.ROUTING_EVIDENCE
+        ):
+            raise ValueError("session telemetry purpose is invalid")
+
+    @property
+    def tenant_id(self) -> str:
+        return self.operational.tenant_id
+
+    @property
+    def session_id(self) -> str:
+        return self.operational.session_id
 
 
 @dataclass(frozen=True, slots=True)

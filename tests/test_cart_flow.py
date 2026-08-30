@@ -55,7 +55,7 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.receipts import IndeterminateReceipt, NotCommittedReceipt
-from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
@@ -95,11 +95,14 @@ def _build(
     cart = cart or CartStore()
     recent_orders = recent_orders or RecentOrderContext(max_refs=_POLICY.cancel_batch_max)
     identity = CallerIdentityStore()
-    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="t1")
-    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
-    otp = OtpProvider(valid_code=_TEST_OTP)
-    verification = VerificationStore(otp)
     telemetry = telemetry or make_session_telemetry("acme_store", "t1")
+    guest_orders = GuestOrderScope(
+        tenant_id="acme_store",
+        session_id=telemetry.session_id,
+    )
+    customers = CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store"))
+    otp = OtpProvider("acme_store", valid_code=_TEST_OTP)
+    verification = VerificationStore(otp)
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,
@@ -117,23 +120,22 @@ def _build(
         catalog=catalog,
         guest_orders=guest_orders,
         cart_store=cart,  # the SAME cart the view_cart tool reads (no split-brain)
-        otp=otp,
         verification_store=verification,
+        risk=RiskProvider("acme_store"),
         recent_orders=recent_orders,
         identity_store=identity,  # the SAME store the order_status gate grants into (P7)
         customers=customers,
         payment_instruments=PaymentInstrumentDirectory(
-            load_payment_instruments_fixture(config_root, "acme_store")
+            "acme_store", load_payment_instruments_fixture(config_root, "acme_store")
         ),
-        profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
+        profile_store=ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store")),
         policy=_POLICY,
         lifecycle=caller_context,
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         response_model_node_timeout_seconds=2.0,
         reasoning_model_node_timeout_seconds=6.0,
-        telemetry=telemetry.operational,
-        routing_telemetry=telemetry.routing_evidence,
+        session_telemetry=telemetry,
         checkpointer=InMemorySaver(),
     )
     return assembly.graph, store, cart

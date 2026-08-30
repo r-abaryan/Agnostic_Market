@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
@@ -16,7 +16,6 @@ from agnostic_market.agents.frontline import FrontlineGraphAssembly, build_front
 from agnostic_market.agents.routing import RoutingRecognizer, RoutingSession
 from agnostic_market.agents.telemetry import (
     SessionTelemetry,
-    TelemetryPurpose,
     TenantTelemetry,
 )
 from agnostic_market.checkpoints import SchemaValidatedCheckpointSaver, build_checkpointer
@@ -25,27 +24,33 @@ from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
+    CustomerDirectoryPort,
     assert_orders_have_customers,
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
     GuestOrderScope,
+    OrderPort,
     OrderStore,
     RecentOrderContext,
     load_orders_fixture,
 )
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentDirectory,
+    PaymentInstrumentPort,
     assert_payment_instruments_have_customers,
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import (
+    ProfilePort,
     ProfileStore,
     assert_profiles_have_customers,
     load_profile_fixture,
 )
 from agnostic_market.commerce.verification import (
+    OtpPort,
     OtpProvider,
+    RiskPort,
     RiskProvider,
     VerificationStore,
     load_verification_fixture,
@@ -53,7 +58,7 @@ from agnostic_market.commerce.verification import (
 from agnostic_market.dtos.config import MerchantConfig
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.session import CallerContext
-from agnostic_market.tenancy.context import TenantContext
+from agnostic_market.tenancy.context import TenantBound, TenantContext, normalize_tenant_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,12 +101,12 @@ class ApplicationSettings:
 class TenantServices:
     tenant_id: str
     catalog: CatalogPort
-    order_store: OrderStore
-    customers: CustomerDirectory
-    payment_instruments: PaymentInstrumentDirectory
-    profile_store: ProfileStore
-    otp: OtpProvider
-    risk: RiskProvider
+    order_store: OrderPort
+    customers: CustomerDirectoryPort
+    payment_instruments: PaymentInstrumentPort
+    profile_store: ProfilePort
+    otp: OtpPort
+    risk: RiskPort
     checkpointer: SchemaValidatedCheckpointSaver
     telemetry: TenantTelemetry
 
@@ -143,17 +148,11 @@ def _validate_session_state(
         raise ValueError("session guest-order scope does not match the application tenant")
     if state.guest_orders.session_id != state.session_id:
         raise ValueError("guest-order scope does not match the application session")
-    recorders = (state.telemetry.operational, state.telemetry.routing_evidence)
-    if any(
-        recorder.tenant_id != tenant.tenant_id or recorder.session_id != state.session_id
-        for recorder in recorders
+    if (
+        state.telemetry.tenant_id != tenant.tenant_id
+        or state.telemetry.session_id != state.session_id
     ):
         raise ValueError("telemetry scope does not match the application session")
-    if (
-        state.telemetry.operational.purpose is not TelemetryPurpose.OPERATIONAL
-        or state.telemetry.routing_evidence.purpose is not TelemetryPurpose.ROUTING_EVIDENCE
-    ):
-        raise ValueError("telemetry purpose does not match the application boundary")
     if (
         state.telemetry.operational.sink is not services.telemetry.operational_sink
         or state.telemetry.routing_evidence.sink is not services.telemetry.routing_evidence_sink
@@ -161,6 +160,8 @@ def _validate_session_state(
         raise ValueError("session telemetry does not use the tenant telemetry service")
     if state.caller_context.telemetry is not state.telemetry.operational:
         raise ValueError("caller lifecycle does not own the application session telemetry")
+    if not state.verification_store.uses_otp_provider(services.otp):
+        raise ValueError("session verification does not use the tenant OTP service")
 
     lifecycle_stores = (
         ("cart", state.caller_context.cart_store, state.cart_store),
@@ -186,6 +187,7 @@ def build_fixture_tenant_services(
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> TenantServices:
     """Load validated development adapters behind the production composition boundary."""
+    tenant_id = normalize_tenant_id(tenant_id, boundary="fixture tenant services")
     if telemetry.tenant_id != tenant_id:
         raise ValueError("telemetry service does not match the fixture tenant")
     orders_fixture = load_orders_fixture(config_root, tenant_id)
@@ -205,11 +207,11 @@ def build_fixture_tenant_services(
         tenant_id=tenant_id,
         catalog=FixtureCatalog(tenant_id, orders_fixture),
         order_store=OrderStore(tenant_id, orders_fixture.orders),
-        customers=CustomerDirectory(customers_fixture),
-        payment_instruments=PaymentInstrumentDirectory(payment_fixture),
-        profile_store=ProfileStore(profile_fixture),
-        otp=OtpProvider(valid_code=verification_fixture.otp_code),
-        risk=RiskProvider(),
+        customers=CustomerDirectory(tenant_id, customers_fixture),
+        payment_instruments=PaymentInstrumentDirectory(tenant_id, payment_fixture),
+        profile_store=ProfileStore(tenant_id, profile_fixture),
+        otp=OtpProvider(tenant_id, valid_code=verification_fixture.otp_code),
+        risk=RiskProvider(tenant_id),
         checkpointer=checkpoint_boundary,
         telemetry=telemetry,
     )
@@ -268,12 +270,19 @@ def build_application_session(
     """Construct the one graph, router, engine, and caller lifecycle."""
     if services.tenant_id != tenant.tenant_id:
         raise ValueError("tenant services do not match the application tenant")
-    if services.catalog.tenant_id != tenant.tenant_id:
-        raise ValueError("catalog service does not match the application tenant")
-    if services.order_store.tenant_id != tenant.tenant_id:
-        raise ValueError("order service does not match the application tenant")
-    if services.telemetry.tenant_id != tenant.tenant_id:
-        raise ValueError("telemetry service does not match the application tenant")
+    mismatched_services: list[str] = []
+    for service_field in fields(services):
+        if service_field.name in {"tenant_id", "checkpointer"}:
+            continue
+        service = getattr(services, service_field.name)
+        if not isinstance(service, TenantBound):
+            raise TypeError(f"{service_field.name} does not expose a tenant identity")
+        if service.tenant_id != tenant.tenant_id:
+            mismatched_services.append(service_field.name)
+    if mismatched_services:
+        raise ValueError(
+            "tenant services do not match the application tenant: " + ", ".join(mismatched_services)
+        )
     state = session_state_factory(tenant, services)
     _validate_session_state(tenant, services, state)
     assembly = build_frontline_graph(
@@ -287,7 +296,6 @@ def build_application_session(
         cart_store=state.cart_store,
         policy=tenant.policy,
         verification_store=state.verification_store,
-        otp=services.otp,
         risk=services.risk,
         profile_store=services.profile_store,
         recent_orders=state.recent_orders,
@@ -299,8 +307,7 @@ def build_application_session(
         caller_audible_model_text_max_chars=settings.caller_audible_model_text_max_chars,
         response_model_node_timeout_seconds=settings.response_model_node_timeout_seconds,
         reasoning_model_node_timeout_seconds=settings.reasoning_model_node_timeout_seconds,
-        telemetry=state.telemetry.operational,
-        routing_telemetry=state.telemetry.routing_evidence,
+        session_telemetry=state.telemetry,
         checkpointer=services.checkpointer,
     )
     routing = RoutingSession(

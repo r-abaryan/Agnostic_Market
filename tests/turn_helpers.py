@@ -28,4 +28,13 @@ async def engine_events(
     facts: TurnFacts | None = None,
 ) -> list[TurnEvent]:
     turn = next_committed_turn(engine, text)
+    return await committed_turn_events(engine, turn, facts)
+
+
+async def committed_turn_events(
+    engine: ReasoningEngine,
+    turn: CommittedTurn,
+    facts: TurnFacts | None = None,
+) -> list[TurnEvent]:
+    """Collect one caller turn while preserving its transport-supplied identity."""
     return [event async for event in engine.stream_turn(turn, facts or TurnFacts())]

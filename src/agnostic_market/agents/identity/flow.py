@@ -65,8 +65,12 @@ from agnostic_market.agents.clarification import (
 from agnostic_market.agents.identity.prompt import compose_identity_prompt
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.telemetry import TelemetryRecorder
-from agnostic_market.commerce.identity import BoundIdentity, CallerIdentityStore, CustomerDirectory
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.identity import (
+    BoundIdentity,
+    CallerIdentityStore,
+    CustomerDirectoryPort,
+)
+from agnostic_market.commerce.verification import RiskPort, VerificationStore
 from agnostic_market.dtos.confirmation import identity_required_level
 from agnostic_market.dtos.orchestration import (
     IntentRequest,
@@ -144,9 +148,8 @@ def _flow_exit(update: dict[str, object]) -> dict[str, object]:
 def build_identity_nodes(
     reasoning_model: BaseChatModel,
     verification_store: VerificationStore,
-    otp: OtpProvider,
-    risk: RiskProvider,
-    customers: CustomerDirectory,
+    risk: RiskPort,
+    customers: CustomerDirectoryPort,
     identity_store: CallerIdentityStore,
     policy: PolicyContext,
     transition_principal: Callable[
@@ -357,9 +360,9 @@ def build_identity_nodes(
 
     stepup = build_stepup_nodes(
         verification_store,
-        otp,
         risk,
         pending_field="pending_identity",
+        pending_type=PendingIdentity,
         required_level=lambda p: identity_required_level(),
         event_prefix="identity",
         max_otp_attempts=policy.otp_max_attempts,

@@ -60,6 +60,7 @@ asyncio_mode = "auto"
 # All dev tooling lives here (uv's native dev group — installed by plain `uv sync`).
 [dependency-groups]
 dev = [
+    "pyright>=1.1.411",
     "ruff>=0.6",
     "pytest>=8.0",
     "pytest-asyncio>=1.4.0",
