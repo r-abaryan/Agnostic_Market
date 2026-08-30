@@ -23,14 +23,14 @@ from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.orders import (
     CancelRecord,
-    OrderStore,
+    OrderPort,
     PlacedOrder,
     RefundRecord,
     ReturnRecord,
     cancelled_batch_outcome,
     render_cart_line,
 )
-from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileStore
+from agnostic_market.commerce.profile import ProfileChangeRecord, ProfilePort
 from agnostic_market.commerce.receipts import CommittedReceipt, NotCommittedReceipt
 from agnostic_market.dtos.orchestration import (
     PrincipalTransitionInspection,
@@ -149,12 +149,12 @@ class NodeRecoveryPolicy:
 class CommerceEffectFinishers:
     """The complete flow-owned post-commit projection boundary used by normal and recovery."""
 
-    placement: Callable[[PlacedOrder], dict[str, object]]
+    placement: Callable[[str, PlacedOrder], dict[str, object]]
     cart_mutation: Callable[[CartMutationRecord], dict[str, object]]
-    refund: Callable[[RefundRecord], dict[str, object]]
+    refund: Callable[[str, RefundRecord], dict[str, object]]
     cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
-    return_: Callable[[ReturnRecord], dict[str, object]]
-    profile_change: Callable[[ProfileChangeRecord], dict[str, object]]
+    return_: Callable[[str, ReturnRecord], dict[str, object]]
+    profile_change: Callable[[str, ProfileChangeRecord], dict[str, object]]
 
 
 class NodeExecutionTracker:
@@ -608,8 +608,8 @@ def build_recovery_node(
     handled_nodes: Callable[[], frozenset[str]],
     safe_abort_continue_node: str,
     cart_store: CartStore,
-    order_store: OrderStore,
-    profile_store: ProfileStore,
+    order_store: OrderPort,
+    profile_store: ProfilePort,
     finishers: CommerceEffectFinishers,
     inspect_principal_transition: Callable[[], PrincipalTransitionInspection],
     invalidate_principal_transition: Callable[[str | None], bool],
@@ -661,7 +661,7 @@ def build_recovery_node(
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, PlacedOrder):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.placement(receipt.record))
+                return complete(finishers.placement(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
@@ -679,7 +679,7 @@ def build_recovery_node(
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, RefundRecord):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.refund(receipt.record))
+                return complete(finishers.refund(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
@@ -724,7 +724,7 @@ def build_recovery_node(
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, ReturnRecord):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.return_(receipt.record))
+                return complete(finishers.return_(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
@@ -743,7 +743,7 @@ def build_recovery_node(
                 receipt.record, ProfileChangeRecord
             ):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.profile_change(receipt.record))
+                return complete(finishers.profile_change(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))

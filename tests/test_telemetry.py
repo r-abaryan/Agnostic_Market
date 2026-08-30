@@ -12,6 +12,7 @@ from agnostic_market.agents.telemetry import (
     JsonlTelemetrySink,
     OperationalTelemetryEvent,
     RoutingEvidenceTelemetryEvent,
+    SessionTelemetry,
     TelemetryPurpose,
     TelemetryRecorder,
     TenantTelemetry,
@@ -88,6 +89,40 @@ def test_session_telemetry_binds_scope_and_purpose() -> None:
     assert routing.attributes["capability"] == "view_cart"
 
 
+@pytest.mark.parametrize(
+    "routing",
+    (
+        TenantTelemetry("other_store", InMemoryTelemetrySink(), InMemoryTelemetrySink())
+        .bind_session("session-1")
+        .routing_evidence,
+        TenantTelemetry("acme_store", InMemoryTelemetrySink(), InMemoryTelemetrySink())
+        .bind_session("session-2")
+        .routing_evidence,
+    ),
+)
+def test_session_telemetry_rejects_split_scope(routing: TelemetryRecorder) -> None:
+    operational = (
+        TenantTelemetry("acme_store", InMemoryTelemetrySink(), InMemoryTelemetrySink())
+        .bind_session("session-1")
+        .operational
+    )
+
+    with pytest.raises(ValueError, match="telemetry scope"):
+        SessionTelemetry(operational=operational, routing_evidence=routing)
+
+
+def test_session_telemetry_rejects_swapped_purposes() -> None:
+    session = TenantTelemetry(
+        "acme_store", InMemoryTelemetrySink(), InMemoryTelemetrySink()
+    ).bind_session("session-1")
+
+    with pytest.raises(ValueError, match="telemetry purpose"):
+        SessionTelemetry(
+            operational=session.routing_evidence,
+            routing_evidence=session.operational,
+        )
+
+
 def test_session_telemetry_isolates_concurrent_callers() -> None:
     sink = InMemoryTelemetrySink()
     tenant = TenantTelemetry("acme_store", sink, sink)
@@ -114,6 +149,23 @@ def test_session_telemetry_isolates_concurrent_callers() -> None:
     assert all(
         record.session_id == record.attributes["expected_session"] for record in sink.records
     )
+
+
+def test_replay_safe_telemetry_emits_one_event_under_concurrent_redelivery() -> None:
+    sink = InMemoryTelemetrySink()
+    recorder = TenantTelemetry("acme_store", sink, sink).bind_session("session-1").operational
+
+    def emit(_sequence: int) -> None:
+        recorder.record_once(
+            "checkout_confirmed:placement-key",
+            {"event": "checkout_confirmed", "order_id": "ORD-9001"},
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        tuple(executor.map(emit, range(50)))
+
+    assert [record.event for record in sink.records] == ["checkout_confirmed"]
+    assert sink.records[0].attributes == {"order_id": "ORD-9001"}
 
 
 def test_recorder_redacts_sensitive_utterances_before_the_sink() -> None:

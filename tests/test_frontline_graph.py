@@ -58,7 +58,7 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.receipts import CommittedReceipt
-from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AbortCurrent,
@@ -129,13 +129,14 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         max_refs=policy.cancel_batch_max
     )
     identity = kwargs.pop("identity", None) or CallerIdentityStore()
-    otp = kwargs.pop("otp", None) or OtpProvider(valid_code=_TEST_OTP)
+    otp = kwargs.pop("otp", None) or OtpProvider("acme_store", valid_code=_TEST_OTP)
     verification = kwargs.pop("verification_store", None) or VerificationStore(otp)
-    guest_orders = kwargs.pop("guest_orders", None) or GuestOrderScope(
-        tenant_id="acme_store", session_id="frontline-graph"
-    )
     telemetry = kwargs.pop("telemetry", None) or make_session_telemetry(
         "acme_store", "frontline-graph"
+    )
+    guest_orders = kwargs.pop("guest_orders", None) or GuestOrderScope(
+        tenant_id="acme_store",
+        session_id=telemetry.session_id,
     )
     caller_context = CallerContext(
         verification_store=verification,
@@ -152,14 +153,17 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         guest_orders=guest_orders,
         cart_store=cart,
         recent_orders=recent_orders,
-        otp=otp,
         verification_store=verification,
+        risk=kwargs.pop("risk", None) or RiskProvider("acme_store"),
         identity_store=identity,
-        customers=CustomerDirectory(load_customers_fixture(config_root, "acme_store")),
-        payment_instruments=PaymentInstrumentDirectory(
-            load_payment_instruments_fixture(config_root, "acme_store")
+        customers=kwargs.pop("customers", None)
+        or CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store")),
+        payment_instruments=kwargs.pop("payment_instruments", None)
+        or PaymentInstrumentDirectory(
+            "acme_store", load_payment_instruments_fixture(config_root, "acme_store")
         ),
-        profile_store=ProfileStore(load_profile_fixture(config_root, "acme_store")),
+        profile_store=kwargs.pop("profile_store", None)
+        or ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store")),
         # Frontline-path tests never reach checkout; a default fake keeps one graph shape.
         reasoning_model=kwargs.pop("reasoning_model", None) or FakeChatModel(),
         store=store,
@@ -177,8 +181,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         reasoning_model_node_timeout_seconds=kwargs.pop(
             "reasoning_model_node_timeout_seconds", 6.0
         ),
-        telemetry=telemetry.operational,
-        routing_telemetry=telemetry.routing_evidence,
+        session_telemetry=telemetry,
         **kwargs,
     )
     graph = assembly.graph
@@ -189,17 +192,55 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     return graph
 
 
-@pytest.mark.parametrize("dependency", ("catalog", "store", "guest_orders"))
+@pytest.mark.parametrize(
+    "dependency",
+    (
+        "catalog",
+        "store",
+        "guest_orders",
+        "customers",
+        "payment_instruments",
+        "profile_store",
+        "otp",
+        "risk",
+        "telemetry",
+    ),
+)
 def test_graph_rejects_cross_tenant_dependencies(config_root: Path, dependency: str) -> None:
     fixture = load_orders_fixture(config_root, "acme_store")
     dependencies = {
         "catalog": FixtureCatalog("other_store", fixture),
         "store": OrderStore("other_store", fixture.orders),
         "guest_orders": GuestOrderScope(tenant_id="other_store", session_id="foreign"),
+        "customers": CustomerDirectory(
+            "other_store", load_customers_fixture(config_root, "acme_store")
+        ),
+        "payment_instruments": PaymentInstrumentDirectory(
+            "other_store", load_payment_instruments_fixture(config_root, "acme_store")
+        ),
+        "profile_store": ProfileStore(
+            "other_store", load_profile_fixture(config_root, "acme_store")
+        ),
+        "otp": OtpProvider("other_store", valid_code=_TEST_OTP),
+        "risk": RiskProvider("other_store"),
+        "telemetry": make_session_telemetry("other_store", "frontline-graph"),
     }
 
     with pytest.raises(ValueError, match="tenant dependencies do not match"):
         _graph(config_root, FakeChatModel(), **{dependency: dependencies[dependency]})
+
+
+def test_graph_rejects_telemetry_from_another_session(config_root: Path) -> None:
+    telemetry = make_session_telemetry("acme_store", "other-session")
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="frontline-graph")
+
+    with pytest.raises(ValueError, match="session dependencies do not match"):
+        _graph(
+            config_root,
+            FakeChatModel(),
+            telemetry=telemetry,
+            guest_orders=guest_orders,
+        )
 
 
 def _admitted_turn(text: str, *, turn_id: str, **state: object) -> dict[str, object]:
@@ -1463,7 +1504,7 @@ async def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
 ) -> None:
     identity = CallerIdentityStore()
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    otp = OtpProvider(valid_code=_TEST_OTP)
+    otp = OtpProvider("acme_store", valid_code=_TEST_OTP)
     verification = VerificationStore(otp)
     assert verification.verify_otp(_TEST_OTP)
     cart = CartStore()

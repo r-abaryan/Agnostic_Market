@@ -9,9 +9,26 @@ change authority under an in-flight action (DESIGN_REVIEW M4).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.state import PolicyContext
+
+
+@runtime_checkable
+class TenantBound(Protocol):
+    """A service whose data and effects belong to exactly one tenant."""
+
+    @property
+    def tenant_id(self) -> str: ...
+
+
+def normalize_tenant_id(tenant_id: str, *, boundary: str) -> str:
+    """Return one non-empty tenant identity for a composition boundary."""
+    normalized = tenant_id.strip()
+    if not normalized:
+        raise ValueError(f"{boundary} requires a tenant id")
+    return normalized
 
 
 @dataclass(frozen=True)

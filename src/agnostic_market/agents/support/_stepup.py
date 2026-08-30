@@ -21,12 +21,12 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, Self
 
 from langgraph.types import interrupt
 
 from agnostic_market.agents.telemetry import OperationalTelemetryEvent, TelemetryRecorder
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import RiskPort, VerificationStore
 from agnostic_market.dtos.state import HandoffRequest, HandoffSource, ReasoningState
 
 
@@ -36,7 +36,7 @@ class _SteppablePending(Protocol):
     attempt_key: str
     otp_tries: int
 
-    def model_copy(self, *, update: dict[str, object]) -> object: ...
+    def model_copy(self, *, update: dict[str, object]) -> Self: ...
 
 
 @dataclass(frozen=True)
@@ -75,13 +75,13 @@ _STEPUP_TELEMETRY_EVENTS: dict[StepupEventFamily, _StepupTelemetryEvents] = {
 }
 
 
-def build_stepup_nodes(
+def build_stepup_nodes[PendingT: _SteppablePending](
     verification_store: VerificationStore,
-    otp: OtpProvider,
-    risk: RiskProvider,
+    risk: RiskPort,
     *,
     pending_field: str,
-    required_level: Callable[[object], int],
+    pending_type: type[PendingT],
+    required_level: Callable[[PendingT], int],
     event_prefix: StepupEventFamily,
     max_otp_attempts: int,
     telemetry: TelemetryRecorder,
@@ -97,8 +97,13 @@ def build_stepup_nodes(
 
     telemetry_events = _STEPUP_TELEMETRY_EVENTS[event_prefix]
 
-    def _pending(state: ReasoningState) -> _SteppablePending | None:
-        return getattr(state, pending_field)
+    def _pending(state: ReasoningState) -> PendingT | None:
+        pending = getattr(state, pending_field)
+        if pending is None:
+            return None
+        if not isinstance(pending, pending_type):
+            raise TypeError(f"{pending_field} has an unexpected pending-state type")
+        return pending
 
     def risk_check_node(state: ReasoningState) -> dict[str, object]:
         """SIM-swap / port-out check on the number-on-file (§A4a). Flagged -> do NOT trust an
@@ -121,7 +126,7 @@ def build_stepup_nodes(
         pre-interrupt effect re-runs on replay; the attempt key makes the re-send a no-op)."""
         pending = _pending(state)
         assert pending is not None
-        otp.dispatch(pending.attempt_key)
+        verification_store.dispatch_otp(pending.attempt_key)
         return {}
 
     def collect_node(state: ReasoningState) -> dict[str, object]:

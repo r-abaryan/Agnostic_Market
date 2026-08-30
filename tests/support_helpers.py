@@ -99,16 +99,16 @@ def build_support_engine(
     cart = CartStore()
     identity = CallerIdentityStore()
     guest_orders = GuestOrderScope(tenant_id="acme_store", session_id=thread_id)
-    customers = CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
+    customers = CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store"))
     instrument_fixture = (
         payment_instruments_fixture
         if payment_instruments_fixture is not None
         else load_payment_instruments_fixture(config_root, "acme_store")
     )
-    payment_instruments = PaymentInstrumentDirectory(instrument_fixture)
-    otp = OtpProvider(valid_code=TEST_OTP)
+    payment_instruments = PaymentInstrumentDirectory("acme_store", instrument_fixture)
+    otp = OtpProvider("acme_store", valid_code=TEST_OTP)
     verification = VerificationStore(otp)
-    profile = ProfileStore(load_profile_fixture(config_root, "acme_store"))
+    profile = ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store"))
     telemetry_sink = InMemoryTelemetrySink()
     telemetry = TenantTelemetry("acme_store", telemetry_sink, telemetry_sink).bind_session(
         thread_id
@@ -131,8 +131,7 @@ def build_support_engine(
         guest_orders=guest_orders,
         policy=policy,
         verification_store=verification,
-        otp=otp,
-        risk=RiskProvider(flagged=risk_flagged),
+        risk=RiskProvider("acme_store", flagged=risk_flagged),
         profile_store=profile,
         cart_store=cart,
         recent_orders=recent_orders,
@@ -144,8 +143,7 @@ def build_support_engine(
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
         response_model_node_timeout_seconds=2.0,
         reasoning_model_node_timeout_seconds=6.0,
-        telemetry=telemetry.operational,
-        routing_telemetry=telemetry.routing_evidence,
+        session_telemetry=telemetry,
         checkpointer=build_checkpointer(),
     )
     engine = ReasoningEngine(

@@ -1,0 +1,18 @@
+{
+  "include": [
+    "src/agnostic_market/application.py",
+    "src/agnostic_market/agents/cart/flow.py",
+    "src/agnostic_market/agents/frontline/graph.py",
+    "src/agnostic_market/agents/frontline/read_flow.py",
+    "src/agnostic_market/agents/identity/flow.py",
+    "src/agnostic_market/agents/recovery.py",
+    "src/agnostic_market/agents/support/_stepup.py",
+    "src/agnostic_market/agents/support/flow.py",
+    "src/agnostic_market/commerce/verification.py"
+  ],
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "off",
+  "reportAttributeAccessIssue": "error"
+}

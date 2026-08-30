@@ -42,13 +42,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agnostic_market.commerce.orders import GuestOrderScope, OrdersFixture, OrderStore
+from agnostic_market.commerce.orders import GuestOrderScope, OrderPort, OrdersFixture
 from agnostic_market.commerce.spoken import scan_contact_candidates, spoken_digits, spoken_email
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
@@ -165,6 +166,13 @@ def assert_orders_have_customers(orders: OrdersFixture, customers: CustomersFixt
         )
 
 
+@runtime_checkable
+class CustomerDirectoryPort(TenantBound, Protocol):
+    """Customer lookups required by identity and order authorization."""
+
+    def match_contact(self, claim: str) -> BoundIdentity | None: ...
+
+
 class CustomerDirectory:
     """The stub identity SoR lookup: a spoken contact claim -> the customer it names.
 
@@ -181,7 +189,8 @@ class CustomerDirectory:
     hardcoded (load via `load_customers_fixture`); tests use the same loader, no baked-in default.
     """
 
-    def __init__(self, fixture: CustomersFixture) -> None:
+    def __init__(self, tenant_id: str, fixture: CustomersFixture) -> None:
+        self.tenant_id = normalize_tenant_id(tenant_id, boundary="customer directory")
         self.fixture = fixture
 
     def masked_contact(self, customer_ref: str) -> str | None:
@@ -250,7 +259,7 @@ class CallerIdentityStore:
 def order_read_allowed(
     order_id: str,
     *,
-    store: OrderStore,
+    store: OrderPort,
     guest_orders: GuestOrderScope,
     identity: CallerIdentityStore,
 ) -> bool:
@@ -276,7 +285,7 @@ def order_read_allowed(
 def order_mutation_allowed(
     order_id: str,
     *,
-    store: OrderStore,
+    store: OrderPort,
     guest_orders: GuestOrderScope,
     identity: CallerIdentityStore,
 ) -> bool:
@@ -300,8 +309,8 @@ def order_mutation_allowed(
 def try_grant_orders_by_contact(
     claim: str,
     *order_ids: str,
-    store: OrderStore,
-    customers: CustomerDirectory,
+    store: OrderPort,
+    customers: CustomerDirectoryPort,
     identity: CallerIdentityStore,
 ) -> Literal["granted", "mismatch"]:
     """Grant an unbound guest's complete same-owner order set from one contact claim.

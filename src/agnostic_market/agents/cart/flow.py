@@ -43,7 +43,7 @@ from agnostic_market.commerce.catalog import (
 )
 from agnostic_market.commerce.orders import (
     GuestOrderScope,
-    OrderStore,
+    OrderPort,
     PlacedOrder,
     RecentOrderContext,
     speak_lines,
@@ -149,14 +149,14 @@ class CartNodes:
     guardrail: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
-    finish_placement: Callable[[PlacedOrder], dict[str, object]]
+    finish_placement: Callable[[str, PlacedOrder], dict[str, object]]
     route_after_capability_entry: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
 
 def build_cart_nodes(
     reasoning_model: BaseChatModel,
-    order_store: OrderStore,
+    order_store: OrderPort,
     catalog: CatalogPort,
     guest_orders: GuestOrderScope,
     cart_store: CartStore,
@@ -648,24 +648,24 @@ def build_cart_nodes(
             raise TypeError("cart clarify node requires CartClarification")
         line = _CART_CLARIFICATION_LINES[clarification.detail]
         invocation = state.active_invocation
+        request = invocation.request if invocation is not None else None
+        item_choices = request.item if isinstance(request, ModifyCart) else None
         if (
             clarification.detail == "item"
-            and invocation is not None
-            and isinstance(invocation.request, ModifyCart)
-            and isinstance(invocation.request.item, CartItemChoices)
+            and isinstance(request, ModifyCart)
+            and isinstance(item_choices, CartItemChoices)
         ):
-            request = invocation.request
             items = (
                 tuple(
                     product
-                    for product in catalog.resolve_products(request.item.skus)
+                    for product in catalog.resolve_products(item_choices.skus)
                     if product is not None
                 )
                 if request.operation == "add"
                 else cart_store.view()
             )
             item_by_sku = {item.sku: item for item in items}
-            choices = [item_by_sku.get(sku) for sku in request.item.skus]
+            choices = [item_by_sku.get(sku) for sku in item_choices.skus]
             if all(item is not None for item in choices):
                 rendered = "; ".join(
                     f"option {index}, {item.name} at ${item.price_usd:.2f}"
@@ -761,7 +761,10 @@ def build_cart_nodes(
             }
         return {}  # yes: pending survives; the router sends us to place
 
-    def finish_placement(placed: PlacedOrder) -> dict[str, object]:
+    def finish_placement(
+        idempotency_key: str,
+        placed: PlacedOrder,
+    ) -> dict[str, object]:
         """Finish one authoritative placement; safe to re-run after receipt reconciliation."""
         update = {
             "pending_placement": None,
@@ -776,12 +779,13 @@ def build_cart_nodes(
         guest_orders.record(placed.order_id)
         cart_store.clear()
         recent_orders.record([placed.order_id], operation="place")
-        telemetry.record(
+        telemetry.record_once(
+            f"checkout_confirmed:{idempotency_key}",
             {
                 "event": "checkout_confirmed",
                 "order_id": placed.order_id,
                 "total": str(placed.total_usd),
-            }
+            },
         )
         return update
 
@@ -793,7 +797,7 @@ def build_cart_nodes(
         placed = order_store.place_cart(
             pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd
         )
-        return finish_placement(placed)
+        return finish_placement(pending.idempotency_key, placed)
 
     def route_after_capability_entry(state: ReasoningState) -> str:
         if current_turn_called(state.messages, "leave_cart"):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -23,6 +24,7 @@ from agnostic_market.commerce.identity import CustomersFixture
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.confirmation import ProfileField
+from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
@@ -102,6 +104,28 @@ def assert_profiles_have_customers(profiles: ProfileFixture, customers: Customer
         )
 
 
+@runtime_checkable
+class ProfilePort(TenantBound, Protocol):
+    """Profile reads, effects, and receipts required by support capabilities."""
+
+    def has_profile(self, customer_ref: str) -> bool: ...
+
+    def contact_on_file(self, customer_ref: str) -> str: ...
+
+    def update_profile(
+        self, idempotency_key: str, *, customer_ref: str, field: ProfileField, new_value: str
+    ) -> ProfileChangeRecord: ...
+
+    def profile_change_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        customer_ref: str,
+        field: ProfileField,
+        new_value: str,
+    ) -> ReceiptLookup[ProfileChangeRecord]: ...
+
+
 class ProfileStore:
     """The stub profile SoR (Fix 5 Milestone B: customer-scoped): per-customer on-file reads
     (update overlay wins) + idempotent updates. EVERY read/update requires a `customer_ref`,
@@ -113,7 +137,8 @@ class ProfileStore:
     The `fixture` is REQUIRED — profile data lives in `config/fixtures/profiles/*.yaml`, never
     hardcoded (load via `load_profile_fixture`); tests use the same loader, no baked-in default."""
 
-    def __init__(self, fixture: ProfileFixture) -> None:
+    def __init__(self, tenant_id: str, fixture: ProfileFixture) -> None:
+        self.tenant_id = normalize_tenant_id(tenant_id, boundary="profile store")
         self.fixture = fixture
         self._lock = threading.RLock()
         self._changes_by_key: dict[tuple[str, str], ProfileChangeRecord] = {}

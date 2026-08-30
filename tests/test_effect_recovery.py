@@ -328,6 +328,7 @@ async def test_external_cancellation_reconciles_every_effect_without_replaying_m
     assert snapshot.next == ()
 
     failures = [record for record in _records(harness) if record["event"] == "turn_failed"]
+    successes = [record for record in _records(harness) if record["event"] == case.success_event]
     assert failures == [
         {
             "event": "turn_failed",
@@ -336,6 +337,7 @@ async def test_external_cancellation_reconciles_every_effect_without_replaying_m
             "action": case.action,
         }
     ]
+    assert len(successes) == int(commits_before_cancellation)
 
 
 @pytest.mark.parametrize("effect", _EFFECTS)

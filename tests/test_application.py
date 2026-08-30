@@ -2,41 +2,123 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import CheckpointTuple
+from langgraph.checkpoint.memory import InMemorySaver
 from llm_fakes import (
     TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
+    NativeAsyncBlockingFakeChatModel,
 )
 from policy_helpers import make_policy
 from routing_helpers import ArchitectureRoutingRecognizer
 from telemetry_helpers import make_tenant_telemetry
 from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
+    committed_turn_events,
     engine_events,
 )
 
+from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE, TURN_FALLBACK_LINE
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, SessionTelemetry
 from agnostic_market.application import (
     ApplicationModels,
+    ApplicationSessionState,
     ApplicationSettings,
     TenantServices,
     build_application_session,
     build_fixture_tenant_services,
     build_in_memory_session_state,
 )
+from agnostic_market.checkpoints import CheckpointScopeError, build_checkpointer
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.catalog import FixtureCatalog
-from agnostic_market.commerce.identity import order_mutation_allowed, order_read_allowed
-from agnostic_market.commerce.orders import GuestOrderScope, OrderStore, load_orders_fixture
-from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent
+from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
+from agnostic_market.commerce.identity import (
+    CustomerDirectory,
+    CustomerDirectoryPort,
+    load_customers_fixture,
+    order_mutation_allowed,
+    order_read_allowed,
+)
+from agnostic_market.commerce.orders import (
+    GuestOrderScope,
+    OrderPort,
+    OrderStore,
+    load_orders_fixture,
+)
+from agnostic_market.commerce.payment_instruments import (
+    PaymentInstrumentDirectory,
+    PaymentInstrumentPort,
+    load_payment_instruments_fixture,
+)
+from agnostic_market.commerce.profile import ProfilePort, ProfileStore, load_profile_fixture
+from agnostic_market.commerce.verification import (
+    OtpPort,
+    OtpProvider,
+    RiskPort,
+    RiskProvider,
+    VerificationStore,
+    load_verification_fixture,
+)
+from agnostic_market.dtos.events import (
+    CommittedTurn,
+    InterruptEvent,
+    SpokenMessageEvent,
+    TokenEvent,
+)
+from agnostic_market.dtos.recovery import PendingRecovery
 from agnostic_market.dtos.state import CartLine, ReasoningState
 from agnostic_market.tenancy.context import TenantContext
 
 _TEST_DEPLOYMENT_ID = "test-application-artifact"
+
+
+class _CheckpointReadOutageSaver(InMemorySaver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_attempts = 0
+        self.delete_attempts = 0
+        self.read_available = False
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        self.read_attempts += 1
+        if not self.read_available:
+            raise OSError("injected checkpoint read outage")
+        return await super().aget_tuple(config)
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        self.delete_attempts += 1
+        self.read_available = True
+        await super().adelete_thread(thread_id)
+
+
+class _PostCommitBlockingOrderStore(OrderStore):
+    def __init__(self, tenant_id: str, orders) -> None:
+        super().__init__(tenant_id, orders)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def place_cart(self, idempotency_key: str, *, lines, total_usd):
+        try:
+            placed = super().place_cart(
+                idempotency_key,
+                lines=lines,
+                total_usd=total_usd,
+            )
+            self.entered.set()
+            if not self.release.wait(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS):
+                raise TimeoutError("test did not release committed placement")
+            return placed
+        finally:
+            self.finished.set()
 
 
 def _tenant(tenant_id: str = "acme_store") -> TenantContext:
@@ -70,30 +152,94 @@ def _routing_factory(_registry):
     return ArchitectureRoutingRecognizer()
 
 
-def test_tenant_services_fields_have_explicit_lifetime_and_mutability() -> None:
-    contracts = {
-        "tenant_id": ("tenant", "immutable"),
-        "catalog": ("tenant", "immutable"),
-        "order_store": ("tenant", "mutable"),
-        "customers": ("tenant", "immutable"),
-        "payment_instruments": ("tenant", "immutable"),
-        "profile_store": ("tenant", "mutable"),
-        "otp": ("tenant", "mutable"),
-        "risk": ("tenant", "immutable"),
-        "checkpointer": ("tenant", "mutable"),
-        "telemetry": ("tenant", "mutable"),
+def test_application_composition_fields_have_one_explicit_owner() -> None:
+    tenant_owned = {
+        ("TenantServices", "tenant_id"),
+        ("TenantServices", "catalog"),
+        ("TenantServices", "order_store"),
+        ("TenantServices", "customers"),
+        ("TenantServices", "payment_instruments"),
+        ("TenantServices", "profile_store"),
+        ("TenantServices", "otp"),
+        ("TenantServices", "risk"),
+    }
+    platform_backed_boundaries = {
+        ("TenantServices", "checkpointer"),
+        ("TenantServices", "telemetry"),
+    }
+    session_owned = {
+        ("ApplicationSessionState", "session_id"),
+        ("ApplicationSessionState", "thread_id"),
+        ("ApplicationSessionState", "cart_store"),
+        ("ApplicationSessionState", "verification_store"),
+        ("ApplicationSessionState", "recent_orders"),
+        ("ApplicationSessionState", "identity_store"),
+        ("ApplicationSessionState", "guest_orders"),
+        ("ApplicationSessionState", "caller_context"),
+        ("ApplicationSessionState", "telemetry"),
+    }
+    ownership_groups = tenant_owned, platform_backed_boundaries, session_owned
+    declared_fields = {
+        (owner.__name__, field.name)
+        for owner in (TenantServices, ApplicationSessionState)
+        for field in fields(owner)
     }
 
-    assert {field.name for field in fields(TenantServices)} == contracts.keys()
-    assert set(contracts.values()) <= {
-        ("tenant", "immutable"),
-        ("tenant", "mutable"),
-        ("session", "immutable"),
-        ("session", "mutable"),
-    }
+    assert all(
+        left.isdisjoint(right)
+        for index, left in enumerate(ownership_groups)
+        for right in ownership_groups[index + 1 :]
+    )
+    assert set().union(*ownership_groups) == declared_fields
 
 
-def test_application_uses_explicit_deployment_artifact_for_checkpoint_namespace(
+def test_fixture_tenant_services_implement_the_replacement_ports(config_root: Path) -> None:
+    services = build_fixture_tenant_services(
+        config_root,
+        "acme_store",
+        telemetry=make_tenant_telemetry("acme_store"),
+    )
+    contracts = (
+        (services.catalog, CatalogPort),
+        (services.order_store, OrderPort),
+        (services.customers, CustomerDirectoryPort),
+        (services.payment_instruments, PaymentInstrumentPort),
+        (services.profile_store, ProfilePort),
+        (services.otp, OtpPort),
+        (services.risk, RiskPort),
+    )
+
+    assert all(isinstance(service, contract) for service, contract in contracts)
+    assert {service.tenant_id for service, _contract in contracts} == {"acme_store"}
+
+
+def _fixture_order_store(services: TenantServices) -> OrderStore:
+    assert isinstance(services.order_store, OrderStore)
+    return services.order_store
+
+
+def test_fixture_tenant_services_normalize_one_identity(config_root: Path) -> None:
+    services = build_fixture_tenant_services(
+        config_root,
+        "  acme_store  ",
+        telemetry=make_tenant_telemetry("acme_store"),
+    )
+
+    assert services.tenant_id == "acme_store"
+    assert {
+        services.catalog.tenant_id,
+        services.order_store.tenant_id,
+        services.customers.tenant_id,
+        services.payment_instruments.tenant_id,
+        services.profile_store.tenant_id,
+        services.otp.tenant_id,
+        services.risk.tenant_id,
+        services.telemetry.tenant_id,
+    } == {"acme_store"}
+
+
+@pytest.mark.asyncio
+async def test_application_uses_explicit_deployment_artifact_for_checkpoint_namespace(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
@@ -136,9 +282,12 @@ def test_application_uses_explicit_deployment_artifact_for_checkpoint_namespace(
         first.engine._checkpoint_binding.storage_thread_id
         != second.engine._checkpoint_binding.storage_thread_id
     )
+    await first.state.caller_context.aclose_session()
+    await second.state.caller_context.aclose_session()
 
 
-def test_shared_tenant_services_keep_guest_visibility_session_isolated(
+@pytest.mark.asyncio
+async def test_shared_tenant_services_keep_guest_visibility_session_isolated(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
@@ -201,6 +350,142 @@ def test_shared_tenant_services_keep_guest_visibility_session_isolated(
     assert first.state.guest_orders.contains(placed.order_id)
     assert not second.state.guest_orders.contains(placed.order_id)
     assert services.order_store.guest_orders(second.state.guest_orders) == []
+    await first.state.caller_context.aclose_session()
+    await second.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backend(
+    config_root: Path,
+) -> None:
+    tenant_ids = ("synthetic-a", "synthetic-b")
+    orders = load_orders_fixture(config_root, "acme_store")
+    customers = load_customers_fixture(config_root, "acme_store")
+    instruments = load_payment_instruments_fixture(config_root, "acme_store")
+    profiles = load_profile_fixture(config_root, "acme_store")
+    verification = load_verification_fixture(config_root, "acme_store")
+    backend = InMemorySaver()
+    tenants = tuple(_tenant(tenant_id) for tenant_id in tenant_ids)
+    services = tuple(
+        TenantServices(
+            tenant_id=tenant.tenant_id,
+            catalog=FixtureCatalog(tenant.tenant_id, orders),
+            order_store=OrderStore(tenant.tenant_id, orders.orders),
+            customers=CustomerDirectory(tenant.tenant_id, customers),
+            payment_instruments=PaymentInstrumentDirectory(
+                tenant.tenant_id,
+                instruments,
+            ),
+            profile_store=ProfileStore(tenant.tenant_id, profiles),
+            otp=OtpProvider(tenant.tenant_id, valid_code=verification.otp_code),
+            risk=RiskProvider(tenant.tenant_id),
+            checkpointer=build_checkpointer(backend),
+            telemetry=make_tenant_telemetry(tenant.tenant_id),
+        )
+        for tenant in tenants
+    )
+
+    def same_logical_state(context, dependencies):
+        return build_in_memory_session_state(
+            context,
+            dependencies,
+            session_id="shared-logical-session",
+            thread_id="shared-logical-thread",
+        )
+
+    response_models = (
+        FakeChatModel(raise_transport=True),
+        FakeChatModel(raise_transport=True),
+    )
+    reasoning_models = (
+        FakeChatModel(raise_transport=True),
+        FakeChatModel(raise_transport=True),
+    )
+    models = tuple(
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        )
+        for response, reasoning in zip(response_models, reasoning_models, strict=True)
+    )
+    applications = tuple(
+        build_application_session(
+            tenant,
+            _settings(),
+            application_models,
+            dependencies,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=same_logical_state,
+        )
+        for tenant, dependencies, application_models in zip(tenants, services, models, strict=True)
+    )
+    product = orders.products[0]
+    line = CartLine(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+
+    try:
+        first_order = services[0].order_store.place_cart(
+            "shared-idempotency-key",
+            lines=(line,),
+            total_usd=product.price_usd,
+        )
+        second_order = services[1].order_store.place_cart(
+            "shared-idempotency-key",
+            lines=(line,),
+            total_usd=product.price_usd,
+        )
+        applications[0].state.guest_orders.record(first_order.order_id)
+        applications[1].state.guest_orders.record(second_order.order_id)
+        applications[0].state.cart_store.add_item(
+            sku=product.sku,
+            name=product.name,
+            price_usd=product.price_usd,
+            quantity=1,
+        )
+
+        first_view = await engine_events(applications[0].engine, "what is in my cart")
+        second_view = await engine_events(applications[1].engine, "what is in my cart")
+
+        assert first_order.order_id == second_order.order_id
+        assert services[0].order_store is not services[1].order_store
+        assert _fixture_order_store(services[0]).placed_count == 1
+        assert _fixture_order_store(services[1]).placed_count == 1
+        assert applications[0].state.session_id == applications[1].state.session_id
+        assert applications[0].state.thread_id == applications[1].state.thread_id
+        assert (
+            applications[0].engine._checkpoint_binding.storage_thread_id
+            != applications[1].engine._checkpoint_binding.storage_thread_id
+        )
+        assert any(
+            isinstance(event, SpokenMessageEvent) and product.name in event.text
+            for event in first_view
+        )
+        assert [event.text for event in second_view if isinstance(event, SpokenMessageEvent)] == [
+            "Your cart's empty at the moment."
+        ]
+        assert all(model.invoke_count == 0 for model in (*response_models, *reasoning_models))
+        assert services[0].order_store.is_guest_order(
+            first_order.order_id,
+            applications[0].state.guest_orders,
+        )
+        assert services[1].order_store.is_guest_order(
+            second_order.order_id,
+            applications[1].state.guest_orders,
+        )
+        with pytest.raises(ValueError, match="order-store tenant"):
+            services[0].order_store.is_guest_order(
+                second_order.order_id,
+                applications[1].state.guest_orders,
+            )
+    finally:
+        await applications[0].state.caller_context.aclose_session()
+        await applications[1].state.caller_context.aclose_session()
 
 
 @pytest.mark.asyncio
@@ -258,7 +543,7 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
 
     assert len([event for event in readback if isinstance(event, InterruptEvent)]) == 1
     assert pending is not None
-    assert services.order_store.placed_count == 0
+    assert _fixture_order_store(services).placed_count == 0
 
     outcome = await engine_events(first.engine, "yes")
     receipt = services.order_store.placement_receipt(
@@ -310,8 +595,8 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
         guest_orders=first.state.guest_orders,
         identity=first.state.identity_store,
     )
-    assert services.order_store.placed_count == 1
-    assert services.order_store.order_summary(order_id) is not None
+    assert _fixture_order_store(services).placed_count == 1
+    assert _fixture_order_store(services).order_summary(order_id) is not None
     assert (
         services.order_store.placement_receipt(
             pending.idempotency_key,
@@ -320,6 +605,509 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
         ).kind
         == "committed"
     )
+    await second.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_completes_stt_shaped_cart_clarification_and_consent(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_item", {"candidate_key": "1"})],
+            [("provide_cart_quantity", {"quantity": 2})],
+        ]
+    )
+    application = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=_routing_factory,
+    )
+
+    try:
+        item_turn = await engine_events(
+            application.engine,
+            "could ya add one of those to my cart",
+        )
+        item_state = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+
+        assert any(
+            isinstance(event, SpokenMessageEvent) and "how many" in event.text.casefold()
+            for event in item_turn
+        )
+        assert item_state.active_invocation is not None
+        assert item_state.active_invocation.request.kind == "modify_cart"
+        assert item_state.pending_cart_mutation is None
+        assert application.state.cart_store.is_empty()
+
+        quantity_turn = await engine_events(application.engine, "make it two")
+        quantity_state = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+        pending = quantity_state.pending_cart_mutation
+
+        assert len([event for event in quantity_turn if isinstance(event, InterruptEvent)]) == 1
+        assert pending is not None and pending.quantity == 2
+        assert application.state.cart_store.is_empty()
+
+        outcome = await engine_events(application.engine, "yeah go ahead")
+
+        assert application.state.cart_store.view()[0].quantity == 2
+        assert _fixture_order_store(services).placed_count == 0
+        assert response.invoke_count == 0
+        assert reasoning.invoke_count == 2
+        assert any(
+            isinstance(event, SpokenMessageEvent) and pending.name in event.text
+            for event in outcome
+        )
+        operational = services.telemetry.operational_sink
+        assert isinstance(operational, InMemoryTelemetrySink)
+        assert [
+            record.event for record in operational.records if record.event == "cart_item_added"
+        ] == ["cart_item_added"]
+    finally:
+        await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_redelivery_commits_one_placement_and_one_receipt(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    recognizer = ArchitectureRoutingRecognizer()
+
+    def fixed_state(context, dependencies):
+        return build_in_memory_session_state(
+            context,
+            dependencies,
+            session_id="redelivered-placement-session",
+            thread_id="redelivered-placement-thread",
+        )
+
+    application = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=lambda _registry: recognizer,
+        session_state_factory=fixed_state,
+    )
+    product = load_orders_fixture(config_root, tenant.tenant_id).products[0]
+    application.state.cart_store.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+    dispatch = CommittedTurn(text="place my order", message_id="place-dispatch")
+    consent = CommittedTurn(text="sure go ahead", message_id="place-consent")
+
+    try:
+        readback = await committed_turn_events(application.engine, dispatch)
+        paused = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+        pending = paused.pending_placement
+
+        assert len([event for event in readback if isinstance(event, InterruptEvent)]) == 1
+        assert pending is not None
+        assert _fixture_order_store(services).placed_count == 0
+
+        assert await committed_turn_events(application.engine, dispatch) == []
+        duplicate_pause = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+        assert duplicate_pause.pending_placement == pending
+
+        outcome = await committed_turn_events(application.engine, consent)
+        assert await committed_turn_events(application.engine, consent) == []
+
+        receipt = services.order_store.placement_receipt(
+            pending.idempotency_key,
+            lines=pending.lines,
+            total_usd=pending.total_usd,
+        )
+        assert receipt.kind == "committed"
+        assert _fixture_order_store(services).placed_count == 1
+        assert application.state.guest_orders.order_refs == (receipt.record.order_id,)
+        assert any(
+            isinstance(event, SpokenMessageEvent) and receipt.record.order_id in event.text
+            for event in outcome
+        )
+        assert response.invoke_count == 0 and reasoning.invoke_count == 0
+        assert [context.utterance for context in recognizer.contexts] == ["place my order"]
+        operational = services.telemetry.operational_sink
+        assert isinstance(operational, InMemoryTelemetrySink)
+        assert [
+            record.attributes["order_id"]
+            for record in operational.records
+            if record.event == "checkout_confirmed"
+        ] == [receipt.record.order_id]
+    finally:
+        await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_reconciles_receipt_after_external_effect_cancellation(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    fixture = load_orders_fixture(config_root, tenant.tenant_id)
+    order_store = _PostCommitBlockingOrderStore(tenant.tenant_id, fixture.orders)
+    services = replace(services, order_store=order_store)
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    recognizer = ArchitectureRoutingRecognizer()
+    application = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=lambda _registry: recognizer,
+    )
+    product = fixture.products[0]
+    application.state.cart_store.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+
+    try:
+        await committed_turn_events(
+            application.engine,
+            CommittedTurn(text="place my order", message_id="cancelled-place-dispatch"),
+        )
+        pending = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        ).pending_placement
+        assert pending is not None
+
+        confirming = asyncio.create_task(
+            committed_turn_events(
+                application.engine,
+                CommittedTurn(text="yes", message_id="cancelled-place-consent"),
+            )
+        )
+        assert await asyncio.to_thread(
+            order_store.entered.wait,
+            TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
+        )
+        confirming.cancel("transport disconnected")
+        order_store.release.set()
+        with pytest.raises(asyncio.CancelledError, match="transport disconnected"):
+            await confirming
+        assert await asyncio.to_thread(
+            order_store.finished.wait,
+            TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
+        )
+
+        interrupted = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+        assert isinstance(interrupted.pending_recovery, PendingRecovery)
+        assert order_store.placed_count == 1
+
+        recovered = await committed_turn_events(
+            application.engine,
+            CommittedTurn(text="continue", message_id="cancelled-place-recovery"),
+        )
+        completed = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+        receipt = order_store.placement_receipt(
+            pending.idempotency_key,
+            lines=pending.lines,
+            total_usd=pending.total_usd,
+        )
+
+        assert receipt.kind == "committed"
+        assert order_store.placed_count == 1
+        assert completed.pending_recovery is None
+        assert completed.pending_placement is None
+        assert any(
+            isinstance(event, SpokenMessageEvent) and receipt.record.order_id in event.text
+            for event in recovered
+        )
+        assert response.invoke_count == 0 and reasoning.invoke_count == 0
+        assert [context.utterance for context in recognizer.contexts] == ["place my order"]
+        operational = services.telemetry.operational_sink
+        assert isinstance(operational, InMemoryTelemetrySink)
+        assert [
+            record.attributes["order_id"]
+            for record in operational.records
+            if record.event == "checkout_confirmed"
+        ] == [receipt.record.order_id]
+    finally:
+        order_store.release.set()
+        await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_engine_reconstruction_resumes_the_same_session_dependencies(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+
+    def fixed_identity_state(context, dependencies):
+        return build_in_memory_session_state(
+            context,
+            dependencies,
+            session_id="reconstructed-session",
+            thread_id="reconstructed-thread",
+        )
+
+    first = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=_routing_factory,
+        session_state_factory=fixed_identity_state,
+    )
+    product = load_orders_fixture(config_root, tenant.tenant_id).products[0]
+    first.state.cart_store.add_item(
+        sku=product.sku,
+        name=product.name,
+        price_usd=product.price_usd,
+        quantity=1,
+    )
+    reconstructed = None
+
+    try:
+        await committed_turn_events(
+            first.engine,
+            CommittedTurn(text="place my order", message_id="reconstructed-dispatch"),
+        )
+        paused = ReasoningState.model_validate(
+            first.engine._graph.get_state(first.engine._config).values
+        )
+        pending = paused.pending_placement
+        assert pending is not None
+
+        reconstructed = build_application_session(
+            tenant,
+            _settings(),
+            ApplicationModels(
+                response=response,
+                reasoning=reasoning,
+                response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+            ),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=fixed_identity_state,
+        )
+
+        assert reconstructed.state is not first.state
+        assert reconstructed.state.caller_context is not first.state.caller_context
+        assert reconstructed.state.cart_store is not first.state.cart_store
+        assert reconstructed.state.session_id == first.state.session_id
+        assert reconstructed.state.thread_id == first.state.thread_id
+        assert reconstructed.engine is not first.engine
+        assert await reconstructed.engine.apending_interrupt()
+
+        outcome = await committed_turn_events(
+            reconstructed.engine,
+            CommittedTurn(text="yes", message_id="reconstructed-consent"),
+        )
+        receipt = services.order_store.placement_receipt(
+            pending.idempotency_key,
+            lines=pending.lines,
+            total_usd=pending.total_usd,
+        )
+
+        assert receipt.kind == "committed"
+        assert _fixture_order_store(services).placed_count == 1
+        assert reconstructed.state.guest_orders.order_refs == (receipt.record.order_id,)
+        assert any(
+            isinstance(event, SpokenMessageEvent) and receipt.record.order_id in event.text
+            for event in outcome
+        )
+        assert response.invoke_count == 0 and reasoning.invoke_count == 0
+    finally:
+        if reconstructed is None:
+            await first.state.caller_context.aclose_session()
+        else:
+            # The first context represents the lost worker. Only its replacement closes the
+            # recovered checkpoint namespace.
+            await reconstructed.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_principal_rotation_retires_old_thread_and_completes_typed_read(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    customers = load_customers_fixture(config_root, tenant.tenant_id)
+    orders = load_orders_fixture(config_root, tenant.tenant_id)
+    verification = load_verification_fixture(config_root, tenant.tenant_id)
+    customer_ref, customer = next(iter(customers.customers.items()))
+    owned_order_ids = tuple(
+        order_id for order_id, order in orders.orders.items() if order.customer_ref == customer_ref
+    )
+    foreign_order_ids = tuple(
+        order_id for order_id, order in orders.orders.items() if order.customer_ref != customer_ref
+    )
+    assert owned_order_ids and foreign_order_ids
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(
+        force_tool="propose_identity",
+        canned_args={"propose_identity": {"contact_claim": customer.contact}},
+        tool_call_limit=1,
+    )
+    application = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=_routing_factory,
+    )
+    old_thread_id = application.engine.thread_id
+    old_config = application.engine._config
+
+    try:
+        verification_prompt = await engine_events(application.engine, "show me my orders")
+        assert [
+            event.prompt for event in verification_prompt if isinstance(event, InterruptEvent)
+        ] == ["For security, please read me the 6-digit code we just sent you."]
+        assert application.state.identity_store.current() is None
+
+        completed = await engine_events(application.engine, verification.otp_code)
+        bound = application.state.identity_store.current()
+        state = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+        spoken = " ".join(
+            event.text for event in completed if isinstance(event, SpokenMessageEvent)
+        )
+
+        assert bound is not None and bound.customer_ref == customer_ref
+        assert application.engine.thread_id != old_thread_id
+        with pytest.raises(CheckpointScopeError, match="namespace"):
+            application.engine._graph.get_state(old_config)
+        assert state.active_invocation is None
+        assert state.pending_identity is None
+        assert all(order_id in spoken for order_id in owned_order_ids)
+        assert all(order_id not in spoken for order_id in foreign_order_ids)
+        assert response.invoke_count == 0
+        assert reasoning.invoke_count == 1
+    finally:
+        await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_request_person_route_terminalizes_and_closes_once(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    recognizer = ArchitectureRoutingRecognizer()
+    application = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=lambda _registry: recognizer,
+    )
+
+    try:
+        requested = await engine_events(application.engine, "i want a person")
+        repeated = await engine_events(application.engine, "what is in my cart")
+        state = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+
+        assert [
+            (event.node, event.text) for event in requested if isinstance(event, SpokenMessageEvent)
+        ] == [("automation_terminal_response", AUTOMATION_TERMINAL_LINE)]
+        assert [event.text for event in repeated if isinstance(event, SpokenMessageEvent)] == [
+            AUTOMATION_TERMINAL_LINE
+        ]
+        assert state.automation_terminal
+        assert state.active_invocation is None
+        assert response.invoke_count == 0 and reasoning.invoke_count == 0
+        assert [context.utterance for context in recognizer.contexts] == ["i want a person"]
+        assert _fixture_order_store(services).placed_count == 0
+    finally:
+        await application.state.caller_context.aclose_session()
+
+    operational = services.telemetry.operational_sink
+    assert isinstance(operational, InMemoryTelemetrySink)
+    assert [record.event for record in operational.records].count("caller_context_closed") == 1
+    assert application.state.cart_store.is_empty()
+    assert application.state.guest_orders.order_refs == ()
 
 
 @pytest.mark.asyncio
@@ -365,7 +1153,7 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
     assert "waterproof rain jacket; SKU SKU-BLU-07; price $129.00" in prompt
     assert "trail running shoes" not in prompt
     assert application.state.cart_store.is_empty()
-    assert services.order_store.placed_count == 0
+    assert _fixture_order_store(services).placed_count == 0
     operational_sink = services.telemetry.operational_sink
     routing_sink = services.telemetry.routing_evidence_sink
     assert isinstance(operational_sink, InMemoryTelemetrySink)
@@ -376,6 +1164,140 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
         for record in routing_sink.records
         if record.event == "capability_answered"
     ] == ["search_catalog"]
+    await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_response_model_timeout_is_bounded_and_effect_free(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = NativeAsyncBlockingFakeChatModel()
+    reasoning = FakeChatModel(raise_transport=True)
+    application = build_application_session(
+        tenant,
+        replace(_settings(), response_model_node_timeout_seconds=0.05),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=_routing_factory,
+    )
+
+    try:
+        events = await engine_events(application.engine, "tell me about the rain jacket")
+        state = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+
+        assert response.started.is_set() and response.cancelled.is_set()
+        assert reasoning.invoke_count == 0
+        assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+            TURN_FALLBACK_LINE
+        ]
+        assert application.state.cart_store.is_empty()
+        assert _fixture_order_store(services).placed_count == 0
+        assert state.active_invocation is None
+        assert not state.automation_terminal
+    finally:
+        await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_reasoning_model_timeout_is_bounded_and_effect_free(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = NativeAsyncBlockingFakeChatModel()
+    application = build_application_session(
+        tenant,
+        replace(_settings(), reasoning_model_node_timeout_seconds=0.05),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=_routing_factory,
+    )
+
+    try:
+        events = await engine_events(application.engine, "add something to my cart")
+        state = ReasoningState.model_validate(
+            application.engine._graph.get_state(application.engine._config).values
+        )
+
+        assert reasoning.started.is_set() and reasoning.cancelled.is_set()
+        assert response.invoke_count == 0
+        assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+            "Your cart is empty. Please review your cart before trying again."
+        ]
+        assert application.state.cart_store.is_empty()
+        assert _fixture_order_store(services).placed_count == 0
+        assert state.active_invocation is None
+        assert not state.automation_terminal
+    finally:
+        await application.state.caller_context.aclose_session()
+
+
+@pytest.mark.asyncio
+async def test_application_checkpoint_read_outage_prevents_admission_and_effects(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    backend = _CheckpointReadOutageSaver()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+        checkpointer=backend,
+    )
+    response = FakeChatModel(raise_transport=True)
+    reasoning = FakeChatModel(raise_transport=True)
+    recognizer = ArchitectureRoutingRecognizer()
+    application = build_application_session(
+        tenant,
+        _settings(),
+        ApplicationModels(
+            response=response,
+            reasoning=reasoning,
+            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        ),
+        services,
+        deployment_id=_TEST_DEPLOYMENT_ID,
+        routing_factory=lambda _registry: recognizer,
+    )
+
+    try:
+        events = await engine_events(application.engine, "place my order")
+
+        assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
+            AUTOMATION_TERMINAL_LINE
+        ]
+        assert backend.read_attempts >= 1
+        assert backend.delete_attempts == 0
+        assert recognizer.contexts == []
+        assert response.invoke_count == 0 and reasoning.invoke_count == 0
+        assert application.state.cart_store.is_empty()
+        assert _fixture_order_store(services).placed_count == 0
+        assert application.engine._terminal_latched
+    finally:
+        await application.state.caller_context.aclose_session()
 
 
 def test_application_rejects_services_from_another_tenant(config_root: Path) -> None:
@@ -397,41 +1319,59 @@ def test_application_rejects_services_from_another_tenant(config_root: Path) -> 
         )
 
 
-def test_application_rejects_a_catalog_from_another_tenant(config_root: Path) -> None:
+def test_application_rejects_every_cross_tenant_service(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
         tenant.tenant_id,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
-    fixture = load_orders_fixture(config_root, tenant.tenant_id)
+    orders = load_orders_fixture(config_root, tenant.tenant_id)
+    customers = load_customers_fixture(config_root, tenant.tenant_id)
+    instruments = load_payment_instruments_fixture(config_root, tenant.tenant_id)
+    profiles = load_profile_fixture(config_root, tenant.tenant_id)
+    verification = load_verification_fixture(config_root, tenant.tenant_id)
+    mismatches = {
+        "catalog": FixtureCatalog("other_store", orders),
+        "order_store": OrderStore("other_store", orders.orders),
+        "customers": CustomerDirectory("other_store", customers),
+        "payment_instruments": PaymentInstrumentDirectory("other_store", instruments),
+        "profile_store": ProfileStore("other_store", profiles),
+        "otp": OtpProvider("other_store", valid_code=verification.otp_code),
+        "risk": RiskProvider("other_store"),
+        "telemetry": make_tenant_telemetry("other_store"),
+    }
 
-    with pytest.raises(ValueError, match="catalog service does not match"):
-        build_application_session(
-            tenant,
-            _settings(),
-            _models(),
-            replace(services, catalog=FixtureCatalog("other_store", fixture)),
-            deployment_id=_TEST_DEPLOYMENT_ID,
-            routing_factory=_routing_factory,
-        )
+    def session_state_must_not_build(_tenant, _services):
+        raise AssertionError("cross-tenant services reached session-state construction")
+
+    for field_name, service in mismatches.items():
+        with pytest.raises(ValueError, match=field_name):
+            build_application_session(
+                tenant,
+                _settings(),
+                _models(),
+                replace(services, **{field_name: service}),
+                deployment_id=_TEST_DEPLOYMENT_ID,
+                routing_factory=_routing_factory,
+                session_state_factory=session_state_must_not_build,
+            )
 
 
-def test_application_rejects_an_order_store_from_another_tenant(config_root: Path) -> None:
+def test_application_rejects_a_service_without_tenant_identity(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
         tenant.tenant_id,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
-    fixture = load_orders_fixture(config_root, tenant.tenant_id)
 
-    with pytest.raises(ValueError, match="order service does not match"):
+    with pytest.raises(TypeError, match="customers does not expose a tenant identity"):
         build_application_session(
             tenant,
             _settings(),
             _models(),
-            replace(services, order_store=OrderStore("other_store", fixture.orders)),
+            replace(services, customers=object()),  # type: ignore[arg-type]
             deployment_id=_TEST_DEPLOYMENT_ID,
             routing_factory=_routing_factory,
         )
@@ -513,6 +1453,40 @@ def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> 
         return replace(state, cart_store=CartStore())
 
     with pytest.raises(ValueError, match=r"lifecycle.*cart"):
+        build_application_session(
+            tenant,
+            _settings(),
+            _models(),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=mismatched_state,
+        )
+
+
+def test_application_rejects_verification_store_using_another_otp_service(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+
+    def mismatched_state(context, dependencies):
+        state = build_in_memory_session_state(context, dependencies)
+        verification = VerificationStore(OtpProvider(context.tenant_id, valid_code="111111"))
+        return replace(
+            state,
+            verification_store=verification,
+            caller_context=replace(
+                state.caller_context,
+                verification_store=verification,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="tenant OTP service"):
         build_application_session(
             tenant,
             _settings(),

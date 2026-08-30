@@ -28,12 +28,14 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agnostic_market.commerce.spoken import spoken_digits
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.orchestration import VerificationProof
+from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 logger = logging.getLogger("agnostic_market.commerce.verification")
 
@@ -57,6 +59,22 @@ class VerificationFixture(BaseModel):
     otp_code: str = Field(pattern=r"^\d{6}$")
 
 
+@runtime_checkable
+class OtpPort(TenantBound, Protocol):
+    """Idempotent dispatch and exact verification required by step-up flows."""
+
+    def dispatch(self, attempt_key: str) -> None: ...
+
+    def verify(self, code: str) -> bool: ...
+
+
+@runtime_checkable
+class RiskPort(TenantBound, Protocol):
+    """The risk decision required before dispatching a trusted OTP."""
+
+    def check_sim_swap(self) -> bool: ...
+
+
 def load_verification_fixture(config_root: Path, merchant_id: str) -> VerificationFixture:
     """Load the temporary fake-verification fixture, failing loudly at session build."""
     path = config_root / "fixtures" / "verification" / f"{merchant_id}.yaml"
@@ -67,7 +85,7 @@ def load_verification_fixture(config_root: Path, merchant_id: str) -> Verificati
 
 
 class VerificationStore:
-    """Authoritative, per-session verification level + the OTP verify seam.
+    """Authoritative per-session verification level and OTP service seam.
 
     Single source of truth for `verification_level`: written only by `verify_otp` (never by
     a graph node writing a literal), read live by the support guardrail. `clear()` is the
@@ -75,12 +93,22 @@ class VerificationStore:
     the session.
     """
 
-    def __init__(self, otp: OtpProvider, *, initial_level: int = _INITIAL_LEVEL) -> None:
+    def __init__(self, otp: OtpPort, *, initial_level: int = _INITIAL_LEVEL) -> None:
         self._otp = otp
         self._level = initial_level
         # Records the method + signals that granted each raise — dispute-defense audit
         # (§A4a "log the verification method + signals per action"). No PII, no code value.
         self.grants: list[VerificationProof] = []
+
+    @property
+    def tenant_id(self) -> str:
+        return self._otp.tenant_id
+
+    def uses_otp_provider(self, otp: OtpPort) -> bool:
+        return self._otp is otp
+
+    def dispatch_otp(self, attempt_key: str) -> None:
+        self._otp.dispatch(attempt_key)
 
     def current_level(self) -> int:
         return self._level
@@ -132,11 +160,13 @@ class OtpProvider:
     uses a NEW attempt_key, which legitimately sends a fresh code.
     """
 
+    tenant_id: str
     valid_code: str
     _dispatched: set[str] = field(default_factory=set)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self.tenant_id = normalize_tenant_id(self.tenant_id, boundary="OTP provider")
         if re.fullmatch(r"\d{6}", self.valid_code) is None:
             raise ValueError("fake OTP code must contain exactly 6 digits")
 
@@ -166,7 +196,11 @@ class RiskProvider:
     switch so tests can drive both branches.
     """
 
+    tenant_id: str
     flagged: bool = False
+
+    def __post_init__(self) -> None:
+        self.tenant_id = normalize_tenant_id(self.tenant_id, boundary="risk provider")
 
     def check_sim_swap(self) -> bool:
         """True when the number-on-file shows SIM-swap/port-out risk (do NOT trust an OTP)."""

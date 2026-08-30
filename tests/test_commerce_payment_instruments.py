@@ -19,7 +19,7 @@ from agnostic_market.config.loader import ConfigError
 
 def test_fixture_loads_customer_scoped_masked_references(config_root: Path) -> None:
     fixture = load_payment_instruments_fixture(config_root, "acme_store")
-    directory = PaymentInstrumentDirectory(fixture)
+    directory = PaymentInstrumentDirectory("acme_store", fixture)
 
     assert set(fixture.payment_instruments) == {"CUST-001", "CUST-002"}
     assert directory.new_instrument_ref("CUST-001")
@@ -28,7 +28,9 @@ def test_fixture_loads_customer_scoped_masked_references(config_root: Path) -> N
 
 
 def test_empty_fixture_is_valid_and_lookup_fails_closed() -> None:
-    directory = PaymentInstrumentDirectory(PaymentInstrumentsFixture(payment_instruments={}))
+    directory = PaymentInstrumentDirectory(
+        "acme_store", PaymentInstrumentsFixture(payment_instruments={})
+    )
 
     assert directory.new_instrument_ref("CUST-001") is None
 

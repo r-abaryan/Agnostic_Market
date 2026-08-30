@@ -13,7 +13,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from functools import wraps
 from pathlib import Path
-from typing import Concatenate, Literal
+from typing import Concatenate, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -23,6 +23,7 @@ from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.money import UsdAmount, validate_usd
 from agnostic_market.dtos.orchestration import OrderContextOperation
 from agnostic_market.dtos.state import BatchCancelOutcome, CartLine
+from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 _STRICT = ConfigDict(extra="forbid")
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
@@ -400,6 +401,105 @@ class ReturnError(ValueError):
     or the recorded refund would exceed the order's refundable balance."""
 
 
+@runtime_checkable
+class OrderPort(TenantBound, Protocol):
+    """Order reads, effects, and receipts required by commerce capability owners."""
+
+    def order_status(self, order_id: str) -> str | None: ...
+
+    def order_owner(self, order_id: str) -> str | None: ...
+
+    def is_guest_order(self, order_id: str, scope: GuestOrderScope) -> bool: ...
+
+    def guest_orders(self, scope: GuestOrderScope) -> list[OrderCandidate]: ...
+
+    def owned_orders(
+        self, customer_ref: str, guest_scope: GuestOrderScope
+    ) -> list[OrderCandidate]: ...
+
+    def owned_cancellable_orders(
+        self, customer_ref: str, guest_scope: GuestOrderScope, *, limit: int
+    ) -> tuple[list[OrderCandidate], bool]: ...
+
+    def order_eta(self, order_id: str) -> str | None: ...
+
+    def place_cart(
+        self, idempotency_key: str, *, lines: Sequence[CartLine], total_usd: UsdAmount
+    ) -> PlacedOrder: ...
+
+    def placement_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        lines: Sequence[CartLine],
+        total_usd: UsdAmount,
+    ) -> ReceiptLookup[PlacedOrder]: ...
+
+    def identical_cart_order(
+        self, lines: Sequence[CartLine], guest_scope: GuestOrderScope
+    ) -> PlacedOrder | None: ...
+
+    def actionable_orders(self, guest_scope: GuestOrderScope) -> list[OrderCandidate]: ...
+
+    def captured_total(self, order_id: str) -> UsdAmount | None: ...
+
+    def refunded_so_far(self, order_id: str) -> UsdAmount: ...
+
+    def delivered_at_epoch(self, order_id: str) -> float | None: ...
+
+    def return_for_order(self, order_id: str) -> ReturnRecord | None: ...
+
+    def return_refund_due(self, order_id: str) -> UsdAmount: ...
+
+    def issue_refund(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        amount_usd: UsdAmount,
+        destination: str,
+        instrument_ref: str,
+    ) -> RefundRecord: ...
+
+    def refund_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        amount_usd: UsdAmount,
+        destination: str,
+        instrument_ref: str,
+    ) -> ReceiptLookup[RefundRecord]: ...
+
+    def create_return(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        refund_due_usd: UsdAmount,
+        destination: str,
+    ) -> ReturnRecord: ...
+
+    def return_receipt(
+        self,
+        idempotency_key: str,
+        *,
+        order_id: str,
+        refund_due_usd: UsdAmount,
+        destination: str,
+    ) -> ReceiptLookup[ReturnRecord]: ...
+
+    def is_cancellable(self, order_id: str) -> bool: ...
+
+    def cancel_order(self, idempotency_key: str, *, order_id: str) -> CancelRecord: ...
+
+    def cancel_receipt(
+        self, idempotency_key: str, *, order_id: str
+    ) -> ReceiptLookup[CancelRecord]: ...
+
+    def order_item_summary(self, order_id: str) -> str: ...
+
+
 def _line_fingerprint(
     lines: Iterable[CartLine | PlacedLine],
 ) -> tuple[tuple[str, str, UsdAmount, int], ...]:
@@ -538,11 +638,10 @@ class GuestOrderScope:
     """Tenant-bound order references visible only to one caller session."""
 
     def __init__(self, *, tenant_id: str, session_id: str) -> None:
-        if not tenant_id.strip():
-            raise ValueError("guest order scope requires a tenant id")
+        normalized_tenant_id = normalize_tenant_id(tenant_id, boundary="guest order scope")
         if not session_id.strip():
             raise ValueError("guest order scope requires a session id")
-        self.tenant_id = tenant_id.strip()
+        self.tenant_id = normalized_tenant_id
         self.session_id = session_id.strip()
         self._order_refs: dict[str, None] = {}
 
@@ -587,9 +686,7 @@ class OrderStore:
     """The stub order SoR: fixture reads + idempotent placement (the dedup ARBITER)."""
 
     def __init__(self, tenant_id: str, orders: Mapping[str, _OrderEntry]) -> None:
-        if not tenant_id.strip():
-            raise ValueError("order store requires a tenant id")
-        self.tenant_id = tenant_id.strip()
+        self.tenant_id = normalize_tenant_id(tenant_id, boundary="order store")
         self._lock = threading.RLock()
         self._orders = {order_id: entry.model_copy(deep=True) for order_id, entry in orders.items()}
         # `_placed_by_key` is the committed placement/idempotency ledger. Caller visibility

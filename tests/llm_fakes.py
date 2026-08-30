@@ -267,6 +267,29 @@ class NativeAsyncOnlyFakeChatModel(FakeChatModel):
         return ChatResult(generations=[ChatGeneration(message=self._respond(messages, **kwargs))])
 
 
+class NativeAsyncBlockingFakeChatModel(NativeAsyncOnlyFakeChatModel):
+    """Native-async model that blocks until its caller cancels the provider task."""
+
+    _started: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _cancelled: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    @property
+    def started(self) -> asyncio.Event:
+        return self._started
+
+    @property
+    def cancelled(self) -> asyncio.Event:
+        return self._cancelled
+
+    async def _agenerate(self, *_args: Any, **_kwargs: Any) -> ChatResult:
+        self._started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self._cancelled.set()
+            raise
+
+
 class ExplodingOnceFakeChatModel(FakeChatModel):
     """Raise once as a provider outage, then use the configured fake response."""
 

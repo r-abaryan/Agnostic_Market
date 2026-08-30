@@ -79,7 +79,7 @@ from agnostic_market.commerce.orders import (
     CancelError,
     GuestOrderScope,
     OrderCandidate,
-    OrderStore,
+    OrderPort,
     RecentOrderContext,
     RefundError,
     RefundRecord,
@@ -89,13 +89,13 @@ from agnostic_market.commerce.orders import (
     render_batch_cancel_outcome,
     render_order_list_line,
 )
-from agnostic_market.commerce.payment_instruments import PaymentInstrumentDirectory
-from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileError, ProfileStore
+from agnostic_market.commerce.payment_instruments import PaymentInstrumentPort
+from agnostic_market.commerce.profile import ProfileChangeRecord, ProfileError, ProfilePort
 from agnostic_market.commerce.spoken import (
     caller_stated_order_ids,
     caller_stated_phone,
 )
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import RiskPort, VerificationStore
 from agnostic_market.dtos.confirmation import (
     CREATE_RETURN_POLICY,
     ISSUE_REFUND_POLICY,
@@ -372,7 +372,7 @@ class SupportNodes:
     collect: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
-    finish_refund: Callable[[RefundRecord], dict[str, object]]
+    finish_refund: Callable[[str, RefundRecord], dict[str, object]]
     cancel_guardrail: Callable[[ReasoningState], dict[str, object]]
     cancel_confirm: Callable[[ReasoningState], dict[str, object]]
     cancel_void: Callable[[ReasoningState], dict[str, object]]
@@ -399,7 +399,7 @@ class SupportNodes:
     return_guardrail: Callable[[ReasoningState], dict[str, object]]
     return_confirm: Callable[[ReasoningState], dict[str, object]]
     return_place: Callable[[ReasoningState], dict[str, object]]
-    finish_return: Callable[[ReturnRecord], dict[str, object]]
+    finish_return: Callable[[str, ReturnRecord], dict[str, object]]
     # "confirm" (eligible) | "cancel" (unshipped steer) | "declined" (guardrail spoke + ends).
     route_after_return_guardrail: Callable[[ReasoningState], str]
     # Profile-change sub-path (Group C): guardrail -> [step-up chain] -> confirm -> place.
@@ -411,7 +411,7 @@ class SupportNodes:
     profile_collect: Callable[[ReasoningState], dict[str, object]]
     profile_confirm: Callable[[ReasoningState], dict[str, object]]
     profile_place: Callable[[ReasoningState], dict[str, object]]
-    finish_profile_change: Callable[[ProfileChangeRecord], dict[str, object]]
+    finish_profile_change: Callable[[str, ProfileChangeRecord], dict[str, object]]
     # "confirm" (level sufficient) | "stepup" (needs the OTP loop on the OLD factor).
     route_after_profile_guardrail: Callable[[ReasoningState], str]
     # "confirm" | "dispatch" (re-collect) | "handover" — the factory's decision router.
@@ -421,15 +421,14 @@ class SupportNodes:
 
 def build_support_nodes(
     reasoning_model: BaseChatModel,
-    order_store: OrderStore,
+    order_store: OrderPort,
     guest_orders: GuestOrderScope,
     verification_store: VerificationStore,
-    otp: OtpProvider,
-    risk: RiskProvider,
+    risk: RiskPort,
     policy: PolicyContext,
-    profile_store: ProfileStore,
+    profile_store: ProfilePort,
     recent_orders: RecentOrderContext,
-    payment_instruments: PaymentInstrumentDirectory,
+    payment_instruments: PaymentInstrumentPort,
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
@@ -780,10 +779,13 @@ def build_support_nodes(
                     if stated_ref is None:
                         return None
                     proposed_target = ExplicitOrderTarget(order_ref=stated_ref)
-                    if current.target is not None and canonical_ref(
-                        current.target.order_ref
-                    ) != canonical_ref(proposed_target.order_ref):
-                        return None
+                    if current.target is not None:
+                        if not isinstance(current.target, ExplicitOrderTarget):
+                            return None
+                        if canonical_ref(current.target.order_ref) != canonical_ref(
+                            proposed_target.order_ref
+                        ):
+                            return None
                     return ReturnOrder(target=current.target or proposed_target)
                 if isinstance(current, RefundOrder):
                     if current.target is None:
@@ -1416,9 +1418,9 @@ def build_support_nodes(
     # five T3 security tests are the regression gate for this extraction.
     refund_stepup = build_stepup_nodes(
         verification_store,
-        otp,
         risk,
         pending_field="pending_refund",
+        pending_type=PendingRefund,
         required_level=lambda p: refund_required_level(p.amount_usd, p.destination),
         event_prefix="refund",
         max_otp_attempts=policy.otp_max_attempts,
@@ -1472,7 +1474,10 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
-    def finish_refund(record: RefundRecord) -> dict[str, object]:
+    def finish_refund(
+        idempotency_key: str,
+        record: RefundRecord,
+    ) -> dict[str, object]:
         """Finish one authoritative refund; safe to re-run after receipt reconciliation."""
         update = {
             "pending_refund": None,
@@ -1486,13 +1491,14 @@ def build_support_nodes(
         }
         verification = [grant.method for grant in verification_store.grants]
         recent_orders.record([record.order_id], operation="refund")
-        telemetry.record(
+        telemetry.record_once(
+            f"refund_confirmed:{idempotency_key}",
             {
                 "event": "refund_confirmed",
                 "refund_id": record.refund_id,
                 "amount": str(record.amount_usd),
                 "verification": verification,
-            }
+            },
         )
         return update
 
@@ -1544,7 +1550,7 @@ def build_support_nodes(
                     source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
-        return finish_refund(record)
+        return finish_refund(pending.idempotency_key, record)
 
     # --- cancel sub-path (F-16.2 batch; single = batch-of-one: guardrail -> confirm -> void)
 
@@ -1726,7 +1732,10 @@ def build_support_nodes(
                 outcomes=[(result.order_id, result.outcome) for result in all_outcomes],
             )
         if outcome.outcome == "cancelled":
-            telemetry.record({"event": "cancel_confirmed", "order_id": outcome.order_id})
+            telemetry.record_once(
+                f"cancel_confirmed:{pending.targets[done].idempotency_key}",
+                {"event": "cancel_confirmed", "order_id": outcome.order_id},
+            )
         elif outcome.outcome == "store_refused":
             telemetry.record(
                 {"event": "cancel_denied", "reason": "store_refused", "order_id": outcome.order_id}
@@ -2018,7 +2027,10 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
-    def finish_return(record: ReturnRecord) -> dict[str, object]:
+    def finish_return(
+        idempotency_key: str,
+        record: ReturnRecord,
+    ) -> dict[str, object]:
         """Finish one authoritative return; safe to re-run after receipt reconciliation."""
         update = {
             "pending_return": None,
@@ -2032,13 +2044,14 @@ def build_support_nodes(
             ],
         }
         recent_orders.record([record.order_id], operation="return")
-        telemetry.record(
+        telemetry.record_once(
+            f"return_confirmed:{idempotency_key}",
             {
                 "event": "return_confirmed",
                 "rma_id": record.rma_id,
                 "order_id": record.order_id,
                 "refund_due": str(record.refund_due_usd),
-            }
+            },
         )
         return update
 
@@ -2073,16 +2086,16 @@ def build_support_nodes(
                     source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
-        return finish_return(record)
+        return finish_return(pending.idempotency_key, record)
 
     # --- profile-change sub-path (Group C; the refund T3 shape minus money:
     # ---  guardrail -> [risk_check -> dispatch -> collect(INT)] -> confirm(INT) -> place) --
 
     profile_stepup = build_stepup_nodes(
         verification_store,
-        otp,
         risk,
         pending_field="pending_profile_change",
+        pending_type=PendingProfileChange,
         required_level=lambda p: profile_change_required_level(p.field),
         event_prefix="profile",
         max_otp_attempts=policy.otp_max_attempts,
@@ -2159,7 +2172,10 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
-    def finish_profile_change(record: ProfileChangeRecord) -> dict[str, object]:
+    def finish_profile_change(
+        idempotency_key: str,
+        record: ProfileChangeRecord,
+    ) -> dict[str, object]:
         """Finish one authoritative profile update; safe to re-run after reconciliation."""
         noun = "delivery address" if record.field == "address" else "contact number"
         update = {
@@ -2170,12 +2186,13 @@ def build_support_nodes(
             ],
         }
         verification = [grant.method for grant in verification_store.grants]
-        telemetry.record(
+        telemetry.record_once(
+            f"profile_change_confirmed:{idempotency_key}",
             {
                 "event": "profile_change_confirmed",
                 "field": record.field,
                 "verification": verification,
-            }
+            },
         )
         return update
 
@@ -2231,7 +2248,7 @@ def build_support_nodes(
                     source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
-        return finish_profile_change(record)
+        return finish_profile_change(pending.idempotency_key, record)
 
     def route_after_guardrail(state: ReasoningState) -> str:
         if state.pending_cancel is not None:

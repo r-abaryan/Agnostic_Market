@@ -29,7 +29,7 @@ _STRANGER = "CUST-002"  # a real customer (customers fixture) with NO profile on
 
 
 def _store(config_root: Path) -> ProfileStore:
-    return ProfileStore(load_profile_fixture(config_root, "acme_store"))
+    return ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store"))
 
 
 def test_fixture_loads_and_reads_through(config_root: Path) -> None:
@@ -164,7 +164,9 @@ def test_idempotency_is_scoped_per_customer(config_root: Path) -> None:
     # customer and replay independently inside each scope.
     loaded = load_profile_fixture(config_root, "acme_store")
     profile = loaded.profiles[_OWNER]
-    store = ProfileStore(ProfileFixture(profiles={_OWNER: profile, _STRANGER: profile}))
+    store = ProfileStore(
+        "acme_store", ProfileFixture(profiles={_OWNER: profile, _STRANGER: profile})
+    )
 
     first = store.update_profile(
         "shared-key", customer_ref=_OWNER, field="address", new_value="7 Elm St"

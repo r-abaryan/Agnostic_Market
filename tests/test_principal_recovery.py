@@ -288,8 +288,7 @@ def test_identity_apply_missing_invocation_fails_before_transition_publication(
     nodes = identity_flow.build_identity_nodes(
         FakeChatModel(emit_tool_calls=False),
         harness.verification,
-        harness.otp,
-        RiskProvider(flagged=False),
+        RiskProvider("acme_store", flagged=False),
         harness.customers,
         harness.identity,
         make_policy(refund_returnless_under_usd=50.0),

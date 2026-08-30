@@ -46,7 +46,7 @@ def test_contact_claim_classification_rejects_two_distinct_claims() -> None:
 
 def _directory(config_root: Path) -> CustomerDirectory:
     # From the acme_store YAML fixture (CUST-001 phone, CUST-002 email) — no hardcoded data.
-    return CustomerDirectory(load_customers_fixture(config_root, "acme_store"))
+    return CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store"))
 
 
 # --- claim matching (stub semantics: routing convenience — the OTP proves identity) --------

@@ -8,11 +8,13 @@ directory. The real payment system of record replaces this fixture in Phase 4.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from agnostic_market.commerce.identity import CustomersFixture
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 _STRICT = ConfigDict(extra="forbid")
 
@@ -75,10 +77,18 @@ def assert_payment_instruments_have_customers(
         )
 
 
+@runtime_checkable
+class PaymentInstrumentPort(TenantBound, Protocol):
+    """Masked payment-instrument lookup required by refund capabilities."""
+
+    def new_instrument_ref(self, customer_ref: str) -> str | None: ...
+
+
 class PaymentInstrumentDirectory:
     """Customer-scoped lookup for caller-speakable alternative refund destinations."""
 
-    def __init__(self, fixture: PaymentInstrumentsFixture) -> None:
+    def __init__(self, tenant_id: str, fixture: PaymentInstrumentsFixture) -> None:
+        self.tenant_id = normalize_tenant_id(tenant_id, boundary="payment instrument directory")
         self._references = {
             customer_ref: entry.masked_ref
             for customer_ref, entry in fixture.payment_instruments.items()
