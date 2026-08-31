@@ -21,6 +21,7 @@ from llm_fakes import (
 )
 from policy_helpers import make_policy
 from telemetry_helpers import make_session_telemetry
+from verification_helpers import grant_verification, make_otp_provider
 
 from agnostic_market.agents.frontline import build_frontline_graph, read_flow
 from agnostic_market.agents.frontline import graph as frontline_graph
@@ -58,7 +59,12 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.receipts import CommittedReceipt
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import (
+    RiskDecision,
+    RiskProvider,
+    RiskSubject,
+    VerificationStore,
+)
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     AbortCurrent,
@@ -101,8 +107,18 @@ from agnostic_market.session import CallerContext
 
 # A DEFERRING destination (planner) — these tests exercise the destination-agnostic handover
 _READ_ARGS = {"order_status": {"order_id": "ORD-1001"}, "catalog_search": {"query": "shoes"}}
-_TEST_OTP = "482913"
 _DISPATCH_REJECTION_LINE = "I couldn't complete that request. Please try again."
+
+
+class _RecordingRisk:
+    tenant_id = "acme_store"
+
+    def __init__(self) -> None:
+        self.subjects: list[RiskSubject] = []
+
+    async def assess(self, subject: RiskSubject) -> RiskDecision:
+        self.subjects.append(subject)
+        return RiskDecision.CLEAR
 
 
 def test_router_no_action_copy_exactly_covers_closed_reasons() -> None:
@@ -129,10 +145,12 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         max_refs=policy.cancel_batch_max
     )
     identity = kwargs.pop("identity", None) or CallerIdentityStore()
-    otp = kwargs.pop("otp", None) or OtpProvider("acme_store", valid_code=_TEST_OTP)
-    verification = kwargs.pop("verification_store", None) or VerificationStore(otp)
     telemetry = kwargs.pop("telemetry", None) or make_session_telemetry(
         "acme_store", "frontline-graph"
+    )
+    otp = kwargs.pop("otp", None) or make_otp_provider()
+    verification = kwargs.pop("verification_store", None) or VerificationStore(
+        otp, session_id=telemetry.session_id
     )
     guest_orders = kwargs.pop("guest_orders", None) or GuestOrderScope(
         tenant_id="acme_store",
@@ -221,7 +239,7 @@ def test_graph_rejects_cross_tenant_dependencies(config_root: Path, dependency: 
         "profile_store": ProfileStore(
             "other_store", load_profile_fixture(config_root, "acme_store")
         ),
-        "otp": OtpProvider("other_store", valid_code=_TEST_OTP),
+        "otp": make_otp_provider("other_store"),
         "risk": RiskProvider("other_store"),
         "telemetry": make_session_telemetry("other_store", "frontline-graph"),
     }
@@ -1499,14 +1517,16 @@ def test_identity_capability_entry_is_preparation_only(config_root: Path) -> Non
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
 
 
-async def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
+async def test_bound_verification_assesses_risk_before_reusing_a_cross_purpose_proof(
     config_root: Path,
 ) -> None:
     identity = CallerIdentityStore()
     identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
-    otp = OtpProvider("acme_store", valid_code=_TEST_OTP)
-    verification = VerificationStore(otp)
-    assert verification.verify_otp(_TEST_OTP)
+    otp = make_otp_provider()
+    verification = VerificationStore(otp, session_id="frontline-graph")
+    await grant_verification(verification, purpose="profile")
+    dispatches_before_turn = otp.dispatch_count
+    risk = _RecordingRisk()
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
     frontline = FakeChatModel()
@@ -1518,6 +1538,7 @@ async def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
         identity=identity,
         otp=otp,
         verification_store=verification,
+        risk=risk,
         cart_store=cart,
     )
 
@@ -1533,7 +1554,8 @@ async def test_bound_verification_uses_the_typed_owner_without_otp_or_rotation(
     )
 
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
-    assert otp.dispatch_count == 0
+    assert [subject.purpose for subject in risk.subjects] == ["identity"]
+    assert otp.dispatch_count == dispatches_before_turn
     assert identity.current() == BoundIdentity(
         customer_ref="CUST-001", masked_contact="number ending 0119"
     )

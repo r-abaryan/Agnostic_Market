@@ -70,6 +70,7 @@ from agnostic_market.agents.support.prompt import (
 from agnostic_market.agents.telemetry import TelemetryRecorder, record_capability_answered
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
+    VerificationFactorPort,
     order_mutation_allowed,
     order_read_allowed,
 )
@@ -95,7 +96,13 @@ from agnostic_market.commerce.spoken import (
     caller_stated_order_ids,
     caller_stated_phone,
 )
-from agnostic_market.commerce.verification import RiskPort, VerificationStore
+from agnostic_market.commerce.verification import (
+    OrderRiskSubject,
+    RiskDecision,
+    RiskPort,
+    VerificationStore,
+    VerificationSubject,
+)
 from agnostic_market.dtos.confirmation import (
     CREATE_RETURN_POLICY,
     ISSUE_REFUND_POLICY,
@@ -367,13 +374,13 @@ class SupportNodes:
     capability_render: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
-    risk_check: Callable[[ReasoningState], dict[str, object]]
-    dispatch: Callable[[ReasoningState], dict[str, object]]
-    collect: Callable[[ReasoningState], dict[str, object]]
+    risk_check: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    dispatch: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    collect: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     confirm: Callable[[ReasoningState], dict[str, object]]
     place: Callable[[ReasoningState], dict[str, object]]
     finish_refund: Callable[[str, RefundRecord], dict[str, object]]
-    cancel_guardrail: Callable[[ReasoningState], dict[str, object]]
+    cancel_guardrail: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     cancel_confirm: Callable[[ReasoningState], dict[str, object]]
     cancel_void: Callable[[ReasoningState], dict[str, object]]
     finish_cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
@@ -384,13 +391,13 @@ class SupportNodes:
     # After resolve: "confirm" (batch frozen -> cancel guardrail) | "clarify" (>2 for 'both',
     # or nothing cancellable: the node spoke + ends).
     route_after_resolve: Callable[[ReasoningState], str]
-    # Branch after the refund guardrail depends on the LIVE verification level (in the store,
-    # which graph.py can't see) — so the flow owns this router, closed over the store.
-    # "confirm" (level sufficient) | "stepup" (OTP loop) | "cancel" (remedy steer) |
+    # The refund guardrail resolves policy and sends L2 actions through current risk assessment.
+    # "confirm" (L1 action) | "stepup" (risk, then proof reuse or OTP) | "cancel" (remedy steer) |
     # "return" (return-first steer, Group C) | "declined" (node spoke + ends).
     route_after_guardrail: Callable[[ReasoningState], str]
-    # Branch after collect: the OTP verify may have raised to L2 (-> confirm), exhausted
-    # attempts / flagged risk (-> handover), or asked for a re-collect (-> dispatch again).
+    # Reassess action risk before either reusing a fresh factor proof or dispatching OTP.
+    route_after_risk: Callable[[ReasoningState], str]
+    # Branch after collect: confirm a valid proof, retry the same challenge, or hand over.
     route_after_collect: Callable[[ReasoningState], str]
     # Branch after the cancel guardrail depends on the LIVE order status + risk (store-owned).
     # "confirm" (processing, no risk) | "handover" (shipped/delivered or risk-flagged).
@@ -406,15 +413,16 @@ class SupportNodes:
     # The step-up nodes are the FACTORY's profile instances — same bodies as the refund
     # chain, own graph node names + confirm target (R5).
     profile_guardrail: Callable[[ReasoningState], dict[str, object]]
-    profile_risk_check: Callable[[ReasoningState], dict[str, object]]
-    profile_dispatch: Callable[[ReasoningState], dict[str, object]]
-    profile_collect: Callable[[ReasoningState], dict[str, object]]
+    profile_risk_check: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    profile_dispatch: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    profile_collect: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     profile_confirm: Callable[[ReasoningState], dict[str, object]]
-    profile_place: Callable[[ReasoningState], dict[str, object]]
-    finish_profile_change: Callable[[str, ProfileChangeRecord], dict[str, object]]
-    # "confirm" (level sufficient) | "stepup" (needs the OTP loop on the OLD factor).
+    profile_place: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    finish_profile_change: Callable[[str, ProfileChangeRecord], Awaitable[dict[str, object]]]
+    # Profile changes always enter risk; the next router reuses a fresh proof or dispatches OTP.
     route_after_profile_guardrail: Callable[[ReasoningState], str]
-    # "confirm" | "dispatch" (re-collect) | "handover" — the factory's decision router.
+    route_after_profile_risk: Callable[[ReasoningState], str]
+    # Confirm a valid proof, retry the same challenge, or hand over.
     route_after_profile_collect: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
@@ -429,6 +437,7 @@ def build_support_nodes(
     profile_store: ProfilePort,
     recent_orders: RecentOrderContext,
     payment_instruments: PaymentInstrumentPort,
+    verification_factors: VerificationFactorPort,
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
@@ -1149,6 +1158,8 @@ def build_support_nodes(
     def _mint_refund(
         chosen: OrderCandidate, *, amount_usd: UsdAmount, destination: RefundDestination
     ) -> PendingRefund | None:
+        customer_ref: str | None = None
+        factor_ref: str | None = None
         if destination == "original":
             instrument_ref = "original payment method"
         elif destination == "new_instrument":
@@ -1163,6 +1174,9 @@ def build_support_nodes(
             )
             if instrument_ref is None:
                 return None
+            factor_ref = verification_factors.verification_factor_ref(customer_ref)
+            if factor_ref is None:
+                return None
         else:
             # There is no typed payout-address reference in this build.
             return None
@@ -1172,8 +1186,11 @@ def build_support_nodes(
             amount_usd=amount_usd,
             destination=destination,
             instrument_ref=instrument_ref,
+            customer_ref=customer_ref,
+            factor_ref=factor_ref,
             idempotency_key=uuid.uuid4().hex,
             attempt_key=uuid.uuid4().hex,
+            challenge_id=None,
             created_at=time.time(),
         )
 
@@ -1197,13 +1214,17 @@ def build_support_nodes(
         if bound is None or not profile_store.has_profile(bound.customer_ref):
             return None
         assert change.new_value is not None
+        factor_ref = verification_factors.verification_factor_ref(bound.customer_ref)
+        if factor_ref is None:
+            return None
         return PendingProfileChange(
             customer_ref=bound.customer_ref,
             field=change.field,
             new_value=change.new_value,
-            factor_ref=profile_store.contact_on_file(bound.customer_ref),
+            factor_ref=factor_ref,
             idempotency_key=uuid.uuid4().hex,
             attempt_key=uuid.uuid4().hex,
+            challenge_id=None,
             created_at=time.time(),
         )
 
@@ -1408,7 +1429,10 @@ def build_support_nodes(
                 ],
             }
         required = refund_required_level(pending.amount_usd, pending.destination)
-        if verification_store.current_level() < required:
+        if required > 1 and not verification_store.authorization_satisfies(
+            _refund_subject(pending),
+            required,
+        ):
             telemetry.record({"event": "refund_stepup_required", "required_level": required})
         return {}
 
@@ -1416,13 +1440,27 @@ def build_support_nodes(
     # family-parametrized factory (_stepup.py, Group C) so the profile flow runs the SAME
     # code. Refund behavior + event names are byte-identical to the pre-factory nodes; the
     # five T3 security tests are the regression gate for this extraction.
+    def _refund_required_level(pending: PendingRefund) -> int:
+        return refund_required_level(pending.amount_usd, pending.destination)
+
+    def _refund_subject(pending: PendingRefund) -> VerificationSubject:
+        if pending.customer_ref is None or pending.factor_ref is None:
+            raise ValueError("pending refund requires a complete verification subject")
+        return verification_store.subject(
+            customer_ref=pending.customer_ref,
+            factor_ref=pending.factor_ref,
+            purpose="refund",
+        )
+
     refund_stepup = build_stepup_nodes(
         verification_store,
         risk,
         pending_field="pending_refund",
         pending_type=PendingRefund,
-        required_level=lambda p: refund_required_level(p.amount_usd, p.destination),
+        required_level=_refund_required_level,
+        subject=_refund_subject,
         event_prefix="refund",
+        reuse_existing_proof=True,
         max_otp_attempts=policy.otp_max_attempts,
         telemetry=telemetry,
     )
@@ -1509,7 +1547,10 @@ def build_support_nodes(
         pending = state.pending_refund
         assert pending is not None
         required = refund_required_level(pending.amount_usd, pending.destination)
-        if verification_store.current_level() < required:
+        if required > 1 and not verification_store.authorization_satisfies(
+            _refund_subject(pending),
+            required,
+        ):
             # Belt-and-suspenders: the level was lost between apply and place (revoked). Do
             # NOT move money; drop back to a human. (Not reachable in the happy path.)
             telemetry.record({"event": "refund_stepup_failed", "reason": "level_lapsed_at_place"})
@@ -1574,7 +1615,7 @@ def build_support_nodes(
             )
         return None
 
-    def cancel_guardrail_node(state: ReasoningState) -> dict[str, object]:
+    async def cancel_guardrail_node(state: ReasoningState) -> dict[str, object]:
         """CODE-enforced batch eligibility (never the model). Partitions the targets into the
         ELIGIBLE subset (survives to the readback) and the INELIGIBLE ones (stated at the
         readback so the caller hears the whole truth), each via `_preflight_target`'s live
@@ -1588,7 +1629,12 @@ def build_support_nodes(
         outcomes; on an eligible subset it takes no other side effect (router -> confirm)."""
         pending = state.pending_cancel
         assert isinstance(pending, PendingCancelBatch)
-        if risk.check_sim_swap():
+        risk_subject = OrderRiskSubject(
+            tenant_id=risk.tenant_id,
+            session_id=guest_orders.session_id,
+            order_refs=tuple(target.order_id for target in pending.targets),
+        )
+        if await risk.assess(risk_subject) is RiskDecision.BLOCKED:
             telemetry.record({"event": "cancel_stepup_to_human", "reason": "risk_flagged"})
             return {
                 "pending_cancel": None,
@@ -2091,13 +2137,27 @@ def build_support_nodes(
     # --- profile-change sub-path (Group C; the refund T3 shape minus money:
     # ---  guardrail -> [risk_check -> dispatch -> collect(INT)] -> confirm(INT) -> place) --
 
+    def _profile_required_level(pending: PendingProfileChange) -> int:
+        return profile_change_required_level(pending.field)
+
+    def _profile_subject(pending: PendingProfileChange) -> VerificationSubject:
+        if pending.customer_ref is None or pending.factor_ref is None:
+            raise ValueError("pending profile change requires a complete verification subject")
+        return verification_store.subject(
+            customer_ref=pending.customer_ref,
+            factor_ref=pending.factor_ref,
+            purpose="profile",
+        )
+
     profile_stepup = build_stepup_nodes(
         verification_store,
         risk,
         pending_field="pending_profile_change",
         pending_type=PendingProfileChange,
-        required_level=lambda p: profile_change_required_level(p.field),
+        required_level=_profile_required_level,
+        subject=_profile_subject,
         event_prefix="profile",
+        reuse_existing_proof=True,
         max_otp_attempts=policy.otp_max_attempts,
         telemetry=telemetry,
     )
@@ -2105,12 +2165,15 @@ def build_support_nodes(
     def profile_guardrail_node(state: ReasoningState) -> dict[str, object]:
         """CODE-gate for a profile change: no merchant tiers (address/contact have no
         merchant knobs — the L2 requirement is the §A4a platform floor), so this node only
-        records whether a step-up is needed; the router (closed over the LIVE store) decides
-        confirm vs stepup. The OTP goes to the number-on-file — for a contact change that is
-        the OLD factor: changing the factor requires the factor (the ladder constraint)."""
+        records whether a fresh proof is available before the mandatory risk check. If OTP is
+        needed, it goes to the number on file. For a contact change that is the old factor:
+        changing the factor requires the factor (the ladder constraint)."""
         pending = state.pending_profile_change
         assert pending is not None
-        if verification_store.current_level() < profile_change_required_level(pending.field):
+        if not verification_store.authorization_satisfies(
+            _profile_subject(pending),
+            profile_change_required_level(pending.field),
+        ):
             telemetry.record(
                 {"event": "profile_stepup_required", "required_level": 2, "field": pending.field}
             )
@@ -2119,8 +2182,7 @@ def build_support_nodes(
     def route_after_profile_guardrail(state: ReasoningState) -> str:
         pending = state.pending_profile_change
         assert pending is not None
-        required = profile_change_required_level(pending.field)
-        return "confirm" if verification_store.current_level() >= required else "stepup"
+        return "stepup"
 
     def profile_confirm_node(state: ReasoningState) -> dict[str, object]:
         """HITL interrupt: the profile-change readback + deterministic consent. NO side
@@ -2172,11 +2234,14 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
-    def finish_profile_change(
+    async def finish_profile_change(
         idempotency_key: str,
         record: ProfileChangeRecord,
     ) -> dict[str, object]:
         """Finish one authoritative profile update; safe to re-run after reconciliation."""
+        verification = [grant.method for grant in verification_store.grants]
+        if record.field == "contact":
+            await verification_store.clear()
         noun = "delivery address" if record.field == "address" else "contact number"
         update = {
             "pending_profile_change": None,
@@ -2185,7 +2250,6 @@ def build_support_nodes(
                 AIMessage(f"Done - the {noun} on your account is updated to {record.new_value}.")
             ],
         }
-        verification = [grant.method for grant in verification_store.grants]
         telemetry.record_once(
             f"profile_change_confirmed:{idempotency_key}",
             {
@@ -2196,7 +2260,7 @@ def build_support_nodes(
         )
         return update
 
-    def profile_place_node(state: ReasoningState) -> dict[str, object]:
+    async def profile_place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Re-validates the LIVE
         level FIRST (§A4c — the change must not apply if the L2 grant lapsed between collect
         and here), then applies via the store's per-intent key (idempotent). Telemetry
@@ -2211,7 +2275,10 @@ def build_support_nodes(
         # a change to the wrong / an unauthorized account).
         bound = identity_store.current()
         binding_holds = bound is not None and bound.customer_ref == pending.customer_ref
-        if verification_store.current_level() < required or not binding_holds:
+        if (
+            not verification_store.authorization_satisfies(_profile_subject(pending), required)
+            or not binding_holds
+        ):
             reason = "level_lapsed_at_place" if binding_holds else "binding_lapsed_at_place"
             telemetry.record({"event": "profile_stepup_failed", "reason": reason})
             return {
@@ -2248,7 +2315,7 @@ def build_support_nodes(
                     source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
-        return finish_profile_change(pending.idempotency_key, record)
+        return await finish_profile_change(pending.idempotency_key, record)
 
     def route_after_guardrail(state: ReasoningState) -> str:
         if state.pending_cancel is not None:
@@ -2259,7 +2326,7 @@ def build_support_nodes(
         if pending is None:
             return "declined"  # over-amount/cancelled: the node spoke its own line + ends
         required = refund_required_level(pending.amount_usd, pending.destination)
-        return "confirm" if verification_store.current_level() >= required else "stepup"
+        return "confirm" if required == 1 else "stepup"
 
     def route_after_capability_entry(state: ReasoningState) -> str:
         # Which effect did assemble mint? (a valid proposal sets exactly one pending.)
@@ -2329,6 +2396,7 @@ def build_support_nodes(
         route_after_capability_entry=route_after_capability_entry,
         route_after_resolve=route_after_resolve,
         route_after_guardrail=route_after_guardrail,
+        route_after_risk=refund_stepup.route_after_risk,
         route_after_collect=refund_stepup.route_after_collect,
         route_after_cancel_guardrail=route_after_cancel_guardrail,
         return_guardrail=return_guardrail_node,
@@ -2344,6 +2412,7 @@ def build_support_nodes(
         profile_place=profile_place_node,
         finish_profile_change=finish_profile_change,
         route_after_profile_guardrail=route_after_profile_guardrail,
+        route_after_profile_risk=profile_stepup.route_after_risk,
         route_after_profile_collect=profile_stepup.route_after_collect,
         speakable_nodes=frozenset(
             {

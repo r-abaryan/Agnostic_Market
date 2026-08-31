@@ -61,6 +61,9 @@ from agnostic_market.dtos.state import (
     CheckpointSchemaError,
     HandoffRequest,
     HandoffSource,
+    PendingIdentity,
+    PendingProfileChange,
+    PendingRefund,
     ReasoningState,
     open_active_invocation,
 )
@@ -368,19 +371,19 @@ def test_checkpoint_state_rejects_unknown_fields() -> None:
 def test_checkpoint_state_has_an_explicit_version_and_execution_owner() -> None:
     state = ReasoningState(execution_owner="cart")
 
-    assert state.checkpoint_schema_version == "1"
+    assert state.checkpoint_schema_version == "2"
     assert state.execution_owner == "cart"
     assert "active_flow" not in ReasoningState.model_fields
     assert ReasoningState.from_checkpoint({}) == ReasoningState()
     with pytest.raises(ValueError, match="checkpoint_schema_version"):
         ReasoningState.from_checkpoint({"consumed_turn_ids": ("turn-1",)})
     with pytest.raises(ValidationError, match="checkpoint_schema_version"):
-        ReasoningState(checkpoint_schema_version="2")
+        ReasoningState(checkpoint_schema_version="1")
 
 
 def test_checkpoint_loader_rejects_a_mutated_state_instance() -> None:
     state = ReasoningState()
-    state.checkpoint_schema_version = "2"  # type: ignore[assignment]
+    state.checkpoint_schema_version = "1"  # type: ignore[assignment]
 
     with pytest.raises(CheckpointSchemaError, match="mapping"):
         ReasoningState.from_checkpoint(state)  # type: ignore[arg-type]
@@ -464,6 +467,178 @@ def test_reasoning_state_distinguishes_latest_history_from_the_current_admitted_
     assert missing.committed_user_message("turn-1").content == "older question"
 
 
+def _verification_proof(**updates) -> VerificationProof:
+    values = {
+        "tenant_id": "acme_store",
+        "session_id": "session-1",
+        "customer_ref": "CUST-001",
+        "factor_ref": "CUST-001",
+        "purpose": "identity",
+        "challenge_id": "challenge-1",
+        "verified_at_epoch": 1.0,
+        "expires_at_epoch": 301.0,
+    }
+    values.update(updates)
+    return VerificationProof.model_validate(values)
+
+
+def test_verification_proof_rejects_an_infinite_timestamp() -> None:
+    with pytest.raises(ValidationError):
+        _verification_proof(verified_at_epoch=float("inf"))
+
+
+@pytest.mark.parametrize("destination", ["new_instrument", "new_address"])
+def test_l2_refund_destination_requires_a_verification_subject(destination: str) -> None:
+    with pytest.raises(ValidationError, match="verification subject"):
+        PendingRefund(
+            order_id="ORD-1001",
+            summary="waterproof jacket",
+            amount_usd=Decimal("20.00"),
+            destination=destination,
+            instrument_ref="instrument-1",
+            customer_ref=None,
+            factor_ref=None,
+            idempotency_key="refund-1",
+            attempt_key="attempt-1",
+            challenge_id=None,
+            created_at=1.0,
+        )
+
+
+def test_refund_verification_subject_rejects_blank_identifiers() -> None:
+    with pytest.raises(ValidationError):
+        PendingRefund(
+            order_id="ORD-1001",
+            summary="waterproof jacket",
+            amount_usd=Decimal("20.00"),
+            destination="new_instrument",
+            instrument_ref="instrument-1",
+            customer_ref="",
+            factor_ref="",
+            idempotency_key="refund-1",
+            attempt_key="attempt-1",
+            challenge_id=None,
+            created_at=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("pending_type", "payload"),
+    [
+        (
+            PendingRefund,
+            {
+                "order_id": "ORD-1001",
+                "summary": "waterproof jacket",
+                "amount_usd": Decimal("20.00"),
+                "destination": "new_instrument",
+                "instrument_ref": "instrument-1",
+                "customer_ref": "CUST-001",
+                "factor_ref": "factor-1",
+                "idempotency_key": "refund-1",
+                "attempt_key": "attempt-1",
+                "challenge_id": "",
+                "created_at": 1.0,
+            },
+        ),
+        (
+            PendingProfileChange,
+            {
+                "customer_ref": "CUST-001",
+                "field": "address",
+                "new_value": "10 Test Street",
+                "factor_ref": "factor-1",
+                "idempotency_key": "profile-1",
+                "attempt_key": "attempt-1",
+                "challenge_id": "",
+                "created_at": 1.0,
+            },
+        ),
+        (
+            PendingIdentity,
+            {
+                "customer_ref": "CUST-001",
+                "masked_contact": "number ending 0119",
+                "factor_ref": "factor-1",
+                "attempt_key": "attempt-1",
+                "challenge_id": "",
+            },
+        ),
+    ],
+)
+def test_pending_verification_rejects_a_blank_challenge_id(
+    pending_type: type[BaseModel],
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        pending_type.model_validate(payload)
+
+
+def _pending_verification_payload(pending_field: str) -> dict[str, object]:
+    if pending_field == "pending_identity":
+        return {
+            "customer_ref": "CUST-001",
+            "masked_contact": "number ending 0119",
+            "factor_ref": "factor-1",
+            "attempt_key": "attempt-1",
+            "challenge_id": None,
+        }
+    if pending_field == "pending_profile_change":
+        return {
+            "customer_ref": "CUST-001",
+            "field": "address",
+            "new_value": "10 Test Street",
+            "factor_ref": "factor-1",
+            "idempotency_key": "profile-1",
+            "attempt_key": "attempt-1",
+            "challenge_id": None,
+            "created_at": 1.0,
+        }
+    if pending_field == "pending_refund":
+        return {
+            "order_id": "ORD-1001",
+            "summary": "waterproof jacket",
+            "amount_usd": Decimal("20.00"),
+            "destination": "new_instrument",
+            "instrument_ref": "instrument-1",
+            "customer_ref": "CUST-001",
+            "factor_ref": "factor-1",
+            "idempotency_key": "refund-1",
+            "attempt_key": "attempt-1",
+            "challenge_id": None,
+            "created_at": 1.0,
+        }
+    raise AssertionError(f"unknown pending verification field: {pending_field}")
+
+
+@pytest.mark.parametrize(
+    ("pending_field", "identifier"),
+    [
+        ("pending_identity", "factor_ref"),
+        ("pending_identity", "attempt_key"),
+        ("pending_profile_change", "factor_ref"),
+        ("pending_profile_change", "idempotency_key"),
+        ("pending_profile_change", "attempt_key"),
+        ("pending_refund", "factor_ref"),
+        ("pending_refund", "idempotency_key"),
+        ("pending_refund", "attempt_key"),
+    ],
+)
+def test_checkpoint_loader_rejects_whitespace_verification_identifiers(
+    pending_field: str,
+    identifier: str,
+) -> None:
+    payload = _pending_verification_payload(pending_field)
+    payload[identifier] = "   "
+    with pytest.raises(CheckpointSchemaError):
+        ReasoningState.from_checkpoint(
+            {
+                "checkpoint_schema_version": "2",
+                pending_field: payload,
+            }
+        )
+
+
 def test_principal_transition_projection_is_closed_and_context_free() -> None:
     allowed = (
         ListOrders(scope="account"),
@@ -478,7 +653,7 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
     switch = PrincipalTransition(
         customer_ref="CUST-001",
         masked_contact="number ending 0119",
-        fresh_proof=VerificationProof(),
+        fresh_proof=_verification_proof(),
         initiating_request=SwitchAccount(),
     )
     assert switch.continuation is None
@@ -486,7 +661,7 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
     verification = PrincipalTransition(
         customer_ref="CUST-001",
         masked_contact="number ending 0119",
-        fresh_proof=VerificationProof(),
+        fresh_proof=_verification_proof(),
         initiating_request=VerifyIdentity(),
     )
     assert verification.continuation is None
@@ -498,7 +673,7 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
         transition = PrincipalTransition(
             customer_ref="CUST-001",
             masked_contact="number ending 0119",
-            fresh_proof=VerificationProof(),
+            fresh_proof=_verification_proof(),
             initiating_request=request,
         )
         assert transition.continuation == request
@@ -520,7 +695,7 @@ def test_principal_transition_projection_is_closed_and_context_free() -> None:
             PrincipalTransition(
                 customer_ref="CUST-001",
                 masked_contact="number ending 0119",
-                fresh_proof=VerificationProof(),
+                fresh_proof=_verification_proof(),
                 initiating_request=request,
             )
 

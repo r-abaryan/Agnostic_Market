@@ -29,12 +29,17 @@ from agnostic_market.dtos.money import PositiveUsdAmount
 
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+type NonNegativeFiniteEpoch = Annotated[
+    float,
+    Field(ge=0, allow_inf_nan=False),
+]
 CancelScope = Literal["all_cancellable", "both_cancellable"]
 OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
 AnswerTopic = Literal["policy", "general"]
 ListOrderScope = Literal["session", "account"]
 CartOperation = Literal["add", "remove", "set_quantity"]
 OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
+VerificationPurpose = Literal["identity", "profile", "refund"]
 
 
 class IntentRequestModel(BaseModel):
@@ -650,13 +655,27 @@ class RoutingContext(BaseModel):
 
 
 class VerificationProof(BaseModel):
-    """One committed proof that may initialize a freshly rotated principal context."""
+    """One challenge-bound proof that may initialize a freshly rotated principal context."""
 
     model_config = _FROZEN
 
     proof_id: NonEmptyText = Field(default_factory=lambda: uuid.uuid4().hex)
     method: Literal["otp"] = "otp"
     raised_to: Literal[2] = 2
+    tenant_id: NonEmptyText
+    session_id: NonEmptyText
+    customer_ref: NonEmptyText
+    factor_ref: NonEmptyText
+    purpose: VerificationPurpose
+    challenge_id: NonEmptyText
+    verified_at_epoch: NonNegativeFiniteEpoch
+    expires_at_epoch: NonNegativeFiniteEpoch
+
+    @model_validator(mode="after")
+    def expiry_follows_verification(self) -> VerificationProof:
+        if self.expires_at_epoch <= self.verified_at_epoch:
+            raise ValueError("verification proof expiry must follow verification")
+        return self
 
 
 PrincipalCompletionKind = Literal[
@@ -745,6 +764,10 @@ class PrincipalTransition(BaseModel):
     @model_validator(mode="after")
     def initiating_request_is_allowlisted(self) -> PrincipalTransition:
         project_principal_transition(self.initiating_request)
+        if self.fresh_proof.customer_ref != self.customer_ref:
+            raise ValueError("principal transition proof does not match the customer")
+        if self.fresh_proof.purpose != "identity":
+            raise ValueError("principal transition requires an identity verification proof")
         return self
 
 

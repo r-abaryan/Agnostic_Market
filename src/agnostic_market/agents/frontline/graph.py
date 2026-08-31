@@ -515,6 +515,7 @@ def build_frontline_graph(
         profile_store,
         recent_orders,
         payment_instruments,
+        customers,
         identity_store=identity_store,
         display_name=display_name,
         telemetry=telemetry,
@@ -721,24 +722,17 @@ def build_frontline_graph(
             "clarify": "identity_ask_contact",
         }[decision]
 
-    def route_after_identity_guardrail(state: ReasoningState) -> str:
-        # "confirm" (already bound to THIS customer at level) goes straight to apply —
-        # identity has no confirm interrupt (nothing irreversible happens at a re-list).
-        return {
-            "confirm": "identity_apply",
-            "stepup": "identity_risk_check",
-        }[identity.route_after_guardrail(state)]
-
     def route_after_identity_risk(state: ReasoningState) -> str:
-        # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
-        return "handover" if state.handover is not None else "identity_dispatch"
-
-    def route_after_identity_collect(state: ReasoningState) -> str:
-        # The flow's WRAPPED factory decision (binding invariant: a stale cross-family L2
-        # "confirm" with no new grant re-collects) mapped to THIS family's nodes.
         return {
             "confirm": "identity_apply",
             "dispatch": "identity_dispatch",
+            "handover": "handover",
+        }[identity.route_after_risk(state)]
+
+    def route_after_identity_collect(state: ReasoningState) -> str:
+        return {
+            "confirm": "identity_apply",
+            "collect": "identity_collect",
             "handover": "handover",
         }[identity.route_after_collect(state)]
 
@@ -810,8 +804,9 @@ def build_frontline_graph(
         return "support_cancel_void" if state.pending_cancel is not None else END
 
     def route_support_guardrail(state: ReasoningState) -> str:
-        # "confirm" (level ok) | "stepup" (-> risk_check) | "declined" (over amount /
-        # cancelled / open return: guardrail spoke its line + ends) | "cancel" (remedy
+        # "confirm" (L1 action) | "stepup" (risk, then proof reuse or OTP) |
+        # "declined" (over amount / cancelled / open return: guardrail spoke its line + ends) |
+        # "cancel" (remedy
         # steer) | "return" (return-first steer, Group C).
         decision = support.route_after_guardrail(state)
         return {
@@ -842,24 +837,25 @@ def build_frontline_graph(
         return "handover" if state.handover is not None else END
 
     def route_after_support_profile_guardrail(state: ReasoningState) -> str:
-        # "confirm" (already L2) | "stepup" (OTP on the OLD factor) — flow-owned decision
-        # (the LIVE level lives in the store, which graph.py can't see).
+        # Profile changes always enter risk before proof reuse or OTP on the old factor.
         return {
             "confirm": "support_profile_confirm",
             "stepup": "support_profile_risk_check",
         }[support.route_after_profile_guardrail(state)]
 
     def route_after_support_profile_risk(state: ReasoningState) -> str:
-        # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
-        return "handover" if state.handover is not None else "support_profile_dispatch"
-
-    def route_after_support_profile_collect(state: ReasoningState) -> str:
-        # The factory's decision ("confirm" | "dispatch" | "handover") mapped to THIS
-        # family's nodes — the confirm target is per-family (R5), never shared.
-        decision = support.route_after_profile_collect(state)
         return {
             "confirm": "support_profile_confirm",
             "dispatch": "support_profile_dispatch",
+            "handover": "handover",
+        }[support.route_after_profile_risk(state)]
+
+    def route_after_support_profile_collect(state: ReasoningState) -> str:
+        # The confirm target is family-specific. A mismatch returns to this collect node.
+        decision = support.route_after_profile_collect(state)
+        return {
+            "confirm": "support_profile_confirm",
+            "collect": "support_profile_collect",
             "handover": "handover",
         }[decision]
 
@@ -875,15 +871,18 @@ def build_frontline_graph(
         return "handover" if state.handover is not None else END
 
     def route_after_support_risk(state: ReasoningState) -> str:
-        # risk_check sets a handover on a SIM-swap flag; otherwise proceed to dispatch.
-        return "handover" if state.handover is not None else "support_dispatch"
+        return {
+            "confirm": "support_confirm",
+            "dispatch": "support_dispatch",
+            "handover": "handover",
+        }[support.route_after_risk(state)]
 
     def route_after_support_collect(state: ReasoningState) -> str:
         # "confirm" (raised to L2) | "dispatch" (re-collect) | "handover" (exhausted).
         decision = support.route_after_collect(state)
         return {
             "confirm": "support_confirm",
-            "dispatch": "support_dispatch",
+            "collect": "support_collect",
             "handover": "handover",
         }[decision]
 
@@ -1440,7 +1439,11 @@ def build_frontline_graph(
     graph.add_conditional_edges(
         "support_risk_check",
         route_after_support_risk,
-        {"support_dispatch": "support_dispatch", "handover": "handover"},
+        {
+            "support_confirm": "support_confirm",
+            "support_dispatch": "support_dispatch",
+            "handover": "handover",
+        },
     )
     graph.add_edge("support_dispatch", "support_collect")
     graph.add_conditional_edges(
@@ -1448,7 +1451,7 @@ def build_frontline_graph(
         route_after_support_collect,
         {
             "support_confirm": "support_confirm",
-            "support_dispatch": "support_dispatch",
+            "support_collect": "support_collect",
             "handover": "handover",
         },
     )
@@ -1512,7 +1515,11 @@ def build_frontline_graph(
     graph.add_conditional_edges(
         "support_profile_risk_check",
         route_after_support_profile_risk,
-        {"support_profile_dispatch": "support_profile_dispatch", "handover": "handover"},
+        {
+            "support_profile_confirm": "support_profile_confirm",
+            "support_profile_dispatch": "support_profile_dispatch",
+            "handover": "handover",
+        },
     )
     graph.add_edge("support_profile_dispatch", "support_profile_collect")
     graph.add_conditional_edges(
@@ -1520,7 +1527,7 @@ def build_frontline_graph(
         route_after_support_profile_collect,
         {
             "support_profile_confirm": "support_profile_confirm",
-            "support_profile_dispatch": "support_profile_dispatch",
+            "support_profile_collect": "support_profile_collect",
             "handover": "handover",
         },
     )
@@ -1548,18 +1555,15 @@ def build_frontline_graph(
     )
     graph.add_edge("identity_ask_contact", END)
     graph.add_edge("identity_reask", END)
-    graph.add_conditional_edges(
-        "identity_guardrail",
-        route_after_identity_guardrail,
-        {
-            "identity_apply": "identity_apply",
-            "identity_risk_check": "identity_risk_check",
-        },
-    )
+    graph.add_edge("identity_guardrail", "identity_risk_check")
     graph.add_conditional_edges(
         "identity_risk_check",
         route_after_identity_risk,
-        {"identity_dispatch": "identity_dispatch", "handover": "handover"},
+        {
+            "identity_apply": "identity_apply",
+            "identity_dispatch": "identity_dispatch",
+            "handover": "handover",
+        },
     )
     graph.add_edge("identity_dispatch", "identity_collect")
     graph.add_conditional_edges(
@@ -1567,7 +1571,7 @@ def build_frontline_graph(
         route_after_identity_collect,
         {
             "identity_apply": "identity_apply",
-            "identity_dispatch": "identity_dispatch",
+            "identity_collect": "identity_collect",
             "handover": "handover",
         },
     )

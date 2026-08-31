@@ -62,6 +62,11 @@ def test_graph_consumers_depend_on_tenant_service_ports() -> None:
         assert {name: annotations[name] for name in expected} == expected
 
 
+def test_remote_verification_ports_are_native_async() -> None:
+    for method in (OtpPort.dispatch, OtpPort.verify, OtpPort.retain_only, RiskPort.assess):
+        assert inspect.iscoroutinefunction(method), method.__qualname__
+
+
 def test_port_contract_typecheck_covers_declared_consumers() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     config_path = repository_root / "pyright.port-contracts.json"

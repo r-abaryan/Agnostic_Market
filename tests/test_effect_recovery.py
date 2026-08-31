@@ -16,6 +16,7 @@ from langgraph.types import Command
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
+from verification_helpers import TEST_FACTOR_REFS, grant_verification
 
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
@@ -87,7 +88,7 @@ async def _run_seeded_effect(harness: SupportHarness) -> list[str]:
     ]
 
 
-def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:
+async def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:
     now = time.time()
     if effect == "placement":
         line = harness.caller_context.cart_store.add_item(
@@ -126,8 +127,11 @@ def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:
                 amount_usd=40.0,
                 destination="original",
                 instrument_ref="original payment method",
+                customer_ref=None,
+                factor_ref=None,
                 idempotency_key="recover-refund",
                 attempt_key="recover-refund-otp",
+                challenge_id=None,
                 created_at=now,
             ),
             predecessor="support_confirm",
@@ -188,16 +192,17 @@ def _case(harness: SupportHarness, effect: EffectName) -> _EffectCase:
         )
 
     harness.identity.bind(BoundIdentity(customer_ref=_OWNER, masked_contact="number ending 0119"))
-    assert harness.verification.verify_otp("482913")
+    await grant_verification(harness.verification, purpose="profile")
     return _EffectCase(
         pending_field="pending_profile_change",
         pending=PendingProfileChange(
             customer_ref=_OWNER,
             field="address",
             new_value="7 Elm Street",
-            factor_ref="number ending 0119",
+            factor_ref=TEST_FACTOR_REFS[_OWNER],
             idempotency_key="recover-profile",
             attempt_key="recover-profile-otp",
+            challenge_id=None,
             created_at=now,
         ),
         predecessor="support_profile_confirm",
@@ -249,7 +254,7 @@ async def test_external_cancellation_reconciles_every_effect_without_replaying_m
         policy=make_policy(),
         thread_id=f"{effect}-cancel-{'post' if commits_before_cancellation else 'pre'}",
     )
-    case = _case(harness, effect)
+    case = await _case(harness, effect)
     original = getattr(case.owner, case.mutator_name)
     entered = threading.Event()
     release = threading.Event()
@@ -353,7 +358,7 @@ async def test_effect_failure_reconciles_from_receipt_without_replaying_mutator(
         policy=make_policy(),
         thread_id=f"{effect}-{'post' if commits_before_failure else 'pre'}-effect",
     )
-    case = _case(harness, effect)
+    case = await _case(harness, effect)
     original = getattr(case.owner, case.mutator_name)
     calls = 0
 
@@ -408,7 +413,7 @@ async def test_post_commit_projection_failure_reuses_finisher_and_logs_success_o
         policy=make_policy(),
         thread_id=f"{effect}-projection-recovery",
     )
-    case = _case(harness, effect)
+    case = await _case(harness, effect)
     original_record = harness.recent_orders.record
     projection_calls = 0
 
@@ -436,7 +441,7 @@ async def test_post_commit_projection_failure_reuses_finisher_and_logs_success_o
 
 @pytest.mark.parametrize("effect", _EFFECTS)
 @pytest.mark.parametrize("reason", ("key_conflict", "pending", "unavailable"))
-def test_indeterminate_receipt_terminalizes_without_an_effect_claim(
+async def test_indeterminate_receipt_terminalizes_without_an_effect_claim(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     effect: EffectName,
@@ -447,7 +452,7 @@ def test_indeterminate_receipt_terminalizes_without_an_effect_claim(
         policy=make_policy(),
         thread_id=f"{effect}-indeterminate-{reason}",
     )
-    case = _case(harness, effect)
+    case = await _case(harness, effect)
     monkeypatch.setattr(
         case.owner,
         _RECEIPT_NAMES[effect],
@@ -464,7 +469,7 @@ def test_indeterminate_receipt_terminalizes_without_an_effect_claim(
         }
     )
 
-    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+    update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
 
     assert update["automation_terminal"] is True
     assert update[case.pending_field] is None
@@ -473,7 +478,7 @@ def test_indeterminate_receipt_terminalizes_without_an_effect_claim(
 
 
 @pytest.mark.parametrize("effect", _EFFECTS)
-def test_committed_receipt_with_wrong_record_shape_terminalizes(
+async def test_committed_receipt_with_wrong_record_shape_terminalizes(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     effect: EffectName,
@@ -483,7 +488,7 @@ def test_committed_receipt_with_wrong_record_shape_terminalizes(
         policy=make_policy(),
         thread_id=f"{effect}-wrong-receipt-shape",
     )
-    case = _case(harness, effect)
+    case = await _case(harness, effect)
     monkeypatch.setattr(
         case.owner,
         _RECEIPT_NAMES[effect],
@@ -500,7 +505,7 @@ def test_committed_receipt_with_wrong_record_shape_terminalizes(
         }
     )
 
-    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+    update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
 
     assert update["automation_terminal"] is True
     assert update[case.pending_field] is None
@@ -508,7 +513,7 @@ def test_committed_receipt_with_wrong_record_shape_terminalizes(
     assert _effect_count(case) == 0
 
 
-def test_missing_pending_effect_contract_terminalizes(
+async def test_missing_pending_effect_contract_terminalizes(
     config_root: Path,
 ) -> None:
     harness = build_support_engine(
@@ -524,7 +529,7 @@ def test_missing_pending_effect_contract_terminalizes(
         )
     )
 
-    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+    update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
 
     assert update["automation_terminal"] is True
     assert update["messages"] == [AIMessage(AUTOMATION_TERMINAL_LINE)]
@@ -655,7 +660,7 @@ async def test_external_cancellation_mid_batch_reconciles_current_and_aborts_rem
 
 @pytest.mark.parametrize("trigger", ("node_exception", "stream_cancelled"))
 @pytest.mark.parametrize("current_committed", (False, True))
-def test_cancel_recovery_preserves_prior_outcomes_and_aborts_the_remainder(
+async def test_cancel_recovery_preserves_prior_outcomes_and_aborts_the_remainder(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     current_committed: bool,
@@ -721,7 +726,7 @@ def test_cancel_recovery_preserves_prior_outcomes_and_aborts_the_remainder(
         ),
     )
 
-    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+    update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
     text = str(update["messages"][0].content)
 
     assert update["pending_cancel"] is None

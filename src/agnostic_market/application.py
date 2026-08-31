@@ -5,7 +5,10 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, fields
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
+from typing import Annotated, get_args, get_type_hints
 
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -97,31 +100,78 @@ class ApplicationSettings:
         )
 
 
+class ApplicationResponsibility(StrEnum):
+    DURABLE_TENANT_BUSINESS_STATE = "durable_tenant_business_state"
+    DURABLE_PLATFORM_SESSION_STATE = "durable_platform_session_state"
+    PROCESS_LOCAL_RUNTIME_COORDINATION = "process_local_runtime_coordination"
+
+
 @dataclass(frozen=True, slots=True)
 class TenantServices:
-    tenant_id: str
-    catalog: CatalogPort
-    order_store: OrderPort
-    customers: CustomerDirectoryPort
-    payment_instruments: PaymentInstrumentPort
-    profile_store: ProfilePort
-    otp: OtpPort
-    risk: RiskPort
-    checkpointer: SchemaValidatedCheckpointSaver
-    telemetry: TenantTelemetry
+    tenant_id: Annotated[str, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    catalog: Annotated[CatalogPort, ApplicationResponsibility.DURABLE_TENANT_BUSINESS_STATE]
+    order_store: Annotated[OrderPort, ApplicationResponsibility.DURABLE_TENANT_BUSINESS_STATE]
+    customers: Annotated[
+        CustomerDirectoryPort, ApplicationResponsibility.DURABLE_TENANT_BUSINESS_STATE
+    ]
+    payment_instruments: Annotated[
+        PaymentInstrumentPort, ApplicationResponsibility.DURABLE_TENANT_BUSINESS_STATE
+    ]
+    profile_store: Annotated[ProfilePort, ApplicationResponsibility.DURABLE_TENANT_BUSINESS_STATE]
+    otp: Annotated[OtpPort, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    risk: Annotated[RiskPort, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    checkpointer: Annotated[
+        SchemaValidatedCheckpointSaver,
+        ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE,
+    ]
+    telemetry: Annotated[TenantTelemetry, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
 
 
 @dataclass(frozen=True, slots=True)
 class ApplicationSessionState:
-    session_id: str
-    thread_id: str
-    cart_store: CartStore
-    verification_store: VerificationStore
-    recent_orders: RecentOrderContext
-    identity_store: CallerIdentityStore
-    guest_orders: GuestOrderScope
-    caller_context: CallerContext
-    telemetry: SessionTelemetry
+    session_id: Annotated[str, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    thread_id: Annotated[str, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    cart_store: Annotated[CartStore, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    verification_store: Annotated[
+        VerificationStore, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
+    ]
+    recent_orders: Annotated[
+        RecentOrderContext, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
+    ]
+    identity_store: Annotated[
+        CallerIdentityStore, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
+    ]
+    guest_orders: Annotated[
+        GuestOrderScope, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
+    ]
+    caller_context: Annotated[
+        CallerContext, ApplicationResponsibility.PROCESS_LOCAL_RUNTIME_COORDINATION
+    ]
+    telemetry: Annotated[
+        SessionTelemetry, ApplicationResponsibility.PROCESS_LOCAL_RUNTIME_COORDINATION
+    ]
+
+
+def _derive_application_responsibilities() -> dict[tuple[str, str], ApplicationResponsibility]:
+    responsibilities: dict[tuple[str, str], ApplicationResponsibility] = {}
+    for owner in (TenantServices, ApplicationSessionState):
+        annotations = get_type_hints(owner, include_extras=True)
+        for declared_field in fields(owner):
+            declared_responsibilities = tuple(
+                value
+                for value in get_args(annotations[declared_field.name])[1:]
+                if isinstance(value, ApplicationResponsibility)
+            )
+            if len(declared_responsibilities) != 1:
+                raise TypeError(
+                    f"{owner.__name__}.{declared_field.name} requires one application "
+                    "responsibility"
+                )
+            responsibilities[(owner.__name__, declared_field.name)] = declared_responsibilities[0]
+    return responsibilities
+
+
+APPLICATION_RESPONSIBILITIES = MappingProxyType(_derive_application_responsibilities())
 
 
 type SessionStateFactory = Callable[[TenantContext, TenantServices], ApplicationSessionState]
@@ -160,6 +210,8 @@ def _validate_session_state(
         raise ValueError("session telemetry does not use the tenant telemetry service")
     if state.caller_context.telemetry is not state.telemetry.operational:
         raise ValueError("caller lifecycle does not own the application session telemetry")
+    if state.verification_store.session_id != state.session_id:
+        raise ValueError("session verification does not match the application session")
     if not state.verification_store.uses_otp_provider(services.otp):
         raise ValueError("session verification does not use the tenant OTP service")
 
@@ -198,6 +250,17 @@ def build_fixture_tenant_services(
     assert_orders_have_customers(orders_fixture, customers_fixture)
     assert_profiles_have_customers(profile_fixture, customers_fixture)
     assert_payment_instruments_have_customers(payment_fixture, customers_fixture)
+    expected_factor_refs = {entry.factor_ref for entry in customers_fixture.customers.values()}
+    factor_refs = set(verification_fixture.otp_codes_by_factor_ref)
+    if factor_refs != expected_factor_refs:
+        missing = sorted(expected_factor_refs - factor_refs)
+        unknown = sorted(factor_refs - expected_factor_refs)
+        details = []
+        if missing:
+            details.append("missing factors: " + ", ".join(missing))
+        if unknown:
+            details.append("unknown factors: " + ", ".join(unknown))
+        raise ValueError("verification fixture does not match customers: " + "; ".join(details))
     checkpoint_boundary = (
         checkpointer
         if isinstance(checkpointer, SchemaValidatedCheckpointSaver)
@@ -210,7 +273,12 @@ def build_fixture_tenant_services(
         customers=CustomerDirectory(tenant_id, customers_fixture),
         payment_instruments=PaymentInstrumentDirectory(tenant_id, payment_fixture),
         profile_store=ProfileStore(tenant_id, profile_fixture),
-        otp=OtpProvider(tenant_id, valid_code=verification_fixture.otp_code),
+        otp=OtpProvider(
+            tenant_id,
+            codes_by_factor_ref=verification_fixture.otp_codes_by_factor_ref,
+            challenge_ttl_seconds=verification_fixture.challenge_ttl_seconds,
+            proof_ttl_seconds=verification_fixture.proof_ttl_seconds,
+        ),
         risk=RiskProvider(tenant_id),
         checkpointer=checkpoint_boundary,
         telemetry=telemetry,
@@ -228,7 +296,7 @@ def build_in_memory_session_state(
     resolved_session_id = session_id or uuid.uuid4().hex
     resolved_thread_id = thread_id or uuid.uuid4().hex
     cart_store = CartStore()
-    verification_store = VerificationStore(services.otp)
+    verification_store = VerificationStore(services.otp, session_id=resolved_session_id)
     recent_orders = RecentOrderContext(max_refs=tenant.policy.cancel_batch_max)
     identity_store = CallerIdentityStore()
     guest_orders = GuestOrderScope(

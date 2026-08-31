@@ -1,0 +1,10 @@
+# Synthetic test-only customer directory.
+customers:
+  CUST-001:
+    contact: "+1 555 010 0119"
+    masked_contact: "number ending 0119"
+    factor_ref: "FACTOR-001"
+  CUST-002:
+    contact: "casey@example.com"
+    masked_contact: "email ending example dot com"
+    factor_ref: "FACTOR-002"

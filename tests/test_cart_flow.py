@@ -30,6 +30,7 @@ from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
     engine_events,
 )
+from verification_helpers import make_otp_provider
 
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import ReasoningEngine
@@ -55,7 +56,7 @@ from agnostic_market.commerce.payment_instruments import (
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
 from agnostic_market.commerce.receipts import IndeterminateReceipt, NotCommittedReceipt
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import RiskProvider, VerificationStore
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
@@ -68,7 +69,6 @@ from agnostic_market.session import CallerContext
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _CFG = {"configurable": {"thread_id": "t1"}}
-_TEST_OTP = "482913"
 _CART_CLARIFICATION_LINES = {
     "action": "What would you like to do with your cart?",
     "item": "Which item would you like?",
@@ -101,8 +101,8 @@ def _build(
         session_id=telemetry.session_id,
     )
     customers = CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store"))
-    otp = OtpProvider("acme_store", valid_code=_TEST_OTP)
-    verification = VerificationStore(otp)
+    otp = make_otp_provider()
+    verification = VerificationStore(otp, session_id=telemetry.session_id)
     caller_context = CallerContext(
         verification_store=verification,
         cart_store=cart,

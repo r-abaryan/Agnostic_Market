@@ -1,0 +1,6 @@
+# Synthetic test-only verification provider data.
+otp_codes_by_factor_ref:
+  FACTOR-001: "482913"
+  FACTOR-002: "739204"
+challenge_ttl_seconds: 300
+proof_ttl_seconds: 300

@@ -13,6 +13,7 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events, next_committed_turn
+from verification_helpers import TEST_FACTOR_REFS, grant_verification
 
 from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE
@@ -36,6 +37,7 @@ from agnostic_market.dtos.state import (
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
 _FACTS = TurnFacts()
 _VALID_OTP = "482913"
+_CUST2_OTP = "739204"
 _CUST1_REF = "CUST-001"
 _CUST2_REF = "CUST-002"
 _CUST1_MASK = "number ending 0119"
@@ -110,9 +112,8 @@ def _switch_harness(
     )
 
 
-def _establish_customer_one(harness: SupportHarness) -> str:
-    assert harness.verification.verify_otp(_VALID_OTP)
-    proof_id = harness.verification.grants[-1].proof_id
+async def _establish_customer_one(harness: SupportHarness) -> str:
+    proof_id = (await grant_verification(harness.verification)).proof_id
     harness.identity.bind(BoundIdentity(customer_ref=_CUST1_REF, masked_contact=_CUST1_MASK))
     return proof_id
 
@@ -424,9 +425,9 @@ async def test_committed_otp_binds_and_speaks_only_their_orders(
 
 async def test_rotation_preserves_populated_profile_slots_exactly(config_root: Path) -> None:
     h = _identity_harness(config_root, thread_id="ident-profile-slot-rotation")
-    assert h.verification.verify_otp(_VALID_OTP)
+    await grant_verification(h.verification)
     request = ChangeProfile(field="address", new_value="10 High Street")
-    transition = h.caller_context.transition_principal(
+    transition = await h.caller_context.transition_principal(
         BoundIdentity(customer_ref=_CUST1_REF, masked_contact=_CUST1_MASK),
         h.verification.grants[-1],
         request,
@@ -467,12 +468,13 @@ async def test_same_principal_apply_preserves_invocation_until_continuation(
         pending_identity=PendingIdentity(
             customer_ref=_CUST1_REF,
             masked_contact=_CUST1_MASK,
+            factor_ref=TEST_FACTOR_REFS[_CUST1_REF],
             attempt_key="same-principal-attempt",
-            grants_at_mint=0,
+            challenge_id=None,
         ),
     )
 
-    apply_update = h.engine._graph.nodes["identity_apply"].invoke(state)
+    apply_update = await h.engine._graph.nodes["identity_apply"].ainvoke(state)
     after_apply = ReasoningState.model_validate({**state.model_dump(mode="python"), **apply_update})
 
     assert "active_invocation" not in apply_update
@@ -601,7 +603,7 @@ async def test_spoken_email_and_spoken_otp_verify_end_to_end(config_root: Path) 
     h = _identity_harness(config_root, claim="casey at example dot com", thread_id="ident-spoken-1")
     await _events(h.engine, _REQUEST)
     assert h.otp.dispatch_count == 1  # the spoken email MATCHED (no re-ask, straight to OTP)
-    events = await _events(h.engine, "It should be four eight two nine one three.")
+    events = await _events(h.engine, "It should be seven three nine two zero four.")
     bound = h.identity.current()
     assert bound is not None and bound.customer_ref == "CUST-002"
     line = next(e for e in _spoken(events) if e.node == "support_capability_render")
@@ -616,7 +618,7 @@ async def test_verified_account_switch_rotates_all_principal_context(
         claim=_CUST2_EMAIL,
         thread_id="switch-success",
     )
-    old_proof_id = _establish_customer_one(h)
+    old_proof_id = await _establish_customer_one(h)
     h.identity.grant_orders("ORD-1001")
     _seed_cart(h)
     h.recent_orders.record(["ORD-1001"], operation="read")
@@ -635,7 +637,7 @@ async def test_verified_account_switch_rotates_all_principal_context(
     assert h.identity.current().customer_ref == _CUST1_REF
     assert not h.caller_context.cart_store.is_empty()
 
-    completed = await _events(h.engine, _VALID_OTP)
+    completed = await _events(h.engine, _CUST2_OTP)
     assert any(
         event.node == "identity_apply" and "new account" in event.text
         for event in _spoken(completed)
@@ -669,7 +671,7 @@ async def test_failed_account_switch_preserves_original_principal(
         thread_id="switch-failed",
         otp_max_attempts=1,
     )
-    old_proof_id = _establish_customer_one(h)
+    old_proof_id = await _establish_customer_one(h)
     _seed_cart(h)
     old_thread_id = h.engine.thread_id
 
@@ -693,7 +695,7 @@ async def test_same_account_switch_skips_rotation_and_preserves_context(
         claim=_CUST1_PHONE,
         thread_id="switch-same",
     )
-    old_proof_id = _establish_customer_one(h)
+    old_proof_id = await _establish_customer_one(h)
     _seed_cart(h)
     old_thread_id = h.engine.thread_id
 
@@ -715,13 +717,13 @@ async def test_closing_turn_stream_completes_a_pending_context_rotation(
         claim=_CUST2_EMAIL,
         thread_id="switch-stream-close",
     )
-    _establish_customer_one(h)
+    await _establish_customer_one(h)
     old_thread_id = h.engine.thread_id
     old_config = h.engine._config
     dispatched = await _events(h.engine, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
 
-    stream = h.engine.stream_turn(next_committed_turn(h.engine, _VALID_OTP), _FACTS)
+    stream = h.engine.stream_turn(next_committed_turn(h.engine, _CUST2_OTP), _FACTS)
     try:
         while True:
             event = await anext(stream)
@@ -746,12 +748,12 @@ async def test_cancelled_stream_close_finishes_pending_context_rotation(
         claim=_CUST2_EMAIL,
         thread_id="switch-cancelled-stream-close",
     )
-    _establish_customer_one(h)
+    await _establish_customer_one(h)
     old_thread_id = h.engine.thread_id
     dispatched = await _events(h.engine, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
 
-    stream = h.engine.stream_turn(next_committed_turn(h.engine, _VALID_OTP), _FACTS)
+    stream = h.engine.stream_turn(next_committed_turn(h.engine, _CUST2_OTP), _FACTS)
     while True:
         event = await anext(stream)
         if isinstance(event, SpokenMessageEvent) and event.node == "identity_apply":
@@ -794,13 +796,13 @@ async def test_rotation_failure_during_stream_close_latches_terminal_for_next_tu
         claim=_CUST2_EMAIL,
         thread_id="switch-stream-close-failure",
     )
-    _establish_customer_one(h)
+    await _establish_customer_one(h)
     old_thread_id = h.engine.thread_id
     old_config = h.engine._config
     dispatched = await _events(h.engine, "switch my account")
     assert any(isinstance(event, InterruptEvent) for event in dispatched)
 
-    stream = h.engine.stream_turn(next_committed_turn(h.engine, _VALID_OTP), _FACTS)
+    stream = h.engine.stream_turn(next_committed_turn(h.engine, _CUST2_OTP), _FACTS)
     try:
         while True:
             event = await anext(stream)
@@ -873,25 +875,22 @@ async def test_already_bound_reask_lists_without_a_second_otp(config_root: Path)
 
 
 async def test_stale_cross_family_l2_cannot_bind_on_a_wrong_otp(config_root: Path) -> None:
-    # An EARLIER profile-flow OTP left the store at L2 (verify_otp = exactly what that flow
-    # commits). The factory's route_after_collect confirms on level ALONE — without the
-    # wrapper, a WRONG identity code would bind. The wrapper demands a grant NEWER than the
-    # pending's mint snapshot, so the wrong code re-collects instead.
+    # An earlier profile challenge left the store at L2. The identity flow must still require
+    # its own challenge proof, so a wrong identity code re-collects instead of binding.
     h = _identity_harness(config_root, thread_id="ident-stale-1")
-    assert h.verification.verify_otp(_VALID_OTP)  # the stale cross-family grant
+    await grant_verification(h.verification, purpose="profile")
     assert h.verification.current_level() == 2
     await _events(h.engine, _REQUEST)  # -> OTP interrupt (level alone must NOT skip it)
     events = await _events(h.engine, "000000")  # WRONG code, level already 2
     assert h.identity.current() is None  # NOT bound — the invariant held
     assert any(isinstance(e, InterruptEvent) for e in events)  # re-collect, not confirm
-    assert h.otp.dispatch_count == 2  # a legitimate re-dispatch (new attempt key)
+    assert h.otp.dispatch_count == 2  # stale grant plus one identity challenge
 
 
 async def test_stale_l2_then_correct_otp_binds(config_root: Path) -> None:
-    # The counterpart: with the stale grant present, the CORRECT code appends a NEW grant
-    # (verify_otp records every success) and the bind proceeds.
+    # The exact identity challenge proof permits the bind despite an older profile grant.
     h = _identity_harness(config_root, thread_id="ident-stale-2")
-    assert h.verification.verify_otp(_VALID_OTP)
+    await grant_verification(h.verification, purpose="profile")
     await _events(h.engine, _REQUEST)
     await _events(h.engine, "000000")  # one miss
     events = await _events(h.engine, _VALID_OTP)  # correct on the re-collect
@@ -901,10 +900,9 @@ async def test_stale_l2_then_correct_otp_binds(config_root: Path) -> None:
 
 
 async def test_stale_l2_wrong_otp_twice_exhausts_to_human(config_root: Path) -> None:
-    # The wrapper preserves the factory's bounded-retry semantics: two committed misses
-    # exhaust to a human even when the stale level would have "confirmed" each time.
+    # Provider-owned attempt limits still exhaust despite an unrelated existing L2 grant.
     h = _identity_harness(config_root, thread_id="ident-stale-3")
-    assert h.verification.verify_otp(_VALID_OTP)
+    await grant_verification(h.verification, purpose="profile")
     await _events(h.engine, _REQUEST)
     await _events(h.engine, "000000")
     events = await _events(h.engine, "111111")
