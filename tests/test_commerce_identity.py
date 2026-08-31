@@ -295,10 +295,72 @@ def test_unknown_customer_ref_fails_loud_at_build(config_root: Path) -> None:
     # order unlistable at call time).
     orders = load_orders_fixture(config_root, "acme_store")
     only_one = CustomersFixture(
-        customers={"CUST-001": CustomerEntry(contact="+1 555 010 0119", masked_contact="m")}
+        customers={
+            "CUST-001": CustomerEntry(
+                contact="+1 555 010 0119",
+                masked_contact="m",
+                factor_ref="FACTOR-001",
+            )
+        }
     )
     with pytest.raises(ConfigError, match="ORD-1002 -> CUST-002"):
         assert_orders_have_customers(orders, only_one)
+
+
+def test_fixture_factor_refs_are_opaque_and_unique(config_root: Path) -> None:
+    fixture = load_customers_fixture(config_root, "acme_store")
+    directory = CustomerDirectory("acme_store", fixture)
+    factor_refs = [entry.factor_ref for entry in fixture.customers.values()]
+
+    assert set(factor_refs).isdisjoint(fixture.customers)
+    assert len(factor_refs) == len(set(factor_refs))
+    assert directory.verification_factor_ref("CUST-001") == "FACTOR-001"
+    assert directory.verification_factor_ref("missing") is None
+
+
+def test_duplicate_factor_ref_fails_fixture_load() -> None:
+    with pytest.raises(ValueError, match="share a verification factor"):
+        CustomersFixture(
+            customers={
+                "CUST-001": CustomerEntry(
+                    contact="one@example.com",
+                    masked_contact="one",
+                    factor_ref="FACTOR-SHARED",
+                ),
+                "CUST-002": CustomerEntry(
+                    contact="two@example.com",
+                    masked_contact="two",
+                    factor_ref="FACTOR-SHARED",
+                ),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "factor_refs",
+    [
+        ("CUST-001", "FACTOR-002"),
+        ("CUST-002", "CUST-001"),
+    ],
+)
+def test_customer_refs_cannot_be_reused_as_factor_refs(
+    factor_refs: tuple[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="must not reuse customer refs"):
+        CustomersFixture(
+            customers={
+                "CUST-001": CustomerEntry(
+                    contact="one@example.com",
+                    masked_contact="one",
+                    factor_ref=factor_refs[0],
+                ),
+                "CUST-002": CustomerEntry(
+                    contact="two@example.com",
+                    masked_contact="two",
+                    factor_ref=factor_refs[1],
+                ),
+            }
+        )
 
 
 def test_duplicate_customer_contact_fails_fixture_load() -> None:
@@ -308,7 +370,15 @@ def test_duplicate_customer_contact_fails_fixture_load() -> None:
     with pytest.raises(ValueError, match="share a contact"):
         CustomersFixture(
             customers={
-                "CUST-001": CustomerEntry(contact="+1 555 010 0119", masked_contact="m1"),
-                "CUST-003": CustomerEntry(contact="555 010 0119", masked_contact="m3"),
+                "CUST-001": CustomerEntry(
+                    contact="+1 555 010 0119",
+                    masked_contact="m1",
+                    factor_ref="FACTOR-001",
+                ),
+                "CUST-003": CustomerEntry(
+                    contact="555 010 0119",
+                    masked_contact="m3",
+                    factor_ref="FACTOR-003",
+                ),
             }
         )

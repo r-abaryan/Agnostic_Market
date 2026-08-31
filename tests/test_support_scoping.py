@@ -28,8 +28,9 @@ import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
-from support_helpers import TEST_OTP, SupportHarness, build_support_engine
+from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
+from verification_helpers import TEST_OTP_CODES
 
 from agnostic_market.agents.support.flow import (
     _SUPPORT_COMBINED_NOT_FOUND,
@@ -618,7 +619,10 @@ async def test_guest_cancel_verifies_then_resumes_and_commits(
     assert _execution_owner(h, "scope-resume") == "identity"
     e1 = await _events(h.engine, _CONTACT_1002)  # -> OTP dispatched
     assert any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in e1)
-    e2 = await _events(h.engine, TEST_OTP)  # OTP -> bind -> resume assemble -> readback
+    e2 = await _events(
+        h.engine,
+        TEST_OTP_CODES["CUST-002"],
+    )  # OTP -> bind -> resume assemble -> readback
     interrupts = [e for e in e2 if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1 and "ORD-1002" in interrupts[0].prompt
     assert h.store.cancel_count == 0  # nothing voided before consent
@@ -654,7 +658,7 @@ async def test_guest_profile_change_verifies_then_resumes_under_the_new_principa
     assert _execution_owner(h, "scope-profile-resume") == "identity"
     await _events(h.engine, _CONTACT_1001)
     assert h.otp.dispatch_count == 1
-    events = await _events(h.engine, TEST_OTP)
+    events = await _events(h.engine, TEST_OTP_CODES["CUST-001"])
 
     interrupts = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1 and new_address in interrupts[0].prompt
@@ -932,7 +936,7 @@ async def _drive_explicit_action_continuation(
     )
     model_calls_before_continuation = reasoning._tool_calls_made
     old_thread_id = h.engine.thread_id
-    events = await _events(h.engine, TEST_OTP)
+    events = await _events(h.engine, TEST_OTP_CODES["CUST-001"])
     assert h.identity.current() is not None
     assert h.engine.thread_id != old_thread_id
     if expect_model_free_continuation:

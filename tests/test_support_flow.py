@@ -19,6 +19,7 @@ from policy_helpers import make_policy
 from pydantic import ValidationError
 from support_helpers import authorize_customer, build_support_engine
 from turn_helpers import engine_events
+from verification_helpers import TEST_FACTOR_REFS, TEST_OTP_CODES, grant_verification
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import RECOVERY_NODE_NAME
@@ -30,7 +31,13 @@ from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentsFixture,
     load_payment_instruments_fixture,
 )
-from agnostic_market.commerce.verification import OtpProvider, VerificationStore
+from agnostic_market.commerce.verification import (
+    OtpProvider,
+    RiskDecision,
+    RiskSubject,
+    VerificationStore,
+    VerificationSubject,
+)
 from agnostic_market.dtos.events import (
     InterruptEvent,
     SpokenMessageEvent,
@@ -54,13 +61,25 @@ from agnostic_market.dtos.state import CartLine, PolicyContext, ReasoningState
 # refunds against the SHIPPED ORD-1001 in isolation; the return-first tests tighten via model_copy.
 _POLICY = make_policy()
 _FACTS = TurnFacts()
-_VALID_OTP = "482913"
+_CUST1_OTP = TEST_OTP_CODES["CUST-001"]
+_CUST2_OTP = TEST_OTP_CODES["CUST-002"]
 _ORIGINAL_INSTRUMENT = "original payment method"
 # The reasoning fake proposes a refund of $129.00 on order key "2" (ORD-1002) to a NEW card.
 _PROPOSE = {
     "propose_refund": {"order_key": "2", "amount_usd": 129.0, "destination": "new_instrument"}
 }
 _REFUND_REQUEST = "I'd like a refund to a different card"
+
+
+class _RecordingRisk:
+    tenant_id = "acme_store"
+
+    def __init__(self) -> None:
+        self.subjects: list[RiskSubject] = []
+
+    async def assess(self, subject: RiskSubject) -> RiskDecision:
+        self.subjects.append(subject)
+        return RiskDecision.CLEAR
 
 
 def _instrument_ref(config_root: Path, customer_ref: str) -> str:
@@ -80,6 +99,7 @@ def _engine(
     thread_id: str = "support-1",
     routing_resolution: RouteResolution | None = None,
     authorized_customer_ref: str = "CUST-002",
+    risk: _RecordingRisk | None = None,
 ) -> tuple[ReasoningEngine, OrderStore, VerificationStore, OtpProvider]:
     """Thin wrapper over the shared harness (support_helpers) preserving this file's
     4-tuple unpacking + its propose_refund default. Fixture orders are PRE-AUTHORIZED
@@ -92,6 +112,7 @@ def _engine(
             reasoning=reasoning
             or FakeChatModel(force_tool="propose_refund", canned_args=_PROPOSE, tool_call_limit=1),
             risk_flagged=risk_flagged,
+            risk=risk,
             thread_id=thread_id,
             routing_resolution=routing_resolution
             or RouteDecision.direct(
@@ -174,7 +195,7 @@ async def test_stepup_asks_for_otp_before_touching_money(config_root: Path) -> N
 async def test_committed_otp_raises_level_then_reads_back_the_refund(config_root: Path) -> None:
     engine, store, verification, _ = _engine(config_root)
     await _pause_at_otp(engine)
-    events = await _events(engine, _VALID_OTP)
+    events = await _events(engine, _CUST2_OTP)
     assert verification.current_level() == 2  # raised mid-flow
     interrupts = [e for e in events if isinstance(e, InterruptEvent)]
     assert len(interrupts) == 1
@@ -190,7 +211,7 @@ async def test_committed_otp_raises_level_then_reads_back_the_refund(config_root
 async def test_yes_after_stepup_issues_exactly_one_refund(config_root: Path) -> None:
     engine, store, _, _ = _engine(config_root)
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)
+    await _events(engine, _CUST2_OTP)
     events = await _events(engine, "yes please")
     assert store.refund_count == 1
     assert store.refunded_so_far("ORD-1002") == 129.0
@@ -199,10 +220,68 @@ async def test_yes_after_stepup_issues_exactly_one_refund(config_root: Path) -> 
     assert any(e.node == "support_place" and "refund" in e.text.lower() for e in spoken)
 
 
+async def test_fresh_identity_proof_reuses_the_factor_but_rechecks_refund_risk(
+    config_root: Path,
+) -> None:
+    risk = _RecordingRisk()
+    engine, store, verification, otp = _engine(
+        config_root,
+        thread_id="refund-proof-reuse",
+        risk=risk,
+    )
+    await grant_verification(
+        verification,
+        customer_ref="CUST-002",
+        purpose="identity",
+        dispatch_idempotency_key="refund-proof-reuse-identity",
+    )
+    dispatches_before_refund = otp.dispatch_count
+
+    events = await _events(engine, _REFUND_REQUEST)
+
+    assert otp.dispatch_count == dispatches_before_refund
+    interrupts = [event for event in events if isinstance(event, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "ORD-1002" in interrupts[0].prompt
+    assert "$129.00" in interrupts[0].prompt
+    assert store.refund_count == 0
+    assert len(risk.subjects) == 1
+    assert isinstance(risk.subjects[0], VerificationSubject)
+    assert risk.subjects[0].customer_ref == "CUST-002"
+    assert risk.subjects[0].factor_ref == TEST_FACTOR_REFS["CUST-002"]
+    assert risk.subjects[0].purpose == "refund"
+
+    await _events(engine, "yes")
+    assert store.refund_count == 1
+
+
+async def test_fresh_identity_proof_does_not_bypass_refund_risk(
+    config_root: Path,
+) -> None:
+    engine, store, verification, otp = _engine(
+        config_root,
+        risk_flagged=True,
+        thread_id="refund-proof-risk",
+    )
+    await grant_verification(
+        verification,
+        customer_ref="CUST-002",
+        purpose="identity",
+        dispatch_idempotency_key="refund-proof-risk-identity",
+    )
+    dispatches_before_refund = otp.dispatch_count
+
+    events = await _events(engine, _REFUND_REQUEST)
+
+    assert otp.dispatch_count == dispatches_before_refund
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert store.refund_count == 0
+
+
 async def test_double_resume_of_the_confirm_never_double_refunds(config_root: Path) -> None:
     engine, store, _, _ = _engine(config_root)
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)
+    await _events(engine, _CUST2_OTP)
     await _events(engine, "yes")
     # A stray extra turn after the flow completed must not re-place (no interrupt pending).
     await _events(engine, "yes")
@@ -256,9 +335,9 @@ async def test_live_read_blocks_a_lapsed_grant_at_place(config_root: Path) -> No
     # but before the effect, the place node re-validates and refuses to move money.
     engine, store, verification, _ = _engine(config_root)
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)
+    await _events(engine, _CUST2_OTP)
     assert verification.current_level() == 2
-    verification.clear()  # session grant revoked (SIM-swap flagged / session invalidated)
+    await verification.clear()  # session grant revoked (SIM-swap flagged / session invalidated)
     await _events(engine, "yes")
     assert store.refund_count == 0  # money did NOT move on a lapsed level
 
@@ -281,7 +360,7 @@ async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
 ) -> None:
     engine, store, _, _ = _engine(config_root, thread_id=thread_id)
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)
+    await _events(engine, _CUST2_OTP)
     events = await _events(engine, response, facts)
     assert store.refund_count == 0
     reconfirms = [e for e in events if isinstance(e, InterruptEvent)]
@@ -297,7 +376,7 @@ async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
 async def test_refund_accepts_supported_natural_affirmation(config_root: Path) -> None:
     engine, store, _, _ = _engine(config_root, thread_id="refund-natural-affirmation")
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)
+    await _events(engine, _CUST2_OTP)
 
     await _events(engine, "sure")
 
@@ -308,7 +387,7 @@ async def test_refund_accepts_supported_natural_affirmation(config_root: Path) -
 async def test_no_at_readback_cancels_without_refunding(config_root: Path) -> None:
     engine, store, _, _ = _engine(config_root)
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)
+    await _events(engine, _CUST2_OTP)
     events = await _events(engine, "no, don't")
     assert store.refund_count == 0
     assert not await engine.apending_interrupt()
@@ -324,7 +403,7 @@ async def test_kill_mid_stepup_leaves_no_ghost_refund_and_no_free_level(config_r
     await _pause_at_otp(engine)  # paused at the OTP collect interrupt
     assert await engine.apending_interrupt()
     await engine.adelete_thread()  # Clock-B teardown
-    verification.clear()  # pipeline reaper also clears the grant
+    await verification.clear()  # pipeline reaper also clears the grant
     assert store.refund_count == 0
     assert verification.current_level() == 1
     # A fresh session starts clean.
@@ -775,8 +854,6 @@ def _scope_engine(
     identity (a turn-1 clarify, then propose_identity when the caller gives their contact).
     A second cancellable order (key '4') is seeded so a resolve yields two targets. If `bound`,
     the session is pre-verified so the scope resolves WITHOUT an identity detour."""
-    from support_helpers import TEST_OTP  # noqa: F401  (the valid code the OtpProvider holds)
-
     scripted = [
         [],  # identity clarify on turn 1 (caller hasn't given a contact yet)
         [("propose_identity", {"contact_claim": "casey@example.com"})],  # identity assemble turn 2
@@ -876,7 +953,7 @@ async def test_unbound_cancel_all_verifies_then_resolves_to_a_batch(config_root:
     await _enter_unbound_cancel_scope(h)
     e1 = await _events(h.engine, "casey@example.com")  # -> OTP dispatched
     assert any(isinstance(e, InterruptEvent) and "code" in e.prompt for e in e1)
-    e2 = await _events(h.engine, "482913")  # OTP -> bind -> resolve -> readback
+    e2 = await _events(h.engine, _CUST2_OTP)  # OTP -> bind -> resolve -> readback
     # NO order-list line spoken on the continuation (the list-speech branch is skipped).
     spoken2 = [e for e in e2 if isinstance(e, SpokenMessageEvent)]
     assert not any("you've got" in e.text.lower() for e in spoken2)
@@ -986,7 +1063,7 @@ async def test_risk_after_identity_clears_scope_without_voiding(config_root: Pat
     h = _scope_engine(config_root, thread_id="mb-risk", risk_flagged=True)
     await _enter_unbound_cancel_scope(h)
     await _events(h.engine, "casey@example.com")
-    events = await _events(h.engine, "482913")
+    events = await _events(h.engine, _CUST2_OTP)
     assert not any(isinstance(event, InterruptEvent) for event in events)
     assert _pending_cancel(h, "mb-risk") is None
     assert _validated_state(h, "mb-risk").active_invocation is None
@@ -1043,7 +1120,7 @@ async def test_new_instrument_reference_follows_the_authorized_order_owner(
         thread_id="instrument-owner",
     )
     await _events(engine, "refund my order to a different card")
-    events = await _events(engine, _VALID_OTP)
+    events = await _events(engine, _CUST1_OTP)
     interrupts = [event for event in events if isinstance(event, InterruptEvent)]
     assert len(interrupts) == 1
     assert _instrument_ref(config_root, "CUST-001") in interrupts[0].prompt
@@ -1206,7 +1283,7 @@ async def test_stale_refund_readback_expires_before_placing(
 ) -> None:
     engine, store, _, _ = _engine(config_root)
     await _pause_at_otp(engine)
-    await _events(engine, _VALID_OTP)  # raised to L2, now paused at the refund readback
+    await _events(engine, _CUST2_OTP)  # raised to L2, now paused at the refund readback
     # Jump the flow clock past the TTL; the resume must find the pending expired.
     future = time.time() + 10_000
     monkeypatch.setattr(support_flow.time, "time", lambda: future)

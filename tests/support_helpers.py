@@ -13,6 +13,7 @@ from llm_fakes import (
 )
 from routing_helpers import make_routing_session
 from turn_helpers import TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS
+from verification_helpers import make_otp_provider
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
@@ -39,7 +40,12 @@ from agnostic_market.commerce.payment_instruments import (
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import (
+    OtpProvider,
+    RiskPort,
+    RiskProvider,
+    VerificationStore,
+)
 from agnostic_market.dtos.orchestration import RouteResolution
 from agnostic_market.dtos.state import PolicyContext
 from agnostic_market.session import CallerContext
@@ -62,9 +68,6 @@ class SupportHarness(NamedTuple):
     telemetry: InMemoryTelemetrySink
 
 
-TEST_OTP = "482913"
-
-
 def authorize_customer(harness: SupportHarness, customer_ref: str) -> SupportHarness:
     """Bind one real fixture principal for tests below the identity-flow boundary."""
     masked_contact = harness.customers.masked_contact(customer_ref)
@@ -81,6 +84,7 @@ def build_support_engine(
     reasoning: FakeChatModel | None = None,
     frontline: FakeChatModel | None = None,
     risk_flagged: bool = False,
+    risk: RiskPort | None = None,
     thread_id: str = "support-1",
     payment_instruments_fixture: PaymentInstrumentsFixture | None = None,
     orders_fixture: OrdersFixture | None = None,
@@ -92,6 +96,8 @@ def build_support_engine(
     (the split-brain rule); the neutral reasoning default clarifies — suites pass their
     own force_tool/scripted fakes.
     """
+    if risk is not None and risk_flagged:
+        raise ValueError("provide either a risk port or risk_flagged, not both")
     fixture = orders_fixture or load_orders_fixture(config_root, "acme_store")
     catalog = FixtureCatalog("acme_store", fixture)
     store = OrderStore("acme_store", fixture.orders)
@@ -106,8 +112,8 @@ def build_support_engine(
         else load_payment_instruments_fixture(config_root, "acme_store")
     )
     payment_instruments = PaymentInstrumentDirectory("acme_store", instrument_fixture)
-    otp = OtpProvider("acme_store", valid_code=TEST_OTP)
-    verification = VerificationStore(otp)
+    otp = make_otp_provider()
+    verification = VerificationStore(otp, session_id=thread_id)
     profile = ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store"))
     telemetry_sink = InMemoryTelemetrySink()
     telemetry = TenantTelemetry("acme_store", telemetry_sink, telemetry_sink).bind_session(
@@ -131,7 +137,7 @@ def build_support_engine(
         guest_orders=guest_orders,
         policy=policy,
         verification_store=verification,
-        risk=RiskProvider("acme_store", flagged=risk_flagged),
+        risk=risk or RiskProvider("acme_store", flagged=risk_flagged),
         profile_store=profile,
         cart_store=cart,
         recent_orders=recent_orders,

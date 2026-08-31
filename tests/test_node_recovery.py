@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 from pathlib import Path
 
@@ -161,7 +160,7 @@ def _commerce_counts(harness) -> tuple[int, int, int, int, int]:
 
 
 @pytest.mark.parametrize(("origin", "action", "expected_line"), _ACTION_CASES)
-def test_every_ordinary_recovery_action_has_one_closed_result(
+async def test_every_ordinary_recovery_action_has_one_closed_result(
     config_root: Path,
     origin: str,
     action: ExceptionAction,
@@ -201,7 +200,7 @@ def test_every_ordinary_recovery_action_has_one_closed_result(
         identity_claim_misses=1,
     )
 
-    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+    update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
 
     for field, value in clear_automation_state().items():
         assert update[field] == value
@@ -246,7 +245,7 @@ def test_every_ordinary_recovery_action_has_one_closed_result(
         {"origin_node": "model", "action": "safe_abort", "trigger": "node_exception"},
     ),
 )
-def test_invalid_recovery_markers_fail_terminal_without_echoing_marker_data(
+async def test_invalid_recovery_markers_fail_terminal_without_echoing_marker_data(
     config_root: Path,
     marker: object,
 ) -> None:
@@ -257,7 +256,7 @@ def test_invalid_recovery_markers_fail_terminal_without_echoing_marker_data(
     )
     state = ReasoningState.model_construct(pending_recovery=marker)
 
-    update = harness.engine._graph.nodes[RECOVERY_NODE_NAME].invoke(state)
+    update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
 
     assert update["automation_terminal"] is True
     assert update["pending_recovery"] is None
@@ -520,15 +519,20 @@ async def test_confirmation_exception_aborts_placement_but_preserves_cart(
 
 def _pending_refund(harness) -> PendingRefund:
     instrument_ref = harness.payment_instruments.new_instrument_ref("CUST-002")
+    factor_ref = harness.customers.verification_factor_ref("CUST-002")
     assert instrument_ref is not None
+    assert factor_ref is not None
     return PendingRefund(
         order_id="ORD-1002",
         summary="a waterproof rain jacket",
         amount_usd=129.0,
         destination="new_instrument",
         instrument_ref=instrument_ref,
+        customer_ref="CUST-002",
+        factor_ref=factor_ref,
         idempotency_key="refund-recovery",
         attempt_key="otp-recovery",
+        challenge_id=None,
         created_at=time.time(),
     )
 
@@ -552,7 +556,7 @@ async def test_otp_dispatch_exception_does_not_retry_or_enter_collection(
         as_node="support_risk_check",
     )
 
-    def fail_dispatch(_attempt_key: str) -> None:
+    def fail_dispatch(_request) -> None:
         raise RuntimeError("simulated OTP provider failure")
 
     monkeypatch.setattr(harness.otp, "dispatch", fail_dispatch)
@@ -627,19 +631,19 @@ async def test_cancelled_otp_dispatch_is_not_replayed_by_recovery(
         config_root,
         thread_id="cancelled-otp-dispatch",
     )
-    entered = threading.Event()
-    release = threading.Event()
+    entered = asyncio.Event()
+    release = asyncio.Event()
     real_dispatch = harness.otp.dispatch
 
-    def dispatch_then_pause(attempt_key: str) -> None:
-        real_dispatch(attempt_key)
+    async def dispatch_then_pause(request):
+        challenge = await real_dispatch(request)
         entered.set()
-        if not release.wait(timeout=5):
-            raise RuntimeError("test did not release OTP dispatch")
+        await release.wait()
+        return challenge
 
     monkeypatch.setattr(harness.otp, "dispatch", dispatch_then_pause)
     dispatching = asyncio.create_task(_events(harness.engine, "list my account orders"))
-    assert await asyncio.to_thread(entered.wait, 5)
+    await asyncio.wait_for(entered.wait(), timeout=5)
 
     dispatching.cancel()
     release.set()
@@ -676,23 +680,22 @@ async def test_cancelled_otp_collect_does_not_reverify_bind_or_resume_the_action
     await _events(harness.engine, "list my account orders")
     assert await harness.engine.apending_interrupt()
     assert harness.otp.dispatch_count == 1
-    entered = threading.Event()
-    release = threading.Event()
+    entered = asyncio.Event()
+    release = asyncio.Event()
     verify_calls = 0
     real_verify = harness.verification.verify_otp
 
-    def verify_then_pause(code: str) -> bool:
+    async def verify_then_pause(challenge_id: str, code: str):
         nonlocal verify_calls
         verify_calls += 1
-        verified = real_verify(code)
+        verified = await real_verify(challenge_id, code)
         entered.set()
-        if not release.wait(timeout=5):
-            raise RuntimeError("test did not release OTP verification")
+        await release.wait()
         return verified
 
     monkeypatch.setattr(harness.verification, "verify_otp", verify_then_pause)
     collecting = asyncio.create_task(_events(harness.engine, "482913"))
-    assert await asyncio.to_thread(entered.wait, 5)
+    await asyncio.wait_for(entered.wait(), timeout=5)
 
     collecting.cancel()
     release.set()

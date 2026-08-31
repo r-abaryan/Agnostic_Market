@@ -148,8 +148,8 @@ def identity_required_level() -> int:
     P7: "what orders do I have?" is the account-takeover recon surface — an attacker with a
     contact claim must not enumerate an account's orders on a claim alone. L2 floor: the
     identity flow's OTP to the on-file contact both raises the level AND binds the customer
-    (the flow additionally requires the grant to be NEW — see PendingIdentity.grants_at_mint;
-    level alone is necessary but not sufficient for a BIND). Note the internal L1/L2 ladder
+    (the flow additionally requires the exact identity challenge proof; level alone is
+    necessary but not sufficient for a bind). Note the internal L1/L2 ladder
     is the platform's own vocabulary (possession-lite/strong) — it is NOT a NIST AAL mapping;
     a contact-delivered OTP is a single possession factor.
     """

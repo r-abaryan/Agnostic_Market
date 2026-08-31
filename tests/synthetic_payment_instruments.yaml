@@ -1,0 +1,4 @@
+# Synthetic masked payment references. No payment credentials are present.
+payment_instruments:
+  CUST-001: { masked_ref: "card ending 1182" }
+  CUST-002: { masked_ref: "card ending 4471" }

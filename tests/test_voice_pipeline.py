@@ -283,13 +283,21 @@ class _FakeClearable:
         self.clears += 1
 
 
+class _FakeAsyncClearable:
+    def __init__(self) -> None:
+        self.clears = 0
+
+    async def clear(self) -> None:
+        self.clears += 1
+
+
 def _fake_caller_context(engine=None):
     from agnostic_market.session import CallerContext
 
     telemetry = make_session_telemetry("acme_store", "fake-caller")
     return CallerContext(
         engine=engine or _FakeEngine(),
-        verification_store=_FakeClearable(),  # type: ignore[arg-type]
+        verification_store=_FakeAsyncClearable(),  # type: ignore[arg-type]
         cart_store=_FakeClearable(),  # type: ignore[arg-type]
         recent_orders=_FakeClearable(),  # type: ignore[arg-type]
         identity_store=_FakeClearable(),  # type: ignore[arg-type]

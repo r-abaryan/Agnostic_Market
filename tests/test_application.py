@@ -29,7 +29,9 @@ from turn_helpers import (
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE, TURN_FALLBACK_LINE
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, SessionTelemetry
 from agnostic_market.application import (
+    APPLICATION_RESPONSIBILITIES,
     ApplicationModels,
+    ApplicationResponsibility,
     ApplicationSessionState,
     ApplicationSettings,
     TenantServices,
@@ -153,44 +155,30 @@ def _routing_factory(_registry):
 
 
 def test_application_composition_fields_have_one_explicit_owner() -> None:
-    tenant_owned = {
-        ("TenantServices", "tenant_id"),
-        ("TenantServices", "catalog"),
-        ("TenantServices", "order_store"),
-        ("TenantServices", "customers"),
-        ("TenantServices", "payment_instruments"),
-        ("TenantServices", "profile_store"),
-        ("TenantServices", "otp"),
-        ("TenantServices", "risk"),
-    }
-    platform_backed_boundaries = {
-        ("TenantServices", "checkpointer"),
-        ("TenantServices", "telemetry"),
-    }
-    session_owned = {
-        ("ApplicationSessionState", "session_id"),
-        ("ApplicationSessionState", "thread_id"),
-        ("ApplicationSessionState", "cart_store"),
-        ("ApplicationSessionState", "verification_store"),
-        ("ApplicationSessionState", "recent_orders"),
-        ("ApplicationSessionState", "identity_store"),
-        ("ApplicationSessionState", "guest_orders"),
-        ("ApplicationSessionState", "caller_context"),
-        ("ApplicationSessionState", "telemetry"),
-    }
-    ownership_groups = tenant_owned, platform_backed_boundaries, session_owned
     declared_fields = {
         (owner.__name__, field.name)
         for owner in (TenantServices, ApplicationSessionState)
         for field in fields(owner)
     }
 
-    assert all(
-        left.isdisjoint(right)
-        for index, left in enumerate(ownership_groups)
-        for right in ownership_groups[index + 1 :]
+    assert APPLICATION_RESPONSIBILITIES.keys() == declared_fields
+    assert set(APPLICATION_RESPONSIBILITIES.values()) == set(ApplicationResponsibility)
+    assert (
+        APPLICATION_RESPONSIBILITIES[("TenantServices", "order_store")]
+        is ApplicationResponsibility.DURABLE_TENANT_BUSINESS_STATE
     )
-    assert set().union(*ownership_groups) == declared_fields
+    assert (
+        APPLICATION_RESPONSIBILITIES[("TenantServices", "checkpointer")]
+        is ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
+    )
+    assert (
+        APPLICATION_RESPONSIBILITIES[("ApplicationSessionState", "cart_store")]
+        is ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
+    )
+    assert (
+        APPLICATION_RESPONSIBILITIES[("ApplicationSessionState", "caller_context")]
+        is ApplicationResponsibility.PROCESS_LOCAL_RUNTIME_COORDINATION
+    )
 
 
 def test_fixture_tenant_services_implement_the_replacement_ports(config_root: Path) -> None:
@@ -377,7 +365,12 @@ async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backe
                 instruments,
             ),
             profile_store=ProfileStore(tenant.tenant_id, profiles),
-            otp=OtpProvider(tenant.tenant_id, valid_code=verification.otp_code),
+            otp=OtpProvider(
+                tenant.tenant_id,
+                codes_by_factor_ref=verification.otp_codes_by_factor_ref,
+                challenge_ttl_seconds=verification.challenge_ttl_seconds,
+                proof_ttl_seconds=verification.proof_ttl_seconds,
+            ),
             risk=RiskProvider(tenant.tenant_id),
             checkpointer=build_checkpointer(backend),
             telemetry=make_tenant_telemetry(tenant.tenant_id),
@@ -1033,7 +1026,10 @@ async def test_application_principal_rotation_retires_old_thread_and_completes_t
         ] == ["For security, please read me the 6-digit code we just sent you."]
         assert application.state.identity_store.current() is None
 
-        completed = await engine_events(application.engine, verification.otp_code)
+        completed = await engine_events(
+            application.engine,
+            verification.otp_codes_by_factor_ref[customer.factor_ref],
+        )
         bound = application.state.identity_store.current()
         state = ReasoningState.model_validate(
             application.engine._graph.get_state(application.engine._config).values
@@ -1337,7 +1333,12 @@ def test_application_rejects_every_cross_tenant_service(config_root: Path) -> No
         "customers": CustomerDirectory("other_store", customers),
         "payment_instruments": PaymentInstrumentDirectory("other_store", instruments),
         "profile_store": ProfileStore("other_store", profiles),
-        "otp": OtpProvider("other_store", valid_code=verification.otp_code),
+        "otp": OtpProvider(
+            "other_store",
+            codes_by_factor_ref=verification.otp_codes_by_factor_ref,
+            challenge_ttl_seconds=verification.challenge_ttl_seconds,
+            proof_ttl_seconds=verification.proof_ttl_seconds,
+        ),
         "risk": RiskProvider("other_store"),
         "telemetry": make_tenant_telemetry("other_store"),
     }
@@ -1476,7 +1477,15 @@ def test_application_rejects_verification_store_using_another_otp_service(
 
     def mismatched_state(context, dependencies):
         state = build_in_memory_session_state(context, dependencies)
-        verification = VerificationStore(OtpProvider(context.tenant_id, valid_code="111111"))
+        verification = VerificationStore(
+            OtpProvider(
+                context.tenant_id,
+                codes_by_factor_ref={"CUST-001": "111111"},
+                challenge_ttl_seconds=300,
+                proof_ttl_seconds=300,
+            ),
+            session_id=state.session_id,
+        )
         return replace(
             state,
             verification_store=verification,
@@ -1487,6 +1496,43 @@ def test_application_rejects_verification_store_using_another_otp_service(
         )
 
     with pytest.raises(ValueError, match="tenant OTP service"):
+        build_application_session(
+            tenant,
+            _settings(),
+            _models(),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=_routing_factory,
+            session_state_factory=mismatched_state,
+        )
+
+
+def test_application_rejects_verification_store_for_another_session(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant.tenant_id,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+
+    def mismatched_state(context, dependencies):
+        state = build_in_memory_session_state(context, dependencies)
+        verification = VerificationStore(
+            dependencies.otp,
+            session_id="foreign-session",
+        )
+        return replace(
+            state,
+            verification_store=verification,
+            caller_context=replace(
+                state.caller_context,
+                verification_store=verification,
+            ),
+        )
+
+    with pytest.raises(ValueError, match=r"verification.*session"):
         build_application_session(
             tenant,
             _settings(),

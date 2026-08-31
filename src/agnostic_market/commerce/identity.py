@@ -5,10 +5,9 @@ Two rungs, matching the guest-lookup / logged-in split (P7 decisions, 2026-07-16
 - **Rung 1 (per-order, no OTP)**: knowing an order id + the account contact on file
   (code-matched, never model-judged) grants THAT order for the session — the industry
   guest-lookup pair. A contact match binds nothing account-wide: no enumeration, no level.
-- **Rung 2 (account-wide)**: a committed OTP to the on-file contact (the identity flow)
-  BINDS the session to a customer and unlocks enumeration (`list_orders`) plus rung 1 for
-  every owned order. Level alone is NOT identity — a profile-flow OTP earns L2 without
-  binding anyone (see `PendingIdentity.grants_at_mint` for the binding invariant).
+- **Rung 2 (account-wide)**: a committed OTP to the on-file contact binds the session to a
+  customer and unlocks enumeration. The exact identity challenge proof is required; an
+  unrelated L2 grant cannot bind anyone.
 
 `CallerIdentityStore` follows the CartStore/RecentOrderContext pattern: one mutable object
 per session, closed into tools/nodes at build, live-read, NEVER checkpointed (a replayed
@@ -49,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from agnostic_market.commerce.orders import GuestOrderScope, OrderPort, OrdersFixture
 from agnostic_market.commerce.spoken import scan_contact_candidates, spoken_digits, spoken_email
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.dtos.orchestration import NonEmptyText
 from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
 _STRICT = ConfigDict(extra="forbid")
@@ -104,6 +104,7 @@ class CustomerEntry(BaseModel):
 
     contact: str = Field(min_length=1)
     masked_contact: str = Field(min_length=1)
+    factor_ref: NonEmptyText
 
 
 class CustomersFixture(BaseModel):
@@ -114,20 +115,32 @@ class CustomersFixture(BaseModel):
     customers: dict[str, CustomerEntry] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _contacts_unique(self) -> CustomersFixture:
+    def _directory_values_unique(self) -> CustomersFixture:
         """`match_contact` is first-match over this dict — a shared contact would silently
         deny every later-listed owner, so the stub directory cannot REPRESENT one. Fail
         loudly at load (same stance as `assert_orders_have_customers`); Phase 4's real SoR
         owns genuine shared-contact semantics."""
-        seen: dict[str, str] = {}
+        contacts: dict[str, str] = {}
+        factors: dict[str, str] = {}
         for ref, entry in self.customers.items():
             key = _match_key(entry.contact)
-            if key in seen:
+            if key in contacts:
                 raise ValueError(
-                    f"customers {seen[key]} and {ref} share a contact - the stub directory "
+                    f"customers {contacts[key]} and {ref} share a contact - the stub directory "
                     "matches first-entry-wins and cannot represent shared contacts"
                 )
-            seen[key] = ref
+            contacts[key] = ref
+            if entry.factor_ref in factors:
+                raise ValueError(
+                    f"customers {factors[entry.factor_ref]} and {ref} share a verification factor"
+                )
+            factors[entry.factor_ref] = ref
+        reused_refs = set(factors).intersection(self.customers)
+        if reused_refs:
+            raise ValueError(
+                "verification factor refs must not reuse customer refs: "
+                + ", ".join(sorted(reused_refs))
+            )
         return self
 
 
@@ -167,7 +180,14 @@ def assert_orders_have_customers(orders: OrdersFixture, customers: CustomersFixt
 
 
 @runtime_checkable
-class CustomerDirectoryPort(TenantBound, Protocol):
+class VerificationFactorPort(TenantBound, Protocol):
+    """Opaque verification-factor lookup for an authorized customer."""
+
+    def verification_factor_ref(self, customer_ref: str) -> str | None: ...
+
+
+@runtime_checkable
+class CustomerDirectoryPort(VerificationFactorPort, Protocol):
     """Customer lookups required by identity and order authorization."""
 
     def match_contact(self, claim: str) -> BoundIdentity | None: ...
@@ -196,6 +216,11 @@ class CustomerDirectory:
     def masked_contact(self, customer_ref: str) -> str | None:
         entry = self.fixture.customers.get(customer_ref)
         return entry.masked_contact if entry else None
+
+    def verification_factor_ref(self, customer_ref: str) -> str | None:
+        """Return the provider-facing factor reference without exposing contact data."""
+        entry = self.fixture.customers.get(customer_ref)
+        return entry.factor_ref if entry is not None else None
 
     def match_contact(self, claim: str) -> BoundIdentity | None:
         cleaned = claim.strip()

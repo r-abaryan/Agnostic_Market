@@ -154,7 +154,7 @@ class CommerceEffectFinishers:
     refund: Callable[[str, RefundRecord], dict[str, object]]
     cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
     return_: Callable[[str, ReturnRecord], dict[str, object]]
-    profile_change: Callable[[str, ProfileChangeRecord], dict[str, object]]
+    profile_change: Callable[[str, ProfileChangeRecord], Awaitable[dict[str, object]]]
 
 
 class NodeExecutionTracker:
@@ -612,9 +612,9 @@ def build_recovery_node(
     profile_store: ProfilePort,
     finishers: CommerceEffectFinishers,
     inspect_principal_transition: Callable[[], PrincipalTransitionInspection],
-    invalidate_principal_transition: Callable[[str | None], bool],
+    invalidate_principal_transition: Callable[[str | None], Awaitable[bool]],
     telemetry: TelemetryRecorder,
-) -> Callable[[ReasoningState], dict[str, object] | Command]:
+) -> Callable[[ReasoningState], Awaitable[dict[str, object] | Command]]:
     def node_failure_event(marker: PendingRecovery) -> dict[str, object]:
         return {
             "event": "turn_failed",
@@ -648,7 +648,10 @@ def build_recovery_node(
         telemetry.record(node_failure_event(marker))
         return {**clear_automation_state(), "messages": [AIMessage(line)]}
 
-    def reconcile_effect(marker: PendingRecovery, state: ReasoningState) -> dict[str, object]:
+    async def reconcile_effect(
+        marker: PendingRecovery,
+        state: ReasoningState,
+    ) -> dict[str, object]:
         action = marker.action
         if action == ExceptionAction.RECONCILE_PLACEMENT:
             pending = state.pending_placement
@@ -743,14 +746,16 @@ def build_recovery_node(
                 receipt.record, ProfileChangeRecord
             ):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.profile_change(pending.idempotency_key, receipt.record))
+                return complete(
+                    await finishers.profile_change(pending.idempotency_key, receipt.record)
+                )
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
 
         return terminal_result(node_failure_event(marker))
 
-    def reconcile_principal_transition(
+    async def reconcile_principal_transition(
         state: ReasoningState,
     ) -> dict[str, object]:
         inspection = inspect_principal_transition()
@@ -785,11 +790,11 @@ def build_recovery_node(
             if completion_line is not None:
                 update["messages"] = [AIMessage(completion_line)]
             return update
-        invalidate_principal_transition(transition.transition_id)
+        await invalidate_principal_transition(transition.transition_id)
         event["outcome"] = "inconsistent"
         return terminal_result(event)
 
-    def recover(state: ReasoningState) -> dict[str, object] | Command:
+    async def recover(state: ReasoningState) -> dict[str, object] | Command:
         marker = state.pending_recovery
         if not isinstance(marker, PendingRecovery):
             return terminal_result()
@@ -818,9 +823,9 @@ def build_recovery_node(
                 "messages": [AIMessage(AUTOMATION_TERMINAL_LINE)],
             }
         if marker.action in _COMMERCE_RECONCILE_ACTIONS:
-            return reconcile_effect(marker, state)
+            return await reconcile_effect(marker, state)
         if marker.action == ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION:
-            return reconcile_principal_transition(state)
+            return await reconcile_principal_transition(state)
         if marker.action == ExceptionAction.SAFE_ABORT:
             if marker.trigger == "stream_cancelled":
                 turn_ids = state.consumed_turn_ids

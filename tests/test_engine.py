@@ -36,6 +36,7 @@ from turn_helpers import (
     engine_events,
     next_committed_turn,
 )
+from verification_helpers import make_otp_provider
 
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
@@ -82,7 +83,7 @@ from agnostic_market.commerce.payment_instruments import (
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import ProfileStore, load_profile_fixture
-from agnostic_market.commerce.verification import OtpProvider, RiskProvider, VerificationStore
+from agnostic_market.commerce.verification import RiskProvider, VerificationStore
 from agnostic_market.dtos.config import ProviderModel
 from agnostic_market.dtos.events import (
     CommittedTurn,
@@ -143,7 +144,6 @@ from agnostic_market.session import CallerContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
 
 _FACTS = TurnFacts()
-_TEST_OTP = "482913"
 _WAIT_TIMEOUT_SECONDS = 5.0
 _DISPATCH_REJECTION_LINE = "I couldn't complete that request. Please try again."
 
@@ -264,8 +264,8 @@ def _engine(
     identity = identity or CallerIdentityStore()
     guest_orders = GuestOrderScope(tenant_id="acme_store", session_id=thread_id)
     customers = CustomerDirectory("acme_store", load_customers_fixture(config_root, "acme_store"))
-    otp = OtpProvider("acme_store", valid_code=_TEST_OTP)
-    verification = VerificationStore(otp)
+    otp = make_otp_provider()
+    verification = VerificationStore(otp, session_id=thread_id)
     telemetry = make_session_telemetry("acme_store", thread_id)
     caller_context = CallerContext(
         verification_store=verification,
@@ -403,7 +403,7 @@ async def test_first_admitted_turn_persists_checkpoint_schema_version(
 
     await _events(engine, "hello")
 
-    assert engine._graph.get_state(engine._config).values["checkpoint_schema_version"] == "1"
+    assert engine._graph.get_state(engine._config).values["checkpoint_schema_version"] == "2"
 
 
 async def test_native_async_model_deadline_keeps_loop_live_and_recovers_in_code(
@@ -514,8 +514,8 @@ def _seed_foreign_checkpoint(
 @pytest.mark.parametrize(
     "foreign_values",
     (
-        {"checkpoint_schema_version": "1", "retired_field": "must not survive"},
-        {"checkpoint_schema_version": "2", "consumed_turn_ids": ("foreign-turn",)},
+        {"checkpoint_schema_version": "2", "retired_field": "must not survive"},
+        {"checkpoint_schema_version": "1", "consumed_turn_ids": ("foreign-turn",)},
     ),
     ids=("unknown-channel", "unsupported-version"),
 )
@@ -2702,8 +2702,11 @@ _CHECKPOINT_CHANNEL_VALUES = (
         amount_usd=79.0,
         destination="original",
         instrument_ref="card ending 1234",
+        customer_ref=None,
+        factor_ref=None,
         idempotency_key="refund-1",
         attempt_key="refund-attempt-1",
+        challenge_id=None,
         created_at=1.0,
     ),
     CancellableOrderScope(scope="all_cancellable"),
@@ -2738,13 +2741,15 @@ _CHECKPOINT_CHANNEL_VALUES = (
         factor_ref="phone ending 1234",
         idempotency_key="profile-1",
         attempt_key="profile-attempt-1",
+        challenge_id=None,
         created_at=1.0,
     ),
     PendingIdentity(
         customer_ref="CUST-1",
         masked_contact="phone ending 1234",
+        factor_ref="CUST-1",
         attempt_key="identity-attempt-1",
-        grants_at_mint=0,
+        challenge_id=None,
     ),
     PendingRecovery(
         origin_node="cart_capability_entry",

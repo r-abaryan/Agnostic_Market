@@ -11,6 +11,7 @@ from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
+from verification_helpers import grant_verification
 
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.commerce.profile import ProfileError, ProfileStore, load_profile_fixture
@@ -36,6 +37,7 @@ def _profile_harness(
     thread_id: str = "prof-1",
     bound: bool = True,
     routing_resolution: RouteResolution | None = None,
+    tool_call_limit: int = 1,
 ) -> SupportHarness:
     h = build_support_engine(
         config_root,
@@ -43,7 +45,7 @@ def _profile_harness(
         reasoning=FakeChatModel(
             force_tool="propose_profile_change",
             canned_args={"propose_profile_change": {"field": field, "new_value": new_value}},
-            tool_call_limit=1,
+            tool_call_limit=tool_call_limit,
         ),
         risk_flagged=risk_flagged,
         thread_id=thread_id,
@@ -103,19 +105,75 @@ async def test_committed_otp_then_readback_then_one_change(config_root: Path) ->
     assert any(e.node == "support_profile_place" and _NEW_ADDRESS in e.text for e in spoken)
 
 
-async def test_contact_change_updates_the_factor_reference(config_root: Path) -> None:
+async def test_fresh_identity_proof_reuses_the_factor_for_a_profile_change(
+    config_root: Path,
+) -> None:
+    h = _profile_harness(config_root, thread_id="profile-proof-reuse")
+    await grant_verification(
+        h.verification,
+        customer_ref=_OWNER,
+        purpose="identity",
+        dispatch_idempotency_key="profile-proof-reuse-identity",
+    )
+    dispatches_before_change = h.otp.dispatch_count
+
+    events = await _events(h.engine, _REQUEST)
+
+    assert h.otp.dispatch_count == dispatches_before_change
+    interrupts = [event for event in events if isinstance(event, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert _NEW_ADDRESS in interrupts[0].prompt
+    assert h.profile.change_count == 0
+
+    await _events(h.engine, "yes")
+    assert h.profile.change_count == 1
+
+
+async def test_fresh_identity_proof_does_not_bypass_profile_risk(
+    config_root: Path,
+) -> None:
+    h = _profile_harness(
+        config_root,
+        risk_flagged=True,
+        thread_id="profile-proof-risk",
+    )
+    await grant_verification(
+        h.verification,
+        customer_ref=_OWNER,
+        purpose="identity",
+        dispatch_idempotency_key="profile-proof-risk-identity",
+    )
+    dispatches_before_change = h.otp.dispatch_count
+
+    events = await _events(h.engine, _REQUEST)
+
+    assert h.otp.dispatch_count == dispatches_before_change
+    assert not any(isinstance(event, InterruptEvent) for event in events)
+    assert h.profile.change_count == 0
+
+
+async def test_contact_change_revokes_the_existing_factor_proof(config_root: Path) -> None:
     h = _profile_harness(
         config_root,
         field="contact",
         new_value="555-0187",
         thread_id="prof-contact-1",
+        tool_call_limit=2,
     )
-    old_factor = h.profile.contact_on_file(_OWNER)
+    old_contact = h.profile.contact_on_file(_OWNER)
     await _events(h.engine, "Put my new phone number 555-0187 on my account")
     await _events(h.engine, _VALID_OTP)  # the OTP went to the OLD factor
     await _events(h.engine, "yes")
     assert h.profile.contact_on_file(_OWNER) == "555-0187"
-    assert h.profile.contact_on_file(_OWNER) != old_factor
+    assert h.profile.contact_on_file(_OWNER) != old_contact
+    assert h.verification.current_level() == 1
+    assert h.verification.grants == []
+
+    events = await _events(h.engine, "Please keep my contact number as 555-0187")
+    interrupts = [event for event in events if isinstance(event, InterruptEvent)]
+    assert len(interrupts) == 1
+    assert "6-digit code" in interrupts[0].prompt
+    assert h.otp.dispatch_count == 2
 
 
 # --- security branches ---------------------------------------------------------------------
@@ -151,7 +209,7 @@ async def test_lapsed_level_at_place_blocks_the_change(config_root: Path) -> Non
     h = _profile_harness(config_root)
     await _events(h.engine, _REQUEST)
     await _events(h.engine, _VALID_OTP)
-    h.verification.clear()  # grant revoked between step-up and the effect
+    await h.verification.clear()  # grant revoked between step-up and the effect
     await _events(h.engine, "yes")
     assert h.profile.change_count == 0  # §A4c live re-validation at place
 

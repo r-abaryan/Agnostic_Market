@@ -533,10 +533,10 @@ class ReasoningEngine:
         current = await self._graph.aget_state(self._config)
         current_state = ReasoningState.from_checkpoint(current.values)
         if current_state.automation_terminal:
-            self._lifecycle.invalidate_principal_transition(transition.transition_id)
+            await self._lifecycle.invalidate_principal_transition(transition.transition_id)
             return None
         if inspection.outcome != "coherent":
-            self._lifecycle.invalidate_principal_transition(transition.transition_id)
+            await self._lifecycle.invalidate_principal_transition(transition.transition_id)
             raise RuntimeError("principal transition is inconsistent")
 
         new_thread_id = _new_thread_id()
@@ -598,7 +598,7 @@ class ReasoningEngine:
             switched = True
             self._lifecycle.complete_transition(transition.transition_id)
         except Exception:
-            self._lifecycle.invalidate_principal_transition(transition.transition_id)
+            await self._lifecycle.invalidate_principal_transition(transition.transition_id)
             if not switched:
                 try:
                     await self._graph.checkpointer.adelete_thread(new_binding.storage_thread_id)
@@ -619,20 +619,22 @@ class ReasoningEngine:
             logger.critical("principal rotation telemetry failed", exc_info=True)
         return transition
 
-    def _invalidate_pending_transition_for_terminal(self) -> None:
+    async def _invalidate_pending_transition_for_terminal(self) -> None:
         if self._lifecycle is None:
             return
         try:
             inspection = self._lifecycle.inspect_principal_transition()
             if inspection.transition is not None:
-                self._lifecycle.invalidate_principal_transition(inspection.transition.transition_id)
+                await self._lifecycle.invalidate_principal_transition(
+                    inspection.transition.transition_id
+                )
         except Exception:
             logger.critical(
                 "failed to inspect principal transition during terminal takeover",
                 exc_info=True,
             )
             try:
-                self._lifecycle.invalidate_principal_transition()
+                await self._lifecycle.invalidate_principal_transition()
             except Exception:
                 logger.critical(
                     "failed to invalidate caller authority during terminal takeover",
@@ -661,7 +663,7 @@ class ReasoningEngine:
         )
 
     async def _afinalize_last_resort_state(self, *, replace_checkpoint: bool = False) -> None:
-        self._invalidate_pending_transition_for_terminal()
+        await self._invalidate_pending_transition_for_terminal()
         terminal_update: dict[str, object] = {
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             **clear_automation_state(),

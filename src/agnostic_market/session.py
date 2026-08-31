@@ -121,7 +121,7 @@ class CallerContext:
             or self.recent_orders.snapshot().order_refs
         )
 
-    def transition_principal(
+    async def transition_principal(
         self,
         new_identity: BoundIdentity,
         fresh_proof: VerificationProof,
@@ -144,7 +144,7 @@ class CallerContext:
         self._pending_transition = transition
         self._clear_ephemeral()
         self.identity_store.clear()
-        self.verification_store.retain_only(fresh_proof)
+        await self.verification_store.retain_only(fresh_proof)
         self.identity_store.bind(new_identity)
         self.telemetry.record(
             {
@@ -180,7 +180,10 @@ class CallerContext:
             transition=transition,
         )
 
-    def invalidate_principal_transition(self, expected_transition_id: str | None = None) -> bool:
+    async def invalidate_principal_transition(
+        self,
+        expected_transition_id: str | None = None,
+    ) -> bool:
         """Destroy all caller authority after an ambiguous or inconsistent transition."""
         pending = self._pending_transition
         matched = bool(
@@ -189,7 +192,7 @@ class CallerContext:
         )
         self._clear_ephemeral()
         self.identity_store.clear()
-        self.verification_store.clear()
+        await self.verification_store.clear()
         self._pending_transition = None
         return matched
 
@@ -233,7 +236,7 @@ class CallerContext:
 
     async def _acomplete_close(self) -> None:
         self._clear_ephemeral()
-        self.verification_store.clear()
+        await self.verification_store.clear()
         self.identity_store.clear()
         self._pending_transition = None
         if self.engine is not None:

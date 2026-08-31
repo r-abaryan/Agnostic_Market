@@ -26,6 +26,7 @@ from agnostic_market.dtos.orchestration import (
     CartOperation,
     ClarificationOwner,
     IntentRequest,
+    NonEmptyText,
     RouterNoActionEnvelope,
     VerifyOrderStatus,
 )
@@ -34,8 +35,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["1"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "1"
+CheckpointSchemaVersion = Literal["2"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "2"
 
 
 class CheckpointSchemaError(ValueError):
@@ -219,16 +220,10 @@ class PendingPlacement(BaseModel):
 
 
 class PendingRefund(BaseModel):
-    """A refund awaiting step-up verification and/or HITL confirmation (AGENTS §A4b/§A10a).
+    """A typed refund proposal awaiting verification and caller confirmation.
 
-    Same A10a discipline as PendingPlacement: `idempotency_key` is per-refund-INTENT (never
-    derived from `order_id`, so a second legitimate PARTIAL refund is not silently deduped
-    as a replay); `amount_usd`/`instrument_ref` are CODE-resolved, never model arithmetic.
-    `destination` drives the required verification level in code (new instrument => L2
-    regardless of amount, §A4b — the fraud floor). `attempt_key` keys the idempotent OTP
-    dispatch (a replayed dispatch node must not re-send); `otp_tries` bounds the re-collect
-    loop deterministically (A10a rule 3). The refund `instrument_ref` is a STORED-instrument
-    reference, never a raw PAN entered by voice (PCI boundary, SECURITY §6).
+    New-instrument refunds carry the exact customer and factor subject. The challenge id
+    preserves provider-owned expiry, attempt limits, and replay identity across interrupts.
     """
 
     model_config = _FROZEN
@@ -239,10 +234,21 @@ class PendingRefund(BaseModel):
     amount_usd: UsdAmount
     destination: RefundDestination
     instrument_ref: str = Field(min_length=1)
-    idempotency_key: str = Field(min_length=1)
-    attempt_key: str = Field(min_length=1)
-    otp_tries: int = Field(ge=0, default=0)
+    customer_ref: NonEmptyText | None
+    factor_ref: NonEmptyText | None
+    idempotency_key: NonEmptyText
+    attempt_key: NonEmptyText
+    challenge_id: NonEmptyText | None
     created_at: float
+
+    @model_validator(mode="after")
+    def verification_subject_matches_destination(self) -> PendingRefund:
+        has_subject = self.customer_ref is not None and self.factor_ref is not None
+        if self.destination in ("new_instrument", "new_address") and not has_subject:
+            raise ValueError("L2 refund destination requires a verification subject")
+        if (self.customer_ref is None) != (self.factor_ref is None):
+            raise ValueError("refund verification subject must be complete")
+        return self
 
 
 # --- the cancel lifecycle (F-16.2 batch-aware cancel) --------------------------------------
@@ -353,21 +359,10 @@ class PendingReturn(BaseModel):
 
 
 class PendingProfileChange(BaseModel):
-    """An address/contact change awaiting step-up verification + HITL confirmation (Group C;
-    PendingRefund's step-up shape minus money).
+    """A typed profile change awaiting subject-bound verification and confirmation.
 
-    Always L2 (`profile_change_required_level`, the §A4a platform floor): address/contact
-    are the account-takeover levers. `factor_ref` RECORDS the MASKED on-file contact at
-    proposal time — for a contact change that is the OLD factor (changing the factor
-    requires the factor, the ladder constraint). It is a Phase-4 breadcrumb: the stub OTP
-    dispatches by `attempt_key` (idempotency), so nothing reads `factor_ref` yet; the
-    real SoR delivery in Phase 4 sends to this recorded factor. `new_value` is the
-    caller-stated value:
-    SPOKEN in the readback/outcome, NEVER logged/telemetered (PII discipline) — and note it
-    sits inside the CHECKPOINT, which is acceptable for the in-memory per-session saver
-    (reaped on close) but must be revisited at the Phase-4 Redis swap (encrypt or exclude).
-    `attempt_key` keys the idempotent OTP dispatch; `otp_tries` bounds the re-collect loop
-    (A10a rule 3) — same discipline as PendingRefund.
+    The factor reference is opaque and identifies the existing delivery factor. The
+    challenge id retains provider authority across collection retries and graph replay.
     """
 
     model_config = _FROZEN
@@ -375,42 +370,26 @@ class PendingProfileChange(BaseModel):
     # The OTP-BOUND customer this change belongs to (Fix 5 Milestone B) — captured from the live
     # binding at proposal time, re-validated against the live binding at effect time (§A4c), and
     # the scope key for the customer-owned profile read/update. Never a model argument.
-    customer_ref: str = Field(min_length=1)
+    customer_ref: NonEmptyText
     field: ProfileField
     new_value: str = Field(min_length=1)
-    factor_ref: str = Field(min_length=1)
-    idempotency_key: str = Field(min_length=1)
-    attempt_key: str = Field(min_length=1)
-    otp_tries: int = Field(ge=0, default=0)
+    factor_ref: NonEmptyText
+    idempotency_key: NonEmptyText
+    attempt_key: NonEmptyText
+    challenge_id: NonEmptyText | None
     created_at: float
 
 
 class PendingIdentity(BaseModel):
-    """An identity verification awaiting step-up (P7 — the third `_stepup.py` family).
-
-    Minted by the identity flow's assemble AFTER the caller's contact claim code-matched a
-    customer. Carries the MASKED contact only (the factor_ref analogue). The raw claim is
-    still present in checkpointed caller/model message history; this DTO adds no second raw-value
-    field. `grants_at_mint` snapshots
-    `len(verification_store.grants)` at mint: THE binding invariant. A stale cross-family L2
-    (e.g. an earlier profile-flow OTP) satisfies the factory's level-only confirm check even
-    when THIS chain's OTP failed — the flow's collect router and apply node require a NEW
-    grant since mint (this chain's OTP actually succeeded) before binding a customer.
-
-    Deliberately NO `idempotency_key` (the bind effect is a session-local set — naturally
-    idempotent, no SoR effect to dedup) and NO `created_at` (identity has no confirm
-    interrupt to TTL-check; its only interrupt is the factory's OTP collect, which no family
-    TTL-checks — a stale-but-correct OTP is still the correct OTP, and abandonment is the
-    Clock-B reaper's job).
-    """
+    """A matched identity awaiting an exact, subject-bound challenge proof."""
 
     model_config = _FROZEN
 
-    customer_ref: str = Field(min_length=1)
+    customer_ref: NonEmptyText
     masked_contact: str = Field(min_length=1)
-    attempt_key: str = Field(min_length=1)
-    otp_tries: int = Field(ge=0, default=0)
-    grants_at_mint: int = Field(ge=0)
+    factor_ref: NonEmptyText
+    attempt_key: NonEmptyText
+    challenge_id: NonEmptyText | None
 
 
 # Graph-local execution phase for transactional capability owners.

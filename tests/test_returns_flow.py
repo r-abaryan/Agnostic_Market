@@ -10,12 +10,12 @@ import pytest
 from llm_fakes import FakeChatModel
 from policy_helpers import make_policy
 from support_helpers import (
-    TEST_OTP,
     SupportHarness,
     authorize_customer,
     build_support_engine,
 )
 from turn_helpers import engine_events
+from verification_helpers import TEST_OTP_CODES
 
 from agnostic_market.agents.support import flow as support_flow
 from agnostic_market.agents.telemetry import TelemetryPurpose
@@ -343,7 +343,7 @@ async def test_refund_stepup_emits_no_profile_events(config_root: Path) -> None:
         "CUST-002",
     )
     await _events(h.engine, "I'd like a refund to a different card")  # pauses at OTP
-    await _events(h.engine, TEST_OTP)
+    await _events(h.engine, TEST_OTP_CODES["CUST-002"])
     await _events(h.engine, "yes")
     assert h.store.refund_count == 1
     events = _telemetry_events(h)

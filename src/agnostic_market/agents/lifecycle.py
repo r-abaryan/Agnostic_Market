@@ -33,7 +33,7 @@ class PrincipalTransitionLifecycle(Protocol):
 
     def cancellation_takeover_lease(self) -> AbstractContextManager[bool]: ...
 
-    def transition_principal(
+    async def transition_principal(
         self,
         new_identity: BoundIdentity,
         fresh_proof: VerificationProof,
@@ -44,7 +44,7 @@ class PrincipalTransitionLifecycle(Protocol):
 
     def inspect_principal_transition(self) -> PrincipalTransitionInspection: ...
 
-    def invalidate_principal_transition(
+    async def invalidate_principal_transition(
         self,
         expected_transition_id: str | None = None,
     ) -> bool: ...

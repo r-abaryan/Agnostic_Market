@@ -1,38 +1,7 @@
-"""The identity gated flow (P7) — verify the caller, bind the session, speak THEIR orders.
+"""Verify a matched customer, bind the session, and continue the typed request.
 
-Entered by handover (reason_code "list_orders"): enumeration is rung 2 of the P7
-authorization split — a caller may guest-look-up ONE order with the order id + contact
-pair (voice/tools.py order_status), but "what orders do I have?" requires an OTP-BOUND
-identity. The chain is the SAME `_stepup.py` factory the refund/profile flows run:
-
-    assemble ─(claim code-matched, pending minted)─▶ guardrail
-        │ no match, within budget ─▶ reask (softened re-ask; never asserts not-on-file)
-        │ no match, budget spent  ─▶ human (SILENT — the handover deferral is the voice)
-        ▼
-    guardrail ─(already bound to this customer)─▶ apply
-        └─(unbound)─▶ risk_check ─▶ dispatch ─▶ collect[INT: OTP] ─▶ apply
-
-THE BINDING INVARIANT (the P7 security-review catch): the factory's route_after_collect
-confirms on `current_level() >= required` ALONE — correct for refund/profile (level IS
-their requirement), insufficient for a BIND: a stale cross-family L2 (an earlier
-profile-flow OTP) would let a WRONG identity OTP route "confirm". `VerificationStore.
-verify_otp` appends a grant on every successful match, so "a NEW grant since the pending
-was minted" ≡ "THIS chain's OTP succeeded": `route_after_collect` here wraps the factory
-decision and downgrades a no-new-grant "confirm" back to "dispatch" (the factory's tries
-counter still bounds the loop), and `apply` re-checks both conditions before binding.
-
-Anti-enumeration posture (P7 decisions 4/5, ACCEPTED GAPS documented in
-commerce/identity.py): the re-ask wording never confirms non-existence, the terminal
-no-match hands to a human with no flow-authored line, and claim attempts are bounded
-per-session only — the cross-session throttle is the platform rate/abuse layer's job.
-A neutral "dispatch anyway" flow is NOT an option in the build phase: the stub OTP code
-is global, so a doomed collect for an unmatched claim would grant L2 to an unverified
-caller.
-
-PII discipline: the checkpointed caller transcript and the model's `propose_identity` tool
-arguments contain the raw spoken claim. The pending carries the MASKED contact only;
-ToolMessages are constant (no value echo); telemetry carries closed slugs + the customer_ref
-fixture slug only. Durable-checkpoint minimization/encryption remains a Phase-4 gate.
+Account-wide authority requires the proof minted by this identity challenge. An unrelated
+verification level cannot bind a customer. Unknown contact claims remain non-enumerating.
 """
 
 from __future__ import annotations
@@ -70,7 +39,11 @@ from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectoryPort,
 )
-from agnostic_market.commerce.verification import RiskPort, VerificationStore
+from agnostic_market.commerce.verification import (
+    RiskPort,
+    VerificationStore,
+    VerificationSubject,
+)
 from agnostic_market.dtos.confirmation import identity_required_level
 from agnostic_market.dtos.orchestration import (
     IntentRequest,
@@ -118,16 +91,15 @@ class IdentityNodes:
     ask_contact: Callable[[ReasoningState], dict[str, object]]
     reask: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
-    risk_check: Callable[[ReasoningState], dict[str, object]]
-    dispatch: Callable[[ReasoningState], dict[str, object]]
-    collect: Callable[[ReasoningState], dict[str, object]]
-    apply: Callable[[ReasoningState], dict[str, object]]
+    risk_check: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    dispatch: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    collect: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    apply: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     # "leave" | "handover" | "guardrail" | "reask" | "clarify" — from the assemble outcome.
     route_after_assemble: Callable[[ReasoningState], str]
-    # "confirm" (already bound to this customer, level held) | "stepup".
-    route_after_guardrail: Callable[[ReasoningState], str]
-    # "confirm" | "dispatch" | "handover" — the factory decision, WRAPPED with the binding
-    # invariant (a no-new-grant "confirm" re-collects instead).
+    # "confirm" | "dispatch" | "handover" after the current identity risk decision.
+    route_after_risk: Callable[[ReasoningState], str]
+    # "confirm" | "collect" | "handover" for the dispatched identity challenge.
     route_after_collect: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
@@ -153,7 +125,7 @@ def build_identity_nodes(
     identity_store: CallerIdentityStore,
     policy: PolicyContext,
     transition_principal: Callable[
-        [BoundIdentity, VerificationProof, IntentRequest], PrincipalTransition
+        [BoundIdentity, VerificationProof, IntentRequest], Awaitable[PrincipalTransition]
     ],
     *,
     display_name: str,
@@ -221,24 +193,39 @@ def build_identity_nodes(
             "clarification_liveness": step.liveness,
         }
 
+    def _pending_for(identity: BoundIdentity) -> PendingIdentity | None:
+        factor_ref = customers.verification_factor_ref(identity.customer_ref)
+        if factor_ref is None:
+            return None
+        return PendingIdentity(
+            customer_ref=identity.customer_ref,
+            masked_contact=identity.masked_contact,
+            factor_ref=factor_ref,
+            attempt_key=uuid.uuid4().hex,
+            challenge_id=None,
+        )
+
+    def _identity_subject(pending: PendingIdentity) -> VerificationSubject:
+        if pending.customer_ref is None or pending.factor_ref is None:
+            raise ValueError("pending identity requires a complete verification subject")
+        return verification_store.subject(
+            customer_ref=pending.customer_ref,
+            factor_ref=pending.factor_ref,
+            purpose="identity",
+        )
+
     async def assemble_node(state: ReasoningState) -> dict[str, object]:
-        """Model turn INSIDE identity: collect the claimed contact, or clarify, or leave.
-        The claim is code-matched HERE (never model-judged); a match mints PendingIdentity
-        with the grants-at-mint snapshot (the binding invariant's baseline)."""
+        """Collect a contact claim, clarify it, or leave the identity flow."""
         bound = identity_store.current()
         invocation = state.active_invocation
         request = invocation.request if invocation is not None else None
         switching = isinstance(request, SwitchAccount)
         if bound is not None and not switching:
-            # Already proven this session (a misrouted second enumeration handover): mint
-            # from the binding directly — no model call, no re-claim; the guardrail's
-            # bound-same-customer check routes straight to apply (no second OTP).
-            pending = PendingIdentity(
-                customer_ref=bound.customer_ref,
-                masked_contact=bound.masked_contact,
-                attempt_key=uuid.uuid4().hex,
-                grants_at_mint=len(verification_store.grants),
-            )
+            # Build from the existing binding without another model claim. Risk still runs
+            # before the current proof is reused.
+            pending = _pending_for(bound)
+            if pending is None:
+                return _human_handover({})
             return {"pending_identity": pending}
         prompt = SystemMessage(compose_identity_prompt(display_name, policy))
         messages: list = [prompt, *state.messages]
@@ -284,12 +271,9 @@ def build_identity_nodes(
                 new_messages.append(ToolMessage("identity claim received", tool_call_id=call["id"]))
                 matched = customers.match_contact(proposed.contact_claim)
                 if matched is not None:
-                    pending = PendingIdentity(
-                        customer_ref=matched.customer_ref,
-                        masked_contact=matched.masked_contact,
-                        attempt_key=uuid.uuid4().hex,
-                        grants_at_mint=len(verification_store.grants),
-                    )
+                    pending = _pending_for(matched)
+                    if pending is None:
+                        return _human_handover({"messages": new_messages})
                     return {"messages": new_messages, "pending_identity": pending}
                 if state.identity_claim_misses < policy.contact_reask_max:
                     # Bounded re-ask (decision 4; budget = policy.contact_reask_max, was a
@@ -340,23 +324,14 @@ def build_identity_nodes(
         already_proven = (
             bound is not None
             and bound.customer_ref == pending.customer_ref
-            and verification_store.current_level() >= identity_required_level()
+            and verification_store.authorization_satisfies(
+                _identity_subject(pending),
+                identity_required_level(),
+            )
         )
         if not already_proven:
             telemetry.record({"event": "identity_stepup_required", "required_level": 2})
         return {}
-
-    def route_after_guardrail(state: ReasoningState) -> str:
-        pending = state.pending_identity
-        assert pending is not None
-        bound = identity_store.current()
-        if (
-            bound is not None
-            and bound.customer_ref == pending.customer_ref
-            and verification_store.current_level() >= identity_required_level()
-        ):
-            return "confirm"  # already bound to THIS customer — no second OTP
-        return "stepup"
 
     stepup = build_stepup_nodes(
         verification_store,
@@ -364,36 +339,33 @@ def build_identity_nodes(
         pending_field="pending_identity",
         pending_type=PendingIdentity,
         required_level=lambda p: identity_required_level(),
+        subject=_identity_subject,
         event_prefix="identity",
+        reuse_existing_proof=True,
         max_otp_attempts=policy.otp_max_attempts,
         telemetry=telemetry,
     )
 
+    def route_after_risk(state: ReasoningState) -> str:
+        """Reuse a proof only for the customer already bound to this session."""
+        decision = stepup.route_after_risk(state)
+        if decision != "confirm":
+            return decision
+        pending = state.pending_identity
+        assert pending is not None
+        bound = identity_store.current()
+        return (
+            "confirm"
+            if bound is not None and bound.customer_ref == pending.customer_ref
+            else "dispatch"
+        )
+
     def route_after_collect(state: ReasoningState) -> str:
-        """The factory decision, WRAPPED with the binding invariant: the factory confirms
-        on level alone, but a bind requires THIS chain's OTP to have succeeded — a stale
-        cross-family L2 with no NEW grant since mint re-collects instead (the factory's
-        tries counter still bounds the loop: `max_otp_attempts` committed misses -> human)."""
-        decision = stepup.route_after_collect(state)
-        if decision == "confirm":
-            pending = state.pending_identity
-            assert pending is not None  # collect clears only via handover
-            bound = identity_store.current()
-            already_proven = bound is not None and bound.customer_ref == pending.customer_ref
-            if not already_proven and len(verification_store.grants) <= pending.grants_at_mint:
-                return "dispatch"
-        return decision
+        """Advance only when this identity challenge satisfies the required level."""
+        return stepup.route_after_collect(state)
 
-    def apply_node(state: ReasoningState) -> dict[str, object]:
-        """Bind the session to the verified customer (authentication), then branch on WHY
-        identity was entered. Re-validates BOTH invariant legs live before a NEW bind (§A4c,
-        triad leg 3): the level, and a grant NEWER than the pending's mint snapshot (this
-        chain's OTP really succeeded). An already-bound same-customer pass (the misrouted-
-        handover shortcut) proceeds without re-proving.
-
-        A typed request survives only as a proposal. A new-principal bind hands it to the
-        lifecycle owner for fresh-thread bootstrap; a same-principal shortcut routes it to the
-        deterministic support continuation in the current thread."""
+    async def apply_node(state: ReasoningState) -> dict[str, object]:
+        """Bind with the exact challenge proof and continue the typed request."""
         pending = state.pending_identity
         assert pending is not None
         invocation = state.active_invocation
@@ -403,15 +375,24 @@ def build_identity_nodes(
         bound = identity_store.current()
         needs_bind = bound is None or bound.customer_ref != pending.customer_ref
         if needs_bind:
-            if verification_store.current_level() < identity_required_level():
+            exact_challenge_holds = bool(
+                pending.challenge_id is not None
+                and verification_store.challenge_satisfies(
+                    pending.challenge_id,
+                    _identity_subject(pending),
+                    identity_required_level(),
+                )
+            )
+            if not exact_challenge_holds:
                 telemetry.record(
                     {"event": "identity_stepup_failed", "reason": "level_lapsed_at_apply"}
                 )
                 return _human_handover({})
-            if len(verification_store.grants) <= pending.grants_at_mint:
-                telemetry.record({"event": "identity_stepup_failed", "reason": "unproven_binding"})
-                return _human_handover({})
-            fresh_proof = verification_store.fresh_proof_since(pending.grants_at_mint)
+            fresh_proof = (
+                verification_store.proof_for_challenge(pending.challenge_id)
+                if pending.challenge_id is not None
+                else None
+            )
             if fresh_proof is None:
                 telemetry.record(
                     {"event": "identity_stepup_failed", "reason": "missing_fresh_proof"}
@@ -420,7 +401,7 @@ def build_identity_nodes(
             new_identity = BoundIdentity(
                 customer_ref=pending.customer_ref, masked_contact=pending.masked_contact
             )
-            transition = transition_principal(new_identity, fresh_proof, request)
+            transition = await transition_principal(new_identity, fresh_proof, request)
             projection = transition.projection
             continuation = projection.continuation
             completion_line = principal_completion_line(projection.completion_kind)
@@ -455,7 +436,10 @@ def build_identity_nodes(
                 }
             )
         if isinstance(request, VerifyIdentity):
-            newly_verified = len(verification_store.grants) > pending.grants_at_mint
+            newly_verified = bool(
+                pending.challenge_id is not None
+                and verification_store.proof_for_challenge(pending.challenge_id) is not None
+            )
             line = (
                 principal_completion_line("verify_identity")
                 if newly_verified
@@ -499,16 +483,16 @@ def build_identity_nodes(
         return "clarify"  # the model's question streamed already; end the turn in-flow
 
     def _clear_selection_on_handover(
-        node: Callable[[ReasoningState], dict[str, object]],
-    ) -> Callable[[ReasoningState], dict[str, object]]:
+        node: Callable[[ReasoningState], Awaitable[dict[str, object]]],
+    ) -> Callable[[ReasoningState], Awaitable[dict[str, object]]]:
         """Wrap a factory step-up node (risk_check/collect) so ANY handover it emits (SIM-swap
         risk, OTP exhaustion) also drops every typed action request — a FAILED verification
         must leave ZERO action intent for a later turn.
         The factory clears only `pending_identity`; both live in channels the shared factory
         must not know about — so the clear is HERE, not in _stepup.py."""
 
-        def wrapped(state: ReasoningState) -> dict[str, object]:
-            update = node(state)
+        async def wrapped(state: ReasoningState) -> dict[str, object]:
+            update = await node(state)
             if update.get("handover") is not None:
                 update = {
                     **update,
@@ -531,7 +515,7 @@ def build_identity_nodes(
         collect=_clear_selection_on_handover(stepup.collect),
         apply=apply_node,
         route_after_assemble=route_after_assemble,
-        route_after_guardrail=route_after_guardrail,
+        route_after_risk=route_after_risk,
         route_after_collect=route_after_collect,
         speakable_nodes=frozenset(
             {
