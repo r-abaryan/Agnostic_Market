@@ -1,0 +1,33 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.5"
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Check formatting and lint
+        run: |
+          uv run --no-sync ruff format --check .
+          uv run --no-sync ruff check .
+      - name: Run the isolated test suite
+        run: uv run --no-sync pytest -m "not postgres"
+      - name: Run the disposable PostgreSQL checkpoint harness
+        run: uv run --no-sync python scripts/postgres_checkpoint_harness.py

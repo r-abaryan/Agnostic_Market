@@ -1338,6 +1338,7 @@ def _build_eval_runtime(
     response_model: BaseChatModel,
     reasoning_model: BaseChatModel,
     *,
+    fixture_config_root: Path,
     routing_model: BaseChatModel,
     routing_recognizer: RoutingRecognizer | None = None,
     thread_id: str,
@@ -1352,7 +1353,7 @@ def _build_eval_runtime(
         policy=config.policies.to_policy_context(),
     )
     services = build_fixture_tenant_services(
-        _CONFIG_ROOT,
+        fixture_config_root,
         config.merchant_id,
         telemetry=TenantTelemetry(
             config.merchant_id,
@@ -2957,6 +2958,7 @@ async def _run_semantic_route_eval(
     report_path: Path,
     gate: SemanticRouteGate = "cutover",
     *,
+    fixture_config_root: Path,
     diagnostic_timeout_seconds: float | None = None,
     candidate_selection: ProviderModel | None = None,
 ) -> int:
@@ -2988,6 +2990,7 @@ async def _run_semantic_route_eval(
         config,
         selection.response_model,
         selection.gateway.chat_model(config.llm.reasoning),
+        fixture_config_root=fixture_config_root,
         routing_model=candidate_model,
         thread_id=f"semantic-route-eval-{uuid.uuid4().hex}",
         structured_output_method=selection.response_structured_output_method,
@@ -3556,6 +3559,7 @@ async def _run_transport_case(
     fault_kind: FaultKind,
     max_retries: int,
     config: MerchantConfig,
+    fixture_config_root: Path,
     credentials: ProviderCredentialsConfig,
     secrets: SecretResolver,
     request_ceiling: int,
@@ -3588,6 +3592,7 @@ async def _run_transport_case(
                     config,
                     model,
                     model,
+                    fixture_config_root=fixture_config_root,
                     routing_model=model,
                     routing_recognizer=_TransportContinuationRecognizer(),
                     thread_id=f"transport-{uuid.uuid4().hex}",
@@ -3685,6 +3690,7 @@ async def _run_transport_certification(
             fault_kind=fault_kind,
             max_retries=max_retries,
             config=config,
+            fixture_config_root=_CONFIG_ROOT,
             credentials=credentials,
             secrets=secrets,
             request_ceiling=request_ceiling,
@@ -3925,6 +3931,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_semantic_route_eval(
                 args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
                 semantic_gate,
+                fixture_config_root=_CONFIG_ROOT,
                 diagnostic_timeout_seconds=diagnostic_timeout_seconds,
                 candidate_selection=args.semantic_routing_candidate,
             )

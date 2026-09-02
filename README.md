@@ -1,114 +1,214 @@
 # Agnostic Market
 
-Multi-tenant, LLM-agnostic voice commerce agent. The model proposes; code authorizes and executes.
+Multi-tenant, provider-agnostic voice commerce with typed semantic routing and code-owned effects.
 
-A caller talks to a voice agent that can search a catalog, build a cart, place an order, and handle
-cancellations, refunds, returns, and profile changes. Every irreversible action passes through
-deterministic guardrails, a spoken readback, and explicit consent before any effect is committed.
-The model never holds effect authority.
+Agnostic Market is a production-shaped voice agent for catalog discovery, cart management, order
+placement, order support, identity verification, and account changes. A model may understand the
+caller and propose typed work. It never grants authority or commits an effect.
 
-## Design rules
+> Current status: the semantic-routing migration is merged. The Phase 4C durable platform
+> foundation is in progress. The system is not production-qualified or authorized for real merchant
+> traffic.
 
-Enforced in code, not by convention.
+## Capabilities
 
-**Two planes.** The model proposes a typed request. Code resolves the target, re-checks
-authorization against live state, and executes. A tool call is a proposal, never a command.
+The current immutable registry contains 16 typed entries covering:
 
-**One author per turn.** Graph topology decides who may speak. A node that invokes a model cannot
-author caller-facing text, and graph construction fails if those two sets intersect.
+- catalog search and bounded general or policy answers;
+- cart view, add, remove, quantity change, and whole-cart placement;
+- order status, session or account order listing, cancellation, refund, and return;
+- identity verification, identity-status read, and account switching;
+- profile changes, current-request abort, and the human on-ramp.
 
-**Authorization is not authentication.** Mutating an order requires an OTP-bound identity or an
-order placed in the current session. A contact match grants reads only.
+Call-start AI disclosure is owned by the voice lifecycle, not ordinary semantic routing. Payment
+card capture, inventory, promotions, tax, shipping, fulfilment, and live SIP transfer are not
+implemented capabilities.
 
-**No existence oracle.** An unknown order and someone else's order produce the same response, so
-the system cannot be probed for which orders exist.
+## Architecture
 
-**Policy within bounds.** Merchants tune refund thresholds and return windows; platform ceilings
-clamp them. The spoken policy summary is derived from the enforced values, so a model cannot state
-a threshold the guardrail would refuse.
+The system separates real-time voice, reasoning, and data responsibilities:
 
-**Effects survive failure.** Pending actions are serialized, idempotent, revalidated against the
-store before commit, and resumed from a checkpoint rather than reinterpreted as a fresh turn.
+| Plane | Responsibility | Current implementation |
+|---|---|---|
+| Voice | VAD, STT, TTS, turn admission, barge-in, disclosure | LiveKit Agents behind the voice adapter |
+| Reasoning | semantic recognition, typed dispatch, deterministic owners, HITL, recovery | LangGraph behind `ReasoningEngine` |
+| Data | tenant services, session authority, effects, receipts, checkpoints, telemetry | fixture-backed ports and in-memory session state; PostgreSQL transition in Phase 4C |
 
-**Providers are swappable.** STT, TTS, and LLM providers are config-driven. A model serves commerce
-turns only after passing a fail-closed conformance gate.
+An ordinary committed turn follows one ownership path:
 
-## Layout
-
+```text
+caller speech
+    -> voice pipeline
+    -> ReasoningEngine
+    -> one semantic recognizer
+    -> typed dispatch or bounded no-action envelope
+    -> immutable capability registry
+    -> one deterministic capability owner
+    -> live authorization, policy, consent, and effect boundary
+    -> validated caller-facing result
 ```
+
+`ReasoningEngine` owns ordinary language recognition before graph execution. The graph entry accepts
+only an engine-authored dispatch, bounded no-action work, recovery work, or terminal state. There is
+no legacy regex intent router, model-authored inter-flow handover, backup recognizer, or runtime
+semantic fallback.
+
+`build_application_session()` is the composition boundary. It binds one immutable tenant context,
+one `TenantServices` bundle, and one `ApplicationSessionState` bundle before constructing the graph,
+router, engine, telemetry, and caller lifecycle. Tenant mismatches fail before an owner can run.
+
+## Safety and correctness
+
+The main contracts are structural rather than prompt-only:
+
+- **A typed request is not authority.** Owners re-resolve live targets and re-check identity,
+  tenant, policy, and effect eligibility.
+- **Consent is deterministic.** Irreversible actions require a complete code-authored readback and
+  explicit consent. Negation wins and ambiguous language re-asks.
+- **Intent has one semantic owner.** Open-language intent is never inferred with regexes, keyword
+  lists, or substring matching. Deterministic classifiers are limited to closed-domain controls.
+- **Speech has declared provenance.** Authoritative commerce outcomes are code-rendered. Dedicated
+  catalog and answer model outputs are buffered, validated, and released only from declared
+  model-speech nodes. Transactional model nodes cannot speak.
+- **Authentication and authorization are separate.** A contact match may grant one order read. It
+  cannot authorize mutation or bind an account. Protected account work uses fresh factor-bound
+  verification.
+- **Effects are replay-safe.** Proposals are checkpointed before consent, effect keys are stable,
+  stores arbitrate idempotency, and recovery renders authoritative receipts instead of replaying a
+  mutator blindly.
+- **Failures converge safely.** Per-node recovery policies, terminal latching, execution
+  quiescence, principal rotation, and verified checkpoint deletion prevent late work from reviving
+  retired authority.
+- **Configuration fails closed.** Platform safety limits constrain merchant policy, and production
+  voice startup requires a current qualification report matching the exact routing runtime.
+
+## Repository structure
+
+```text
 src/agnostic_market/
-  dtos/       Pydantic contracts, the single source of truth for shared types
-  config/     three-layer merchant resolution, safety-locked keys enforced in code
-  tenancy/    merchant resolution and immutable per-session context
-  secrets/    pluggable SecretResolver; config holds env:// refs, never values
-  llm/        provider-agnostic gateway and the conformance gate
-  voice/      STT/TTS factories, LiveKit adapter, call-start disclosure
-  commerce/   fixture-backed catalog, orders, cart, profile, verification
-  agents/     the tiered reasoning graph and its engine
-scripts/      worker entrypoint, evaluator, conformance, transport-fault and smoke runners
-tests/        38 test modules, zero network
+  application.py     tenant services and application-session composition
+  checkpoints.py     strict checkpoint namespace, schema, serializer, and I/O boundary
+  session.py         caller authority, lifecycle, close, and principal transition
+  agents/
+    engine.py        turn admission, semantic routing, replay, and recovery orchestration
+    capabilities.py  immutable typed capability registry
+    routing.py       recognizer-neutral semantic routing boundary
+    frontline/       dispatcher, typed read owners, and caller-facing graph assembly
+    cart/            cart mutation and placement flow
+    support/         cancel, refund, return, and profile-change flow
+    identity/        factor-bound identity flow
+  commerce/          service ports, fixture adapters, effects, receipts, and renderers
+  config/            validated base, template, merchant, policy, and provider resolution
+  dtos/              strict Pydantic state, routing, confirmation, and money contracts
+  llm/               provider gateway and model conformance
+  secrets/           environment-backed secret resolution
+  tenancy/           immutable tenant identity and resolution
+  voice/             LiveKit pipeline, adapter, disclosure, and speech transport
+scripts/             worker, evaluators, smoke checks, recovery tools, PostgreSQL harness
+tests/               synthetic unit, integration, adversarial, lifecycle, and backend contracts
+.github/workflows/   locked verification workflow
 ```
 
-Inside `agents/`, each gated flow is a package pairing graph logic with its model-facing prompt.
-`engine.py` owns ordinary-turn semantic recognition plus thread and resume lifecycle,
-`frontline/graph.py` dispatches typed requests, `recovery.py` owns per-node failure policy, and
-`capabilities.py` provides the immutable per-session registry. `cart/`, `support/`, `identity/`,
-and `frontline/read_flow.py` own execution. `routing.py` understands intent but carries no live
-authority.
+## Development setup
 
-## Run
+Requirements:
 
-Requires Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/).
+- Python 3.12 or newer;
+- [uv](https://docs.astral.sh/uv/);
+- Docker only for the default CI PostgreSQL harness, with native binaries and a remote DSN
+  supported for local runs;
+- provider credentials only for voice, live conformance, or credentialed evaluation.
+
+Install the locked environment:
 
 ```bash
-uv sync
-uv run ruff check
-uv run ruff format --check
-uv run pytest                # no network and no API keys, but see below
+uv sync --frozen
 ```
 
-The suite needs merchant fixture data under `config/fixtures/`, which is not committed. Those
-files stand in for a system of record the code does not ship with, so the commerce, identity, and
-verification suites cannot run from a clean checkout.
-
-To run the voice worker, copy `.env.example` to `.env`, fill in the provider keys, then:
+Run the offline quality gates:
 
 ```bash
-uv run python scripts/voice_agent.py console   # terminal, no LiveKit room
-uv run python scripts/voice_agent.py dev       # connect to a LiveKit room
+uv run --no-sync ruff format --check .
+uv run --no-sync ruff check .
+uv run --no-sync pytest -m "not postgres"
 ```
 
-Voice startup is fail-closed. In addition to provider conformance, the configured routing model
-must have a current passing cutover report at
+The offline suite assembles a complete synthetic configuration from committed fixture and test
+artifacts. It requires no API keys or network access. Runtime voice sessions require the complete
+local fixture families under `config/fixtures/` until durable service adapters replace them.
+
+## PostgreSQL checkpoint harness
+
+Phase 4C selects PostgreSQL 18 as the only new durable service. The branch pins PostgreSQL 18.6,
+`langgraph-checkpoint-postgres` 3.1.2, and Psycopg 3.3.4. The asynchronous saver remains behind the
+same strict schema, namespace, serializer, deletion, and whole-operation deadline boundary as the
+development saver.
+
+Run the canonical disposable-container harness used by CI:
+
+```bash
+uv run --no-sync python scripts/postgres_checkpoint_harness.py
+```
+
+The harness exercises two independent pools, setup, read, list, checkpoint and pending-write
+persistence, deletion, pool exhaustion, deadline, cancellation, and post-cancellation recovery.
+
+For a Docker-free local run, set exactly one alternative before invoking the same command:
+
+- `PHASE4C_POSTGRES_DSN` uses a PostgreSQL 18.6 service. The harness creates a uniquely named
+  schema, binds every test connection to it with `search_path`, and removes only that schema.
+- `PHASE4C_POSTGRES_BIN` names an extracted PostgreSQL 18.6 binary directory containing `initdb`,
+  `pg_ctl`, and `postgres`. The harness creates, starts, stops, and removes a fresh local cluster.
+
+The native path verifies the server executable reports exactly PostgreSQL 18.6. Release provenance
+still depends on obtaining and checksum-verifying the archive from the PostgreSQL Windows download
+provider. Setting both alternatives is rejected as ambiguous configuration.
+
+Production composition still uses the in-memory saver. Docker execution, the first workflow run,
+payload encryption, durable session leases and fencing, bounded retention, and production adapter
+integration remain open evidence gates. The native Windows path has passed the four real-backend
+checkpoint contracts against its fresh PostgreSQL 18.6 cluster and removed the owned temporary
+cluster after the run.
+
+## Voice worker
+
+Copy `.env.example` to `.env` and provide the required provider and LiveKit credentials.
+`VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact. The optional
+`VOICE_AGENT_MERCHANT_ID` selects a development merchant and defaults to `acme_store`.
+
+```bash
+uv run --no-sync python scripts/voice_agent.py console
+uv run --no-sync python scripts/voice_agent.py dev
+```
+
+Voice startup is fail-closed. The configured routing model requires a current passing report at
 `config/telemetry/semantic_routing_report.json`. The report must match the active model, structured
 output method, route schema, prompt, registry, context projector, runtime limits, and frozen corpus.
-The preserved rejected report does not satisfy that contract.
+A stale or failed report prevents recognizer construction.
 
-Secrets are never committed. Config files hold `env://NAME` references and the resolver reads the
-value at use time.
+Secrets are never stored in configuration files. Config holds `env://NAME` references and resolves
+their values at use time. `.env` is ignored by Git.
 
-## Status
+## Current delivery boundary
 
-Phases 0 through 3 are built: config and tenancy, the LLM gateway and conformance gate, the voice
-loop, and the gated commerce graph. The current feature branch has completed the source-level
-migration from keyword gates to typed capability requests resolved through one immutable
-per-session registry. Ordinary human and abort requests are semantic capabilities; deterministic
-code still owns consent, authorization, effects, and speech from authoritative outcomes.
+Implemented and exercised offline:
 
-This architecture is not production-qualified. The prior generative candidate remains rejected,
-and voice startup now rejects it before constructing the recognizer. Activation still requires an
-approved recognizer, per-domain acceptance, latency and outage evidence, live shadow review, and
-the separate disclosure owner.
+- typed semantic routing and the complete executable capability registry;
+- deterministic authorization, consent, effect, receipt, and speech boundaries;
+- cart, order-support, identity, profile, recovery, replay, and lifecycle journeys;
+- tenant and session composition contracts with fixture implementations behind narrow ports;
+- asynchronous PostgreSQL checkpoint conformance against a real PostgreSQL 18.6 service.
 
-Deliberately not built yet:
+Still required before production activation:
 
-- Commerce, profile, and verification data are fixture-backed. There is no real system of record.
-- Checkpointing is in memory, per session.
-- No payment processing, inventory, tax, shipping, or live human transfer.
-- Tenant scoping is enforced at the tool wrapper, not yet at a shared store.
+- a qualified semantic recognizer, latency and outage evidence, and reviewed live shadow;
+- durable tenant admission, session registry, lease and fencing, encryption, retention, and reap;
+- durable business, verification, abuse-control, and operational telemetry adapters;
+- hard shared-store tenant isolation and production restore and failover evidence;
+- payment, inventory, tax, shipping, fulfilment, and live human-transfer contracts where required.
 
-Real integrations, durable checkpointing, shared-store tenant enforcement, and production OTP
-delivery are Phase 4 work. Payments and SIP warm transfer are Phase 5.
+Synthetic evidence is the current development authority. It is used to deepen tests and
+evaluations, not to weaken rubrics or claim real-caller population accuracy.
 
 ## License
 
