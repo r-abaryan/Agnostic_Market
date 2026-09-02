@@ -387,12 +387,36 @@ def test_frontline_eval_speech_authority_preflight_is_green() -> None:
     assert _speech_authority_failures() == ()
 
 
+def test_evaluator_runtime_uses_the_supplied_fixture_root(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(frontline_eval, "_CONFIG_ROOT", config_root / "unavailable-repository-root")
+    config = ConfigRegistry(config_root).load().get("acme_store").config
+
+    runtime = _build_eval_runtime(
+        config,
+        FakeChatModel(),
+        FakeChatModel(),
+        fixture_config_root=config_root,
+        routing_model=_router_model(),
+        thread_id="eval-explicit-fixture-root",
+        structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        routing_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+        operational_telemetry_sink=DisabledTelemetrySink(),
+        routing_evidence_sink=DisabledTelemetrySink(),
+    )
+
+    assert runtime.capability_registry.capability_ids
+
+
 def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Path) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
     runtime = _build_eval_runtime(
         config,
         FakeChatModel(),
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id="eval-registry-identity",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -420,6 +444,7 @@ def test_evaluator_runtime_uses_the_production_checkpointer(
         config,
         FakeChatModel(),
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id="eval-production-checkpointer",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -446,6 +471,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         config,
         frontline,
         reasoning,
+        fixture_config_root=config_root,
         routing_model=_router_model(
             {
                 "decision": "direct",
@@ -524,6 +550,7 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
         config,
         routing,
         reasoning,
+        fixture_config_root=config_root,
         routing_model=_router_model({"decision": "continue"}),
         thread_id="eval-typed-cart-execution-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -601,6 +628,7 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
         config,
         routing,
         reasoning,
+        fixture_config_root=config_root,
         routing_model=_router_model({"decision": "continue"}),
         thread_id="eval-typed-catalog-execution-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -669,6 +697,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
         config,
         routing,
         reasoning,
+        fixture_config_root=config_root,
         routing_model=_router_model({"decision": "continue"}),
         thread_id="eval-typed-place-execution-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -987,6 +1016,7 @@ async def test_routing_data_contract_reuses_the_production_registry(config_root:
         config,
         FakeChatModel(),
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id="eval-routing-data-contract",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -1452,6 +1482,7 @@ async def test_production_projector_matches_the_fixture_built_registry(config_ro
         config,
         FakeChatModel(),
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id="eval-routing-projector",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -1609,6 +1640,7 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
         config,
         model,
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id="eval-routing-runner",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -2418,6 +2450,7 @@ async def test_read_owner_corpus_runs_through_the_production_graph_without_netwo
         config,
         routing,
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id="eval-read-owner-corpus",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -3111,6 +3144,7 @@ async def test_read_owner_eval_observes_the_executed_branch_not_matching_copy(
             structured_args={"AnswerResponse": ({"decision": "answer", "answer": answer},)}
         ),
         FakeChatModel(),
+        fixture_config_root=config_root,
         routing_model=_router_model(),
         thread_id=f"eval-copy-collision-{expected_disposition}",
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
@@ -3200,6 +3234,7 @@ async def test_offline_transport_cases_reach_and_recover_every_real_model_owner(
             fault_kind=fault_kind,
             max_retries=0,
             config=config,
+            fixture_config_root=config_root,
             credentials=credentials,
             secrets=_OfflineSecretResolver(),
             request_ceiling=3,
