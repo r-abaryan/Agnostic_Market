@@ -2958,6 +2958,7 @@ async def _run_semantic_route_eval(
     report_path: Path,
     gate: SemanticRouteGate = "cutover",
     *,
+    fixture_config_root: Path,
     diagnostic_timeout_seconds: float | None = None,
     candidate_selection: ProviderModel | None = None,
 ) -> int:
@@ -2989,7 +2990,7 @@ async def _run_semantic_route_eval(
         config,
         selection.response_model,
         selection.gateway.chat_model(config.llm.reasoning),
-        fixture_config_root=_CONFIG_ROOT,
+        fixture_config_root=fixture_config_root,
         routing_model=candidate_model,
         thread_id=f"semantic-route-eval-{uuid.uuid4().hex}",
         structured_output_method=selection.response_structured_output_method,
@@ -3930,6 +3931,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _run_semantic_route_eval(
                 args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
                 semantic_gate,
+                fixture_config_root=_CONFIG_ROOT,
                 diagnostic_timeout_seconds=diagnostic_timeout_seconds,
                 candidate_selection=args.semantic_routing_candidate,
             )

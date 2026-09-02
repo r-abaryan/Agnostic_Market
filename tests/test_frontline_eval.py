@@ -2533,16 +2533,19 @@ def test_cli_dispatches_semantic_route_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report_path = tmp_path / "semantic-routing.json"
-    received: list[tuple[Path, str, float | None, ProviderModel | None]] = []
+    received: list[tuple[Path, str, Path, float | None, ProviderModel | None]] = []
 
     async def run(
         path: Path,
         gate: str,
         *,
+        fixture_config_root: Path,
         diagnostic_timeout_seconds: float | None,
         candidate_selection: ProviderModel | None,
     ) -> int:
-        received.append((path, gate, diagnostic_timeout_seconds, candidate_selection))
+        received.append(
+            (path, gate, fixture_config_root, diagnostic_timeout_seconds, candidate_selection)
+        )
         return 0
 
     monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", run)
@@ -2553,7 +2556,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received == [(report_path, "cutover", None, None)]
+    assert received == [(report_path, "cutover", frontline_eval._CONFIG_ROOT, None, None)]
 
     assert (
         frontline_eval.main(
@@ -2567,7 +2570,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "shadow", None, None)
+    assert received[-1] == (report_path, "shadow", frontline_eval._CONFIG_ROOT, None, None)
 
     assert (
         frontline_eval.main(
@@ -2583,7 +2586,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "diagnostic", 3.0, None)
+    assert received[-1] == (report_path, "diagnostic", frontline_eval._CONFIG_ROOT, 3.0, None)
 
     assert (
         frontline_eval.main(
@@ -2602,6 +2605,7 @@ def test_cli_dispatches_semantic_route_mode(
     assert received[-1] == (
         report_path,
         "shadow",
+        frontline_eval._CONFIG_ROOT,
         None,
         ProviderModel(
             provider="openai",
@@ -2841,6 +2845,7 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     report_path = tmp_path / "semantic-routing.json"
     monkeypatch.setattr(frontline_eval, "_load_routing_eval_selection", lambda: selection)
     monkeypatch.setattr(frontline_eval, "_load_semantic_route_corpus", lambda: corpus)
+    monkeypatch.setattr(frontline_eval, "_CONFIG_ROOT", config_root / "unavailable-repository-root")
     verdict_calls = 0
     series_verdict = frontline_eval._semantic_series_verdict
 
@@ -2854,6 +2859,7 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     assert (
         await frontline_eval._run_semantic_route_eval(
             report_path,
+            fixture_config_root=config_root,
             candidate_selection=alternate_selection,
         )
         == 0
@@ -2917,6 +2923,7 @@ async def test_semantic_route_diagnostic_projection_drift_is_invalid_without_pro
     report_path = tmp_path / "semantic-routing-invalid.json"
     monkeypatch.setattr(frontline_eval, "_load_routing_eval_selection", lambda: selection)
     monkeypatch.setattr(frontline_eval, "_load_semantic_route_corpus", lambda: corpus)
+    monkeypatch.setattr(frontline_eval, "_CONFIG_ROOT", config_root / "unavailable-repository-root")
     monkeypatch.setattr(
         frontline_eval,
         "project_routing_context",
@@ -2927,6 +2934,7 @@ async def test_semantic_route_diagnostic_projection_drift_is_invalid_without_pro
         await frontline_eval._run_semantic_route_eval(
             report_path,
             "diagnostic",
+            fixture_config_root=config_root,
             diagnostic_timeout_seconds=3.0,
         )
         == 1
