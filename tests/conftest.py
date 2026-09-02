@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import selectors
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from shutil import copy2, copytree, ignore_patterns
 
@@ -22,6 +26,22 @@ _SYNTHETIC_FIXTURES = {
     "payment_instruments": _TEST_ROOT / "synthetic_payment_instruments.yaml",
     "verification": _TEST_ROOT / "synthetic_verification.yaml",
 }
+
+
+def _postgres_event_loop() -> asyncio.AbstractEventLoop:
+    if sys.platform == "win32":
+        return asyncio.SelectorEventLoop(selectors.SelectSelector())
+    return asyncio.new_event_loop()
+
+
+def pytest_asyncio_loop_factories(
+    config: pytest.Config,
+    item: pytest.Item,
+) -> dict[str, Callable[[], asyncio.AbstractEventLoop]]:
+    del config
+    if item.get_closest_marker("postgres") is not None:
+        return {"postgres-compatible": _postgres_event_loop}
+    return {"platform-default": asyncio.new_event_loop}
 
 
 @pytest.fixture(scope="session")

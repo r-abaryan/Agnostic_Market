@@ -13,6 +13,8 @@ dependencies = [
     "langchain-openai>=1.3.3",
     "livekit-agents[cartesia,deepgram,langchain]>=1.6",
     "langgraph>=1.0",
+    "langgraph-checkpoint-postgres==3.1.2",
+    "psycopg[binary]==3.3.4",
 ]
 
 [build-system]
@@ -56,6 +58,9 @@ cache_dir = ".test-tmp/pytest-cache"
 # "." so tests importing scripts/ (the evaluator and fault proxy) resolve without a src install.
 pythonpath = ["src", "."]
 asyncio_mode = "auto"
+markers = [
+    "postgres: requires the disposable Phase 4C PostgreSQL harness",
+]
 
 # All dev tooling lives here (uv's native dev group — installed by plain `uv sync`).
 [dependency-groups]

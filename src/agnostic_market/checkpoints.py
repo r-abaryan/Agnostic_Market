@@ -117,6 +117,10 @@ class CheckpointDeletionError(RuntimeError):
     """A backend acknowledged deletion but retained a readable checkpoint."""
 
 
+class SynchronousCheckpointOperationError(RuntimeError):
+    """A synchronous checkpoint operation reached an async-only boundary."""
+
+
 def _fingerprint(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -203,9 +207,15 @@ class CheckpointBinding:
 class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
     """Validate one graph contract while delegating storage to any LangGraph saver."""
 
-    def __init__(self, backend: BaseCheckpointSaver) -> None:
+    def __init__(
+        self,
+        backend: BaseCheckpointSaver,
+        *,
+        synchronous_operations: bool = True,
+    ) -> None:
         super().__init__(serde=backend.serde)
         self._backend = backend
+        self._synchronous_operations = synchronous_operations
         self._allowed_checkpoint_channels: frozenset[str] | None = None
         self._graph_contract: str | None = None
         self._authorized_thread_ids: set[str] = set()
@@ -215,6 +225,12 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
     @property
     def config_specs(self) -> list:
         return self._backend.config_specs
+
+    def _require_synchronous_operations(self) -> None:
+        if not self._synchronous_operations:
+            raise SynchronousCheckpointOperationError(
+                "this checkpoint boundary supports asynchronous operations only"
+            )
 
     def bind_checkpoint_contract(
         self,
@@ -348,6 +364,7 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
                 await self._bounded(close())
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        self._require_synchronous_operations()
         self._validate_config(config)
         return self._validate_tuple(self._backend.get_tuple(config))
 
@@ -359,6 +376,7 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         before: RunnableConfig | None = None,
         limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
+        self._require_synchronous_operations()
         if config is None:
             raise CheckpointScopeError("unscoped checkpoint listing is forbidden")
         self._validate_config(config)
@@ -374,6 +392,7 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
+        self._require_synchronous_operations()
         self._validate_config(config)
         self._validate_checkpoint(checkpoint)
         return self._backend.put(config, checkpoint, metadata, new_versions)
@@ -385,11 +404,13 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         task_id: str,
         task_path: str = "",
     ) -> None:
+        self._require_synchronous_operations()
         self._validate_config(config)
         self._validate_pending_write_channels([channel for channel, _value in writes])
         self._backend.put_writes(config, writes, task_id, task_path)
 
     def delete_thread(self, thread_id: str) -> None:
+        self._require_synchronous_operations()
         self._validate_storage_thread_id(thread_id)
         self._backend.delete_thread(thread_id)
         self._verify_thread_deleted(thread_id)
@@ -469,12 +490,20 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
 
 def build_checkpointer(
     backend: BaseCheckpointSaver | None = None,
+    *,
+    synchronous_operations: bool = True,
 ) -> SchemaValidatedCheckpointSaver:
     """Build the strict boundary over an in-memory or injected durable saver."""
     if backend is None:
-        backend = InMemorySaver(
-            serde=JsonPlusSerializer(
-                allowed_msgpack_modules=[*_CHECKPOINT_CHANNEL_DTOS, *_CHECKPOINT_NESTED_ENUMS]
-            )
-        )
-    return SchemaValidatedCheckpointSaver(backend)
+        backend = InMemorySaver(serde=build_checkpoint_serializer())
+    return SchemaValidatedCheckpointSaver(
+        backend,
+        synchronous_operations=synchronous_operations,
+    )
+
+
+def build_checkpoint_serializer() -> JsonPlusSerializer:
+    """Build the allowlisted serializer shared by every checkpoint backend."""
+    return JsonPlusSerializer(
+        allowed_msgpack_modules=[*_CHECKPOINT_CHANNEL_DTOS, *_CHECKPOINT_NESTED_ENUMS]
+    )

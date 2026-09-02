@@ -23,6 +23,7 @@ from agnostic_market.checkpoints import (
     CheckpointDeletionError,
     CheckpointScopeError,
     SchemaValidatedCheckpointSaver,
+    SynchronousCheckpointOperationError,
     graph_contract_fingerprint,
 )
 from agnostic_market.dtos.state import CheckpointSchemaError
@@ -153,6 +154,41 @@ async def test_async_graph_checkpointing_never_uses_sync_backend_methods() -> No
     await saver.adelete_thread(binding.storage_thread_id)
     with pytest.raises(CheckpointScopeError, match="namespace"):
         await graph.aget_state(binding.config)
+
+
+@pytest.mark.asyncio
+async def test_async_only_boundary_rejects_every_synchronous_storage_operation() -> None:
+    saver = SchemaValidatedCheckpointSaver(
+        _AsyncOnlySaver(),
+        synchronous_operations=False,
+    )
+    graph = _compiled(saver)
+    binding = CheckpointBinding(
+        tenant_id="tenant-a",
+        deployment_id="deployment-a",
+        graph_contract=graph_contract_fingerprint(graph),
+        thread_id="thread-a",
+    )
+    saver.bind_checkpoint_contract(
+        graph.channels,
+        binding=binding,
+        io_timeout_seconds=0.5,
+        required_state_keys=_State.__annotations__,
+    )
+    await graph.ainvoke({"value": 1}, binding.config)
+    saved = await saver.aget_tuple(binding.config)
+    assert saved is not None
+
+    with pytest.raises(SynchronousCheckpointOperationError):
+        saver.get_tuple(binding.config)
+    with pytest.raises(SynchronousCheckpointOperationError):
+        list(saver.list(binding.config))
+    with pytest.raises(SynchronousCheckpointOperationError):
+        saver.put(saved.config, saved.checkpoint, saved.metadata, {})
+    with pytest.raises(SynchronousCheckpointOperationError):
+        saver.put_writes(saved.config, (("value", 2),), "task-a")
+    with pytest.raises(SynchronousCheckpointOperationError):
+        saver.delete_thread(binding.storage_thread_id)
 
 
 @pytest.mark.asyncio
