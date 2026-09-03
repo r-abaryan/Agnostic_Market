@@ -1,28 +1,32 @@
-"""Resolve an inbound signal (phone# / explicit button) to a merchant_id.
+"""Resolve trusted inbound signals to a configured merchant identity.
 
-Backed by the ConfigRegistry: the inbound-number index is built from each merchant's
-`telephony.inbound_number`. An explicit button press carries a merchant_id directly
-(validated against the registry). Unknown signals fail loudly — a caller is never silently
-mapped to the wrong tenant.
-
-DID (inbound number) is the isolation anchor for inbound calls (DESIGN_REVIEW L6). ANI /
-caller-ID is NOT used for tenant resolution of sensitive actions (SECURITY §2a).
-
-Domain-based resolution (for the web channel) is deferred: MerchantConfig has no domain
-field to index yet, so it lands with the web/voice work (Phase 2+), not here.
+Inbound calls resolve from their canonical DID. Approved server-side dispatches resolve
+from an explicit merchant identity. Unknown or malformed signals fail closed.
 """
 
 from __future__ import annotations
 
+from pydantic import TypeAdapter, ValidationError
+
 from agnostic_market.config.registry import ConfigRegistry
+from agnostic_market.dtos.config import E164PhoneNumber
+
+_INBOUND_NUMBER_ADAPTER = TypeAdapter(E164PhoneNumber)
 
 
 class TenantResolutionError(RuntimeError):
     """An inbound signal did not resolve to a known merchant."""
 
 
+def _canonical_inbound_number(value: str) -> str:
+    try:
+        return _INBOUND_NUMBER_ADAPTER.validate_python(value, strict=True)
+    except ValidationError as exc:
+        raise TenantResolutionError("inbound number must use canonical E.164 format") from exc
+
+
 class TenantResolver:
-    """Map phone# / explicit merchant_id -> merchant_id, via the registry. (Domain: Phase 2+.)"""
+    """Map an inbound DID or trusted merchant identity through the registry."""
 
     def __init__(self, registry: ConfigRegistry) -> None:
         self._registry = registry
@@ -34,7 +38,7 @@ class TenantResolver:
         by_number: dict[str, str] = {}
         for merchant_id in self._registry.merchant_ids:
             config = self._registry.get(merchant_id).config
-            number = config.telephony.inbound_number
+            number = _canonical_inbound_number(config.telephony.inbound_number)
             if number in by_number:
                 raise TenantResolutionError(
                     f"inbound number {number} is claimed by both "
@@ -45,13 +49,14 @@ class TenantResolver:
 
     def resolve_by_number(self, inbound_number: str) -> str:
         """Inbound DID -> merchant_id (the primary inbound path)."""
-        merchant_id = self._by_inbound_number.get(inbound_number)
+        canonical_number = _canonical_inbound_number(inbound_number)
+        merchant_id = self._by_inbound_number.get(canonical_number)
         if merchant_id is None:
-            raise TenantResolutionError(f"no merchant for inbound number {inbound_number!r}")
+            raise TenantResolutionError(f"no merchant for inbound number {canonical_number!r}")
         return merchant_id
 
-    def resolve_by_button(self, merchant_id: str) -> str:
-        """Explicit merchant selection (UI button) -> validated merchant_id."""
+    def resolve_by_id(self, merchant_id: str) -> str:
+        """Validate an explicit merchant identity against the registry."""
         if merchant_id not in self._registry.merchant_ids:
             raise TenantResolutionError(f"unknown merchant_id {merchant_id!r}")
         return merchant_id

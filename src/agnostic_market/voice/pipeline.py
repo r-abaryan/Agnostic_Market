@@ -112,6 +112,7 @@ def _build_background_audio() -> BackgroundAudioPlayer:
 
 
 def build_voice_loop(
+    tenant: TenantContext,
     resolved: ResolvedConfig,
     credentials: ProviderCredentialsConfig,
     secrets: SecretResolver,
@@ -122,12 +123,11 @@ def build_voice_loop(
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
+    if tenant.tenant_id != config.merchant_id or tenant.config_version != resolved.config_version:
+        raise ValueError("voice tenant context does not match the resolved configuration")
+    if tenant.policy != config.policies.to_policy_context():
+        raise ValueError("voice tenant policy does not match the resolved configuration")
     gateway = LLMGateway(credentials, secrets)
-    tenant = TenantContext(
-        tenant_id=config.merchant_id,
-        config_version=resolved.config_version,
-        policy=config.policies.to_policy_context(),
-    )
     application = build_application_session(
         tenant,
         ApplicationSettings.from_merchant_config(config),

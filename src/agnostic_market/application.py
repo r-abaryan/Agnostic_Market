@@ -61,7 +61,7 @@ from agnostic_market.commerce.verification import (
 from agnostic_market.dtos.config import MerchantConfig
 from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.session import CallerContext
-from agnostic_market.tenancy.context import TenantBound, TenantContext, normalize_tenant_id
+from agnostic_market.tenancy.context import TenantBound, TenantContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,13 +233,13 @@ def _validate_session_state(
 
 def build_fixture_tenant_services(
     config_root: Path,
-    tenant_id: str,
+    tenant: TenantContext,
     *,
     telemetry: TenantTelemetry,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> TenantServices:
     """Load validated development adapters behind the production composition boundary."""
-    tenant_id = normalize_tenant_id(tenant_id, boundary="fixture tenant services")
+    tenant_id = tenant.tenant_id
     if telemetry.tenant_id != tenant_id:
         raise ValueError("telemetry service does not match the fixture tenant")
     orders_fixture = load_orders_fixture(config_root, tenant_id)

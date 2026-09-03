@@ -499,17 +499,21 @@ class _RecorderRoom:
 
 async def _recorder_loop(config_root: Path) -> VoiceLoop:
     from agnostic_market.application import build_fixture_tenant_services
+    from agnostic_market.tenancy.context import build_tenant_context
 
-    resolved = ConfigRegistry(config_root).load().get("acme_store")
+    registry = ConfigRegistry(config_root).load()
+    resolved = registry.get("acme_store")
+    tenant = build_tenant_context(registry, "acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     return build_voice_loop(
+        tenant,
         resolved,
         credentials,
         RecordingResolver(),
         deployment_id="test-close-evidence-artifact",
         tenant_services=build_fixture_tenant_services(
             config_root,
-            "acme_store",
+            tenant,
             telemetry=make_tenant_telemetry("acme_store"),
         ),
         routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),

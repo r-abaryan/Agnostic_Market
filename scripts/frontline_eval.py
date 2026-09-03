@@ -1354,7 +1354,7 @@ def _build_eval_runtime(
     )
     services = build_fixture_tenant_services(
         fixture_config_root,
-        config.merchant_id,
+        tenant,
         telemetry=TenantTelemetry(
             config.merchant_id,
             operational_telemetry_sink,

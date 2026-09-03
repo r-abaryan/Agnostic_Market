@@ -8,6 +8,7 @@ disclosure-first (on_enter), engine/adapter wiring, and the credential seam.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -31,21 +32,25 @@ from agnostic_market.commerce.profile import ProfileFixture, load_profile_fixtur
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.llm.gateway import load_provider_credentials
+from agnostic_market.tenancy.context import build_tenant_context
 from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.pipeline import DisclosureFirstAgent, VoiceLoop, build_voice_loop
 
 
 async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
-    resolved = ConfigRegistry(config_root).load().get("acme_store")
+    registry = ConfigRegistry(config_root).load()
+    resolved = registry.get("acme_store")
+    tenant = build_tenant_context(registry, "acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
     return build_voice_loop(
+        tenant,
         resolved,
         credentials,
         resolver,
         deployment_id="test-voice-artifact",
         tenant_services=build_fixture_tenant_services(
             config_root,
-            "acme_store",
+            tenant,
             telemetry=make_tenant_telemetry("acme_store"),
         ),
         routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
@@ -127,6 +132,38 @@ async def test_voice_graph_uses_only_response_and_reasoning_model_roles(
     assert method_selections == [config.llm.response]
 
 
+def test_voice_composition_rejects_a_mismatched_tenant_before_model_construction(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agnostic_market.voice import pipeline
+
+    registry = ConfigRegistry(config_root).load()
+    resolved = registry.get("acme_store")
+    tenant = build_tenant_context(registry, "acme_store")
+    credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
+
+    def model_construction_started(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("model construction started before tenant validation")
+
+    monkeypatch.setattr(pipeline, "LLMGateway", model_construction_started)
+
+    with pytest.raises(ValueError, match="tenant context"):
+        build_voice_loop(
+            replace(tenant, tenant_id="demo_shop"),
+            resolved,
+            credentials,
+            RecordingResolver(),
+            deployment_id="test-voice-artifact",
+            tenant_services=build_fixture_tenant_services(
+                config_root,
+                tenant,
+                telemetry=make_tenant_telemetry("acme_store"),
+            ),
+            routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+        )
+
+
 async def test_background_audio_has_a_thinking_sound_and_no_ambient(config_root: Path) -> None:
     # The thinking-sound earcon masks LLM/tool dead-air (constructed here; started in the
     # worker entrypoint where the room lives). A call is not a storefront -> no ambient sound.
@@ -182,7 +219,7 @@ async def test_session_build_rejects_profile_for_unknown_customer(
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
         build_fixture_tenant_services(
             config_root,
-            "acme_store",
+            build_tenant_context(ConfigRegistry(config_root).load(), "acme_store"),
             telemetry=make_tenant_telemetry("acme_store"),
         )
 
@@ -204,7 +241,7 @@ async def test_session_build_rejects_payment_instrument_for_unknown_customer(
     with pytest.raises(ConfigError, match="CUST-UNKNOWN"):
         build_fixture_tenant_services(
             config_root,
-            "acme_store",
+            build_tenant_context(ConfigRegistry(config_root).load(), "acme_store"),
             telemetry=make_tenant_telemetry("acme_store"),
         )
 

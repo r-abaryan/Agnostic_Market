@@ -1,6 +1,6 @@
-"""Tenancy — resolve a caller/request to a merchant, and carry an immutable tenant context.
+"""Resolve trusted admission signals and carry an immutable tenant context.
 
-- resolver.py : phone# / domain / explicit button -> merchant_id (registry-backed).
+- resolver.py : inbound DID / approved dispatch identity -> merchant_id.
 - context.py  : the per-session TenantContext (tenant_id + config_version + policy),
                 bound once at session start and read-only thereafter (AGENTS §A5/§A0).
 """

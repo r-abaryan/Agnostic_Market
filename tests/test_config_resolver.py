@@ -18,6 +18,7 @@ def _base() -> dict:
             "schema_version",
             "policies.cancel_batch_max",
             "runtime.cancellation_quiescence_timeout_seconds",
+            "runtime.voice_admission_timeout_seconds",
             "runtime.checkpoint_io_timeout_seconds",
             "runtime.response_model_node_timeout_seconds",
             "runtime.reasoning_model_node_timeout_seconds",
@@ -47,6 +48,7 @@ def _base() -> dict:
         "schema_version": "0.2",
         "runtime": {
             "cancellation_quiescence_timeout_seconds": 2.0,
+            "voice_admission_timeout_seconds": 10.0,
             "checkpoint_io_timeout_seconds": 2.0,
             "response_model_node_timeout_seconds": 2.0,
             "reasoning_model_node_timeout_seconds": 6.0,
@@ -220,6 +222,19 @@ def test_semantic_router_timeout_comes_from_locked_base() -> None:
     with pytest.raises(
         SafetyLockViolationError,
         match="semantic_router_timeout_seconds",
+    ):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+def test_voice_admission_timeout_comes_from_locked_base() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.runtime.voice_admission_timeout_seconds == 10.0
+
+    bad = _override()
+    bad["runtime"] = {"voice_admission_timeout_seconds": 60.0}
+    with pytest.raises(
+        SafetyLockViolationError,
+        match="voice_admission_timeout_seconds",
     ):
         resolve_merchant_config(_base(), _template(), bad)
 

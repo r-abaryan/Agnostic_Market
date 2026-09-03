@@ -16,9 +16,17 @@ Strictness (Phase-0 plan, YAML-footgun defense):
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    Strict,
+    StrictBool,
+    StringConstraints,
+    field_validator,
+)
 
 from agnostic_market.dtos.money import UsdAmount
 
@@ -28,6 +36,11 @@ if TYPE_CHECKING:
 # Reusable strict base: forbid unknown keys, validate on assignment.
 _STRICT = ConfigDict(extra="forbid", validate_assignment=True)
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+E164PhoneNumber = Annotated[
+    str,
+    Strict(),
+    StringConstraints(pattern=r"^\+[1-9][0-9]{1,14}$"),
+]
 
 
 class ProviderModel(BaseModel):
@@ -97,7 +110,7 @@ class TelephonyConfig(BaseModel):
     model_config = _STRICT
 
     provider: str = Field(min_length=1)
-    inbound_number: str = Field(min_length=1)
+    inbound_number: E164PhoneNumber
 
 
 class RefundPolicy(BaseModel):
@@ -299,6 +312,7 @@ class RuntimeConfig(BaseModel):
     model_config = _STRICT
 
     cancellation_quiescence_timeout_seconds: float = Field(gt=0)
+    voice_admission_timeout_seconds: float = Field(gt=0)
     checkpoint_io_timeout_seconds: float = Field(gt=0)
     response_model_node_timeout_seconds: float = Field(gt=0)
     reasoning_model_node_timeout_seconds: float = Field(gt=0)

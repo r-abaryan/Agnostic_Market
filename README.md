@@ -6,8 +6,8 @@ Agnostic Market is a production-shaped voice agent for catalog discovery, cart m
 placement, order support, identity verification, and account changes. A model may understand the
 caller and propose typed work. It never grants authority or commits an effect.
 
-> Current status: the semantic-routing migration is merged. The Phase 4C durable platform
-> foundation is in progress. The system is not production-qualified or authorized for real merchant
+> Current status: the semantic-routing migration is merged. The Phase 4C durable multi-tenant
+> runtime is in progress. The system is not production-qualified or authorized for real merchant
 > traffic.
 
 ## Capabilities
@@ -32,7 +32,7 @@ The system separates real-time voice, reasoning, and data responsibilities:
 |---|---|---|
 | Voice | VAD, STT, TTS, turn admission, barge-in, disclosure | LiveKit Agents behind the voice adapter |
 | Reasoning | semantic recognition, typed dispatch, deterministic owners, HITL, recovery | LangGraph behind `ReasoningEngine` |
-| Data | tenant services, session authority, effects, receipts, checkpoints, telemetry | fixture-backed ports and in-memory session state; PostgreSQL transition in Phase 4C |
+| Data | tenant services, session authority, effects, receipts, checkpoints, telemetry | fixture-backed ports and in-memory session state; production PostgreSQL composition begins in Phase 4C Milestone 3 |
 
 An ordinary committed turn follows one ownership path:
 
@@ -103,7 +103,7 @@ src/agnostic_market/
   llm/               provider gateway and model conformance
   secrets/           environment-backed secret resolution
   tenancy/           immutable tenant identity and resolution
-  voice/             LiveKit pipeline, adapter, disclosure, and speech transport
+  voice/             trusted tenant admission, LiveKit pipeline, disclosure, and speech transport
 scripts/             worker, evaluators, smoke checks, recovery tools, PostgreSQL harness
 tests/               synthetic unit, integration, adversarial, lifecycle, and backend contracts
 .github/workflows/   locked verification workflow
@@ -139,7 +139,7 @@ local fixture families under `config/fixtures/` until durable service adapters r
 
 ## PostgreSQL checkpoint harness
 
-Phase 4C selects PostgreSQL 18 as the only new durable service. The branch pins PostgreSQL 18.6,
+Phase 4C Milestone 1 selects PostgreSQL 18 as the only new durable service. The branch pins PostgreSQL 18.6,
 `langgraph-checkpoint-postgres` 3.1.2, and Psycopg 3.3.4. The asynchronous saver remains behind the
 same strict schema, namespace, serializer, deletion, and whole-operation deadline boundary as the
 development saver.
@@ -164,22 +164,37 @@ The native path verifies the server executable reports exactly PostgreSQL 18.6. 
 still depends on obtaining and checksum-verifying the archive from the PostgreSQL Windows download
 provider. Setting both alternatives is rejected as ambiguous configuration.
 
-Production composition still uses the in-memory saver. Docker execution, the first workflow run,
-payload encryption, durable session leases and fencing, bounded retention, and production adapter
-integration remain open evidence gates. The native Windows path has passed the four real-backend
-checkpoint contracts against its fresh PostgreSQL 18.6 cluster and removed the owned temporary
-cluster after the run.
+Production composition still uses the in-memory saver. Payload encryption, durable session leases
+and fencing, bounded retention, and production adapter integration remain open evidence gates. The
+same four checkpoint contracts have passed through a schema-isolated remote service, a fresh native
+Windows cluster, and the digest-pinned Docker path in the repository workflow. Each provisioner
+removes only the database resources it owns.
 
 ## Voice worker
 
 Copy `.env.example` to `.env` and provide the required provider and LiveKit credentials.
-`VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact. The optional
-`VOICE_AGENT_MERCHANT_ID` selects a development merchant and defaults to `acme_store`.
+`VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact. Console mode also
+requires an explicit `VOICE_AGENT_MERCHANT_ID`; there is no default merchant.
+`VOICE_AGENT_NAME` is required for network worker commands and must match the named LiveKit
+dispatch target. Console and model-file download commands do not require it.
 
 ```bash
 uv run --no-sync python scripts/voice_agent.py console
 uv run --no-sync python scripts/voice_agent.py dev
 ```
+
+Every network job uses named explicit dispatch. A strict metadata preflight resolves the tenant,
+then startup certification and runtime construction finish before the worker joins the room.
+Standard participants require metadata shaped
+as `{"schema_version":1,"merchant_id":"<configured merchant>","participant_kind":"standard","participant_identity":"<participant identity>"}`.
+SIP participants require metadata shaped as
+`{"schema_version":1,"merchant_id":"<configured merchant>","participant_kind":"sip"}`; an optional
+`participant_identity` may bind a specific caller. SIP admission also reads LiveKit's
+server-populated `sip.trunkPhoneNumber` and requires it to resolve to the metadata tenant. Caller
+ANI is never a tenant authority. Inbound numbers must use canonical E.164 form. Unknown,
+malformed, missing, duplicate, or conflicting admission signals fail the job. Room connection and
+participant binding share the safety-locked `runtime.voice_admission_timeout_seconds` budget.
+Participant or DID rejection happens before the voice session starts or any owner executes.
 
 Voice startup is fail-closed. The configured routing model requires a current passing report at
 `config/telemetry/semantic_routing_report.json`. The report must match the active model, structured
@@ -196,13 +211,14 @@ Implemented and exercised offline:
 - typed semantic routing and the complete executable capability registry;
 - deterministic authorization, consent, effect, receipt, and speech boundaries;
 - cart, order-support, identity, profile, recovery, replay, and lifecycle journeys;
-- tenant and session composition contracts with fixture implementations behind narrow ports;
+- trusted voice tenant admission and session composition with fixture implementations behind
+  narrow ports;
 - asynchronous PostgreSQL checkpoint conformance against a real PostgreSQL 18.6 service.
 
 Still required before production activation:
 
 - a qualified semantic recognizer, latency and outage evidence, and reviewed live shadow;
-- durable tenant admission, session registry, lease and fencing, encryption, retention, and reap;
+- durable session registry, lease and fencing, encryption, retention, and reap;
 - durable business, verification, abuse-control, and operational telemetry adapters;
 - hard shared-store tenant isolation and production restore and failover evidence;
 - payment, inventory, tax, shipping, fulfilment, and live human-transfer contracts where required.

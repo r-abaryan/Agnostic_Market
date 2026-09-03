@@ -12,6 +12,7 @@ _safety_locked:
   - schema_version       # structural — merchant may not fork the schema version
   - policies.cancel_batch_max   # safety bound (fits the LangGraph step budget), not a merchant knob
   - runtime.cancellation_quiescence_timeout_seconds
+  - runtime.voice_admission_timeout_seconds
   - runtime.checkpoint_io_timeout_seconds
   - runtime.response_model_node_timeout_seconds
   - runtime.reasoning_model_node_timeout_seconds
@@ -70,6 +71,9 @@ schema_version: "0.2"
 # survive resolution because runtime owners consume them; the safety lock prevents tenant tuning.
 runtime:
   cancellation_quiescence_timeout_seconds: 2.0
+  # One budget for joining the room and binding the declared participant. Startup qualification
+  # and runtime construction complete before this timer begins.
+  voice_admission_timeout_seconds: 10.0
   # Per-operation deadline for checkpoint reads, writes, and deletion. Durable adapters must
   # expose native async methods; this deadline contains backend stalls on the voice event loop.
   checkpoint_io_timeout_seconds: 2.0

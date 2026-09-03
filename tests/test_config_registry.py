@@ -31,6 +31,7 @@ secrets_ref: "vault://m1"
 _BASE_BODY = (
     "_safety_locked: [policies.cancel_batch_max, "
     "runtime.cancellation_quiescence_timeout_seconds, "
+    "runtime.voice_admission_timeout_seconds, "
     "runtime.checkpoint_io_timeout_seconds, "
     "runtime.response_model_node_timeout_seconds, "
     "runtime.reasoning_model_node_timeout_seconds, "
@@ -38,6 +39,7 @@ _BASE_BODY = (
     "runtime.semantic_router_input_max_chars, "
     'runtime.semantic_router_timeout_seconds]\nschema_version: "0.2"\n'
     "runtime: { cancellation_quiescence_timeout_seconds: 2.0, "
+    "voice_admission_timeout_seconds: 10.0, "
     "checkpoint_io_timeout_seconds: 2.0, response_model_node_timeout_seconds: 2.0, "
     "reasoning_model_node_timeout_seconds: 6.0, "
     "caller_audible_model_text_max_chars: 500, "

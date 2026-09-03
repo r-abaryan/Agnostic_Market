@@ -6,6 +6,7 @@ import asyncio
 import threading
 from dataclasses import fields, replace
 from pathlib import Path
+from shutil import copy2, copytree
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -39,7 +40,7 @@ from agnostic_market.application import (
     build_fixture_tenant_services,
     build_in_memory_session_state,
 )
-from agnostic_market.checkpoints import CheckpointScopeError, build_checkpointer
+from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
 from agnostic_market.commerce.identity import (
@@ -69,6 +70,7 @@ from agnostic_market.commerce.verification import (
     VerificationStore,
     load_verification_fixture,
 )
+from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.events import (
     CommittedTurn,
     InterruptEvent,
@@ -77,7 +79,7 @@ from agnostic_market.dtos.events import (
 )
 from agnostic_market.dtos.recovery import PendingRecovery
 from agnostic_market.dtos.state import CartLine, ReasoningState
-from agnostic_market.tenancy.context import TenantContext
+from agnostic_market.tenancy.context import TenantContext, build_tenant_context
 
 _TEST_DEPLOYMENT_ID = "test-application-artifact"
 
@@ -182,9 +184,10 @@ def test_application_composition_fields_have_one_explicit_owner() -> None:
 
 
 def test_fixture_tenant_services_implement_the_replacement_ports(config_root: Path) -> None:
+    tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        "acme_store",
+        tenant,
         telemetry=make_tenant_telemetry("acme_store"),
     )
     contracts = (
@@ -206,10 +209,11 @@ def _fixture_order_store(services: TenantServices) -> OrderStore:
     return services.order_store
 
 
-def test_fixture_tenant_services_normalize_one_identity(config_root: Path) -> None:
+def test_fixture_tenant_services_use_normalized_context_identity(config_root: Path) -> None:
+    tenant = _tenant("  acme_store  ")
     services = build_fixture_tenant_services(
         config_root,
-        "  acme_store  ",
+        tenant,
         telemetry=make_tenant_telemetry("acme_store"),
     )
 
@@ -233,7 +237,7 @@ async def test_application_uses_explicit_deployment_artifact_for_checkpoint_name
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -281,7 +285,7 @@ async def test_shared_tenant_services_keep_guest_visibility_session_isolated(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -345,35 +349,27 @@ async def test_shared_tenant_services_keep_guest_visibility_session_isolated(
 @pytest.mark.asyncio
 async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backend(
     config_root: Path,
+    tmp_path: Path,
 ) -> None:
-    tenant_ids = ("synthetic-a", "synthetic-b")
-    orders = load_orders_fixture(config_root, "acme_store")
-    customers = load_customers_fixture(config_root, "acme_store")
-    instruments = load_payment_instruments_fixture(config_root, "acme_store")
-    profiles = load_profile_fixture(config_root, "acme_store")
-    verification = load_verification_fixture(config_root, "acme_store")
+    isolated_config_root = tmp_path / "config"
+    copytree(config_root, isolated_config_root)
+    for family in ("orders", "customers", "payment_instruments", "profiles", "verification"):
+        copy2(
+            isolated_config_root / "fixtures" / family / "acme_store.yaml",
+            isolated_config_root / "fixtures" / family / "demo_shop.yaml",
+        )
+    registry = ConfigRegistry(isolated_config_root).load()
+    tenants = tuple(
+        build_tenant_context(registry, tenant_id) for tenant_id in ("acme_store", "demo_shop")
+    )
+    orders = load_orders_fixture(isolated_config_root, "acme_store")
     backend = InMemorySaver()
-    tenants = tuple(_tenant(tenant_id) for tenant_id in tenant_ids)
     services = tuple(
-        TenantServices(
-            tenant_id=tenant.tenant_id,
-            catalog=FixtureCatalog(tenant.tenant_id, orders),
-            order_store=OrderStore(tenant.tenant_id, orders.orders),
-            customers=CustomerDirectory(tenant.tenant_id, customers),
-            payment_instruments=PaymentInstrumentDirectory(
-                tenant.tenant_id,
-                instruments,
-            ),
-            profile_store=ProfileStore(tenant.tenant_id, profiles),
-            otp=OtpProvider(
-                tenant.tenant_id,
-                codes_by_factor_ref=verification.otp_codes_by_factor_ref,
-                challenge_ttl_seconds=verification.challenge_ttl_seconds,
-                proof_ttl_seconds=verification.proof_ttl_seconds,
-            ),
-            risk=RiskProvider(tenant.tenant_id),
-            checkpointer=build_checkpointer(backend),
+        build_fixture_tenant_services(
+            isolated_config_root,
+            tenant,
             telemetry=make_tenant_telemetry(tenant.tenant_id),
+            checkpointer=backend,
         )
         for tenant in tenants
     )
@@ -488,7 +484,7 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -608,7 +604,7 @@ async def test_application_completes_stt_shaped_cart_clarification_and_consent(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(raise_transport=True)
@@ -685,7 +681,7 @@ async def test_application_redelivery_commits_one_placement_and_one_receipt(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(raise_transport=True)
@@ -775,7 +771,7 @@ async def test_application_reconciles_receipt_after_external_effect_cancellation
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     fixture = load_orders_fixture(config_root, tenant.tenant_id)
@@ -881,7 +877,7 @@ async def test_application_engine_reconstruction_resumes_the_same_session_depend
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(raise_transport=True)
@@ -995,7 +991,7 @@ async def test_application_principal_rotation_retires_old_thread_and_completes_t
     assert owned_order_ids and foreign_order_ids
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(raise_transport=True)
@@ -1059,7 +1055,7 @@ async def test_application_request_person_route_terminalizes_and_closes_once(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(raise_transport=True)
@@ -1113,7 +1109,7 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(
@@ -1170,7 +1166,7 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = NativeAsyncBlockingFakeChatModel()
@@ -1214,7 +1210,7 @@ async def test_application_reasoning_model_timeout_is_bounded_and_effect_free(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(raise_transport=True)
@@ -1259,7 +1255,7 @@ async def test_application_checkpoint_read_outage_prevents_admission_and_effects
     backend = _CheckpointReadOutageSaver()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
         checkpointer=backend,
     )
@@ -1300,7 +1296,7 @@ def test_application_rejects_services_from_another_tenant(config_root: Path) -> 
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1319,7 +1315,7 @@ def test_application_rejects_every_cross_tenant_service(config_root: Path) -> No
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     orders = load_orders_fixture(config_root, tenant.tenant_id)
@@ -1363,7 +1359,7 @@ def test_application_rejects_a_service_without_tenant_identity(config_root: Path
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1382,7 +1378,7 @@ def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> No
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1410,7 +1406,7 @@ def test_application_rejects_a_guest_scope_from_another_session(config_root: Pat
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1445,7 +1441,7 @@ def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> 
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1471,7 +1467,7 @@ def test_application_rejects_verification_store_using_another_otp_service(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1513,7 +1509,7 @@ def test_application_rejects_verification_store_for_another_session(
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1548,7 +1544,7 @@ def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) 
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1576,7 +1572,7 @@ def test_application_rejects_session_telemetry_from_another_sink(config_root: Pa
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
@@ -1601,7 +1597,7 @@ def test_application_rejects_swapped_telemetry_purposes(config_root: Path) -> No
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
-        tenant.tenant_id,
+        tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 

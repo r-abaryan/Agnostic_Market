@@ -39,6 +39,17 @@ class TenantContext:
     config_version: str
     policy: PolicyContext
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "tenant_id",
+            normalize_tenant_id(self.tenant_id, boundary="tenant context"),
+        )
+        config_version = self.config_version.strip()
+        if not config_version:
+            raise ValueError("tenant context requires a config version")
+        object.__setattr__(self, "config_version", config_version)
+
 
 def build_tenant_context(registry: ConfigRegistry, merchant_id: str) -> TenantContext:
     """Build the frozen context for a session from the registry's resolved config."""
