@@ -46,7 +46,11 @@ from agnostic_market.llm.providers import (
 )
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.tenancy.resolver import TenantResolutionError
-from agnostic_market.voice.admission import VoiceJobAdmission, VoiceTenantAdmission
+from agnostic_market.voice.admission import (
+    NetworkVoiceTenantAdmission,
+    VoiceJobAdmission,
+    VoiceTenantAdmission,
+)
 from agnostic_market.voice.pipeline import VoiceLoop, build_voice_loop
 
 if __package__:
@@ -98,11 +102,9 @@ async def _start_admitted_session(
     loop: VoiceLoop,
     admission: VoiceTenantAdmission,
 ) -> None:
-    room_options = (
-        room_io.RoomOptions()
-        if admission.participant_identity is None
-        else room_io.RoomOptions(participant_identity=admission.participant_identity)
-    )
+    room_options = room_io.RoomOptions()
+    if isinstance(admission, NetworkVoiceTenantAdmission):
+        room_options = room_io.RoomOptions(participant_identity=admission.participant_identity)
     await loop.session.start(loop.agent, room=ctx.room, room_options=room_options)
 
 
@@ -112,7 +114,7 @@ async def _certification_participant_identity(
     *,
     timeout_seconds: float,
 ) -> str:
-    if admission.participant_identity is not None:
+    if isinstance(admission, NetworkVoiceTenantAdmission):
         return admission.participant_identity
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -168,7 +170,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )
     routing_evidence = DisabledTelemetrySink()
 
-    loop = build_voice_loop(
+    loop = await build_voice_loop(
         tenant,
         resolved,
         credentials,

@@ -387,14 +387,14 @@ def test_frontline_eval_speech_authority_preflight_is_green() -> None:
     assert _speech_authority_failures() == ()
 
 
-def test_evaluator_runtime_uses_the_supplied_fixture_root(
+async def test_evaluator_runtime_uses_the_supplied_fixture_root(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(frontline_eval, "_CONFIG_ROOT", config_root / "unavailable-repository-root")
     config = ConfigRegistry(config_root).load().get("acme_store").config
 
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         FakeChatModel(),
         FakeChatModel(),
@@ -410,9 +410,11 @@ def test_evaluator_runtime_uses_the_supplied_fixture_root(
     assert runtime.capability_registry.capability_ids
 
 
-def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Path) -> None:
+async def test_evaluator_runtime_shares_the_graph_capability_registry(
+    config_root: Path,
+) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         FakeChatModel(),
         FakeChatModel(),
@@ -432,7 +434,7 @@ def test_evaluator_runtime_shares_the_graph_capability_registry(config_root: Pat
     assert runtime.capability_registry.capability_ids
 
 
-def test_evaluator_runtime_uses_the_production_checkpointer(
+async def test_evaluator_runtime_uses_the_production_checkpointer(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -440,7 +442,7 @@ def test_evaluator_runtime_uses_the_production_checkpointer(
     monkeypatch.setattr(frontline_eval, "build_checkpointer", lambda: expected)
     config = ConfigRegistry(config_root).load().get("acme_store").config
 
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         FakeChatModel(),
         FakeChatModel(),
@@ -467,7 +469,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
             [("provide_cart_quantity", {"quantity": 1})],
         ],
     )
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         frontline,
         reasoning,
@@ -546,7 +548,7 @@ async def test_evaluator_contains_a_seeded_typed_cart_request_at_confirmation(
     config = ConfigRegistry(config_root).load().get("acme_store").config
     routing = FakeChatModel(emit_tool_calls=False)
     reasoning = FakeChatModel(emit_tool_calls=False)
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         routing,
         reasoning,
@@ -624,7 +626,7 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
         text_response="We carry trail running shoes for $89.99.",
     )
     reasoning = FakeChatModel(emit_tool_calls=False)
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         routing,
         reasoning,
@@ -693,7 +695,7 @@ async def test_evaluator_executes_seeded_typed_placement_without_semantic_routin
     config = ConfigRegistry(config_root).load().get("acme_store").config
     routing = FakeChatModel(emit_tool_calls=False)
     reasoning = FakeChatModel(emit_tool_calls=False)
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         routing,
         reasoning,
@@ -1012,7 +1014,7 @@ def test_cli_runs_structural_coverage_without_provider_construction(
 async def test_routing_data_contract_reuses_the_production_registry(config_root: Path) -> None:
     contract = _routing_data_contract()
     config = ConfigRegistry(config_root).load().get("acme_store").config
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         FakeChatModel(),
         FakeChatModel(),
@@ -1478,7 +1480,7 @@ def test_routing_data_protected_and_synthetic_review_contracts_are_closed() -> N
 
 async def test_production_projector_matches_the_fixture_built_registry(config_root: Path) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         FakeChatModel(),
         FakeChatModel(),
@@ -1636,7 +1638,7 @@ async def test_semantic_route_runner_uses_the_production_router_envelope(
         }
     )
     config = ConfigRegistry(config_root).load().get("acme_store").config
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         model,
         FakeChatModel(),
@@ -2446,7 +2448,7 @@ async def test_read_owner_corpus_runs_through_the_production_graph_without_netwo
         },
     )
     config = ConfigRegistry(config_root).load().get("acme_store").config
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         routing,
         FakeChatModel(),
@@ -3146,7 +3148,7 @@ async def test_read_owner_eval_observes_the_executed_branch_not_matching_copy(
         ),
     )
     config = ConfigRegistry(config_root).load().get("acme_store").config
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         FakeChatModel(
             structured_args={"AnswerResponse": ({"decision": "answer", "answer": answer},)}

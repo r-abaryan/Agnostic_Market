@@ -1333,7 +1333,7 @@ async def _checkpoint_observation(
     )
 
 
-def _build_eval_runtime(
+async def _build_eval_runtime(
     config: MerchantConfig,
     response_model: BaseChatModel,
     reasoning_model: BaseChatModel,
@@ -1373,14 +1373,14 @@ def _build_eval_runtime(
             registry=registry,
         )
 
-    def session_state_factory(tenant_context, tenant_services):
-        return build_in_memory_session_state(
+    async def session_state_factory(tenant_context, tenant_services):
+        return await build_in_memory_session_state(
             tenant_context,
             tenant_services,
             thread_id=thread_id,
         )
 
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         ApplicationSettings.from_merchant_config(config),
         ApplicationModels(
@@ -2986,7 +2986,7 @@ async def _run_semantic_route_eval(
         if diagnostic_timeout_seconds is not None:
             raise ValueError("diagnostic timeout is valid only in diagnostic mode")
         timeout_seconds = config.runtime.semantic_router_timeout_seconds
-    runtime = _build_eval_runtime(
+    runtime = await _build_eval_runtime(
         config,
         selection.response_model,
         selection.gateway.chat_model(config.llm.reasoning),
@@ -3588,7 +3588,7 @@ async def _run_transport_case(
                     max_retries=max_retries,
                     timeout=upstream_timeout_seconds,
                 )
-                runtime = _build_eval_runtime(
+                runtime = await _build_eval_runtime(
                     config,
                     model,
                     model,

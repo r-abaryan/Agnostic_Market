@@ -505,7 +505,7 @@ async def _recorder_loop(config_root: Path) -> VoiceLoop:
     resolved = registry.get("acme_store")
     tenant = build_tenant_context(registry, "acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
-    return build_voice_loop(
+    return await build_voice_loop(
         tenant,
         resolved,
         credentials,

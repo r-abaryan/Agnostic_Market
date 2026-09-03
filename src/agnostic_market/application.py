@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields
 from enum import StrEnum
 from pathlib import Path
@@ -174,7 +174,9 @@ def _derive_application_responsibilities() -> dict[tuple[str, str], ApplicationR
 APPLICATION_RESPONSIBILITIES = MappingProxyType(_derive_application_responsibilities())
 
 
-type SessionStateFactory = Callable[[TenantContext, TenantServices], ApplicationSessionState]
+type SessionStateFactory = Callable[
+    [TenantContext, TenantServices], Awaitable[ApplicationSessionState]
+]
 type RoutingFactory = Callable[[CapabilityRegistry], RoutingRecognizer]
 
 
@@ -285,7 +287,7 @@ def build_fixture_tenant_services(
     )
 
 
-def build_in_memory_session_state(
+async def build_in_memory_session_state(
     tenant: TenantContext,
     services: TenantServices,
     *,
@@ -325,7 +327,7 @@ def build_in_memory_session_state(
     )
 
 
-def build_application_session(
+async def build_application_session(
     tenant: TenantContext,
     settings: ApplicationSettings,
     models: ApplicationModels,
@@ -351,7 +353,7 @@ def build_application_session(
         raise ValueError(
             "tenant services do not match the application tenant: " + ", ".join(mismatched_services)
         )
-    state = session_state_factory(tenant, services)
+    state = await session_state_factory(tenant, services)
     _validate_session_state(tenant, services, state)
     assembly = build_frontline_graph(
         models.response,
