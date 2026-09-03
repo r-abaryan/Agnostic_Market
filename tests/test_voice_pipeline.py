@@ -42,7 +42,7 @@ async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
     resolved = registry.get("acme_store")
     tenant = build_tenant_context(registry, "acme_store")
     credentials = load_provider_credentials(config_root / "base" / "providers.yaml")
-    return build_voice_loop(
+    return await build_voice_loop(
         tenant,
         resolved,
         credentials,
@@ -132,7 +132,7 @@ async def test_voice_graph_uses_only_response_and_reasoning_model_roles(
     assert method_selections == [config.llm.response]
 
 
-def test_voice_composition_rejects_a_mismatched_tenant_before_model_construction(
+async def test_voice_composition_rejects_a_mismatched_tenant_before_model_construction(
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -149,7 +149,7 @@ def test_voice_composition_rejects_a_mismatched_tenant_before_model_construction
     monkeypatch.setattr(pipeline, "LLMGateway", model_construction_started)
 
     with pytest.raises(ValueError, match="tenant context"):
-        build_voice_loop(
+        await build_voice_loop(
             replace(tenant, tenant_id="demo_shop"),
             resolved,
             credentials,

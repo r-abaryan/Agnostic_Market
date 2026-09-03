@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 from dataclasses import fields, replace
 from pathlib import Path
@@ -82,6 +83,11 @@ from agnostic_market.dtos.state import CartLine, ReasoningState
 from agnostic_market.tenancy.context import TenantContext, build_tenant_context
 
 _TEST_DEPLOYMENT_ID = "test-application-artifact"
+
+
+def test_application_composition_boundary_is_native_async() -> None:
+    assert inspect.iscoroutinefunction(build_in_memory_session_state)
+    assert inspect.iscoroutinefunction(build_application_session)
 
 
 class _CheckpointReadOutageSaver(InMemorySaver):
@@ -241,15 +247,15 @@ async def test_application_uses_explicit_deployment_artifact_for_checkpoint_name
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def fixed_state(context, dependencies):
-        return build_in_memory_session_state(
+    async def fixed_state(context, dependencies):
+        return await build_in_memory_session_state(
             context,
             dependencies,
             session_id="same-session",
             thread_id="same-thread",
         )
 
-    first = build_application_session(
+    first = await build_application_session(
         tenant,
         _settings(),
         _models(),
@@ -258,7 +264,7 @@ async def test_application_uses_explicit_deployment_artifact_for_checkpoint_name
         routing_factory=_routing_factory,
         session_state_factory=fixed_state,
     )
-    second = build_application_session(
+    second = await build_application_session(
         tenant,
         _settings(),
         _models(),
@@ -289,23 +295,23 @@ async def test_shared_tenant_services_keep_guest_visibility_session_isolated(
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def first_state(context, dependencies):
-        return build_in_memory_session_state(
+    async def first_state(context, dependencies):
+        return await build_in_memory_session_state(
             context,
             dependencies,
             session_id="session-a",
             thread_id="thread-a",
         )
 
-    def second_state(context, dependencies):
-        return build_in_memory_session_state(
+    async def second_state(context, dependencies):
+        return await build_in_memory_session_state(
             context,
             dependencies,
             session_id="session-b",
             thread_id="thread-b",
         )
 
-    first = build_application_session(
+    first = await build_application_session(
         tenant,
         _settings(),
         _models(),
@@ -314,7 +320,7 @@ async def test_shared_tenant_services_keep_guest_visibility_session_isolated(
         routing_factory=_routing_factory,
         session_state_factory=first_state,
     )
-    second = build_application_session(
+    second = await build_application_session(
         tenant,
         _settings(),
         _models(),
@@ -374,8 +380,8 @@ async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backe
         for tenant in tenants
     )
 
-    def same_logical_state(context, dependencies):
-        return build_in_memory_session_state(
+    async def same_logical_state(context, dependencies):
+        return await build_in_memory_session_state(
             context,
             dependencies,
             session_id="shared-logical-session",
@@ -398,18 +404,24 @@ async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backe
         )
         for response, reasoning in zip(response_models, reasoning_models, strict=True)
     )
-    applications = tuple(
-        build_application_session(
-            tenant,
-            _settings(),
-            application_models,
-            dependencies,
-            deployment_id=_TEST_DEPLOYMENT_ID,
-            routing_factory=_routing_factory,
-            session_state_factory=same_logical_state,
+    applications = []
+    for tenant, dependencies, application_models in zip(
+        tenants,
+        services,
+        models,
+        strict=True,
+    ):
+        applications.append(
+            await build_application_session(
+                tenant,
+                _settings(),
+                application_models,
+                dependencies,
+                deployment_id=_TEST_DEPLOYMENT_ID,
+                routing_factory=_routing_factory,
+                session_state_factory=same_logical_state,
+            )
         )
-        for tenant, dependencies, application_models in zip(tenants, services, models, strict=True)
-    )
     product = orders.products[0]
     line = CartLine(
         sku=product.sku,
@@ -489,8 +501,8 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
     )
 
     def session_state(session_id: str, thread_id: str):
-        def build_state(context, dependencies):
-            return build_in_memory_session_state(
+        async def build_state(context, dependencies):
+            return await build_in_memory_session_state(
                 context,
                 dependencies,
                 session_id=session_id,
@@ -499,7 +511,7 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
 
         return build_state
 
-    first = build_application_session(
+    first = await build_application_session(
         tenant,
         _settings(),
         _models(),
@@ -508,7 +520,7 @@ async def test_confirmed_placement_grants_authority_only_to_the_placing_session(
         routing_factory=_routing_factory,
         session_state_factory=session_state("placing-session", "placing-thread"),
     )
-    second = build_application_session(
+    second = await build_application_session(
         tenant,
         _settings(),
         _models(),
@@ -614,7 +626,7 @@ async def test_application_completes_stt_shaped_cart_clarification_and_consent(
             [("provide_cart_quantity", {"quantity": 2})],
         ]
     )
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -688,15 +700,15 @@ async def test_application_redelivery_commits_one_placement_and_one_receipt(
     reasoning = FakeChatModel(raise_transport=True)
     recognizer = ArchitectureRoutingRecognizer()
 
-    def fixed_state(context, dependencies):
-        return build_in_memory_session_state(
+    async def fixed_state(context, dependencies):
+        return await build_in_memory_session_state(
             context,
             dependencies,
             session_id="redelivered-placement-session",
             thread_id="redelivered-placement-thread",
         )
 
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -780,7 +792,7 @@ async def test_application_reconciles_receipt_after_external_effect_cancellation
     response = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(raise_transport=True)
     recognizer = ArchitectureRoutingRecognizer()
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -883,15 +895,15 @@ async def test_application_engine_reconstruction_resumes_the_same_session_depend
     response = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(raise_transport=True)
 
-    def fixed_identity_state(context, dependencies):
-        return build_in_memory_session_state(
+    async def fixed_identity_state(context, dependencies):
+        return await build_in_memory_session_state(
             context,
             dependencies,
             session_id="reconstructed-session",
             thread_id="reconstructed-thread",
         )
 
-    first = build_application_session(
+    first = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -924,7 +936,7 @@ async def test_application_engine_reconstruction_resumes_the_same_session_depend
         pending = paused.pending_placement
         assert pending is not None
 
-        reconstructed = build_application_session(
+        reconstructed = await build_application_session(
             tenant,
             _settings(),
             ApplicationModels(
@@ -1000,7 +1012,7 @@ async def test_application_principal_rotation_retires_old_thread_and_completes_t
         canned_args={"propose_identity": {"contact_claim": customer.contact}},
         tool_call_limit=1,
     )
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -1061,7 +1073,7 @@ async def test_application_request_person_route_terminalizes_and_closes_once(
     response = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(raise_transport=True)
     recognizer = ArchitectureRoutingRecognizer()
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -1118,7 +1130,7 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
         record_prompts=True,
     )
     reasoning = FakeChatModel(raise_transport=True)
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -1171,7 +1183,7 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
     )
     response = NativeAsyncBlockingFakeChatModel()
     reasoning = FakeChatModel(raise_transport=True)
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         replace(_settings(), response_model_node_timeout_seconds=0.05),
         ApplicationModels(
@@ -1215,7 +1227,7 @@ async def test_application_reasoning_model_timeout_is_bounded_and_effect_free(
     )
     response = FakeChatModel(raise_transport=True)
     reasoning = NativeAsyncBlockingFakeChatModel()
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         replace(_settings(), reasoning_model_node_timeout_seconds=0.05),
         ApplicationModels(
@@ -1262,7 +1274,7 @@ async def test_application_checkpoint_read_outage_prevents_admission_and_effects
     response = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(raise_transport=True)
     recognizer = ArchitectureRoutingRecognizer()
-    application = build_application_session(
+    application = await build_application_session(
         tenant,
         _settings(),
         ApplicationModels(
@@ -1292,7 +1304,7 @@ async def test_application_checkpoint_read_outage_prevents_admission_and_effects
         await application.state.caller_context.aclose_session()
 
 
-def test_application_rejects_services_from_another_tenant(config_root: Path) -> None:
+async def test_application_rejects_services_from_another_tenant(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1301,7 +1313,7 @@ def test_application_rejects_services_from_another_tenant(config_root: Path) -> 
     )
 
     with pytest.raises(ValueError, match="services do not match"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1311,7 +1323,7 @@ def test_application_rejects_services_from_another_tenant(config_root: Path) -> 
         )
 
 
-def test_application_rejects_every_cross_tenant_service(config_root: Path) -> None:
+async def test_application_rejects_every_cross_tenant_service(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1339,12 +1351,12 @@ def test_application_rejects_every_cross_tenant_service(config_root: Path) -> No
         "telemetry": make_tenant_telemetry("other_store"),
     }
 
-    def session_state_must_not_build(_tenant, _services):
+    async def session_state_must_not_build(_tenant, _services):
         raise AssertionError("cross-tenant services reached session-state construction")
 
     for field_name, service in mismatches.items():
         with pytest.raises(ValueError, match=field_name):
-            build_application_session(
+            await build_application_session(
                 tenant,
                 _settings(),
                 _models(),
@@ -1355,7 +1367,9 @@ def test_application_rejects_every_cross_tenant_service(config_root: Path) -> No
             )
 
 
-def test_application_rejects_a_service_without_tenant_identity(config_root: Path) -> None:
+async def test_application_rejects_a_service_without_tenant_identity(
+    config_root: Path,
+) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1364,7 +1378,7 @@ def test_application_rejects_a_service_without_tenant_identity(config_root: Path
     )
 
     with pytest.raises(TypeError, match="customers does not expose a tenant identity"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1374,7 +1388,7 @@ def test_application_rejects_a_service_without_tenant_identity(config_root: Path
         )
 
 
-def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> None:
+async def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1382,8 +1396,8 @@ def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> No
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(_context, dependencies):
-        return build_in_memory_session_state(
+    async def mismatched_state(_context, dependencies):
+        return await build_in_memory_session_state(
             _tenant("other_store"),
             dependencies,
             session_id="wrong-tenant-session",
@@ -1391,7 +1405,7 @@ def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> No
         )
 
     with pytest.raises(ValueError, match="guest-order scope does not match"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1402,7 +1416,9 @@ def test_application_rejects_a_cross_tenant_guest_scope(config_root: Path) -> No
         )
 
 
-def test_application_rejects_a_guest_scope_from_another_session(config_root: Path) -> None:
+async def test_application_rejects_a_guest_scope_from_another_session(
+    config_root: Path,
+) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1410,8 +1426,8 @@ def test_application_rejects_a_guest_scope_from_another_session(config_root: Pat
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(
             context,
             dependencies,
             session_id="session-a",
@@ -1426,7 +1442,7 @@ def test_application_rejects_a_guest_scope_from_another_session(config_root: Pat
         )
 
     with pytest.raises(ValueError, match="scope does not match the application session"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1437,7 +1453,7 @@ def test_application_rejects_a_guest_scope_from_another_session(config_root: Pat
         )
 
 
-def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> None:
+async def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1445,12 +1461,12 @@ def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> 
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(context, dependencies)
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(context, dependencies)
         return replace(state, cart_store=CartStore())
 
     with pytest.raises(ValueError, match=r"lifecycle.*cart"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1461,7 +1477,7 @@ def test_application_rejects_split_brain_lifecycle_stores(config_root: Path) -> 
         )
 
 
-def test_application_rejects_verification_store_using_another_otp_service(
+async def test_application_rejects_verification_store_using_another_otp_service(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
@@ -1471,8 +1487,8 @@ def test_application_rejects_verification_store_using_another_otp_service(
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(context, dependencies)
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(context, dependencies)
         verification = VerificationStore(
             OtpProvider(
                 context.tenant_id,
@@ -1492,7 +1508,7 @@ def test_application_rejects_verification_store_using_another_otp_service(
         )
 
     with pytest.raises(ValueError, match="tenant OTP service"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1503,7 +1519,7 @@ def test_application_rejects_verification_store_using_another_otp_service(
         )
 
 
-def test_application_rejects_verification_store_for_another_session(
+async def test_application_rejects_verification_store_for_another_session(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
@@ -1513,8 +1529,8 @@ def test_application_rejects_verification_store_for_another_session(
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(context, dependencies)
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(context, dependencies)
         verification = VerificationStore(
             dependencies.otp,
             session_id="foreign-session",
@@ -1529,7 +1545,7 @@ def test_application_rejects_verification_store_for_another_session(
         )
 
     with pytest.raises(ValueError, match=r"verification.*session"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1540,7 +1556,7 @@ def test_application_rejects_verification_store_for_another_session(
         )
 
 
-def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) -> None:
+async def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1548,8 +1564,8 @@ def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) 
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(context, dependencies)
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(context, dependencies)
         other = make_tenant_telemetry(context.tenant_id).bind_session(state.session_id)
         return replace(
             state,
@@ -1557,7 +1573,7 @@ def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) 
         )
 
     with pytest.raises(ValueError, match=r"lifecycle.*telemetry"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1568,7 +1584,9 @@ def test_application_rejects_split_brain_lifecycle_telemetry(config_root: Path) 
         )
 
 
-def test_application_rejects_session_telemetry_from_another_sink(config_root: Path) -> None:
+async def test_application_rejects_session_telemetry_from_another_sink(
+    config_root: Path,
+) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1576,13 +1594,13 @@ def test_application_rejects_session_telemetry_from_another_sink(config_root: Pa
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(context, dependencies)
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(context, dependencies)
         other = make_tenant_telemetry(context.tenant_id).bind_session(state.session_id)
         return replace(state, telemetry=other)
 
     with pytest.raises(ValueError, match="tenant telemetry service"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),
@@ -1593,7 +1611,7 @@ def test_application_rejects_session_telemetry_from_another_sink(config_root: Pa
         )
 
 
-def test_application_rejects_swapped_telemetry_purposes(config_root: Path) -> None:
+async def test_application_rejects_swapped_telemetry_purposes(config_root: Path) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
         config_root,
@@ -1601,8 +1619,8 @@ def test_application_rejects_swapped_telemetry_purposes(config_root: Path) -> No
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
 
-    def mismatched_state(context, dependencies):
-        state = build_in_memory_session_state(context, dependencies)
+    async def mismatched_state(context, dependencies):
+        state = await build_in_memory_session_state(context, dependencies)
         return replace(
             state,
             telemetry=SessionTelemetry(
@@ -1612,7 +1630,7 @@ def test_application_rejects_swapped_telemetry_purposes(config_root: Path) -> No
         )
 
     with pytest.raises(ValueError, match="telemetry purpose"):
-        build_application_session(
+        await build_application_session(
             tenant,
             _settings(),
             _models(),

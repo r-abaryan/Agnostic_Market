@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from livekit import rtc
@@ -11,6 +11,7 @@ from livekit.agents import JobContext
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.config.registry import ConfigRegistry, ResolvedConfig
+from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
 from agnostic_market.tenancy.context import TenantContext, build_tenant_context
 from agnostic_market.tenancy.resolver import TenantResolutionError, TenantResolver
 
@@ -43,18 +44,39 @@ class VoiceJobMetadata(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
-class VoiceTenantAdmission:
+class _ResolvedVoiceContext:
     tenant: TenantContext
     resolved: ResolvedConfig
-    participant_identity: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class VoiceAdmissionPreflight:
-    tenant: TenantContext
-    resolved: ResolvedConfig
-    participant_kind: Literal["console", "sip", "standard"]
+class ConsoleVoiceTenantAdmission(_ResolvedVoiceContext):
+    admission_kind: Literal["console"] = field(default="console", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkVoiceTenantAdmission(_ResolvedVoiceContext):
+    participant_identity: str
+    session_authority: AdmittedSessionAuthority
+    admission_kind: Literal["network"] = field(default="network", init=False)
+
+
+type VoiceTenantAdmission = ConsoleVoiceTenantAdmission | NetworkVoiceTenantAdmission
+
+
+@dataclass(frozen=True, slots=True)
+class ConsoleVoiceAdmissionPreflight(_ResolvedVoiceContext):
+    participant_kind: Literal["console"] = field(default="console", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkVoiceAdmissionPreflight(_ResolvedVoiceContext):
+    participant_kind: Literal["sip", "standard"]
     participant_identity: str | None
+    session_authority: AdmittedSessionAuthority
+
+
+type VoiceAdmissionPreflight = ConsoleVoiceAdmissionPreflight | NetworkVoiceAdmissionPreflight
 
 
 def _parse_job_metadata(raw_metadata: str) -> VoiceJobMetadata | None:
@@ -64,6 +86,20 @@ def _parse_job_metadata(raw_metadata: str) -> VoiceJobMetadata | None:
         return VoiceJobMetadata.model_validate_json(raw_metadata)
     except ValidationError as exc:
         raise TenantResolutionError("voice job metadata is invalid") from exc
+
+
+def _session_authority(job_context: JobContext) -> AdmittedSessionAuthority:
+    try:
+        return AdmittedSessionAuthority(
+            logical_session_id=job_context.job.dispatch_id,
+            transport=TransportAuthority(
+                provider="livekit",
+                assignment_id=job_context.job.id,
+                worker_id=job_context.worker_id,
+            ),
+        )
+    except (AttributeError, ValidationError) as exc:
+        raise TenantResolutionError("voice job transport authority is invalid") from exc
 
 
 class VoiceJobAdmission:
@@ -87,23 +123,23 @@ class VoiceJobAdmission:
                     "console voice admission requires VOICE_AGENT_MERCHANT_ID"
                 )
             admitted_merchant_id = self._resolver.resolve_by_id(merchant_id)
-            participant_kind: Literal["console", "sip", "standard"] = "console"
-            participant_identity = None
-        else:
-            metadata = _parse_job_metadata(job_context.job.metadata)
-            if metadata is None:
-                raise TenantResolutionError(
-                    "production voice admission requires approved dispatch metadata"
-                )
-            admitted_merchant_id = self._resolver.resolve_by_id(metadata.merchant_id)
-            participant_kind = metadata.participant_kind
-            participant_identity = metadata.participant_identity
+            return ConsoleVoiceAdmissionPreflight(
+                tenant=build_tenant_context(self._registry, admitted_merchant_id),
+                resolved=self._registry.get(admitted_merchant_id),
+            )
+        metadata = _parse_job_metadata(job_context.job.metadata)
+        if metadata is None:
+            raise TenantResolutionError(
+                "production voice admission requires approved dispatch metadata"
+            )
+        admitted_merchant_id = self._resolver.resolve_by_id(metadata.merchant_id)
 
-        return VoiceAdmissionPreflight(
+        return NetworkVoiceAdmissionPreflight(
             tenant=build_tenant_context(self._registry, admitted_merchant_id),
             resolved=self._registry.get(admitted_merchant_id),
-            participant_kind=participant_kind,
-            participant_identity=participant_identity,
+            participant_kind=metadata.participant_kind,
+            participant_identity=metadata.participant_identity,
+            session_authority=_session_authority(job_context),
         )
 
     async def complete(
@@ -119,26 +155,32 @@ class VoiceJobAdmission:
         try:
             async with asyncio.timeout(timeout_seconds):
                 await job_context.connect()
-                participant_identity = await self._bind_participant(job_context, preflight)
+                if isinstance(preflight, ConsoleVoiceAdmissionPreflight):
+                    return ConsoleVoiceTenantAdmission(
+                        tenant=preflight.tenant,
+                        resolved=preflight.resolved,
+                    )
+                participant_identity = await self._bind_network_participant(
+                    job_context,
+                    preflight,
+                )
         except TimeoutError as exc:
             raise TenantResolutionError(
                 "voice admission timed out while connecting or waiting for the participant"
             ) from exc
 
-        return VoiceTenantAdmission(
+        return NetworkVoiceTenantAdmission(
             tenant=preflight.tenant,
             resolved=preflight.resolved,
             participant_identity=participant_identity,
+            session_authority=preflight.session_authority,
         )
 
-    async def _bind_participant(
+    async def _bind_network_participant(
         self,
         job_context: JobContext,
-        preflight: VoiceAdmissionPreflight,
-    ) -> str | None:
-        if preflight.participant_kind == "console":
-            return None
-
+        preflight: NetworkVoiceAdmissionPreflight,
+    ) -> str:
         participant_kind = (
             rtc.ParticipantKind.PARTICIPANT_KIND_SIP
             if preflight.participant_kind == "sip"

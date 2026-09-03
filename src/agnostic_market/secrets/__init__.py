@@ -8,5 +8,6 @@ the same Protocol, with no config-schema change.
 
 from agnostic_market.secrets.base import SecretResolutionError, SecretResolver
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
+from agnostic_market.secrets.reference import SecretReference
 
-__all__ = ["EnvSecretResolver", "SecretResolutionError", "SecretResolver"]
+__all__ = ["EnvSecretResolver", "SecretReference", "SecretResolutionError", "SecretResolver"]

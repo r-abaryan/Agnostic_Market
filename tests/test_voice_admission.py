@@ -13,7 +13,12 @@ from livekit import rtc
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.config.resolver import ConfigResolutionError
 from agnostic_market.tenancy.resolver import TenantResolutionError, TenantResolver
-from agnostic_market.voice.admission import VoiceJobAdmission, VoiceTenantAdmission
+from agnostic_market.voice.admission import (
+    ConsoleVoiceTenantAdmission,
+    NetworkVoiceTenantAdmission,
+    VoiceJobAdmission,
+    VoiceTenantAdmission,
+)
 
 _ADMISSION_TIMEOUT_SECONDS = 1.0
 
@@ -42,6 +47,9 @@ class _JobContext:
         *,
         fake: bool,
         metadata: str = "",
+        job_id: str = "AJ_test_job",
+        dispatch_id: str = "AD_test_dispatch",
+        worker_id: str = "AW_test_worker",
         participant_kind: int = rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
         participant_attributes: dict[str, str] | None = None,
         participant_identity: str = "caller-primary",
@@ -50,7 +58,12 @@ class _JobContext:
         wait_event: asyncio.Event | None = None,
     ) -> None:
         self._fake = fake
-        self.job = SimpleNamespace(metadata=metadata)
+        self.job = SimpleNamespace(
+            metadata=metadata,
+            id=job_id,
+            dispatch_id=dispatch_id,
+        )
+        self.worker_id = worker_id
         self.room = object()
         self.participants = (
             SimpleNamespace(
@@ -112,9 +125,9 @@ async def test_console_admission_requires_an_explicit_known_merchant(
         registry,
         development_merchant_id="acme_store",
     )
+    assert isinstance(admitted, ConsoleVoiceTenantAdmission)
     assert admitted.tenant.tenant_id == "acme_store"
     assert admitted.tenant.config_version == admitted.resolved.config_version
-    assert admitted.participant_identity is None
     assert job.connect_count == 1
 
 
@@ -138,8 +151,12 @@ async def test_sip_admission_uses_the_called_trunk_and_not_caller_ani(
         development_merchant_id="demo_shop",
     )
 
+    assert isinstance(admitted, NetworkVoiceTenantAdmission)
     assert admitted.tenant.tenant_id == "acme_store"
     assert admitted.participant_identity == "caller-primary"
+    assert admitted.session_authority.logical_session_id == "AD_test_dispatch"
+    assert admitted.session_authority.transport.assignment_id == "AJ_test_job"
+    assert admitted.session_authority.transport.worker_id == "AW_test_worker"
     assert job.connect_count == 1
     assert job.wait_count == 1
     assert job.wait_kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
@@ -169,6 +186,78 @@ async def test_non_sip_admission_requires_strict_explicit_dispatch_metadata(
             development_merchant_id="acme_store",
         )
     assert missing.connect_count == 0
+
+
+@pytest.mark.parametrize(
+    "field_name, value",
+    (
+        ("job_id", ""),
+        ("job_id", " AJ_test_job"),
+        ("dispatch_id", ""),
+        ("dispatch_id", "AD_test_dispatch "),
+        ("worker_id", ""),
+        ("worker_id", " AW_test_worker"),
+    ),
+)
+async def test_network_admission_requires_canonical_server_authority_before_connecting(
+    registry: ConfigRegistry,
+    field_name: str,
+    value: str,
+) -> None:
+    arguments = {
+        "fake": False,
+        "metadata": (
+            '{"schema_version":1,"merchant_id":"demo_shop",'
+            '"participant_kind":"standard","participant_identity":"caller-primary"}'
+        ),
+        field_name: value,
+    }
+    job = _JobContext(**arguments)
+
+    with pytest.raises(TenantResolutionError, match="transport authority"):
+        await _run_admission(  # type: ignore[arg-type]
+            job,
+            registry,
+            development_merchant_id=None,
+        )
+
+    assert job.connect_count == 0
+
+
+async def test_dispatch_identity_is_stable_while_transport_ownership_changes(
+    registry: ConfigRegistry,
+) -> None:
+    metadata = (
+        '{"schema_version":1,"merchant_id":"demo_shop",'
+        '"participant_kind":"standard","participant_identity":"caller-primary"}'
+    )
+    first = await _run_admission(  # type: ignore[arg-type]
+        _JobContext(
+            fake=False,
+            metadata=metadata,
+            job_id="AJ_first",
+            dispatch_id="AD_shared",
+            worker_id="AW_first",
+        ),
+        registry,
+        development_merchant_id=None,
+    )
+    second = await _run_admission(  # type: ignore[arg-type]
+        _JobContext(
+            fake=False,
+            metadata=metadata,
+            job_id="AJ_second",
+            dispatch_id="AD_shared",
+            worker_id="AW_second",
+        ),
+        registry,
+        development_merchant_id=None,
+    )
+
+    assert isinstance(first, NetworkVoiceTenantAdmission)
+    assert isinstance(second, NetworkVoiceTenantAdmission)
+    assert first.session_authority.logical_session_id == second.session_authority.logical_session_id
+    assert first.session_authority.transport != second.session_authority.transport
 
 
 async def test_unknown_dispatch_merchant_fails_before_connecting(
@@ -260,6 +349,7 @@ async def test_matching_sip_and_dispatch_authorities_are_accepted(
         development_merchant_id=None,
     )
 
+    assert isinstance(admitted, NetworkVoiceTenantAdmission)
     assert admitted.tenant.tenant_id == "acme_store"
 
 
@@ -314,6 +404,7 @@ async def test_sip_admission_ignores_an_unrelated_standard_participant(
         development_merchant_id=None,
     )
 
+    assert isinstance(admitted, NetworkVoiceTenantAdmission)
     assert admitted.tenant.tenant_id == "acme_store"
     assert admitted.participant_identity == "sip-caller"
     assert job.wait_kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
@@ -343,6 +434,7 @@ async def test_standard_admission_binds_the_declared_participant_identity(
         development_merchant_id=None,
     )
 
+    assert isinstance(admitted, NetworkVoiceTenantAdmission)
     assert admitted.tenant.tenant_id == "demo_shop"
     assert admitted.participant_identity == "caller-intended"
     assert job.wait_identity == "caller-intended"

@@ -321,6 +321,7 @@ def _run_contracts(dsn: str) -> None:
             "-m",
             "postgres",
             "tests/test_postgres_checkpoints.py",
+            "tests/test_postgres_session_registry.py",
         ),
         cwd=_ROOT,
         env=environment,

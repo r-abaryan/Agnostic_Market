@@ -170,6 +170,16 @@ same four checkpoint contracts have passed through a schema-isolated remote serv
 Windows cluster, and the digest-pinned Docker path in the repository workflow. Each provisioner
 removes only the database resources it owns.
 
+Milestone 3 first migrates application-session construction and its restorable session-state ports
+to native async, then adds the registry, encryption, revision, lease, fencing, close, and reap
+contracts. Durable verification later owns full principal recovery. Durable commerce owns
+post-effect receipt reconciliation and the transactional commerce-success outbox. Telemetry
+delivery drains that outbox asynchronously and never decides whether an effect committed.
+Network admission now reserves the server-issued LiveKit dispatch ID for logical session identity
+and the job-plus-worker pair for physical transport authority. Worker-loss recovery remains
+terminate-call until the live crash matrix proves old-transport retirement and one replacement
+speaker.
+
 ## Voice worker
 
 Copy `.env.example` to `.env` and provide the required provider and LiveKit credentials.
