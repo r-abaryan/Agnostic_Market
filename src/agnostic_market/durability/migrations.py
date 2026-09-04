@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 
 from agnostic_market.dtos.session import AuthorityIdentifier
 
-PLATFORM_SESSION_SCHEMA_VERSION = 1
+PLATFORM_SESSION_SCHEMA_VERSION = 2
 _DATABASE_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
 
 _BOOTSTRAP_SQL: LiteralString = """
@@ -110,6 +110,12 @@ CREATE POLICY platform_sessions_tenant_isolation ON platform_sessions
     WITH CHECK (tenant_id = current_setting('agnostic_market.tenant_id', true))
 """
 
+_ADD_TRANSPORT_ROOM_ID_SQL: LiteralString = """
+ALTER TABLE platform_sessions
+    ADD COLUMN transport_room_id text NOT NULL
+        CHECK (transport_room_id = btrim(transport_room_id) AND transport_room_id <> '')
+"""
+
 
 class PlatformSchemaError(RuntimeError):
     """The installed platform schema is absent, divergent, or incompatible."""
@@ -137,6 +143,11 @@ PLATFORM_MIGRATIONS = (
             _FORCE_SESSION_RLS_SQL,
             _CREATE_SESSION_POLICY_SQL,
         ),
+    ),
+    PlatformMigration(
+        version=2,
+        name="transport_room_authority",
+        statements=(_ADD_TRANSPORT_ROOM_ID_SQL,),
     ),
 )
 

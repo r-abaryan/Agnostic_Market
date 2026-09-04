@@ -11,6 +11,7 @@ from agnostic_market.dtos.platform import (
     PlatformRuntimeConfig,
     SessionEncryptionConfig,
 )
+from agnostic_market.durability.migrations import PLATFORM_SESSION_SCHEMA_VERSION
 
 
 def _valid_config() -> dict[str, object]:
@@ -28,7 +29,7 @@ def _valid_config() -> dict[str, object]:
             "statement_timeout_seconds": 1.0,
             "transaction_timeout_seconds": 2.0,
             "operation_timeout_seconds": 3.0,
-            "expected_schema_version": 1,
+            "expected_schema_version": PLATFORM_SESSION_SCHEMA_VERSION,
         },
         "sessions": {
             "lease_duration_seconds": 30.0,

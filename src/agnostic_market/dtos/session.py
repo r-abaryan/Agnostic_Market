@@ -19,6 +19,7 @@ class TransportAuthority(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     provider: Literal["livekit"]
+    room_id: AuthorityIdentifier
     assignment_id: AuthorityIdentifier
     worker_id: AuthorityIdentifier
 

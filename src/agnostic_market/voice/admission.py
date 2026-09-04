@@ -94,6 +94,7 @@ def _session_authority(job_context: JobContext) -> AdmittedSessionAuthority:
             logical_session_id=job_context.job.dispatch_id,
             transport=TransportAuthority(
                 provider="livekit",
+                room_id=job_context.job.room.sid,
                 assignment_id=job_context.job.id,
                 worker_id=job_context.worker_id,
             ),

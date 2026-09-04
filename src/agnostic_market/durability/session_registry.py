@@ -50,6 +50,7 @@ fencing_generation,
 lease_owner_id,
 lease_expires_at,
 transport_provider,
+transport_room_id,
 transport_assignment_id,
 transport_worker_id,
 expires_at,
@@ -183,6 +184,7 @@ def _record_from_row(row: Mapping[str, object]) -> SessionRegistryRecord:
                     "logical_session_id": row["logical_session_id"],
                     "transport": {
                         "provider": row["transport_provider"],
+                        "room_id": row["transport_room_id"],
                         "assignment_id": row["transport_assignment_id"],
                         "worker_id": row["transport_worker_id"],
                     },
@@ -262,6 +264,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 session_revision,
                                 fencing_generation,
                                 transport_provider,
+                                transport_room_id,
                                 transport_assignment_id,
                                 transport_worker_id,
                                 expires_at,
@@ -272,7 +275,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 encrypted_payload
                             ) VALUES (
                                 %s, %s, 'opening', %s, %s, %s, %s, %s, %s, 0,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                             )
                             RETURNING {}
                             """
@@ -289,6 +292,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 registration.principal_generation,
                                 registration.session_revision,
                                 registration.authority.transport.provider,
+                                registration.authority.transport.room_id,
                                 registration.authority.transport.assignment_id,
                                 registration.authority.transport.worker_id,
                                 registration.expires_at,

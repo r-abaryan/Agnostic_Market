@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from psycopg import AsyncConnection, sql
 from psycopg.conninfo import make_conninfo
-from psycopg.errors import CheckViolation, InsufficientPrivilege
+from psycopg.errors import CheckViolation, InsufficientPrivilege, NotNullViolation
 from psycopg_pool import AsyncConnectionPool
 
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
@@ -118,6 +118,44 @@ async def test_platform_schema_gate_rejects_divergent_migration_history(
             await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
+@pytest.mark.postgres
+async def test_room_authority_migration_refuses_to_invent_identity_for_v1_rows() -> None:
+    dsn = _dsn()
+    schema = f"room_authority_{uuid.uuid4().hex[:20]}"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await apply_platform_migrations(connection)
+
+        async with AsyncExitStack() as stack:
+            registry = PostgresSessionRegistry(
+                await _open_pool(stack, isolated_dsn),
+                cipher=_cipher(),
+                operation_timeout_seconds=2.0,
+            )
+            await registry.create(
+                _registration("acme_store", "AD_v1", "cp_v1"),
+                payload=b'{"cart":[]}',
+            )
+
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await connection.execute("DELETE FROM platform_schema_migrations WHERE version = 2")
+            await connection.execute("ALTER TABLE platform_sessions DROP COLUMN transport_room_id")
+
+            with pytest.raises(NotNullViolation):
+                await apply_platform_migrations(connection)
+
+            cursor = await connection.execute(
+                "SELECT version FROM platform_schema_migrations ORDER BY version"
+            )
+            assert [row[0] for row in await cursor.fetchall()] == [1]
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
 def _registration(
     tenant_id: str,
     logical_session_id: str,
@@ -129,6 +167,7 @@ def _registration(
             logical_session_id=logical_session_id,
             transport=TransportAuthority(
                 provider="livekit",
+                room_id=f"RM_{tenant_id}",
                 assignment_id=f"AJ_{tenant_id}",
                 worker_id=f"AW_{tenant_id}",
             ),

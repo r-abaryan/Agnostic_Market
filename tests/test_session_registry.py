@@ -27,6 +27,7 @@ def _authority() -> AdmittedSessionAuthority:
         logical_session_id="AD_session",
         transport=TransportAuthority(
             provider="livekit",
+            room_id="RM_room",
             assignment_id="AJ_job",
             worker_id="AW_worker",
         ),
@@ -51,6 +52,15 @@ def test_platform_migration_inventory_is_contiguous_and_complete() -> None:
         range(1, PLATFORM_SESSION_SCHEMA_VERSION + 1)
     )
     assert all(len(migration.checksum) == 64 for migration in PLATFORM_MIGRATIONS)
+
+
+def test_transport_authority_requires_a_room_identity() -> None:
+    with pytest.raises(ValidationError, match="room_id"):
+        TransportAuthority(
+            provider="livekit",
+            assignment_id="AJ_job",
+            worker_id="AW_worker",
+        )
 
 
 def test_session_registration_requires_timezone_aware_expiry() -> None:

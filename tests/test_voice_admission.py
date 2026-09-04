@@ -49,6 +49,7 @@ class _JobContext:
         metadata: str = "",
         job_id: str = "AJ_test_job",
         dispatch_id: str = "AD_test_dispatch",
+        room_id: str = "RM_test_room",
         worker_id: str = "AW_test_worker",
         participant_kind: int = rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
         participant_attributes: dict[str, str] | None = None,
@@ -62,6 +63,7 @@ class _JobContext:
             metadata=metadata,
             id=job_id,
             dispatch_id=dispatch_id,
+            room=SimpleNamespace(sid=room_id),
         )
         self.worker_id = worker_id
         self.room = object()
@@ -155,6 +157,7 @@ async def test_sip_admission_uses_the_called_trunk_and_not_caller_ani(
     assert admitted.tenant.tenant_id == "acme_store"
     assert admitted.participant_identity == "caller-primary"
     assert admitted.session_authority.logical_session_id == "AD_test_dispatch"
+    assert admitted.session_authority.transport.room_id == "RM_test_room"
     assert admitted.session_authority.transport.assignment_id == "AJ_test_job"
     assert admitted.session_authority.transport.worker_id == "AW_test_worker"
     assert job.connect_count == 1
@@ -195,6 +198,8 @@ async def test_non_sip_admission_requires_strict_explicit_dispatch_metadata(
         ("job_id", " AJ_test_job"),
         ("dispatch_id", ""),
         ("dispatch_id", "AD_test_dispatch "),
+        ("room_id", ""),
+        ("room_id", " RM_test_room"),
         ("worker_id", ""),
         ("worker_id", " AW_test_worker"),
     ),
@@ -224,7 +229,7 @@ async def test_network_admission_requires_canonical_server_authority_before_conn
     assert job.connect_count == 0
 
 
-async def test_dispatch_identity_is_stable_while_transport_ownership_changes(
+async def test_admission_preserves_shared_dispatch_and_room_across_assignments(
     registry: ConfigRegistry,
 ) -> None:
     metadata = (
@@ -237,6 +242,7 @@ async def test_dispatch_identity_is_stable_while_transport_ownership_changes(
             metadata=metadata,
             job_id="AJ_first",
             dispatch_id="AD_shared",
+            room_id="RM_shared",
             worker_id="AW_first",
         ),
         registry,
@@ -248,6 +254,7 @@ async def test_dispatch_identity_is_stable_while_transport_ownership_changes(
             metadata=metadata,
             job_id="AJ_second",
             dispatch_id="AD_shared",
+            room_id="RM_shared",
             worker_id="AW_second",
         ),
         registry,
@@ -257,6 +264,7 @@ async def test_dispatch_identity_is_stable_while_transport_ownership_changes(
     assert isinstance(first, NetworkVoiceTenantAdmission)
     assert isinstance(second, NetworkVoiceTenantAdmission)
     assert first.session_authority.logical_session_id == second.session_authority.logical_session_id
+    assert first.session_authority.transport.room_id == second.session_authority.transport.room_id
     assert first.session_authority.transport != second.session_authority.transport
 
 

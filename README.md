@@ -176,9 +176,9 @@ contracts. Durable verification later owns full principal recovery. Durable comm
 post-effect receipt reconciliation and the transactional commerce-success outbox. Telemetry
 delivery drains that outbox asynchronously and never decides whether an effect committed.
 Network admission now reserves the server-issued LiveKit dispatch ID for logical session identity
-and the job-plus-worker pair for physical transport authority. Worker-loss recovery remains
-terminate-call until the live crash matrix proves old-transport retirement and one replacement
-speaker.
+and binds the room SID, job ID, and worker ID as physical transport authority. Room identity alone
+never authorizes recovery. Worker-loss recovery remains terminate-call until the live crash matrix
+proves dispatch continuity, old-transport retirement, and one replacement speaker.
 
 ## Voice worker
 
