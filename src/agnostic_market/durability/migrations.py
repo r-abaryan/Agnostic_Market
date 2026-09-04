@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 
 from agnostic_market.dtos.session import AuthorityIdentifier
 
-PLATFORM_SESSION_SCHEMA_VERSION = 2
+PLATFORM_SESSION_SCHEMA_VERSION = 3
 _DATABASE_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
 
 _BOOTSTRAP_SQL: LiteralString = """
@@ -116,6 +116,23 @@ ALTER TABLE platform_sessions
         CHECK (transport_room_id = btrim(transport_room_id) AND transport_room_id <> '')
 """
 
+_REQUIRE_OPEN_LEASE_SQL: LiteralString = """
+ALTER TABLE platform_sessions
+    ADD CONSTRAINT platform_sessions_open_requires_lease
+        CHECK ((lifecycle = 'closed') = (lease_owner_id IS NULL)),
+    ADD CONSTRAINT platform_sessions_open_requires_positive_fence
+        CHECK (lifecycle = 'closed' OR fencing_generation > 0),
+    ADD CONSTRAINT platform_sessions_checkpoint_matches_fence
+        CHECK (
+            checkpoint_namespace = logical_session_id || '::fence::' || fencing_generation
+        ),
+    ADD CONSTRAINT platform_sessions_lease_starts_before_expiry
+        CHECK (
+            lease_expires_at IS NULL
+            OR (lease_expires_at > created_at AND lease_expires_at <= expires_at)
+        )
+"""
+
 
 class PlatformSchemaError(RuntimeError):
     """The installed platform schema is absent, divergent, or incompatible."""
@@ -148,6 +165,11 @@ PLATFORM_MIGRATIONS = (
         version=2,
         name="transport_room_authority",
         statements=(_ADD_TRANSPORT_ROOM_ID_SQL,),
+    ),
+    PlatformMigration(
+        version=3,
+        name="atomic_initial_session_lease",
+        statements=(_REQUIRE_OPEN_LEASE_SQL,),
     ),
 )
 
