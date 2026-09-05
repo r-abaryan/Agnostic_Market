@@ -140,6 +140,7 @@ from agnostic_market.dtos.state import (
     SupportClarification,
     open_active_invocation,
 )
+from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
 
@@ -269,10 +270,8 @@ def _engine(
     telemetry = make_session_telemetry("acme_store", thread_id)
     caller_context = CallerContext(
         verification_store=verification,
-        cart_store=cart,
-        recent_orders=recent_orders,
+        session_state=SessionStateCoordinator(cart, recent_orders, guest_orders),
         identity_store=identity,
-        guest_orders=guest_orders,
         telemetry=telemetry.operational,
     )
     assembly = build_frontline_graph(
@@ -403,7 +402,10 @@ async def test_first_admitted_turn_persists_checkpoint_schema_version(
 
     await _events(engine, "hello")
 
-    assert engine._graph.get_state(engine._config).values["checkpoint_schema_version"] == "2"
+    assert (
+        engine._graph.get_state(engine._config).values["checkpoint_schema_version"]
+        == CHECKPOINT_SCHEMA_VERSION
+    )
 
 
 async def test_native_async_model_deadline_keeps_loop_live_and_recovers_in_code(
@@ -514,7 +516,10 @@ def _seed_foreign_checkpoint(
 @pytest.mark.parametrize(
     "foreign_values",
     (
-        {"checkpoint_schema_version": "2", "retired_field": "must not survive"},
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "retired_field": "must not survive",
+        },
         {"checkpoint_schema_version": "1", "consumed_turn_ids": ("foreign-turn",)},
     ),
     ids=("unknown-channel", "unsupported-version"),
@@ -2414,18 +2419,19 @@ async def test_close_session_defers_teardown_until_the_mutable_worker_exits(
     )
     cart_cleared = threading.Event()
     thread_deleted = threading.Event()
-    real_clear = context.cart_store.clear
+    real_clear = context.session_state.clear_ephemeral
     real_delete_thread = engine.adelete_thread
 
-    def observed_clear() -> None:
-        real_clear()
+    async def observed_clear(operation_id: str):
+        result = await real_clear(operation_id)
         cart_cleared.set()
+        return result
 
     async def observed_delete_thread() -> None:
         await real_delete_thread()
         thread_deleted.set()
 
-    monkeypatch.setattr(context.cart_store, "clear", observed_clear)
+    monkeypatch.setattr(context.session_state, "clear_ephemeral", observed_clear)
     monkeypatch.setattr(engine, "adelete_thread", observed_delete_thread)
     consent = asyncio.create_task(
         _adapter_turn(adapter, "yes", "close-consent-turn"),

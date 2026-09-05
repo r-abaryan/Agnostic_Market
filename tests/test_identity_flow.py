@@ -489,7 +489,7 @@ async def test_same_principal_apply_preserves_invocation_until_continuation(
         {**after_apply.model_dump(mode="python"), **entry_update}
     )
     assert after_entry.active_invocation == invocation
-    render_update = h.engine._graph.nodes["support_capability_render"].invoke(after_entry)
+    render_update = await h.engine._graph.nodes["support_capability_render"].ainvoke(after_entry)
     assert render_update["active_invocation"] is None
 
 

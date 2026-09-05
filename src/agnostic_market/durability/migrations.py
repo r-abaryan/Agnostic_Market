@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 
 from agnostic_market.dtos.session import AuthorityIdentifier
 
-PLATFORM_SESSION_SCHEMA_VERSION = 3
+PLATFORM_SESSION_SCHEMA_VERSION = 4
 _DATABASE_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
 
 _BOOTSTRAP_SQL: LiteralString = """
@@ -133,6 +133,50 @@ ALTER TABLE platform_sessions
         )
 """
 
+_CREATE_SESSION_OPERATIONS_SQL: LiteralString = """
+CREATE TABLE platform_session_operations (
+    tenant_id text NOT NULL,
+    logical_session_id text NOT NULL,
+    operation_id text NOT NULL
+        CHECK (operation_id = btrim(operation_id) AND operation_id <> ''),
+    request_fingerprint text NOT NULL CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+    committed_revision bigint NOT NULL CHECK (committed_revision > 0),
+    committed_checkpoint_namespace text NOT NULL
+        CHECK (
+            committed_checkpoint_namespace = btrim(committed_checkpoint_namespace)
+            AND committed_checkpoint_namespace <> ''
+        ),
+    result_envelope_format text NOT NULL CHECK (result_envelope_format = 'aes_256_gcm_v1'),
+    result_envelope_key_version text NOT NULL
+        CHECK (
+            result_envelope_key_version = btrim(result_envelope_key_version)
+            AND result_envelope_key_version <> ''
+        ),
+    result_schema_version integer NOT NULL CHECK (result_schema_version > 0),
+    result_envelope_nonce bytea NOT NULL CHECK (octet_length(result_envelope_nonce) = 12),
+    encrypted_result bytea NOT NULL CHECK (octet_length(encrypted_result) >= 16),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, logical_session_id, operation_id),
+    FOREIGN KEY (tenant_id, logical_session_id)
+        REFERENCES platform_sessions (tenant_id, logical_session_id)
+        ON DELETE CASCADE
+)
+"""
+
+_ENABLE_SESSION_OPERATIONS_RLS_SQL: LiteralString = """
+ALTER TABLE platform_session_operations ENABLE ROW LEVEL SECURITY
+"""
+
+_FORCE_SESSION_OPERATIONS_RLS_SQL: LiteralString = """
+ALTER TABLE platform_session_operations FORCE ROW LEVEL SECURITY
+"""
+
+_CREATE_SESSION_OPERATIONS_POLICY_SQL: LiteralString = """
+CREATE POLICY platform_session_operations_tenant_isolation ON platform_session_operations
+    USING (tenant_id = current_setting('agnostic_market.tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('agnostic_market.tenant_id', true))
+"""
+
 
 class PlatformSchemaError(RuntimeError):
     """The installed platform schema is absent, divergent, or incompatible."""
@@ -170,6 +214,16 @@ PLATFORM_MIGRATIONS = (
         version=3,
         name="atomic_initial_session_lease",
         statements=(_REQUIRE_OPEN_LEASE_SQL,),
+    ),
+    PlatformMigration(
+        version=4,
+        name="session_state_operation_receipts",
+        statements=(
+            _CREATE_SESSION_OPERATIONS_SQL,
+            _ENABLE_SESSION_OPERATIONS_RLS_SQL,
+            _FORCE_SESSION_OPERATIONS_RLS_SQL,
+            _CREATE_SESSION_OPERATIONS_POLICY_SQL,
+        ),
     ),
 )
 
@@ -276,17 +330,26 @@ async def grant_platform_application_role(
     schema = sql.Identifier(schema_name)
     role = sql.Identifier(role_name)
     sessions = sql.Identifier(schema_name, "platform_sessions")
+    operations = sql.Identifier(schema_name, "platform_session_operations")
     migrations = sql.Identifier(schema_name, "platform_schema_migrations")
     async with connection.transaction():
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(sessions))
+        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(operations))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(migrations))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(sessions, role))
+        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(operations, role))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(migrations, role))
         await connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema, role))
         await connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(migrations, role))
         await connection.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
                 sessions,
+                role,
+            )
+        )
+        await connection.execute(
+            sql.SQL("GRANT SELECT, INSERT, DELETE ON TABLE {} TO {}").format(
+                operations,
                 role,
             )
         )

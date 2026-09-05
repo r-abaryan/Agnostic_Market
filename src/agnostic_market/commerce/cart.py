@@ -9,7 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.dtos.money import UsdAmount, validate_usd
@@ -56,6 +56,37 @@ class CartMutationRecord(BaseModel):
         return self
 
 
+class CartMutationReceipt(BaseModel):
+    model_config = _FROZEN
+
+    idempotency_key: str = Field(min_length=1)
+    record: CartMutationRecord
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def idempotency_key_is_nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("cart mutation idempotency key must not be blank")
+        return value
+
+
+class CartSessionState(BaseModel):
+    model_config = _FROZEN
+
+    lines: tuple[CartLine, ...] = ()
+    mutation_receipts: tuple[CartMutationReceipt, ...] = ()
+
+    @model_validator(mode="after")
+    def identifiers_are_unique(self) -> CartSessionState:
+        skus = [line.sku for line in self.lines]
+        keys = [receipt.idempotency_key for receipt in self.mutation_receipts]
+        if len(skus) != len(set(skus)):
+            raise ValueError("cart session state contains duplicate SKUs")
+        if len(keys) != len(set(keys)):
+            raise ValueError("cart session state contains duplicate mutation receipts")
+        return self
+
+
 def _mutation_matches(
     record: CartMutationRecord,
     *,
@@ -82,6 +113,29 @@ class CartStore:
     def __init__(self) -> None:
         self._lines: dict[str, CartLine] = {}
         self._mutations_by_key: dict[str, CartMutationRecord] = {}
+
+    @classmethod
+    def from_state(cls, state: CartSessionState) -> CartStore:
+        store = cls()
+        store._lines = {line.sku: line for line in state.lines}
+        store._mutations_by_key = {
+            receipt.idempotency_key: receipt.record for receipt in state.mutation_receipts
+        }
+        return store
+
+    def export_state(self) -> CartSessionState:
+        return CartSessionState(
+            lines=tuple(self._lines.values()),
+            mutation_receipts=tuple(
+                CartMutationReceipt(idempotency_key=key, record=record)
+                for key, record in self._mutations_by_key.items()
+            ),
+        )
+
+    def restore_state(self, state: CartSessionState) -> None:
+        restored = self.from_state(state)
+        self._lines = restored._lines
+        self._mutations_by_key = restored._mutations_by_key
 
     def add_item(self, *, sku: str, name: str, price_usd: UsdAmount, quantity: int) -> CartLine:
         """Add `quantity` of an item — ADDITIVE (a second add increments the existing line).

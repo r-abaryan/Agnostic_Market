@@ -65,6 +65,7 @@ from agnostic_market.dtos.orchestration import (
     PlaceOrder,
 )
 from agnostic_market.dtos.state import PendingCartMutation
+from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
@@ -105,10 +106,8 @@ def _build(
     verification = VerificationStore(otp, session_id=telemetry.session_id)
     caller_context = CallerContext(
         verification_store=verification,
-        cart_store=cart,
-        recent_orders=recent_orders,
+        session_state=SessionStateCoordinator(cart, recent_orders, guest_orders),
         identity_store=identity,
-        guest_orders=guest_orders,
         telemetry=telemetry.operational,
     )
     assembly = build_frontline_graph(

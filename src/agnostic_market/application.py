@@ -60,6 +60,16 @@ from agnostic_market.commerce.verification import (
 )
 from agnostic_market.dtos.config import MerchantConfig
 from agnostic_market.dtos.llm import StructuredOutputMethod
+from agnostic_market.durability.session_registry import (
+    RestoredSessionState,
+    SessionLeaseAuthority,
+    SessionRestoreError,
+    SessionRestoreReason,
+)
+from agnostic_market.durability.session_state import (
+    SessionStateCoordinator,
+    SessionStatePersistencePort,
+)
 from agnostic_market.session import CallerContext
 from agnostic_market.tenancy.context import TenantBound, TenantContext
 
@@ -131,18 +141,15 @@ class TenantServices:
 class ApplicationSessionState:
     session_id: Annotated[str, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
     thread_id: Annotated[str, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
-    cart_store: Annotated[CartStore, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE]
+    session_state: Annotated[
+        SessionStateCoordinator,
+        ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE,
+    ]
     verification_store: Annotated[
         VerificationStore, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
     ]
-    recent_orders: Annotated[
-        RecentOrderContext, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
-    ]
     identity_store: Annotated[
         CallerIdentityStore, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
-    ]
-    guest_orders: Annotated[
-        GuestOrderScope, ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
     ]
     caller_context: Annotated[
         CallerContext, ApplicationResponsibility.PROCESS_LOCAL_RUNTIME_COORDINATION
@@ -150,6 +157,18 @@ class ApplicationSessionState:
     telemetry: Annotated[
         SessionTelemetry, ApplicationResponsibility.PROCESS_LOCAL_RUNTIME_COORDINATION
     ]
+
+    @property
+    def cart_store(self) -> CartStore:
+        return self.session_state.cart
+
+    @property
+    def recent_orders(self) -> RecentOrderContext:
+        return self.session_state.recent_orders
+
+    @property
+    def guest_orders(self) -> GuestOrderScope:
+        return self.session_state.guest_orders
 
 
 def _derive_application_responsibilities() -> dict[tuple[str, str], ApplicationResponsibility]:
@@ -218,11 +237,9 @@ def _validate_session_state(
         raise ValueError("session verification does not use the tenant OTP service")
 
     lifecycle_stores = (
-        ("cart", state.caller_context.cart_store, state.cart_store),
+        ("session-state", state.caller_context.session_state, state.session_state),
         ("verification", state.caller_context.verification_store, state.verification_store),
-        ("recent-order", state.caller_context.recent_orders, state.recent_orders),
         ("identity", state.caller_context.identity_store, state.identity_store),
-        ("guest-order", state.caller_context.guest_orders, state.guest_orders),
     )
     mismatched = [
         name for name, lifecycle_store, store in lifecycle_stores if lifecycle_store is not store
@@ -287,6 +304,33 @@ def build_fixture_tenant_services(
     )
 
 
+def _assemble_application_session_state(
+    services: TenantServices,
+    *,
+    session_id: str,
+    thread_id: str,
+    session_state: SessionStateCoordinator,
+) -> ApplicationSessionState:
+    verification_store = VerificationStore(services.otp, session_id=session_id)
+    identity_store = CallerIdentityStore()
+    telemetry = services.telemetry.bind_session(session_id)
+    caller_context = CallerContext(
+        verification_store=verification_store,
+        session_state=session_state,
+        identity_store=identity_store,
+        telemetry=telemetry.operational,
+    )
+    return ApplicationSessionState(
+        session_id=session_id,
+        thread_id=thread_id,
+        session_state=session_state,
+        verification_store=verification_store,
+        identity_store=identity_store,
+        caller_context=caller_context,
+        telemetry=telemetry,
+    )
+
+
 async def build_in_memory_session_state(
     tenant: TenantContext,
     services: TenantServices,
@@ -297,33 +341,65 @@ async def build_in_memory_session_state(
     """Build isolated caller state while retaining injected tenant services."""
     resolved_session_id = session_id or uuid.uuid4().hex
     resolved_thread_id = thread_id or uuid.uuid4().hex
-    cart_store = CartStore()
-    verification_store = VerificationStore(services.otp, session_id=resolved_session_id)
-    recent_orders = RecentOrderContext(max_refs=tenant.policy.cancel_batch_max)
-    identity_store = CallerIdentityStore()
-    guest_orders = GuestOrderScope(
-        tenant_id=tenant.tenant_id,
-        session_id=resolved_session_id,
+    session_state = SessionStateCoordinator(
+        CartStore(),
+        RecentOrderContext(max_refs=tenant.policy.cancel_batch_max),
+        GuestOrderScope(
+            tenant_id=tenant.tenant_id,
+            session_id=resolved_session_id,
+        ),
     )
-    telemetry = services.telemetry.bind_session(resolved_session_id)
-    caller_context = CallerContext(
-        verification_store=verification_store,
-        cart_store=cart_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        guest_orders=guest_orders,
-        telemetry=telemetry.operational,
-    )
-    return ApplicationSessionState(
+    return _assemble_application_session_state(
+        services,
         session_id=resolved_session_id,
         thread_id=resolved_thread_id,
-        cart_store=cart_store,
-        verification_store=verification_store,
-        recent_orders=recent_orders,
-        identity_store=identity_store,
-        guest_orders=guest_orders,
-        caller_context=caller_context,
-        telemetry=telemetry,
+        session_state=session_state,
+    )
+
+
+async def build_restored_session_state(
+    tenant: TenantContext,
+    services: TenantServices,
+    *,
+    restored: RestoredSessionState,
+    persistence: SessionStatePersistencePort,
+) -> ApplicationSessionState:
+    """Reconstruct non-authority session state after registry admission."""
+    record = restored.record
+    session_id = record.authority.logical_session_id
+    if record.tenant_id != tenant.tenant_id:
+        raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+    if record.lease_owner_id is None:
+        raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+    expected_authority = SessionLeaseAuthority(
+        tenant_id=record.tenant_id,
+        authority=record.authority,
+        deployment_id=record.deployment_id,
+        graph_contract=record.graph_contract,
+        config_version=record.config_version,
+        lease_owner_id=record.lease_owner_id,
+        fencing_generation=record.fencing_generation,
+    )
+    if persistence.authority != expected_authority:
+        raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+    if restored.payload.principal_retirement is not None:
+        raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+    try:
+        session_state = SessionStateCoordinator.reconstruct(
+            restored.payload,
+            tenant_id=tenant.tenant_id,
+            session_id=session_id,
+            recent_order_max_refs=tenant.policy.cancel_batch_max,
+            session_revision=record.session_revision,
+            persistence=persistence,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED) from exc
+    return _assemble_application_session_state(
+        services,
+        session_id=session_id,
+        thread_id=record.checkpoint_namespace,
+        session_state=session_state,
     )
 
 

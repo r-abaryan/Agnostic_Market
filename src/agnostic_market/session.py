@@ -35,6 +35,7 @@ from agnostic_market.dtos.orchestration import (
     PrincipalTransitionInspection,
     VerificationProof,
 )
+from agnostic_market.durability.session_state import SessionStateCoordinator
 
 
 @dataclass
@@ -45,10 +46,8 @@ class CallerContext:
     nodes need this lifecycle callback while the graph itself must exist before the engine."""
 
     verification_store: VerificationStore
-    cart_store: CartStore
-    recent_orders: RecentOrderContext
+    session_state: SessionStateCoordinator
     identity_store: CallerIdentityStore
-    guest_orders: GuestOrderScope
     telemetry: TelemetryRecorder
     engine: ReasoningEngine | None = None
     _pending_transition: PrincipalTransition | None = field(default=None, init=False)
@@ -63,6 +62,22 @@ class CallerContext:
     _takeover_idle_callbacks: list[Callable[[], None]] = field(
         default_factory=list, init=False, repr=False
     )
+
+    @property
+    def cart_store(self) -> CartStore:
+        return self.session_state.cart
+
+    @property
+    def recent_orders(self) -> RecentOrderContext:
+        return self.session_state.recent_orders
+
+    @property
+    def guest_orders(self) -> GuestOrderScope:
+        return self.session_state.guest_orders
+
+    @property
+    def session_revision(self) -> int:
+        return self.session_state.revision
 
     def attach_execution_quiescence(
         self,
@@ -104,15 +119,14 @@ class CallerContext:
                 for callback in callbacks:
                     callback()
 
-    def _clear_ephemeral(self) -> None:
+    async def _clear_ephemeral(self, operation_id: str) -> int:
         """Clear the non-identity, non-verification caller-ephemeral state — the part a close
         AND a principal transition both drop identically (cart, recent-order context, guest/session
         orders). Identity + verification are handled by each PUBLIC op per its postcondition
         (close clears both; a transition installs the new binding/proof instead), so they are
         NOT touched here."""
-        self.cart_store.clear()
-        self.recent_orders.clear()
-        self.guest_orders.clear()
+        result = await self.session_state.clear_ephemeral(operation_id)
+        return result.session_revision
 
     def has_discardable_state(self) -> bool:
         return bool(
@@ -142,7 +156,7 @@ class CallerContext:
         # Publish the fail-closed marker before old authority is retired. If downstream graph
         # execution is cancelled, the engine's finally path still sees and rotates it.
         self._pending_transition = transition
-        self._clear_ephemeral()
+        await self.session_state.begin_principal_retirement(transition.transition_id)
         self.identity_store.clear()
         await self.verification_store.retain_only(fresh_proof)
         self.identity_store.bind(new_identity)
@@ -190,17 +204,33 @@ class CallerContext:
             expected_transition_id is None
             or (pending is not None and pending.transition_id == expected_transition_id)
         )
-        self._clear_ephemeral()
-        self.identity_store.clear()
-        await self.verification_store.clear()
-        self._pending_transition = None
+        try:
+            if pending is None:
+                await self._clear_ephemeral(
+                    f"principal-authority-invalidation:{self.session_revision}"
+                )
+            else:
+                if self.session_state.principal_retirement is None:
+                    await self.session_state.begin_principal_retirement(pending.transition_id)
+                await self.session_state.finish_principal_retirement(pending.transition_id)
+        finally:
+            try:
+                await self.session_state.discard_local_projection()
+            finally:
+                try:
+                    self.identity_store.clear()
+                    await self.verification_store.clear()
+                finally:
+                    self._pending_transition = None
         return matched
 
-    def complete_transition(self, transition_id: str) -> None:
+    async def complete_transition(self, transition_id: str) -> int:
         pending = self._pending_transition
         if pending is None or pending.transition_id != transition_id:
             raise RuntimeError("principal transition completion does not match pending marker")
+        committed = await self.session_state.finish_principal_retirement(transition_id)
         self._pending_transition = None
+        return committed.session_revision
 
     async def _await_callback(self, register: Callable[[Callable[[], None]], None]) -> None:
         loop = asyncio.get_running_loop()
@@ -234,11 +264,27 @@ class CallerContext:
     def close_had_pending_interrupt(self) -> bool:
         return self._close_had_pending_interrupt is True
 
+    def stop_turn_admission(self) -> None:
+        """Irreversibly prevent this caller context from accepting another turn."""
+        with self._close_lock:
+            if self._close_started:
+                return
+            self._close_started = True
+            if self._execution_quiescence is not None:
+                self._execution_quiescence.stop_turn_admission()
+
     async def _acomplete_close(self) -> None:
-        self._clear_ephemeral()
-        await self.verification_store.clear()
-        self.identity_store.clear()
-        self._pending_transition = None
+        try:
+            await self._clear_ephemeral("session-close")
+        except BaseException:
+            await self.session_state.discard_local_projection()
+            raise
+        finally:
+            try:
+                await self.verification_store.clear()
+            finally:
+                self.identity_store.clear()
+                self._pending_transition = None
         if self.engine is not None:
             await self.engine.adelete_thread()
         self.telemetry.record({"event": "caller_context_closed"})
@@ -247,11 +293,8 @@ class CallerContext:
 
     async def aclose_session(self) -> None:
         """Stop admission, await quiescence, and delete the checkpoint asynchronously."""
+        self.stop_turn_admission()
         with self._close_lock:
-            if not self._close_started:
-                self._close_started = True
-                if self._execution_quiescence is not None:
-                    self._execution_quiescence.stop_turn_admission()
             tracker = self._execution_quiescence
         async with self._async_close_lock:
             with self._close_lock:

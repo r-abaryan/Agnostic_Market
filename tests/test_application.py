@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import threading
 from dataclasses import fields, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from shutil import copy2, copytree
 
@@ -40,6 +41,7 @@ from agnostic_market.application import (
     build_application_session,
     build_fixture_tenant_services,
     build_in_memory_session_state,
+    build_restored_session_state,
 )
 from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.cart import CartStore
@@ -55,6 +57,7 @@ from agnostic_market.commerce.orders import (
     GuestOrderScope,
     OrderPort,
     OrderStore,
+    RecentOrderContext,
     load_orders_fixture,
 )
 from agnostic_market.commerce.payment_instruments import (
@@ -79,7 +82,26 @@ from agnostic_market.dtos.events import (
     TokenEvent,
 )
 from agnostic_market.dtos.recovery import PendingRecovery
+from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
 from agnostic_market.dtos.state import CartLine, ReasoningState
+from agnostic_market.durability.encryption import SessionEnvelope
+from agnostic_market.durability.session_payload import (
+    DurableSessionPayload,
+    PrincipalRetirementMarker,
+    SessionOperationResult,
+)
+from agnostic_market.durability.session_registry import (
+    RestoredSessionState,
+    SessionLeaseAuthority,
+    SessionLifecycle,
+    SessionRegistryRecord,
+    SessionRestoreError,
+    SessionRestoreReason,
+)
+from agnostic_market.durability.session_state import (
+    SessionStateCoordinator,
+    SessionStatePersistencePort,
+)
 from agnostic_market.tenancy.context import TenantContext, build_tenant_context
 
 _TEST_DEPLOYMENT_ID = "test-application-artifact"
@@ -162,6 +184,74 @@ def _routing_factory(_registry):
     return ArchitectureRoutingRecognizer()
 
 
+class _NeverPublishSessionState(SessionStatePersistencePort):
+    def __init__(self, authority: SessionLeaseAuthority) -> None:
+        self.authority = authority
+
+    async def publish(
+        self,
+        *,
+        expected_revision: int,
+        operation_id: str,
+        request_fingerprint: str,
+        payload: DurableSessionPayload,
+        operation_result: SessionOperationResult,
+    ) -> RestoredSessionState:
+        raise AssertionError("reconstruction must not publish session state")
+
+
+def _restored_session(
+    payload: DurableSessionPayload,
+) -> tuple[RestoredSessionState, _NeverPublishSessionState]:
+    now = datetime.now(UTC)
+    authority = AdmittedSessionAuthority(
+        logical_session_id="restored-session",
+        transport=TransportAuthority(
+            provider="livekit",
+            room_id="RM_restored",
+            assignment_id="AJ_restored",
+            worker_id="AW_restored",
+        ),
+    )
+    lease_authority = SessionLeaseAuthority(
+        tenant_id="acme_store",
+        authority=authority,
+        deployment_id="deployment-a",
+        graph_contract="graph-a",
+        config_version="test-config",
+        lease_owner_id="lease-restored",
+        fencing_generation=1,
+    )
+    record = SessionRegistryRecord(
+        tenant_id="acme_store",
+        authority=authority,
+        lifecycle=SessionLifecycle.ACTIVE,
+        checkpoint_namespace="restored-session::fence::1",
+        deployment_id="deployment-a",
+        graph_contract="graph-a",
+        config_version="test-config",
+        principal_generation=0,
+        session_revision=4,
+        fencing_generation=1,
+        lease_owner_id="lease-restored",
+        lease_expires_at=now + timedelta(minutes=1),
+        expires_at=now + timedelta(hours=1),
+        envelope=SessionEnvelope(
+            format="aes_256_gcm_v1",
+            key_version="key-v1",
+            payload_schema_version=1,
+            nonce=b"0" * 12,
+            ciphertext=b"0" * 16,
+        ),
+        created_at=now,
+        updated_at=now,
+    )
+    return (
+        RestoredSessionState(record=record, payload=payload),
+        _NeverPublishSessionState(lease_authority),
+    )
+
+
 def test_application_composition_fields_have_one_explicit_owner() -> None:
     declared_fields = {
         (owner.__name__, field.name)
@@ -180,13 +270,102 @@ def test_application_composition_fields_have_one_explicit_owner() -> None:
         is ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
     )
     assert (
-        APPLICATION_RESPONSIBILITIES[("ApplicationSessionState", "cart_store")]
+        APPLICATION_RESPONSIBILITIES[("ApplicationSessionState", "session_state")]
         is ApplicationResponsibility.DURABLE_PLATFORM_SESSION_STATE
     )
     assert (
         APPLICATION_RESPONSIBILITIES[("ApplicationSessionState", "caller_context")]
         is ApplicationResponsibility.PROCESS_LOCAL_RUNTIME_COORDINATION
     )
+
+
+async def test_restored_session_reconstructs_state_without_restoring_authority(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    cart = CartStore()
+    cart.add_item(sku="SKU-1", name="Trail Jacket", price_usd="79.00", quantity=1)
+    recent = RecentOrderContext(max_refs=tenant.policy.cancel_batch_max)
+    recent.record(("ORD-1001",), operation="read")
+    restored, persistence = _restored_session(
+        DurableSessionPayload(
+            cart=cart.export_state(),
+            recent_orders=recent.snapshot(),
+            guest_order_refs=("ORD-1001",),
+        )
+    )
+
+    state = await build_restored_session_state(
+        tenant,
+        services,
+        restored=restored,
+        persistence=persistence,
+    )
+
+    assert state.session_id == "restored-session"
+    assert state.thread_id == "restored-session::fence::1"
+    assert state.session_state.revision == 4
+    assert state.cart_store.view() == cart.view()
+    assert state.recent_orders.snapshot() == recent.snapshot()
+    assert state.guest_orders.order_refs == ("ORD-1001",)
+    assert state.identity_store.current() is None
+    assert state.verification_store.grants == []
+
+
+async def test_restored_session_rejects_an_unreconciled_principal_retirement(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    restored, persistence = _restored_session(
+        DurableSessionPayload(
+            principal_retirement=PrincipalRetirementMarker(transition_id="transition-1")
+        )
+    )
+
+    with pytest.raises(SessionRestoreError) as rejected:
+        await build_restored_session_state(
+            tenant,
+            services,
+            restored=restored,
+            persistence=persistence,
+        )
+
+    assert rejected.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
+
+
+async def test_restored_session_rejects_a_mismatched_persistence_authority(
+    config_root: Path,
+) -> None:
+    tenant = _tenant()
+    services = build_fixture_tenant_services(
+        config_root,
+        tenant,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    restored, persistence = _restored_session(DurableSessionPayload())
+    persistence.authority = persistence.authority.model_copy(
+        update={"lease_owner_id": "different-owner"}
+    )
+
+    with pytest.raises(SessionRestoreError) as rejected:
+        await build_restored_session_state(
+            tenant,
+            services,
+            restored=restored,
+            persistence=persistence,
+        )
+
+    assert rejected.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
 
 
 def test_fixture_tenant_services_implement_the_replacement_ports(config_root: Path) -> None:
@@ -1435,9 +1614,13 @@ async def test_application_rejects_a_guest_scope_from_another_session(
         )
         return replace(
             state,
-            guest_orders=GuestOrderScope(
-                tenant_id=context.tenant_id,
-                session_id="session-b",
+            session_state=SessionStateCoordinator(
+                state.cart_store,
+                state.recent_orders,
+                GuestOrderScope(
+                    tenant_id=context.tenant_id,
+                    session_id="session-b",
+                ),
             ),
         )
 
@@ -1463,9 +1646,19 @@ async def test_application_rejects_split_brain_lifecycle_stores(config_root: Pat
 
     async def mismatched_state(context, dependencies):
         state = await build_in_memory_session_state(context, dependencies)
-        return replace(state, cart_store=CartStore())
+        return replace(
+            state,
+            session_state=SessionStateCoordinator(
+                CartStore(),
+                RecentOrderContext(max_refs=context.policy.cancel_batch_max),
+                GuestOrderScope(
+                    tenant_id=context.tenant_id,
+                    session_id=state.session_id,
+                ),
+            ),
+        )
 
-    with pytest.raises(ValueError, match=r"lifecycle.*cart"):
+    with pytest.raises(ValueError, match=r"lifecycle.*session-state"):
         await build_application_session(
             tenant,
             _settings(),

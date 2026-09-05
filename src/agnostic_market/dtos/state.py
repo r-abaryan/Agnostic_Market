@@ -35,8 +35,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["2"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "2"
+CheckpointSchemaVersion = Literal["3"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "3"
 
 
 class CheckpointSchemaError(ValueError):
@@ -477,6 +477,7 @@ class ReasoningState(BaseModel):
     model_config = _STATE_CONFIG
 
     checkpoint_schema_version: CheckpointSchemaVersion = CHECKPOINT_SCHEMA_VERSION
+    session_revision: int = Field(default=0, ge=0)
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     # Stable transport IDs admitted or explicitly consumed in this caller session. This is
     # replay-defense metadata, not an automation channel: ordinary flow cleanup preserves it,

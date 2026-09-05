@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from functools import wraps
@@ -562,13 +561,28 @@ CANCELLED_STATUS = "cancelled"
 FULFILLED_STATUSES = frozenset({"shipped", "delivered"})
 
 
-@dataclass(frozen=True)
-class RecentOrderSnapshot:
+class RecentOrderSnapshot(BaseModel):
+    model_config = _FROZEN
+
     focused_order_ref: str | None
     order_refs: tuple[str, ...]
     operation: OrderContextOperation | None
     outcomes: tuple[tuple[str, str], ...]
     complete: bool
+
+    @model_validator(mode="after")
+    def references_are_coherent(self) -> RecentOrderSnapshot:
+        if len(self.order_refs) != len(set(self.order_refs)):
+            raise ValueError("recent order context contains duplicate references")
+        if any(not ref or ref != ref.strip().upper() for ref in self.order_refs):
+            raise ValueError("recent order references must be canonical")
+        if (self.operation is None) != (not self.order_refs):
+            raise ValueError("recent order operation and references must be present together")
+        if self.focused_order_ref is not None and self.focused_order_ref not in self.order_refs:
+            raise ValueError("focused order must be included in recent order references")
+        if any(ref not in self.order_refs for ref, _code in self.outcomes):
+            raise ValueError("recent order outcome must reference a retained order")
+        return self
 
 
 class RecentOrderContext:
@@ -628,6 +642,28 @@ class RecentOrderContext:
     def snapshot(self) -> RecentOrderSnapshot:
         return self._snapshot
 
+    @property
+    def max_refs(self) -> int:
+        return self._max_refs
+
+    def restore_snapshot(self, snapshot: RecentOrderSnapshot) -> None:
+        if len(snapshot.order_refs) > self._max_refs:
+            raise ValueError("restored recent order context exceeds its configured bound")
+        self._snapshot = snapshot
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: RecentOrderSnapshot,
+        *,
+        max_refs: int,
+    ) -> RecentOrderContext:
+        if len(snapshot.order_refs) > max_refs:
+            raise ValueError("restored recent order context exceeds its configured bound")
+        context = cls(max_refs=max_refs)
+        context._snapshot = snapshot
+        return context
+
     def clear(self) -> None:
         self._snapshot = RecentOrderSnapshot(
             focused_order_ref=None, order_refs=(), operation=None, outcomes=(), complete=True
@@ -649,6 +685,14 @@ class GuestOrderScope:
     def order_refs(self) -> tuple[str, ...]:
         return tuple(self._order_refs)
 
+    def restore_refs(self, order_refs: Iterable[str]) -> None:
+        restored = self.from_refs(
+            tenant_id=self.tenant_id,
+            session_id=self.session_id,
+            order_refs=order_refs,
+        )
+        self._order_refs = restored._order_refs
+
     def record(self, order_id: str) -> None:
         normalized = order_id.strip().upper()
         if not normalized:
@@ -660,6 +704,19 @@ class GuestOrderScope:
 
     def clear(self) -> None:
         self._order_refs.clear()
+
+    @classmethod
+    def from_refs(
+        cls,
+        *,
+        tenant_id: str,
+        session_id: str,
+        order_refs: Iterable[str],
+    ) -> GuestOrderScope:
+        scope = cls(tenant_id=tenant_id, session_id=session_id)
+        for order_ref in order_refs:
+            scope.record(order_ref)
+        return scope
 
 
 def load_orders_fixture(config_root: Path, merchant_id: str) -> OrdersFixture:

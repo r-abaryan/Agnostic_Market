@@ -51,6 +51,7 @@ from agnostic_market.dtos.orchestration import (
     VerifyOrderStatus,
 )
 from agnostic_market.dtos.state import HandoffRequest, PolicyContext, ReasoningState
+from agnostic_market.durability.session_state import SessionStateCoordinator
 
 CATALOG_ENTRY_NODE = "catalog_entry"
 CATALOG_QUERY_REJECT_NODE = "catalog_query_reject"
@@ -97,7 +98,7 @@ class ReadFlowNodes:
     order_status_target_propose: Callable[[ReasoningState], Awaitable[Command]]
     order_status_target_confirm: Callable[[ReasoningState], Command]
     order_status_target_reject: Callable[[ReasoningState], dict[str, object]]
-    order_status_fulfill: Callable[[ReasoningState], Command]
+    order_status_fulfill: Callable[[ReasoningState], Awaitable[Command]]
     speakable_nodes: frozenset[str]
     model_speech_nodes: frozenset[str]
 
@@ -113,6 +114,7 @@ def build_read_flow_nodes(
     structured_output_method: StructuredOutputMethod,
     model_text_policy: CallerAudibleModelTextPolicy,
     recent_orders: RecentOrderContext,
+    session_state: SessionStateCoordinator,
     identity_store: CallerIdentityStore,
     customers: CustomerDirectoryPort,
     telemetry: TelemetryRecorder,
@@ -259,7 +261,7 @@ def build_read_flow_nodes(
                 }
             )
 
-    def order_status_fulfill_node(state: ReasoningState) -> Command:
+    async def order_status_fulfill_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
             raise TypeError("order-status fulfilment requires a verify-order-status invocation")
@@ -373,7 +375,11 @@ def build_read_flow_nodes(
             for order_id in order_ids
         )
         line = f"{line} {warm_close()}"
-        recent_orders.record(order_ids, operation="read")
+        committed = await session_state.record_recent_orders(
+            f"recent-orders:read:{invocation.invocation_id}",
+            order_ids,
+            operation="read",
+        )
         record_capability_answered(
             routing_telemetry,
             authorization_message.content,
@@ -382,7 +388,11 @@ def build_read_flow_nodes(
         )
         return Command(
             goto=END,
-            update={"active_invocation": None, "messages": [AIMessage(line)]},
+            update={
+                "active_invocation": None,
+                "session_revision": committed.session_revision,
+                "messages": [AIMessage(line)],
+            },
         )
 
     def catalog_entry_node(state: ReasoningState) -> Command:

@@ -103,6 +103,7 @@ from agnostic_market.dtos.state import (
     PendingCartMutation,
     ReasoningState,
 )
+from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
 
 # A DEFERRING destination (planner) — these tests exercise the destination-agnostic handover
@@ -156,12 +157,15 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
         tenant_id="acme_store",
         session_id=telemetry.session_id,
     )
+    session_state = kwargs.pop("session_state", None) or SessionStateCoordinator(
+        cart,
+        recent_orders,
+        guest_orders,
+    )
     caller_context = CallerContext(
         verification_store=verification,
-        cart_store=cart,
-        recent_orders=recent_orders,
+        session_state=session_state,
         identity_store=identity,
-        guest_orders=guest_orders,
         telemetry=telemetry.operational,
     )
     assembly = build_frontline_graph(
@@ -258,6 +262,21 @@ def test_graph_rejects_telemetry_from_another_session(config_root: Path) -> None
             FakeChatModel(),
             telemetry=telemetry,
             guest_orders=guest_orders,
+        )
+
+
+def test_graph_rejects_session_stores_outside_the_coordinator(config_root: Path) -> None:
+    split_state = SessionStateCoordinator(
+        CartStore(),
+        RecentOrderContext(max_refs=make_policy().cancel_batch_max),
+        GuestOrderScope(tenant_id="acme_store", session_id="frontline-graph"),
+    )
+
+    with pytest.raises(ValueError, match="coordinator does not own"):
+        _graph(
+            config_root,
+            FakeChatModel(),
+            session_state=split_state,
         )
 
 
@@ -1355,28 +1374,34 @@ async def test_typed_cart_recovery_reconciles_without_replaying_mutation(
 ) -> None:
     store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
+    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="frontline-graph")
+    session_state = SessionStateCoordinator(cart, recent_orders, guest_orders)
     graph = _graph(
         config_root,
         FakeChatModel(),
         store=store,
         cart_store=cart,
+        recent_orders=recent_orders,
+        guest_orders=guest_orders,
+        session_state=session_state,
         checkpointer=InMemorySaver(),
     )
     product = load_orders_fixture(config_root, "acme_store").products[0]
-    real_apply = cart.apply_confirmed_mutation
+    real_apply = session_state.apply_cart_mutation
     if fails_after_mutation:
 
-        def fail_after_mutation(*args, **kwargs):
-            real_apply(*args, **kwargs)
+        async def fail_after_mutation(*args, **kwargs):
+            await real_apply(*args, **kwargs)
             raise RuntimeError("injected post-mutation failure")
 
-        monkeypatch.setattr(cart, "apply_confirmed_mutation", fail_after_mutation)
+        monkeypatch.setattr(session_state, "apply_cart_mutation", fail_after_mutation)
     else:
 
-        def fail_before_mutation(*_args, **_kwargs):
+        async def fail_before_mutation(*_args, **_kwargs):
             raise RuntimeError("injected pre-mutation failure")
 
-        monkeypatch.setattr(cart, "apply_confirmed_mutation", fail_before_mutation)
+        monkeypatch.setattr(session_state, "apply_cart_mutation", fail_before_mutation)
     turn_id = f"typed-cart-recovery-{fails_after_mutation}"
     config = {"configurable": {"thread_id": turn_id}}
 
@@ -1421,11 +1446,17 @@ async def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
 ) -> None:
     store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
+    recent_orders = RecentOrderContext(max_refs=make_policy().cancel_batch_max)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="frontline-graph")
+    session_state = SessionStateCoordinator(cart, recent_orders, guest_orders)
     graph = _graph(
         config_root,
         FakeChatModel(),
         store=store,
         cart_store=cart,
+        recent_orders=recent_orders,
+        guest_orders=guest_orders,
+        session_state=session_state,
         checkpointer=InMemorySaver(),
     )
     product = load_orders_fixture(config_root, "acme_store").products[0]
@@ -1447,10 +1478,10 @@ async def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
         config,
     )
 
-    def fail_before_mutation(*_args, **_kwargs):
+    async def fail_before_mutation(*_args, **_kwargs):
         raise RuntimeError("injected effect failure")
 
-    monkeypatch.setattr(cart, "apply_confirmed_mutation", fail_before_mutation)
+    monkeypatch.setattr(session_state, "apply_cart_mutation", fail_before_mutation)
     monkeypatch.setattr(
         cart,
         "mutation_receipt",

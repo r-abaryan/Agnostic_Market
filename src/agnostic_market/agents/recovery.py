@@ -149,11 +149,11 @@ class NodeRecoveryPolicy:
 class CommerceEffectFinishers:
     """The complete flow-owned post-commit projection boundary used by normal and recovery."""
 
-    placement: Callable[[str, PlacedOrder], dict[str, object]]
+    placement: Callable[[str, PlacedOrder], Awaitable[dict[str, object]]]
     cart_mutation: Callable[[CartMutationRecord], dict[str, object]]
-    refund: Callable[[str, RefundRecord], dict[str, object]]
-    cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
-    return_: Callable[[str, ReturnRecord], dict[str, object]]
+    refund: Callable[[str, RefundRecord], Awaitable[dict[str, object]]]
+    cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], Awaitable[dict[str, object]]]
+    return_: Callable[[str, ReturnRecord], Awaitable[dict[str, object]]]
     profile_change: Callable[[str, ProfileChangeRecord], Awaitable[dict[str, object]]]
 
 
@@ -212,21 +212,51 @@ class NodeExecutionTracker:
             self._condition.notify_all()
         return full_callbacks
 
-    @contextmanager
-    def _node_span(self, node_name: str) -> Iterator[None]:
+    def _enter_node(self, node_name: str) -> None:
         with self._condition:
             self._active_by_node[node_name] = self._active_by_node.get(node_name, 0) + 1
+
+    def _leave_node(self, node_name: str) -> None:
+        with self._condition:
+            remaining = self._active_by_node[node_name] - 1
+            if remaining:
+                self._active_by_node[node_name] = remaining
+            else:
+                del self._active_by_node[node_name]
+            full_callbacks = self._fully_idle_callbacks_locked()
+        self._run_callbacks(full_callbacks)
+
+    @contextmanager
+    def _node_span(self, node_name: str) -> Iterator[None]:
+        self._enter_node(node_name)
         try:
             yield
         finally:
-            with self._condition:
-                remaining = self._active_by_node[node_name] - 1
-                if remaining:
-                    self._active_by_node[node_name] = remaining
-                else:
-                    del self._active_by_node[node_name]
-                full_callbacks = self._fully_idle_callbacks_locked()
-            self._run_callbacks(full_callbacks)
+            self._leave_node(node_name)
+
+    def _retain_until_done(self, node_name: str, task: asyncio.Task[object]) -> None:
+        self._enter_node(node_name)
+
+        def release(completed: asyncio.Task[object]) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.error("detached synchronous effect failed", exc_info=True)
+            finally:
+                self._leave_node(node_name)
+
+        task.add_done_callback(release)
+
+    async def run_sync_effect[T](self, node_name: str, effect: Callable[[], T]) -> T:
+        """Run a blocking effect without losing its lifetime on caller cancellation."""
+        task = asyncio.create_task(asyncio.to_thread(effect))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self._retain_until_done(node_name, task)
+            raise
 
     def _run(
         self,
@@ -379,6 +409,7 @@ class NodePolicyRegistry:
         *,
         error_handler_factory: NodeErrorHandlerFactory | None = None,
         model_node_timeouts: Mapping[str, float] | None = None,
+        execution_tracker: NodeExecutionTracker | None = None,
     ) -> None:
         resolved_model_timeouts = dict(model_node_timeouts or {})
         model_node_names = frozenset(resolved_model_timeouts)
@@ -398,8 +429,11 @@ class NodePolicyRegistry:
         self._handled: set[str] = set()
         self._handled_infrastructure: set[str] = set()
         self._consent_interrupt_kinds: dict[str, Literal["standard", "cancel"]] = {}
-        self._execution_tracker = NodeExecutionTracker()
+        self._execution_tracker = execution_tracker or NodeExecutionTracker()
         self._validated: Mapping[str, NodeRecoveryPolicy] | None = None
+
+    async def run_sync_effect[T](self, node_name: str, effect: Callable[[], T]) -> T:
+        return await self._execution_tracker.run_sync_effect(node_name, effect)
 
     def _ensure_open_and_unique(self, name: str) -> None:
         if self._validated is not None:
@@ -613,6 +647,7 @@ def build_recovery_node(
     finishers: CommerceEffectFinishers,
     inspect_principal_transition: Callable[[], PrincipalTransitionInspection],
     invalidate_principal_transition: Callable[[str | None], Awaitable[bool]],
+    current_session_revision: Callable[[], int],
     telemetry: TelemetryRecorder,
 ) -> Callable[[ReasoningState], Awaitable[dict[str, object] | Command]]:
     def node_failure_event(marker: PendingRecovery) -> dict[str, object]:
@@ -664,7 +699,7 @@ def build_recovery_node(
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, PlacedOrder):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.placement(pending.idempotency_key, receipt.record))
+                return complete(await finishers.placement(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
@@ -682,7 +717,7 @@ def build_recovery_node(
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, RefundRecord):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.refund(pending.idempotency_key, receipt.record))
+                return complete(await finishers.refund(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
@@ -713,7 +748,7 @@ def build_recovery_node(
             else:
                 return terminal_result(node_failure_event(marker))
             telemetry.record(node_failure_event(marker))
-            return complete(finishers.cancel(pending, outcome, True))
+            return complete(await finishers.cancel(pending, outcome, True))
 
         if action == ExceptionAction.RECONCILE_RETURN:
             pending = state.pending_return
@@ -727,7 +762,7 @@ def build_recovery_node(
             )
             if isinstance(receipt, CommittedReceipt) and isinstance(receipt.record, ReturnRecord):
                 telemetry.record(node_failure_event(marker))
-                return complete(finishers.return_(pending.idempotency_key, receipt.record))
+                return complete(await finishers.return_(pending.idempotency_key, receipt.record))
             if isinstance(receipt, NotCommittedReceipt):
                 return not_committed(marker)
             return terminal_result(node_failure_event(marker))
@@ -792,7 +827,9 @@ def build_recovery_node(
             return update
         await invalidate_principal_transition(transition.transition_id)
         event["outcome"] = "inconsistent"
-        return terminal_result(event)
+        update = terminal_result(event)
+        update["session_revision"] = current_session_revision()
+        return update
 
     async def recover(state: ReasoningState) -> dict[str, object] | Command:
         marker = state.pending_recovery

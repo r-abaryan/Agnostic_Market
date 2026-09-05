@@ -100,6 +100,7 @@ src/agnostic_market/
   commerce/          service ports, fixture adapters, effects, receipts, and renderers
   config/            validated base, template, merchant, policy, and provider resolution
   dtos/              strict Pydantic state, routing, confirmation, and money contracts
+  durability/        encryption, migrations, session registry, leases, and revisioned state
   llm/               provider gateway and model conformance
   secrets/           environment-backed secret resolution
   tenancy/           immutable tenant identity and resolution
@@ -164,15 +165,20 @@ The native path verifies the server executable reports exactly PostgreSQL 18.6. 
 still depends on obtaining and checksum-verifying the archive from the PostgreSQL Windows download
 provider. Setting both alternatives is rejected as ambiguous configuration.
 
-Production composition still uses the in-memory saver. Payload encryption, durable session leases
-and fencing, bounded retention, and production adapter integration remain open evidence gates. The
+Production composition still uses the in-memory saver. Encrypted session payloads, registry leases
+and fencing, and revisioned reconstruction are implemented and backend-tested. Production wiring,
+encrypted checkpoint integration, shared durable close/reaping, and crash certification remain open. The
 same four checkpoint contracts have passed through a schema-isolated remote service, a fresh native
 Windows cluster, and the digest-pinned Docker path in the repository workflow. Each provisioner
 removes only the database resources it owns.
 
-Milestone 3 first migrates application-session construction and its restorable session-state ports
-to native async, then adds the registry, encryption, revision, lease, fencing, close, and reap
-contracts. Durable verification later owns full principal recovery. Durable commerce owns
+Milestone 3 now has native async application construction, registry and encryption contracts,
+lease supervision, and revisioned session-state adapters. The same harness also exercises registry
+fencing, encrypted operation replay, and committed-but-unacknowledged principal retirement.
+These are component and lifecycle contracts, not proof of a production durable voice session.
+The next integration connects admitted authority, lease supervision, session/checkpoint revision
+checks, and verified durable close/reaping before enabling the production path.
+Durable verification later owns full principal recovery. Durable commerce owns
 post-effect receipt reconciliation and the transactional commerce-success outbox. Telemetry
 delivery drains that outbox asynchronously and never decides whether an effect committed.
 Network admission now reserves the server-issued LiveKit dispatch ID for logical session identity
@@ -223,12 +229,14 @@ Implemented and exercised offline:
 - cart, order-support, identity, profile, recovery, replay, and lifecycle journeys;
 - trusted voice tenant admission and session composition with fixture implementations behind
   narrow ports;
-- asynchronous PostgreSQL checkpoint conformance against a real PostgreSQL 18.6 service.
+- asynchronous PostgreSQL checkpoint conformance against a real PostgreSQL 18.6 service;
+- encrypted session registry, lease/fence enforcement, revisioned state and operation receipts;
+- local teardown that discards caller state on durable failure without claiming durable deletion.
 
 Still required before production activation:
 
 - a qualified semantic recognizer, latency and outage evidence, and reviewed live shadow;
-- durable session registry, lease and fencing, encryption, retention, and reap;
+- production registry/lease composition, encrypted checkpoint integration, retention, and reap;
 - durable business, verification, abuse-control, and operational telemetry adapters;
 - hard shared-store tenant isolation and production restore and failover evidence;
 - payment, inventory, tax, shipping, fulfilment, and live human-transfer contracts where required.

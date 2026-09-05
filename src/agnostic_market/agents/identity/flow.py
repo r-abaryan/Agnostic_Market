@@ -127,6 +127,7 @@ def build_identity_nodes(
     transition_principal: Callable[
         [BoundIdentity, VerificationProof, IntentRequest], Awaitable[PrincipalTransition]
     ],
+    current_session_revision: Callable[[], int],
     *,
     display_name: str,
     telemetry: TelemetryRecorder,
@@ -425,6 +426,7 @@ def build_identity_nodes(
                 "identity_claim_misses": 0,
                 "active_invocation": None,
                 "execution_owner": None,
+                "session_revision": current_session_revision(),
                 "messages": [AIMessage(completion_line)] if completion_line is not None else [],
             }
         if isinstance(request, SwitchAccount):
