@@ -414,17 +414,20 @@ async def test_post_commit_projection_failure_reuses_finisher_and_logs_success_o
         thread_id=f"{effect}-projection-recovery",
     )
     case = await _case(harness, effect)
-    original_record = harness.recent_orders.record
+    session_state = harness.caller_context.session_state
+    projection_name = "complete_placement" if effect == "placement" else "record_recent_orders"
+    original_projection = getattr(session_state, projection_name)
     projection_calls = 0
 
-    def fail_first_projection(*args, **kwargs):
+    async def fail_first_projection(*args, **kwargs):
         nonlocal projection_calls
         projection_calls += 1
+        result = await original_projection(*args, **kwargs)
         if projection_calls == 1:
             raise RuntimeError("simulated post-commit projection failure")
-        return original_record(*args, **kwargs)
+        return result
 
-    monkeypatch.setattr(harness.recent_orders, "record", fail_first_projection)
+    monkeypatch.setattr(session_state, projection_name, fail_first_projection)
     _seed(harness, case)
 
     spoken = await _run_seeded_effect(harness)

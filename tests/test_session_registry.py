@@ -16,6 +16,7 @@ from agnostic_market.durability.migrations import (
 from agnostic_market.durability.session_registry import (
     LeaseAdmissionError,
     LeaseAdmissionReason,
+    SessionLeaseAuthority,
     SessionLeaseRenewal,
     SessionLeaseRequest,
     SessionLifecycle,
@@ -85,7 +86,6 @@ def test_session_registration_requires_positive_finite_retention() -> None:
                 principal_generation=0,
                 session_revision=0,
                 retention_seconds=retention,
-                payload_schema_version=1,
             )
 
 
@@ -100,7 +100,6 @@ def test_session_registration_rejects_a_caller_selected_checkpoint_namespace() -
             principal_generation=0,
             session_revision=0,
             retention_seconds=3600.0,
-            payload_schema_version=1,
             checkpoint_namespace="caller-selected",
         )
 
@@ -117,7 +116,6 @@ def test_session_registration_does_not_accept_a_detached_envelope() -> None:
                 "principal_generation": 0,
                 "session_revision": 0,
                 "retention_seconds": 3600.0,
-                "payload_schema_version": 1,
                 "envelope": _envelope(),
             }
         )
@@ -339,11 +337,23 @@ def test_lease_renewal_requires_a_positive_expected_fence() -> None:
             deployment_id="deployment-a",
             graph_contract="graph-a",
             config_version="config-a",
-            lease=SessionLeaseRequest(
-                lease_owner_id="lease-owner",
-                duration_seconds=30.0,
-            ),
+            lease_owner_id="lease-owner",
             fencing_generation=0,
+            duration_seconds=30.0,
+        )
+
+
+def test_lease_authority_does_not_accept_a_renewal_duration() -> None:
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        SessionLeaseAuthority(
+            tenant_id="acme_store",
+            authority=_authority(),
+            deployment_id="deployment-a",
+            graph_contract="graph-a",
+            config_version="config-a",
+            lease_owner_id="lease-owner",
+            fencing_generation=1,
+            duration_seconds=30.0,
         )
 
 

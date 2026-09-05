@@ -40,6 +40,11 @@ from agnostic_market.dtos.state import (
     ReasoningState,
     open_active_invocation,
 )
+from agnostic_market.durability.session_registry import (
+    SessionStateWriteError,
+    SessionStateWriteReason,
+)
+from agnostic_market.durability.session_state import SessionStateCoordinator
 
 _FACTS = TurnFacts()
 _CUST1_OTP = TEST_OTP_CODES["CUST-001"]
@@ -116,6 +121,78 @@ async def test_transition_inspection_requires_every_postcondition_and_invalidati
     assert harness.verification.grants == []
 
 
+async def test_rejected_retirement_marker_destroys_local_authority(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _identity_harness(config_root, thread_id="transition-marker-rejected")
+    context = harness.caller_context
+    context.cart_store.add_item(
+        sku="SKU-001",
+        name="Trail Jacket",
+        price_usd="79.00",
+        quantity=1,
+    )
+    context.guest_orders.record("ORD-9001")
+    context.recent_orders.record(("ORD-9001",), operation="list")
+    await grant_verification(harness.verification)
+
+    async def reject_marker(_transition_id: str):
+        raise SessionStateWriteError(SessionStateWriteReason.STALE_REVISION)
+
+    monkeypatch.setattr(context.session_state, "begin_principal_retirement", reject_marker)
+
+    with pytest.raises(SessionStateWriteError):
+        await context.transition_principal(
+            _CUST1,
+            harness.verification.grants[-1],
+            ListOrders(scope="account"),
+        )
+    with pytest.raises(SessionStateWriteError):
+        await context.invalidate_principal_transition()
+
+    assert context.pending_transition() is None
+    assert context.session_state.principal_retirement is None
+    assert context.cart_store.is_empty()
+    assert context.guest_orders.order_refs == ()
+    assert context.recent_orders.snapshot().order_refs == ()
+    assert harness.identity.current() is None
+    assert harness.verification.grants == []
+
+
+async def test_rejected_close_publication_discards_local_projection(
+    config_root: Path,
+) -> None:
+    from test_session_state import _RejectingPersistence
+
+    harness = _identity_harness(config_root, thread_id="close-publication-rejected")
+    context = harness.caller_context
+    context.session_state = SessionStateCoordinator(
+        context.cart_store,
+        context.recent_orders,
+        context.guest_orders,
+        persistence=_RejectingPersistence(),
+    )
+    context.cart_store.add_item(sku="SKU-001", name="Trail Jacket", price_usd="79.00", quantity=1)
+    context.guest_orders.record("ORD-9001")
+    context.recent_orders.record(("ORD-9001",), operation="list")
+    harness.identity.bind(_CUST1)
+    await grant_verification(harness.verification)
+
+    with pytest.raises(SessionStateWriteError) as rejected:
+        await context.aclose_session()
+
+    assert rejected.value.reason is SessionStateWriteReason.STALE_REVISION
+    assert context.cart_store.is_empty()
+    assert context.guest_orders.order_refs == ()
+    assert context.recent_orders.snapshot().order_refs == ()
+    assert harness.identity.current() is None
+    assert harness.verification.grants == []
+    assert context.session_revision == 0
+    assert context._close_started is True
+    assert context._closed is False
+
+
 async def test_rejected_initiating_request_does_not_retire_existing_principal(
     config_root: Path,
 ) -> None:
@@ -180,6 +257,7 @@ async def test_principal_recovery_rejects_missing_or_mismatched_initiating_reque
     update = await harness.engine._graph.nodes[RECOVERY_NODE_NAME].ainvoke(state)
 
     assert update["automation_terminal"] is True
+    assert update["session_revision"] == harness.caller_context.session_revision == 2
     assert [message.content for message in update["messages"]] == [AUTOMATION_TERMINAL_LINE]
     assert harness.caller_context.pending_transition() is None
     assert harness.identity.current() is None
@@ -296,6 +374,7 @@ async def test_identity_apply_missing_invocation_fails_before_transition_publica
         harness.identity,
         make_policy(refund_returnless_under_usd=50.0),
         harness.caller_context.transition_principal,
+        lambda: harness.caller_context.session_revision,
         display_name="Acme Store",
         telemetry=harness.caller_context.telemetry,
     )

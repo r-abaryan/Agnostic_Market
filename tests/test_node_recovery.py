@@ -458,13 +458,14 @@ async def test_cart_mutation_then_exception_reconciles_the_committed_effect(
         ),
     )
     cart = harness.caller_context.cart_store
-    original_apply = cart.apply_confirmed_mutation
+    session_state = harness.caller_context.session_state
+    original_apply = session_state.apply_cart_mutation
 
-    def write_then_fail(*args, **kwargs):
-        original_apply(*args, **kwargs)
+    async def write_then_fail(*args, **kwargs):
+        await original_apply(*args, **kwargs)
         raise RuntimeError("simulated failure after reversible cart write")
 
-    monkeypatch.setattr(cart, "apply_confirmed_mutation", write_then_fail)
+    monkeypatch.setattr(session_state, "apply_cart_mutation", write_then_fail)
 
     await _events(harness.engine, "add one waterproof rain jacket to my cart")
     events = await _events(harness.engine, "yes")

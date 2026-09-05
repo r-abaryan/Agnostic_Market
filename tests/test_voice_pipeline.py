@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from livekit.agents import Agent
@@ -31,10 +32,19 @@ from agnostic_market.commerce.payment_instruments import (
 from agnostic_market.commerce.profile import ProfileFixture, load_profile_fixture
 from agnostic_market.config.loader import ConfigError
 from agnostic_market.config.registry import ConfigRegistry
+from agnostic_market.durability.session_registry import (
+    SessionStateWriteError,
+    SessionStateWriteReason,
+)
 from agnostic_market.llm.gateway import load_provider_credentials
 from agnostic_market.tenancy.context import build_tenant_context
 from agnostic_market.voice.graph import GraphVoiceAdapter
-from agnostic_market.voice.pipeline import DisclosureFirstAgent, VoiceLoop, build_voice_loop
+from agnostic_market.voice.pipeline import (
+    DisclosureFirstAgent,
+    VoiceLoop,
+    build_voice_loop,
+    retire_voice_transport,
+)
 
 
 async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
@@ -312,6 +322,32 @@ class _FakeJobContext:
         self.shutdown_callbacks.append(callback)
 
 
+class _RetirementSession:
+    def __init__(self, tracker: NodeExecutionTracker, *, fail_shutdown: bool = False) -> None:
+        self.tracker = tracker
+        self.fail_shutdown = fail_shutdown
+        self.shutdown_calls: list[bool] = []
+
+    def shutdown(self, *, drain: bool = True) -> None:
+        assert self.tracker.turn_admission_open is False
+        self.shutdown_calls.append(drain)
+        if self.fail_shutdown:
+            raise RuntimeError("injected output shutdown failure")
+
+
+class _RetirementRoom:
+    def __init__(self, tracker: NodeExecutionTracker, *, block: bool = False) -> None:
+        self.tracker = tracker
+        self.block = block
+        self.disconnect_calls = 0
+
+    async def disconnect(self) -> None:
+        assert self.tracker.turn_admission_open is False
+        self.disconnect_calls += 1
+        if self.block:
+            await asyncio.Event().wait()
+
+
 class _FakeClearable:
     def __init__(self) -> None:
         self.clears = 0
@@ -328,17 +364,37 @@ class _FakeAsyncClearable:
         self.clears += 1
 
 
-def _fake_caller_context(engine=None):
+class _FakeSessionState:
+    def __init__(self, *, clear_error: Exception | None = None) -> None:
+        self.cart = _FakeClearable()
+        self.recent_orders = _FakeClearable()
+        self.guest_orders = _FakeClearable()
+        self.clear_error = clear_error
+
+    async def discard_local_projection(self) -> None:
+        self.cart.clear()
+        self.recent_orders.clear()
+        self.guest_orders.clear()
+
+    async def clear_ephemeral(self, _operation_id: str):
+        if self.clear_error is not None:
+            raise self.clear_error
+        self.cart.clear()
+        self.recent_orders.clear()
+        self.guest_orders.clear()
+        return SimpleNamespace(session_revision=1)
+
+
+def _fake_caller_context(engine=None, *, session_state=None):
     from agnostic_market.session import CallerContext
 
     telemetry = make_session_telemetry("acme_store", "fake-caller")
+    session_state = session_state or _FakeSessionState()
     return CallerContext(
         engine=engine or _FakeEngine(),
         verification_store=_FakeAsyncClearable(),  # type: ignore[arg-type]
-        cart_store=_FakeClearable(),  # type: ignore[arg-type]
-        recent_orders=_FakeClearable(),  # type: ignore[arg-type]
+        session_state=session_state,  # type: ignore[arg-type]
         identity_store=_FakeClearable(),  # type: ignore[arg-type]
-        guest_orders=_FakeClearable(),  # type: ignore[arg-type]
         telemetry=telemetry.operational,
     )
 
@@ -354,6 +410,22 @@ async def test_close_session_clears_every_caller_store_and_thread() -> None:
     assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.engine.deletes == 1  # type: ignore[attr-defined]
+
+
+async def test_close_destroys_local_authority_when_durable_clear_is_rejected() -> None:
+    session_state = _FakeSessionState(
+        clear_error=SessionStateWriteError(SessionStateWriteReason.STALE_REVISION)
+    )
+    ctx = _fake_caller_context(session_state=session_state)
+
+    with pytest.raises(SessionStateWriteError) as rejected:
+        await ctx.aclose_session()
+
+    assert rejected.value.reason is SessionStateWriteReason.STALE_REVISION
+    assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 0  # type: ignore[attr-defined]
+    assert ctx._closed is False
 
 
 async def test_close_session_is_idempotent() -> None:
@@ -509,6 +581,65 @@ async def test_voice_loop_registers_awaited_caller_teardown_for_job_shutdown(
     engine.release_delete.set()
     await shutdown
     assert engine.deletes == 1
+
+
+async def test_lease_loss_stops_turns_and_output_before_transport_disconnect() -> None:
+    context = _fake_caller_context()
+    tracker = NodeExecutionTracker()
+    context.attach_execution_quiescence(tracker, timeout_seconds=1.0)
+    session = _RetirementSession(tracker)
+    room = _RetirementRoom(tracker)
+
+    await retire_voice_transport(
+        session,  # type: ignore[arg-type]
+        room,  # type: ignore[arg-type]
+        context,
+        timeout_seconds=1.0,
+    )
+
+    assert session.shutdown_calls == [False]
+    assert room.disconnect_calls == 1
+    assert context.engine.deletes == 1
+
+
+async def test_transport_retirement_timeout_still_closes_local_caller_state() -> None:
+    context = _fake_caller_context()
+    tracker = NodeExecutionTracker()
+    context.attach_execution_quiescence(tracker, timeout_seconds=1.0)
+    session = _RetirementSession(tracker)
+    room = _RetirementRoom(tracker, block=True)
+
+    with pytest.raises(TimeoutError):
+        await retire_voice_transport(
+            session,  # type: ignore[arg-type]
+            room,  # type: ignore[arg-type]
+            context,
+            timeout_seconds=0.01,
+        )
+
+    assert session.shutdown_calls == [False]
+    assert room.disconnect_calls == 1
+    assert context.engine.deletes == 1
+
+
+async def test_transport_retirement_attempts_disconnect_after_output_shutdown_failure() -> None:
+    context = _fake_caller_context()
+    tracker = NodeExecutionTracker()
+    context.attach_execution_quiescence(tracker, timeout_seconds=1.0)
+    session = _RetirementSession(tracker, fail_shutdown=True)
+    room = _RetirementRoom(tracker)
+
+    with pytest.raises(RuntimeError, match="output shutdown"):
+        await retire_voice_transport(
+            session,  # type: ignore[arg-type]
+            room,  # type: ignore[arg-type]
+            context,
+            timeout_seconds=1.0,
+        )
+
+    assert session.shutdown_calls == [False]
+    assert room.disconnect_calls == 1
+    assert context.engine.deletes == 1
 
 
 @pytest.mark.asyncio

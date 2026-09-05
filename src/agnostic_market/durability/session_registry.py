@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, LiteralString, Protocol, Self, runtime_checkable
 
+from psycopg import AsyncConnection, sql
 from psycopg import Error as PsycopgError
-from psycopg import sql
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -31,6 +31,14 @@ from agnostic_market.durability.encryption import (
     AesGcmSessionCipher,
     SessionEnvelope,
     SessionEnvelopeContext,
+    SessionEnvelopeError,
+)
+from agnostic_market.durability.session_payload import (
+    SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+    SESSION_PAYLOAD_SCHEMA_VERSION,
+    DurableSessionPayload,
+    SessionOperationReceiptPayload,
+    SessionOperationResult,
 )
 
 _STRICT = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -96,6 +104,31 @@ class LeaseAdmissionError(SessionRegistryError):
         super().__init__(f"session lease admission rejected: {reason.value}")
 
 
+class SessionRestoreReason(StrEnum):
+    DECRYPTION_FAILED = "decryption_failed"
+    PAYLOAD_SCHEMA_INVALID = "payload_schema_invalid"
+    REVISION_MISMATCH = "revision_mismatch"
+    CHECKPOINT_INVALID = "checkpoint_invalid"
+    RECONSTRUCTION_FAILED = "reconstruction_failed"
+
+
+class SessionRestoreError(SessionRegistryError):
+    def __init__(self, reason: SessionRestoreReason) -> None:
+        self.reason = reason
+        super().__init__(f"session restore rejected: {reason.value}")
+
+
+class SessionStateWriteReason(StrEnum):
+    STALE_REVISION = "stale_revision"
+    OPERATION_CONFLICT = "operation_conflict"
+
+
+class SessionStateWriteError(SessionRegistryError):
+    def __init__(self, reason: SessionStateWriteReason) -> None:
+        self.reason = reason
+        super().__init__(f"session state publication rejected: {reason.value}")
+
+
 class SessionLifecycle(StrEnum):
     OPENING = "opening"
     ACTIVE = "active"
@@ -125,7 +158,6 @@ class SessionRegistration(SessionContract):
     principal_generation: int = Field(ge=0)
     session_revision: int = Field(ge=0)
     retention_seconds: DurationSeconds
-    payload_schema_version: int = Field(ge=1)
 
 
 class SessionLeaseRequest(BaseModel):
@@ -135,9 +167,21 @@ class SessionLeaseRequest(BaseModel):
     duration_seconds: DurationSeconds
 
 
-class SessionLeaseRenewal(SessionContract):
-    lease: SessionLeaseRequest
+class SessionLeaseAuthority(SessionContract):
+    lease_owner_id: AuthorityIdentifier
     fencing_generation: int = Field(ge=1)
+
+
+class SessionLeaseRenewal(SessionLeaseAuthority):
+    duration_seconds: DurationSeconds
+
+
+class SessionStatePublication(SessionLeaseAuthority):
+    expected_revision: int = Field(ge=0)
+    operation_id: AuthorityIdentifier
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload: DurableSessionPayload
+    operation_result: SessionOperationResult
 
 
 class SessionRegistryRecord(BaseModel):
@@ -195,6 +239,35 @@ class SessionRegistryRecord(BaseModel):
         return self
 
 
+class RestoredSessionState(BaseModel):
+    model_config = _STRICT
+
+    record: SessionRegistryRecord
+    payload: DurableSessionPayload
+    replayed: bool = False
+    operation_revision: int | None = Field(default=None, ge=1)
+    operation_result: SessionOperationResult | None = None
+
+    @model_validator(mode="after")
+    def operation_receipt_matches_replay(self) -> RestoredSessionState:
+        has_complete_receipt = (
+            self.operation_revision is not None and self.operation_result is not None
+        )
+        has_partial_receipt = (
+            self.operation_revision is not None or self.operation_result is not None
+        )
+        if (self.replayed and not has_complete_receipt) or (
+            not self.replayed and has_partial_receipt
+        ):
+            raise ValueError("only replayed session state carries an operation receipt")
+        if (
+            self.operation_revision is not None
+            and self.operation_revision > self.record.session_revision
+        ):
+            raise ValueError("operation revision cannot exceed current session revision")
+        return self
+
+
 @runtime_checkable
 class SessionRegistryPort(Protocol):
     async def register_and_acquire(
@@ -202,10 +275,16 @@ class SessionRegistryPort(Protocol):
         registration: SessionRegistration,
         lease: SessionLeaseRequest,
         *,
-        payload: bytes,
+        payload: DurableSessionPayload,
     ) -> SessionRegistryRecord: ...
 
+    async def activate(self, authority: SessionLeaseAuthority) -> SessionRegistryRecord: ...
+
     async def renew(self, renewal: SessionLeaseRenewal) -> SessionRegistryRecord: ...
+
+    async def restore(self, authority: SessionLeaseAuthority) -> RestoredSessionState: ...
+
+    async def publish(self, publication: SessionStatePublication) -> RestoredSessionState: ...
 
     async def get(
         self,
@@ -280,9 +359,9 @@ def _transport_values(authority: AdmittedSessionAuthority) -> tuple[str, str, st
     )
 
 
-def _renewal_rejection(
+def _lease_authority_rejection(
     record: SessionRegistryRecord,
-    renewal: SessionLeaseRenewal,
+    authority: SessionLeaseAuthority,
     *,
     database_now: datetime,
 ) -> LeaseAdmissionReason | None:
@@ -290,21 +369,91 @@ def _renewal_rejection(
         return LeaseAdmissionReason.SESSION_EXPIRED
     if record.lifecycle not in {SessionLifecycle.OPENING, SessionLifecycle.ACTIVE}:
         return LeaseAdmissionReason.LIFECYCLE_REJECTED
-    if record.deployment_id != renewal.deployment_id:
+    if record.deployment_id != authority.deployment_id:
         return LeaseAdmissionReason.WRONG_DEPLOYMENT
-    if record.graph_contract != renewal.graph_contract:
+    if record.graph_contract != authority.graph_contract:
         return LeaseAdmissionReason.WRONG_GRAPH_CONTRACT
-    if record.config_version != renewal.config_version:
+    if record.config_version != authority.config_version:
         return LeaseAdmissionReason.STALE_CONFIG
-    if record.authority != renewal.authority:
+    if record.authority != authority.authority:
         return LeaseAdmissionReason.WRONG_TRANSPORT
     if record.lease_expires_at is None or record.lease_expires_at <= database_now:
         return LeaseAdmissionReason.LEASE_EXPIRED
-    if record.lease_owner_id != renewal.lease.lease_owner_id:
+    if record.lease_owner_id != authority.lease_owner_id:
         return LeaseAdmissionReason.WRONG_LEASE_OWNER
-    if record.fencing_generation != renewal.fencing_generation:
+    if record.fencing_generation != authority.fencing_generation:
         return LeaseAdmissionReason.STALE_FENCE
     return None
+
+
+async def _database_now(connection: AsyncConnection) -> datetime:
+    async with connection.cursor(row_factory=dict_row) as cursor:
+        await cursor.execute("SELECT clock_timestamp() AS database_now")
+        row = await cursor.fetchone()
+    database_now = None if row is None else row.get("database_now")
+    if not isinstance(database_now, datetime):
+        raise SessionRegistryDataError("session lease operation returned no database time")
+    return database_now
+
+
+def _envelope_context(
+    record: SessionRegistryRecord,
+    *,
+    checkpoint_namespace: str | None = None,
+    payload_schema_version: int = SESSION_PAYLOAD_SCHEMA_VERSION,
+) -> SessionEnvelopeContext:
+    return SessionEnvelopeContext(
+        tenant_id=record.tenant_id,
+        logical_session_id=record.authority.logical_session_id,
+        checkpoint_namespace=(
+            record.checkpoint_namespace
+            if checkpoint_namespace is None
+            else _AUTHORITY_IDENTIFIER.validate_python(checkpoint_namespace)
+        ),
+        payload_schema_version=payload_schema_version,
+    )
+
+
+def _operation_result_from_row(
+    cipher: AesGcmSessionCipher,
+    record: SessionRegistryRecord,
+    row: Mapping[str, object],
+    *,
+    operation_id: str,
+    request_fingerprint: str,
+) -> SessionOperationResult:
+    try:
+        envelope = SessionEnvelope.model_validate(
+            {
+                "format": row["result_envelope_format"],
+                "key_version": row["result_envelope_key_version"],
+                "payload_schema_version": row["result_schema_version"],
+                "nonce": row["result_envelope_nonce"],
+                "ciphertext": row["encrypted_result"],
+            }
+        )
+        committed_checkpoint_namespace = _AUTHORITY_IDENTIFIER.validate_python(
+            row["committed_checkpoint_namespace"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionRegistryDataError("stored session operation result is invalid") from exc
+    if envelope.payload_schema_version != SESSION_OPERATION_RESULT_SCHEMA_VERSION:
+        raise SessionRegistryDataError("stored session operation result has an unsupported schema")
+    try:
+        plaintext = cipher.decrypt(
+            envelope,
+            _envelope_context(
+                record,
+                checkpoint_namespace=committed_checkpoint_namespace,
+                payload_schema_version=SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+            ),
+        )
+        receipt = SessionOperationReceiptPayload.from_bytes(plaintext)
+    except (SessionEnvelopeError, TypeError, ValueError) as exc:
+        raise SessionRegistryDataError("stored session operation result is invalid") from exc
+    if receipt.operation_id != operation_id or receipt.request_fingerprint != request_fingerprint:
+        raise SessionRegistryDataError("stored session operation result has invalid authority")
+    return receipt.result
 
 
 class PostgresSessionRegistry(SessionRegistryPort):
@@ -326,7 +475,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         registration: SessionRegistration,
         lease: SessionLeaseRequest,
         *,
-        payload: bytes,
+        payload: DurableSessionPayload,
     ) -> SessionRegistryRecord:
         row = None
         try:
@@ -343,12 +492,12 @@ class PostgresSessionRegistry(SessionRegistryPort):
                         "session retention must be longer than the initial lease"
                     )
                 envelope = self._cipher.encrypt(
-                    payload,
+                    payload.to_bytes(),
                     SessionEnvelopeContext(
                         tenant_id=registration.tenant_id,
                         logical_session_id=registration.authority.logical_session_id,
                         checkpoint_namespace=checkpoint_namespace,
-                        payload_schema_version=registration.payload_schema_version,
+                        payload_schema_version=SESSION_PAYLOAD_SCHEMA_VERSION,
                     ),
                 )
                 async with (
@@ -434,50 +583,116 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryError("session registration returned no authoritative row")
         return _record_from_row(row)
 
-    async def renew(self, renewal: SessionLeaseRenewal) -> SessionRegistryRecord:
+    async def _locked_record(
+        self,
+        connection: AsyncConnection,
+        authority: SessionLeaseAuthority,
+    ) -> tuple[SessionRegistryRecord, datetime]:
+        await connection.execute(
+            "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+            (authority.tenant_id,),
+        )
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            query = sql.SQL(
+                """
+                SELECT {}, clock_timestamp() AS database_now
+                FROM platform_sessions
+                WHERE tenant_id = %s AND logical_session_id = %s
+                FOR UPDATE
+                """
+            ).format(sql.SQL(_RETURNING_COLUMNS))
+            await cursor.execute(
+                query,
+                (
+                    authority.tenant_id,
+                    authority.authority.logical_session_id,
+                ),
+            )
+            locked = await cursor.fetchone()
+        if locked is None:
+            raise LeaseAdmissionError(LeaseAdmissionReason.SESSION_NOT_FOUND)
+        record = _record_from_row(locked)
+        database_now = locked.get("database_now")
+        if not isinstance(database_now, datetime):
+            raise SessionRegistryDataError("session lease read returned no database time")
+        if reason := _lease_authority_rejection(
+            record,
+            authority,
+            database_now=database_now,
+        ):
+            raise LeaseAdmissionError(reason)
+        return record, database_now
+
+    async def activate(self, authority: SessionLeaseAuthority) -> SessionRegistryRecord:
         row = None
         try:
             async with asyncio.timeout(self._operation_timeout_seconds):
-                lease_duration = _lease_duration(renewal.lease.duration_seconds)
                 async with (
                     self._pool.connection() as connection,
                     connection.transaction(),
                 ):
-                    await connection.execute(
-                        "SELECT set_config('agnostic_market.tenant_id', %s, true)",
-                        (renewal.tenant_id,),
-                    )
+                    record, _ = await self._locked_record(connection, authority)
+                    if record.lifecycle is SessionLifecycle.ACTIVE:
+                        return record
                     async with connection.cursor(row_factory=dict_row) as cursor:
                         query = sql.SQL(
                             """
-                            SELECT {}, clock_timestamp() AS database_now
-                            FROM platform_sessions
-                            WHERE tenant_id = %s AND logical_session_id = %s
-                            FOR UPDATE
+                            WITH authority_time AS (
+                                SELECT clock_timestamp() AS now
+                            )
+                            UPDATE platform_sessions
+                            SET lifecycle = 'active',
+                                updated_at = authority_time.now
+                            FROM authority_time
+                            WHERE tenant_id = %s
+                              AND logical_session_id = %s
+                              AND lifecycle = 'opening'
+                              AND lease_owner_id = %s
+                              AND fencing_generation = %s
+                              AND expires_at > authority_time.now
+                              AND lease_expires_at > authority_time.now
+                            RETURNING {}
                             """
                         ).format(sql.SQL(_RETURNING_COLUMNS))
                         await cursor.execute(
                             query,
                             (
-                                renewal.tenant_id,
-                                renewal.authority.logical_session_id,
+                                authority.tenant_id,
+                                authority.authority.logical_session_id,
+                                authority.lease_owner_id,
+                                authority.fencing_generation,
                             ),
                         )
-                        locked = await cursor.fetchone()
-                        if locked is None:
-                            raise LeaseAdmissionError(LeaseAdmissionReason.SESSION_NOT_FOUND)
-                        record = _record_from_row(locked)
-                        database_now = locked.get("database_now")
-                        if not isinstance(database_now, datetime):
-                            raise SessionRegistryDataError(
-                                "session lease read returned no database time"
+                        row = await cursor.fetchone()
+                        if row is None:
+                            database_now = await _database_now(connection)
+                            reason = (
+                                LeaseAdmissionReason.SESSION_EXPIRED
+                                if record.expires_at <= database_now
+                                else LeaseAdmissionReason.LEASE_EXPIRED
                             )
-                        if reason := _renewal_rejection(
-                            record,
-                            renewal,
-                            database_now=database_now,
-                        ):
                             raise LeaseAdmissionError(reason)
+        except (LeaseAdmissionError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session activation failed") from exc
+        if row is None:
+            raise SessionRegistryError("session activation returned no authoritative row")
+        return _record_from_row(row)
+
+    async def renew(self, renewal: SessionLeaseRenewal) -> SessionRegistryRecord:
+        row = None
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                lease_duration = _lease_duration(renewal.duration_seconds)
+                async with (
+                    self._pool.connection() as connection,
+                    connection.transaction(),
+                ):
+                    record, _ = await self._locked_record(connection, renewal)
+                    async with connection.cursor(row_factory=dict_row) as cursor:
                         query = sql.SQL(
                             """
                             WITH authority_time AS (
@@ -505,23 +720,13 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 lease_duration,
                                 renewal.tenant_id,
                                 renewal.authority.logical_session_id,
-                                renewal.lease.lease_owner_id,
+                                renewal.lease_owner_id,
                                 renewal.fencing_generation,
                             ),
                         )
                         row = await cursor.fetchone()
                         if row is None:
-                            await cursor.execute("SELECT clock_timestamp()")
-                            current_time = await cursor.fetchone()
-                            database_now = (
-                                None
-                                if current_time is None
-                                else current_time.get("clock_timestamp")
-                            )
-                            if not isinstance(database_now, datetime):
-                                raise SessionRegistryDataError(
-                                    "session lease update returned no database time"
-                                )
+                            database_now = await _database_now(connection)
                             reason = (
                                 LeaseAdmissionReason.SESSION_EXPIRED
                                 if record.expires_at <= database_now
@@ -539,6 +744,215 @@ class PostgresSessionRegistry(SessionRegistryPort):
         if row is None:
             raise SessionRegistryError("session lease renewal returned no authoritative row")
         return _record_from_row(row)
+
+    def _restore_payload(self, record: SessionRegistryRecord) -> DurableSessionPayload:
+        if record.envelope is None:
+            raise SessionRestoreError(SessionRestoreReason.PAYLOAD_SCHEMA_INVALID)
+        if record.envelope.payload_schema_version != SESSION_PAYLOAD_SCHEMA_VERSION:
+            raise SessionRestoreError(SessionRestoreReason.PAYLOAD_SCHEMA_INVALID)
+        try:
+            plaintext = self._cipher.decrypt(record.envelope, _envelope_context(record))
+        except SessionEnvelopeError as exc:
+            raise SessionRestoreError(SessionRestoreReason.DECRYPTION_FAILED) from exc
+        try:
+            return DurableSessionPayload.from_bytes(plaintext)
+        except (TypeError, ValueError) as exc:
+            raise SessionRestoreError(SessionRestoreReason.PAYLOAD_SCHEMA_INVALID) from exc
+
+    async def restore(self, authority: SessionLeaseAuthority) -> RestoredSessionState:
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with (
+                    self._pool.connection() as connection,
+                    connection.transaction(),
+                ):
+                    record, _ = await self._locked_record(connection, authority)
+                    payload = self._restore_payload(record)
+        except (LeaseAdmissionError, SessionRegistryDataError, SessionRestoreError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session state restore failed") from exc
+        return RestoredSessionState(record=record, payload=payload)
+
+    async def publish(self, publication: SessionStatePublication) -> RestoredSessionState:
+        row = None
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with (
+                    self._pool.connection() as connection,
+                    connection.transaction(),
+                ):
+                    record, _ = await self._locked_record(connection, publication)
+                    if record.lifecycle is not SessionLifecycle.ACTIVE:
+                        raise LeaseAdmissionError(LeaseAdmissionReason.LIFECYCLE_REJECTED)
+                    async with connection.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute(
+                            """
+                            SELECT
+                                request_fingerprint,
+                                committed_revision,
+                                committed_checkpoint_namespace,
+                                result_envelope_format,
+                                result_envelope_key_version,
+                                result_schema_version,
+                                result_envelope_nonce,
+                                encrypted_result
+                            FROM platform_session_operations
+                            WHERE tenant_id = %s
+                              AND logical_session_id = %s
+                              AND operation_id = %s
+                            """,
+                            (
+                                publication.tenant_id,
+                                publication.authority.logical_session_id,
+                                publication.operation_id,
+                            ),
+                        )
+                        receipt = await cursor.fetchone()
+                        if receipt is not None:
+                            if (
+                                receipt.get("request_fingerprint")
+                                != publication.request_fingerprint
+                            ):
+                                raise SessionStateWriteError(
+                                    SessionStateWriteReason.OPERATION_CONFLICT
+                                )
+                            operation_revision = receipt.get("committed_revision")
+                            if not isinstance(operation_revision, int):
+                                raise SessionRegistryDataError(
+                                    "session operation receipt has an invalid revision"
+                                )
+                            return RestoredSessionState(
+                                record=record,
+                                payload=self._restore_payload(record),
+                                replayed=True,
+                                operation_revision=operation_revision,
+                                operation_result=_operation_result_from_row(
+                                    self._cipher,
+                                    record,
+                                    receipt,
+                                    operation_id=publication.operation_id,
+                                    request_fingerprint=publication.request_fingerprint,
+                                ),
+                            )
+                        if publication.expected_revision != record.session_revision:
+                            raise SessionStateWriteError(SessionStateWriteReason.STALE_REVISION)
+                        next_revision = record.session_revision + 1
+                        envelope = self._cipher.encrypt(
+                            publication.payload.to_bytes(),
+                            _envelope_context(record),
+                        )
+                        operation_result = SessionOperationReceiptPayload(
+                            operation_id=publication.operation_id,
+                            request_fingerprint=publication.request_fingerprint,
+                            result=publication.operation_result,
+                        )
+                        result_envelope = self._cipher.encrypt(
+                            operation_result.to_bytes(),
+                            _envelope_context(
+                                record,
+                                payload_schema_version=SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+                            ),
+                        )
+                        query = sql.SQL(
+                            """
+                            WITH authority_time AS (
+                                SELECT clock_timestamp() AS now
+                            )
+                            UPDATE platform_sessions
+                            SET session_revision = %s,
+                                envelope_format = %s,
+                                envelope_key_version = %s,
+                                payload_schema_version = %s,
+                                envelope_nonce = %s,
+                                encrypted_payload = %s,
+                                updated_at = authority_time.now
+                            FROM authority_time
+                            WHERE tenant_id = %s
+                              AND logical_session_id = %s
+                              AND lifecycle = 'active'
+                              AND lease_owner_id = %s
+                              AND fencing_generation = %s
+                              AND session_revision = %s
+                              AND expires_at > authority_time.now
+                              AND lease_expires_at > authority_time.now
+                            RETURNING {}
+                            """
+                        ).format(sql.SQL(_RETURNING_COLUMNS))
+                        await cursor.execute(
+                            query,
+                            (
+                                next_revision,
+                                envelope.format,
+                                envelope.key_version,
+                                envelope.payload_schema_version,
+                                envelope.nonce,
+                                envelope.ciphertext,
+                                publication.tenant_id,
+                                publication.authority.logical_session_id,
+                                publication.lease_owner_id,
+                                publication.fencing_generation,
+                                publication.expected_revision,
+                            ),
+                        )
+                        row = await cursor.fetchone()
+                        if row is None:
+                            database_now = await _database_now(connection)
+                            reason = (
+                                LeaseAdmissionReason.SESSION_EXPIRED
+                                if record.expires_at <= database_now
+                                else LeaseAdmissionReason.LEASE_EXPIRED
+                            )
+                            raise LeaseAdmissionError(reason)
+                        await cursor.execute(
+                            """
+                            INSERT INTO platform_session_operations (
+                                tenant_id,
+                                logical_session_id,
+                                operation_id,
+                                request_fingerprint,
+                                committed_revision,
+                                committed_checkpoint_namespace,
+                                result_envelope_format,
+                                result_envelope_key_version,
+                                result_schema_version,
+                                result_envelope_nonce,
+                                encrypted_result
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                publication.tenant_id,
+                                publication.authority.logical_session_id,
+                                publication.operation_id,
+                                publication.request_fingerprint,
+                                next_revision,
+                                record.checkpoint_namespace,
+                                result_envelope.format,
+                                result_envelope.key_version,
+                                result_envelope.payload_schema_version,
+                                result_envelope.nonce,
+                                result_envelope.ciphertext,
+                            ),
+                        )
+        except (
+            LeaseAdmissionError,
+            SessionRegistryDataError,
+            SessionRestoreError,
+            SessionStateWriteError,
+        ):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session state publication failed") from exc
+        if row is None:
+            raise SessionRegistryError("session state publication returned no authoritative row")
+        return RestoredSessionState(
+            record=_record_from_row(row),
+            payload=publication.payload,
+        )
 
     async def get(
         self,

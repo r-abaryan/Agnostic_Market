@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
+from livekit import rtc
 from livekit.agents import Agent, AgentSession, ConversationItemAddedEvent, JobContext
 from livekit.agents.voice.background_audio import AudioConfig, BackgroundAudioPlayer
 from livekit.plugins import langchain as lk_langchain
@@ -86,6 +88,27 @@ class VoiceLoop:
     def register_shutdown(self, job_context: JobContext) -> None:
         """Make job shutdown await the caller lifecycle's idempotent teardown."""
         job_context.add_shutdown_callback(self.application.state.caller_context.aclose_session)
+
+
+async def retire_voice_transport(
+    session: AgentSession,
+    room: rtc.Room,
+    caller_context: CallerContext,
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Stop caller work and output, then retire the current room transport."""
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("transport retirement timeout must be positive")
+    caller_context.stop_turn_admission()
+    try:
+        try:
+            session.shutdown(drain=False)
+        finally:
+            async with asyncio.timeout(timeout_seconds):
+                await room.disconnect()
+    finally:
+        await caller_context.aclose_session()
 
 
 # The thinking earcon: a subtle double-blip (assets/audio/, reproducible via its generator

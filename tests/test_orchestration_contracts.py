@@ -57,6 +57,7 @@ from agnostic_market.dtos.orchestration import (
     validate_route_output,
 )
 from agnostic_market.dtos.state import (
+    CHECKPOINT_SCHEMA_VERSION,
     CartLine,
     CheckpointSchemaError,
     HandoffRequest,
@@ -371,7 +372,7 @@ def test_checkpoint_state_rejects_unknown_fields() -> None:
 def test_checkpoint_state_has_an_explicit_version_and_execution_owner() -> None:
     state = ReasoningState(execution_owner="cart")
 
-    assert state.checkpoint_schema_version == "2"
+    assert state.checkpoint_schema_version == CHECKPOINT_SCHEMA_VERSION
     assert state.execution_owner == "cart"
     assert "active_flow" not in ReasoningState.model_fields
     assert ReasoningState.from_checkpoint({}) == ReasoningState()
@@ -633,7 +634,7 @@ def test_checkpoint_loader_rejects_whitespace_verification_identifiers(
     with pytest.raises(CheckpointSchemaError):
         ReasoningState.from_checkpoint(
             {
-                "checkpoint_schema_version": "2",
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
                 pending_field: payload,
             }
         )

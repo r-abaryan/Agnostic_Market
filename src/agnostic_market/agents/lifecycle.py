@@ -13,6 +13,7 @@ from agnostic_market.dtos.orchestration import (
     PrincipalTransitionInspection,
     VerificationProof,
 )
+from agnostic_market.durability.session_state import SessionStateCoordinator
 
 
 class ExecutionQuiescence(Protocol):
@@ -24,6 +25,12 @@ class ExecutionQuiescence(Protocol):
 
 
 class PrincipalTransitionLifecycle(Protocol):
+    @property
+    def session_state(self) -> SessionStateCoordinator: ...
+
+    @property
+    def session_revision(self) -> int: ...
+
     def attach_execution_quiescence(
         self,
         tracker: ExecutionQuiescence,
@@ -49,4 +56,4 @@ class PrincipalTransitionLifecycle(Protocol):
         expected_transition_id: str | None = None,
     ) -> bool: ...
 
-    def complete_transition(self, transition_id: str) -> None: ...
+    async def complete_transition(self, transition_id: str) -> int: ...

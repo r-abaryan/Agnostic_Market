@@ -48,6 +48,7 @@ from agnostic_market.agents._consent import (
     classify_cancel_consent,
     classify_consent,
 )
+from agnostic_market.agents.execution import await_resisting_cancellation
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
@@ -97,19 +98,6 @@ from agnostic_market.dtos.state import (
 )
 
 logger = logging.getLogger("agnostic_market.agents.engine")
-
-
-async def _await_resisting_cancellation[T](
-    task: asyncio.Task[T],
-) -> tuple[T, asyncio.CancelledError | None]:
-    deferred_cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as cancellation:
-            if deferred_cancellation is None:
-                deferred_cancellation = cancellation
-    return task.result(), deferred_cancellation
 
 
 def _new_thread_id() -> str:
@@ -557,6 +545,7 @@ class ReasoningEngine:
         try:
             seed: dict[str, object] = {
                 "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "session_revision": self._lifecycle.session_revision,
                 "consumed_turn_ids": carried_turn_ids,
             }
             expected_invocation: ActiveInvocation | None = None
@@ -596,7 +585,12 @@ class ReasoningEngine:
             self._checkpoint_binding = new_binding
             self._config = new_config
             switched = True
-            self._lifecycle.complete_transition(transition.transition_id)
+            completed_revision = await self._lifecycle.complete_transition(transition.transition_id)
+            await self._aupdate_state(
+                new_config,
+                {"session_revision": completed_revision},
+                as_node=seed_author,
+            )
         except Exception:
             await self._lifecycle.invalidate_principal_transition(transition.transition_id)
             if not switched:
@@ -976,7 +970,7 @@ class ReasoningEngine:
                 self._cancellation_quiescence_timeout_seconds,
             )
         )
-        result, _deferred_cancellation = await _await_resisting_cancellation(cleanup_task)
+        result, _deferred_cancellation = await await_resisting_cancellation(cleanup_task)
         return result
 
     async def _afinalize_stream_transition(self, message_id: str) -> None:
@@ -1306,7 +1300,7 @@ class ReasoningEngine:
                             resumed_interrupt_node=owned_resumed_interrupt_node,
                         )
                     )
-                    await _await_resisting_cancellation(takeover)
+                    await await_resisting_cancellation(takeover)
                 raise original_cancellation
             except CheckpointSchemaError:
                 logger.exception("checkpoint schema rejected; terminalizing the session")
@@ -1319,7 +1313,7 @@ class ReasoningEngine:
             finally:
                 if not cancelled_stream and not self._terminal_latched:
                     cleanup = asyncio.create_task(self._afinalize_stream_transition(message_id))
-                    _result, deferred_cancellation = await _await_resisting_cancellation(cleanup)
+                    _result, deferred_cancellation = await await_resisting_cancellation(cleanup)
                     if deferred_cancellation is not None:
                         raise deferred_cancellation
             for flushed in speech.flush():

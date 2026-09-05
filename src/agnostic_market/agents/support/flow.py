@@ -43,6 +43,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import partial
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -63,6 +64,7 @@ from agnostic_market.agents.clarification import (
     invocation_clarification_owner,
     with_clarification_lifecycle,
 )
+from agnostic_market.agents.execution import SyncEffectExecutor
 from agnostic_market.agents.support._stepup import build_stepup_nodes
 from agnostic_market.agents.support.prompt import (
     compose_support_capability_prompt,
@@ -147,6 +149,7 @@ from agnostic_market.dtos.state import (
     SupportQuestionDetail,
     open_active_invocation,
 )
+from agnostic_market.durability.session_state import SessionStateCoordinator
 
 logger = logging.getLogger("agnostic_market.agents.support")
 
@@ -371,19 +374,21 @@ class SupportNodes:
     """
 
     capability_entry: Callable[[ReasoningState], Awaitable[dict[str, object]]]
-    capability_render: Callable[[ReasoningState], dict[str, object]]
+    capability_render: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     risk_check: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     dispatch: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     collect: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     confirm: Callable[[ReasoningState], dict[str, object]]
-    place: Callable[[ReasoningState], dict[str, object]]
-    finish_refund: Callable[[str, RefundRecord], dict[str, object]]
+    place: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    finish_refund: Callable[[str, RefundRecord], Awaitable[dict[str, object]]]
     cancel_guardrail: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     cancel_confirm: Callable[[ReasoningState], dict[str, object]]
-    cancel_void: Callable[[ReasoningState], dict[str, object]]
-    finish_cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], dict[str, object]]
+    cancel_void: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    finish_cancel: Callable[
+        [PendingCancelBatch, BatchCancelOutcome, bool], Awaitable[dict[str, object]]
+    ]
     # Resolve a CancellableOrderScope into a batch after authorization. Reached from the typed
     # continuation or directly from an already-bound caller's assemble, and never speaks a list.
     resolve: Callable[[ReasoningState], dict[str, object]]
@@ -405,8 +410,8 @@ class SupportNodes:
     # Returns sub-path (Group C): guardrail -> confirm[interrupt] -> place[effect].
     return_guardrail: Callable[[ReasoningState], dict[str, object]]
     return_confirm: Callable[[ReasoningState], dict[str, object]]
-    return_place: Callable[[ReasoningState], dict[str, object]]
-    finish_return: Callable[[str, ReturnRecord], dict[str, object]]
+    return_place: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    finish_return: Callable[[str, ReturnRecord], Awaitable[dict[str, object]]]
     # "confirm" (eligible) | "cancel" (unshipped steer) | "declined" (guardrail spoke + ends).
     route_after_return_guardrail: Callable[[ReasoningState], str]
     # Profile-change sub-path (Group C): guardrail -> [step-up chain] -> confirm -> place.
@@ -438,6 +443,8 @@ def build_support_nodes(
     recent_orders: RecentOrderContext,
     payment_instruments: PaymentInstrumentPort,
     verification_factors: VerificationFactorPort,
+    session_state: SessionStateCoordinator,
+    run_sync_effect: SyncEffectExecutor,
     *,
     identity_store: CallerIdentityStore,
     display_name: str,
@@ -576,7 +583,7 @@ def build_support_nodes(
             result["messages"] = messages
         return result
 
-    def capability_render_node(state: ReasoningState) -> dict[str, object]:
+    async def capability_render_node(state: ReasoningState) -> dict[str, object]:
         """Render a completed typed read without granting the model speech authority."""
 
         invocation = state.active_invocation
@@ -592,10 +599,15 @@ def build_support_nodes(
                 raise TypeError("account order rendering requires a bound identity")
             orders = order_store.owned_orders(bound.customer_ref, guest_orders)
             close = warm_close()
+        operation_id = f"recent-orders:list:{invocation.invocation_id}"
         if orders:
-            recent_orders.record([order.order_id for order in orders], operation="list")
+            committed = await session_state.record_recent_orders(
+                operation_id,
+                [order.order_id for order in orders],
+                operation="list",
+            )
         else:
-            recent_orders.clear()
+            committed = await session_state.clear_recent_orders(operation_id)
         telemetry.record({"event": "order_list_rendered", "order_scope": request.scope})
         line = f"{render_order_list_line(orders, scope=request.scope)} {close}"
         # This node ENDs, bypassing the frontline's finalize sink, so the answered-turn record
@@ -609,6 +621,7 @@ def build_support_nodes(
         return {
             "active_invocation": None,
             "execution_owner": None,
+            "session_revision": committed.session_revision,
             "messages": [AIMessage(line)],
         }
 
@@ -1512,7 +1525,7 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
-    def finish_refund(
+    async def finish_refund(
         idempotency_key: str,
         record: RefundRecord,
     ) -> dict[str, object]:
@@ -1528,7 +1541,12 @@ def build_support_nodes(
             ],
         }
         verification = [grant.method for grant in verification_store.grants]
-        recent_orders.record([record.order_id], operation="refund")
+        committed = await session_state.record_recent_orders(
+            f"recent-orders:refund:{idempotency_key}",
+            [record.order_id],
+            operation="refund",
+        )
+        update["session_revision"] = committed.session_revision
         telemetry.record_once(
             f"refund_confirmed:{idempotency_key}",
             {
@@ -1540,7 +1558,7 @@ def build_support_nodes(
         )
         return update
 
-    def place_node(state: ReasoningState) -> dict[str, object]:
+    async def place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
         per-intent key dedup + cumulative-cap enforcement; re-validates the LIVE level (§A4c
         server-side re-validation - the money must not move if the level lapsed)."""
@@ -1564,12 +1582,16 @@ def build_support_nodes(
                 ),
             }
         try:
-            record = order_store.issue_refund(
-                pending.idempotency_key,
-                order_id=pending.order_id,
-                amount_usd=pending.amount_usd,
-                destination=pending.destination,
-                instrument_ref=pending.instrument_ref,
+            record = await run_sync_effect(
+                "support_place",
+                partial(
+                    order_store.issue_refund,
+                    pending.idempotency_key,
+                    order_id=pending.order_id,
+                    amount_usd=pending.amount_usd,
+                    destination=pending.destination,
+                    instrument_ref=pending.instrument_ref,
+                ),
             )
         except RefundError as exc:
             logger.warning("refund refused by store: %s", exc)
@@ -1591,7 +1613,7 @@ def build_support_nodes(
                     source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
-        return finish_refund(pending.idempotency_key, record)
+        return await finish_refund(pending.idempotency_key, record)
 
     # --- cancel sub-path (F-16.2 batch; single = batch-of-one: guardrail -> confirm -> void)
 
@@ -1738,7 +1760,7 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> void
 
-    def finish_cancel(
+    async def finish_cancel(
         pending: PendingCancelBatch,
         outcome: BatchCancelOutcome,
         abort_remainder: bool,
@@ -1771,12 +1793,14 @@ def build_support_nodes(
                 "execution_owner": None,
                 "messages": [AIMessage(render_batch_cancel_outcome(all_outcomes))],
             }
-            recent_orders.record(
+            committed = await session_state.record_recent_orders(
+                f"recent-orders:cancel:{pending.targets[done].idempotency_key}",
                 [result.order_id for result in all_outcomes],
                 operation="cancel",
                 focused_order_ref=all_outcomes[-1].order_id,
                 outcomes=[(result.order_id, result.outcome) for result in all_outcomes],
             )
+            update["session_revision"] = committed.session_revision
         if outcome.outcome == "cancelled":
             telemetry.record_once(
                 f"cancel_confirmed:{pending.targets[done].idempotency_key}",
@@ -1788,7 +1812,7 @@ def build_support_nodes(
             )
         return update
 
-    def cancel_void_node(state: ReasoningState) -> dict[str, object]:
+    async def cancel_void_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Voids ONE eligible target
         per node completion, recording its outcome, then returns — the router loops back here
         while targets remain, so progress is CHECKPOINTED BETWEEN writes (a kill after target
@@ -1802,7 +1826,14 @@ def build_support_nodes(
         assert isinstance(pending, PendingCancelBatch)
         target = pending.targets[len(pending.outcomes)]
         try:
-            record = order_store.cancel_order(target.idempotency_key, order_id=target.order_id)
+            record = await run_sync_effect(
+                "support_cancel_void",
+                partial(
+                    order_store.cancel_order,
+                    target.idempotency_key,
+                    order_id=target.order_id,
+                ),
+            )
             outcome = cancelled_batch_outcome(record)
         except CancelError as exc:
             # No typed reason on CancelError, and parsing its text is forbidden — a rare
@@ -1811,7 +1842,7 @@ def build_support_nodes(
             outcome = BatchCancelOutcome(
                 order_id=target.order_id, summary=target.summary, outcome="store_refused"
             )
-        return finish_cancel(pending, outcome, False)
+        return await finish_cancel(pending, outcome, False)
 
     def resolve_node(state: ReasoningState) -> dict[str, object]:
         """Resolve a retained CancellableOrderScope after the account is bound (Milestone
@@ -2073,7 +2104,7 @@ def build_support_nodes(
             }
         return {}  # yes: pending survives; router -> place
 
-    def finish_return(
+    async def finish_return(
         idempotency_key: str,
         record: ReturnRecord,
     ) -> dict[str, object]:
@@ -2089,7 +2120,12 @@ def build_support_nodes(
                 )
             ],
         }
-        recent_orders.record([record.order_id], operation="return")
+        committed = await session_state.record_recent_orders(
+            f"recent-orders:return:{idempotency_key}",
+            [record.order_id],
+            operation="return",
+        )
+        update["session_revision"] = committed.session_revision
         telemetry.record_once(
             f"return_confirmed:{idempotency_key}",
             {
@@ -2101,7 +2137,7 @@ def build_support_nodes(
         )
         return update
 
-    def return_place_node(state: ReasoningState) -> dict[str, object]:
+    async def return_place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the
         store's per-intent key; the store RE-VALIDATES eligibility (§A4c) so a proposal
         that went stale can't create a ghost return. No live level re-check: creating a
@@ -2110,11 +2146,15 @@ def build_support_nodes(
         pending = state.pending_return
         assert pending is not None
         try:
-            record = order_store.create_return(
-                pending.idempotency_key,
-                order_id=pending.order_id,
-                refund_due_usd=pending.refund_due_usd,
-                destination="original",  # v1 constant — see PendingReturn's docstring
+            record = await run_sync_effect(
+                "support_return_place",
+                partial(
+                    order_store.create_return,
+                    pending.idempotency_key,
+                    order_id=pending.order_id,
+                    refund_due_usd=pending.refund_due_usd,
+                    destination="original",  # v1 constant — see PendingReturn's docstring
+                ),
             )
         except ReturnError as exc:
             logger.warning("return refused by store: %s", exc)
@@ -2132,7 +2172,7 @@ def build_support_nodes(
                     source=HandoffSource.DETERMINISTIC_POLICY,
                 ),
             }
-        return finish_return(pending.idempotency_key, record)
+        return await finish_return(pending.idempotency_key, record)
 
     # --- profile-change sub-path (Group C; the refund T3 shape minus money:
     # ---  guardrail -> [risk_check -> dispatch -> collect(INT)] -> confirm(INT) -> place) --

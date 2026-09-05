@@ -283,8 +283,20 @@ def build_frontline_graph(
     telemetry = session_telemetry.operational
     routing_telemetry = session_telemetry.routing_evidence
     model_text_policy = CallerAudibleModelTextPolicy(caller_audible_model_text_max_chars)
-    # Production and tests pass the same session context used by routing projection.
-    recent_orders = recent_orders or RecentOrderContext(max_refs=policy.cancel_batch_max)
+    session_state = lifecycle.session_state
+    recent_orders = recent_orders or session_state.recent_orders
+    session_stores = {
+        "cart": (cart_store, session_state.cart),
+        "recent orders": (recent_orders, session_state.recent_orders),
+        "guest orders": (guest_orders, session_state.guest_orders),
+    }
+    split_stores = [
+        name for name, (dependency, owned) in session_stores.items() if dependency is not owned
+    ]
+    if split_stores:
+        raise ValueError(
+            "frontline session-state coordinator does not own: " + ", ".join(split_stores)
+        )
 
     def _cart_view_line(close: str) -> str:
         """Render the live session cart with an optional close."""
@@ -494,6 +506,17 @@ def build_frontline_graph(
             return "cart_place"  # explicit committed yes
         return END  # declined / expired (node spoke its line, clear-before-speak)
 
+    graph = StateGraph(ReasoningState)
+    validate_automation_state_clear()
+    node_registry = NodePolicyRegistry(
+        graph,
+        error_handler_factory=build_node_error_handler,
+        model_node_timeouts={
+            **dict.fromkeys(MODEL_SPEECH_NODES, response_model_node_timeout_seconds),
+            **dict.fromkeys(NON_SPEAKING_MODEL_NODES, reasoning_model_node_timeout_seconds),
+        },
+    )
+
     cart = build_cart_nodes(
         reasoning_model,
         store,
@@ -502,6 +525,8 @@ def build_frontline_graph(
         cart_store,
         policy,
         recent_orders,
+        session_state,
+        node_registry.run_sync_effect,
         display_name=display_name,
         telemetry=telemetry,
     )
@@ -516,6 +541,8 @@ def build_frontline_graph(
         recent_orders,
         payment_instruments,
         customers,
+        session_state,
+        node_registry.run_sync_effect,
         identity_store=identity_store,
         display_name=display_name,
         telemetry=telemetry,
@@ -529,6 +556,7 @@ def build_frontline_graph(
         identity_store,
         policy,
         lifecycle.transition_principal,
+        lambda: lifecycle.session_revision,
         display_name=display_name,
         telemetry=telemetry,
     )
@@ -542,6 +570,7 @@ def build_frontline_graph(
         structured_output_method=structured_output_method,
         model_text_policy=model_text_policy,
         recent_orders=recent_orders,
+        session_state=session_state,
         identity_store=identity_store,
         customers=customers,
         telemetry=telemetry,
@@ -897,16 +926,6 @@ def build_frontline_graph(
         # place may hand to a human on a store refusal / lapsed level; else it spoke + ends.
         return "handover" if state.handover is not None else END
 
-    graph = StateGraph(ReasoningState)
-    validate_automation_state_clear()
-    node_registry = NodePolicyRegistry(
-        graph,
-        error_handler_factory=build_node_error_handler,
-        model_node_timeouts={
-            **dict.fromkeys(MODEL_SPEECH_NODES, response_model_node_timeout_seconds),
-            **dict.fromkeys(NON_SPEAKING_MODEL_NODES, reasoning_model_node_timeout_seconds),
-        },
-    )
     entry_node_name = "entry"
     node_registry.register(
         entry_node_name, entry_node, ExceptionAction.SAFE_ABORT, AbandonmentKind.PURE_ABORT
@@ -1319,6 +1338,7 @@ def build_frontline_graph(
             ),
             lifecycle.inspect_principal_transition,
             lifecycle.invalidate_principal_transition,
+            lambda: lifecycle.session_revision,
             telemetry,
         ),
         error_handler=build_recovery_infrastructure_handler,

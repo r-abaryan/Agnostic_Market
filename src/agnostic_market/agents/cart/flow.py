@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -33,6 +34,7 @@ from agnostic_market.agents.clarification import (
     invocation_clarification_owner,
     with_clarification_lifecycle,
 )
+from agnostic_market.agents.execution import SyncEffectExecutor
 from agnostic_market.agents.telemetry import OperationalTelemetryEvent, TelemetryRecorder
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.catalog import (
@@ -69,6 +71,7 @@ from agnostic_market.dtos.state import (
     PolicyContext,
     ReasoningState,
 )
+from agnostic_market.durability.session_state import SessionStateCoordinator
 
 logger = logging.getLogger("agnostic_market.agents.cart")
 
@@ -144,12 +147,12 @@ class CartNodes:
     ack: Callable[[ReasoningState], dict[str, object]]
     clarify: Callable[[ReasoningState], dict[str, object]]
     mutation_confirm: Callable[[ReasoningState], dict[str, object]]
-    mutation_apply: Callable[[ReasoningState], dict[str, object]]
+    mutation_apply: Callable[[ReasoningState], Awaitable[dict[str, object]]]
     reconcile_mutation: Callable[[CartMutationRecord], dict[str, object]]
     guardrail: Callable[[ReasoningState], dict[str, object]]
     confirm: Callable[[ReasoningState], dict[str, object]]
-    place: Callable[[ReasoningState], dict[str, object]]
-    finish_placement: Callable[[str, PlacedOrder], dict[str, object]]
+    place: Callable[[ReasoningState], Awaitable[dict[str, object]]]
+    finish_placement: Callable[[str, PlacedOrder], Awaitable[dict[str, object]]]
     route_after_capability_entry: Callable[[ReasoningState], str]
     speakable_nodes: frozenset[str]
 
@@ -162,6 +165,8 @@ def build_cart_nodes(
     cart_store: CartStore,
     policy: PolicyContext,
     recent_orders: RecentOrderContext,
+    session_state: SessionStateCoordinator,
+    run_sync_effect: SyncEffectExecutor,
     *,
     display_name: str,
     telemetry: TelemetryRecorder,
@@ -600,6 +605,7 @@ def build_cart_nodes(
     def finish_mutation(
         record: CartMutationRecord,
         *,
+        session_revision: int | None = None,
         reconciled: bool = False,
         speak_now: bool = False,
     ) -> dict[str, object]:
@@ -608,6 +614,9 @@ def build_cart_nodes(
         update: dict[str, object] = {
             "pending_cart_mutation": None,
             "execution_owner": None,
+            "session_revision": (
+                session_state.revision if session_revision is None else session_revision
+            ),
         }
         if speak_now:
             update["messages"] = [AIMessage(ack)]
@@ -622,12 +631,12 @@ def build_cart_nodes(
             telemetry.record({"event": event, "sku": record.sku})
         return update
 
-    def mutation_apply_node(state: ReasoningState) -> dict[str, object]:
+    async def mutation_apply_node(state: ReasoningState) -> dict[str, object]:
         """Apply the confirmed mutation once through the authoritative store."""
         pending = state.pending_cart_mutation
         if not isinstance(pending, PendingCartMutation):
             raise TypeError("cart mutation apply requires a pending mutation")
-        record = cart_store.apply_confirmed_mutation(
+        committed = await session_state.apply_cart_mutation(
             pending.idempotency_key,
             operation=pending.operation,
             sku=pending.sku,
@@ -636,7 +645,10 @@ def build_cart_nodes(
             quantity=pending.quantity,
             pre_confirm_quantity=pending.pre_confirm_quantity,
         )
-        return finish_mutation(record)
+        return finish_mutation(
+            committed.value,
+            session_revision=committed.session_revision,
+        )
 
     def reconcile_mutation(record: CartMutationRecord) -> dict[str, object]:
         """Project a committed receipt without replaying effect telemetry."""
@@ -761,14 +773,16 @@ def build_cart_nodes(
             }
         return {}  # yes: pending survives; the router sends us to place
 
-    def finish_placement(
+    async def finish_placement(
         idempotency_key: str,
         placed: PlacedOrder,
     ) -> dict[str, object]:
         """Finish one authoritative placement; safe to re-run after receipt reconciliation."""
+        committed = await session_state.complete_placement(idempotency_key, placed.order_id)
         update = {
             "pending_placement": None,
             "execution_owner": None,
+            "session_revision": committed.session_revision,
             "messages": [
                 AIMessage(
                     f"Done - your order for {speak_lines(placed.lines)} is placed. Your order "
@@ -776,9 +790,6 @@ def build_cart_nodes(
                 )
             ],
         }
-        guest_orders.record(placed.order_id)
-        cart_store.clear()
-        recent_orders.record([placed.order_id], operation="place")
         telemetry.record_once(
             f"checkout_confirmed:{idempotency_key}",
             {
@@ -789,15 +800,21 @@ def build_cart_nodes(
         )
         return update
 
-    def place_node(state: ReasoningState) -> dict[str, object]:
+    async def place_node(state: ReasoningState) -> dict[str, object]:
         """The EFFECT node (post-interrupt, own node - A10a rule 1). Idempotent by the store's
         key dedup: a replay returns the ORIGINAL order. Clears the cart on success."""
         pending = state.pending_placement
         assert pending is not None
-        placed = order_store.place_cart(
-            pending.idempotency_key, lines=pending.lines, total_usd=pending.total_usd
+        placed = await run_sync_effect(
+            "cart_place",
+            partial(
+                order_store.place_cart,
+                pending.idempotency_key,
+                lines=pending.lines,
+                total_usd=pending.total_usd,
+            ),
         )
-        return finish_placement(pending.idempotency_key, placed)
+        return await finish_placement(pending.idempotency_key, placed)
 
     def route_after_capability_entry(state: ReasoningState) -> str:
         if current_turn_called(state.messages, "leave_cart"):

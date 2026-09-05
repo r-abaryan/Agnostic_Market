@@ -60,6 +60,15 @@ class _CallVisitor(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute) and node.func.attr in self._names:
             owner = self._functions[-1] if self._functions else None
             self.calls.append((owner, node.func.attr))
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "partial"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr in self._names
+        ):
+            owner = self._functions[-1] if self._functions else None
+            self.calls.append((owner, node.args[0].attr))
         self.generic_visit(node)
 
 
@@ -79,14 +88,14 @@ def test_all_production_graph_nodes_use_the_registration_seam() -> None:
     }
 
 
-def test_production_mutators_remain_in_the_six_reconcile_nodes() -> None:
+def test_production_mutators_remain_in_the_six_reconcile_boundaries() -> None:
     assert _production_calls(_MUTATORS) == {
-        ("agents/cart/flow.py", "mutation_apply_node", "apply_confirmed_mutation"),
         ("agents/cart/flow.py", "place_node", "place_cart"),
         ("agents/support/flow.py", "place_node", "issue_refund"),
         ("agents/support/flow.py", "cancel_void_node", "cancel_order"),
         ("agents/support/flow.py", "return_place_node", "create_return"),
         ("agents/support/flow.py", "profile_place_node", "update_profile"),
+        ("durability/session_state.py", "apply_cart_mutation", "apply_confirmed_mutation"),
     }
 
 
