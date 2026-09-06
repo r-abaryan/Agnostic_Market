@@ -11,7 +11,7 @@ from pydantic import TypeAdapter
 
 from agnostic_market.dtos.session import AuthorityIdentifier
 
-PLATFORM_SESSION_SCHEMA_VERSION = 4
+PLATFORM_SESSION_SCHEMA_VERSION = 5
 _DATABASE_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
 
 _BOOTSTRAP_SQL: LiteralString = """
@@ -178,6 +178,82 @@ CREATE POLICY platform_session_operations_tenant_isolation ON platform_session_o
 """
 
 
+_CREATE_CHECKPOINT_GENERATIONS_SQL: LiteralString = """
+CREATE TABLE platform_checkpoint_generations (
+    tenant_id text NOT NULL,
+    logical_session_id text NOT NULL,
+    checkpoint_namespace text NOT NULL
+        CHECK (checkpoint_namespace = btrim(checkpoint_namespace) AND checkpoint_namespace <> ''),
+    fencing_generation bigint NOT NULL CHECK (fencing_generation >= 0),
+    principal_generation bigint NOT NULL CHECK (principal_generation >= 0),
+    binding_version integer NOT NULL CHECK (binding_version = 1),
+    state text NOT NULL CHECK (state IN ('pending', 'current', 'retired', 'deleted')),
+    transition_id text
+        CHECK (
+            transition_id IS NULL
+            OR (transition_id = btrim(transition_id) AND transition_id <> '')
+        ),
+    source_revision bigint CHECK (source_revision >= 0),
+    CHECK ((transition_id IS NULL) = (source_revision IS NULL)),
+    CHECK (state <> 'pending' OR transition_id IS NOT NULL),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, logical_session_id, checkpoint_namespace),
+    UNIQUE (tenant_id, logical_session_id, fencing_generation, principal_generation),
+    UNIQUE (tenant_id, logical_session_id, transition_id),
+    FOREIGN KEY (tenant_id, logical_session_id)
+        REFERENCES platform_sessions (tenant_id, logical_session_id) ON DELETE CASCADE
+)
+"""
+
+_BACKFILL_CHECKPOINT_GENERATIONS_SQL: LiteralString = """
+INSERT INTO platform_checkpoint_generations (
+    tenant_id, logical_session_id, checkpoint_namespace, fencing_generation,
+    principal_generation, binding_version, state
+)
+SELECT tenant_id, logical_session_id, checkpoint_namespace, fencing_generation,
+    principal_generation, 1, CASE WHEN lifecycle = 'closed' THEN 'retired' ELSE 'current' END
+FROM platform_sessions
+"""
+
+_CHECKPOINT_GENERATIONS_CURRENT_INDEX_SQL: LiteralString = """
+CREATE UNIQUE INDEX platform_checkpoint_generations_one_current
+    ON platform_checkpoint_generations (tenant_id, logical_session_id)
+    WHERE state = 'current'
+"""
+
+_CHECKPOINT_GENERATIONS_PENDING_INDEX_SQL: LiteralString = """
+CREATE UNIQUE INDEX platform_checkpoint_generations_one_pending
+    ON platform_checkpoint_generations (tenant_id, logical_session_id)
+    WHERE state = 'pending'
+"""
+
+_CHECKPOINT_GENERATIONS_RLS_SQL: LiteralString = """
+ALTER TABLE platform_checkpoint_generations ENABLE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_GENERATIONS_FORCE_RLS_SQL: LiteralString = """
+ALTER TABLE platform_checkpoint_generations FORCE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_GENERATIONS_POLICY_SQL: LiteralString = """
+CREATE POLICY platform_checkpoint_generations_tenant_isolation ON platform_checkpoint_generations
+    USING (tenant_id = current_setting('agnostic_market.tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('agnostic_market.tenant_id', true))
+"""
+
+_ALLOW_PRINCIPAL_CHECKPOINT_GENERATIONS_SQL: LiteralString = """
+ALTER TABLE platform_sessions
+    DROP CONSTRAINT platform_sessions_checkpoint_matches_fence,
+    ADD CONSTRAINT platform_sessions_checkpoint_matches_generation
+        CHECK (
+            checkpoint_namespace = logical_session_id || '::fence::' || fencing_generation
+            OR checkpoint_namespace =
+                logical_session_id || '::fence::' || fencing_generation
+                || '::principal::' || principal_generation
+        )
+"""
+
+
 class PlatformSchemaError(RuntimeError):
     """The installed platform schema is absent, divergent, or incompatible."""
 
@@ -223,6 +299,23 @@ PLATFORM_MIGRATIONS = (
             _ENABLE_SESSION_OPERATIONS_RLS_SQL,
             _FORCE_SESSION_OPERATIONS_RLS_SQL,
             _CREATE_SESSION_OPERATIONS_POLICY_SQL,
+        ),
+    ),
+    PlatformMigration(
+        version=5,
+        name="checkpoint_generation_inventory",
+        statements=(
+            _CREATE_CHECKPOINT_GENERATIONS_SQL,
+            _ALLOW_PRINCIPAL_CHECKPOINT_GENERATIONS_SQL,
+            # The migration owner inventories every tenant inside the migration transaction.
+            "ALTER TABLE platform_sessions NO FORCE ROW LEVEL SECURITY",
+            _BACKFILL_CHECKPOINT_GENERATIONS_SQL,
+            "ALTER TABLE platform_sessions FORCE ROW LEVEL SECURITY",
+            _CHECKPOINT_GENERATIONS_CURRENT_INDEX_SQL,
+            _CHECKPOINT_GENERATIONS_PENDING_INDEX_SQL,
+            _CHECKPOINT_GENERATIONS_RLS_SQL,
+            _CHECKPOINT_GENERATIONS_FORCE_RLS_SQL,
+            _CHECKPOINT_GENERATIONS_POLICY_SQL,
         ),
     ),
 )
@@ -331,16 +424,24 @@ async def grant_platform_application_role(
     role = sql.Identifier(role_name)
     sessions = sql.Identifier(schema_name, "platform_sessions")
     operations = sql.Identifier(schema_name, "platform_session_operations")
+    generations = sql.Identifier(schema_name, "platform_checkpoint_generations")
     migrations = sql.Identifier(schema_name, "platform_schema_migrations")
     async with connection.transaction():
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(sessions))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(operations))
+        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(generations))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(migrations))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(sessions, role))
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(operations, role))
+        await connection.execute(
+            sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(generations, role)
+        )
         await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(migrations, role))
         await connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema, role))
         await connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(migrations, role))
+        await connection.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {} TO {}").format(generations, role)
+        )
         await connection.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
                 sessions,

@@ -7,7 +7,7 @@ import math
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, LiteralString, Protocol, Self, runtime_checkable
+from typing import Annotated, Literal, LiteralString, Protocol, Self, runtime_checkable
 
 from psycopg import AsyncConnection, sql
 from psycopg import Error as PsycopgError
@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 
+from agnostic_market.checkpoints import CheckpointBinding
 from agnostic_market.dtos.session import (
     AdmittedSessionAuthority,
     AuthorityIdentifier,
@@ -37,6 +38,7 @@ from agnostic_market.durability.session_payload import (
     SESSION_OPERATION_RESULT_SCHEMA_VERSION,
     SESSION_PAYLOAD_SCHEMA_VERSION,
     DurableSessionPayload,
+    PrincipalRetirementMarker,
     SessionOperationReceiptPayload,
     SessionOperationResult,
 )
@@ -121,6 +123,9 @@ class SessionRestoreError(SessionRegistryError):
 class SessionStateWriteReason(StrEnum):
     STALE_REVISION = "stale_revision"
     OPERATION_CONFLICT = "operation_conflict"
+    ROTATION_PENDING = "rotation_pending"
+    STALE_PRINCIPAL = "stale_principal"
+    ROTATION_NOT_FOUND = "rotation_not_found"
 
 
 class SessionStateWriteError(SessionRegistryError):
@@ -225,17 +230,72 @@ class SessionRegistryRecord(BaseModel):
             raise ValueError("open sessions require a lease")
         if self.lifecycle is not SessionLifecycle.CLOSED and self.fencing_generation < 1:
             raise ValueError("open sessions require a positive fencing generation")
-        if self.checkpoint_namespace != _checkpoint_namespace(
-            self.authority.logical_session_id,
-            self.fencing_generation,
+        if not _checkpoint_namespace_matches(
+            self.checkpoint_namespace,
+            logical_session_id=self.authority.logical_session_id,
+            fencing_generation=self.fencing_generation,
+            principal_generation=self.principal_generation,
         ):
-            raise ValueError("checkpoint namespace does not match the session fence")
+            raise ValueError("checkpoint namespace does not match the session generation")
         if self.lease_expires_at is not None and self.lease_expires_at <= self.created_at:
             raise ValueError("lease expiry must follow session creation")
         if self.lease_expires_at is not None and self.lease_expires_at > self.expires_at:
             raise ValueError("lease expiry cannot exceed session expiry")
         if self.updated_at < self.created_at:
             raise ValueError("session update time cannot precede creation")
+        return self
+
+
+class CheckpointGeneration(BaseModel):
+    model_config = _STRICT
+
+    tenant_id: AuthorityIdentifier
+    logical_session_id: AuthorityIdentifier
+    deployment_id: AuthorityIdentifier
+    graph_contract: AuthorityIdentifier
+    checkpoint_namespace: AuthorityIdentifier
+    fencing_generation: int = Field(ge=0)
+    principal_generation: int = Field(ge=0)
+    binding_version: Literal[1]
+    state: Literal["pending", "current", "retired", "deleted"]
+    transition_id: AuthorityIdentifier | None
+    source_revision: int | None = Field(ge=0)
+
+    @property
+    def binding(self) -> CheckpointBinding:
+        return CheckpointBinding(
+            tenant_id=self.tenant_id,
+            deployment_id=self.deployment_id,
+            graph_contract=self.graph_contract,
+            thread_id=self.checkpoint_namespace,
+        )
+
+
+class CheckpointRotation(BaseModel):
+    model_config = _STRICT
+
+    source: CheckpointGeneration
+    destination: CheckpointGeneration
+
+    @model_validator(mode="after")
+    def generations_form_one_rotation(self) -> Self:
+        same_scope = (
+            self.source.tenant_id == self.destination.tenant_id
+            and self.source.logical_session_id == self.destination.logical_session_id
+            and self.source.deployment_id == self.destination.deployment_id
+            and self.source.graph_contract == self.destination.graph_contract
+            and self.source.fencing_generation == self.destination.fencing_generation
+            and self.source.binding_version == self.destination.binding_version
+        )
+        if (
+            not same_scope
+            or self.source.state not in {"retired", "deleted"}
+            or self.destination.state not in {"current", "retired", "deleted"}
+            or self.destination.transition_id is None
+            or self.destination.source_revision is None
+            or self.destination.principal_generation != self.source.principal_generation + 1
+        ):
+            raise ValueError("checkpoint generations do not form a completed rotation")
         return self
 
 
@@ -270,6 +330,27 @@ class RestoredSessionState(BaseModel):
 
 @runtime_checkable
 class SessionRegistryPort(Protocol):
+    async def begin_checkpoint_rotation(
+        self,
+        authority: SessionLeaseAuthority,
+        *,
+        expected_revision: int,
+        expected_principal_generation: int,
+        transition_id: str,
+    ) -> CheckpointGeneration: ...
+
+    async def switch_checkpoint_generation(
+        self, authority: SessionLeaseAuthority, transition_id: str
+    ) -> CheckpointRotation: ...
+
+    async def record_checkpoint_deletion(
+        self, authority: SessionLeaseAuthority, transition_id: str
+    ) -> CheckpointGeneration: ...
+
+    async def checkpoint_generations(
+        self, authority: SessionLeaseAuthority
+    ) -> tuple[CheckpointGeneration, ...]: ...
+
     async def register_and_acquire(
         self,
         registration: SessionRegistration,
@@ -338,6 +419,17 @@ def _record_from_row(row: Mapping[str, object]) -> SessionRegistryRecord:
 
 def _checkpoint_namespace(logical_session_id: str, fencing_generation: int) -> str:
     return f"{logical_session_id}::fence::{fencing_generation}"
+
+
+def _checkpoint_namespace_matches(
+    checkpoint_namespace: str,
+    *,
+    logical_session_id: str,
+    fencing_generation: int,
+    principal_generation: int,
+) -> bool:
+    base = _checkpoint_namespace(logical_session_id, fencing_generation)
+    return checkpoint_namespace in {base, f"{base}::principal::{principal_generation}"}
 
 
 def _lease_duration(seconds: float) -> timedelta:
@@ -571,6 +663,21 @@ class PostgresSessionRegistry(SessionRegistryPort):
                             ),
                         )
                         row = await cursor.fetchone()
+                        await cursor.execute(
+                            """
+                            INSERT INTO platform_checkpoint_generations (
+                                tenant_id, logical_session_id, checkpoint_namespace,
+                                fencing_generation, principal_generation, binding_version, state
+                            ) VALUES (%s, %s, %s, %s, %s, 1, 'current')
+                            """,
+                            (
+                                registration.tenant_id,
+                                registration.authority.logical_session_id,
+                                checkpoint_namespace,
+                                fencing_generation,
+                                registration.principal_generation,
+                            ),
+                        )
         except UniqueViolation as exc:
             raise LeaseAdmissionError(LeaseAdmissionReason.SESSION_EXISTS) from exc
         except TimeoutError:
@@ -622,6 +729,408 @@ class PostgresSessionRegistry(SessionRegistryPort):
         ):
             raise LeaseAdmissionError(reason)
         return record, database_now
+
+    async def checkpoint_generations(
+        self, authority: SessionLeaseAuthority
+    ) -> tuple[CheckpointGeneration, ...]:
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_record(connection, authority)
+                    return await self._checkpoint_generations(connection, record)
+        except ValueError as exc:
+            raise SessionRegistryDataError("checkpoint generation inventory is invalid") from exc
+        except PsycopgError as exc:
+            raise SessionRegistryError("checkpoint generation lookup failed") from exc
+
+    async def _checkpoint_generations(
+        self,
+        connection: AsyncConnection,
+        record: SessionRegistryRecord,
+    ) -> tuple[CheckpointGeneration, ...]:
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT checkpoint_namespace, fencing_generation, principal_generation,
+                    binding_version, state, transition_id, source_revision
+                FROM platform_checkpoint_generations
+                WHERE tenant_id = %s AND logical_session_id = %s
+                ORDER BY fencing_generation, principal_generation
+                """,
+                (record.tenant_id, record.authority.logical_session_id),
+            )
+            generations = tuple(
+                CheckpointGeneration(
+                    **row,
+                    tenant_id=record.tenant_id,
+                    logical_session_id=record.authority.logical_session_id,
+                    deployment_id=record.deployment_id,
+                    graph_contract=record.graph_contract,
+                )
+                for row in await cursor.fetchall()
+            )
+        current = [item for item in generations if item.state == "current"]
+        if len(current) != 1 or (
+            current[0].checkpoint_namespace != record.checkpoint_namespace
+            or current[0].fencing_generation != record.fencing_generation
+            or current[0].principal_generation != record.principal_generation
+        ):
+            raise SessionRegistryDataError(
+                "checkpoint inventory does not match the current session"
+            )
+        return generations
+
+    @staticmethod
+    def _rotation_members(
+        generations: tuple[CheckpointGeneration, ...],
+        transition_id: str,
+    ) -> tuple[CheckpointGeneration, CheckpointGeneration] | None:
+        destination = next(
+            (generation for generation in generations if generation.transition_id == transition_id),
+            None,
+        )
+        if destination is None:
+            return None
+        sources = tuple(
+            generation
+            for generation in generations
+            if generation.fencing_generation == destination.fencing_generation
+            and generation.principal_generation == destination.principal_generation - 1
+        )
+        if len(sources) != 1 or destination.source_revision is None:
+            raise SessionRegistryDataError("checkpoint rotation inventory is inconsistent")
+        return sources[0], destination
+
+    async def begin_checkpoint_rotation(
+        self,
+        authority: SessionLeaseAuthority,
+        *,
+        expected_revision: int,
+        expected_principal_generation: int,
+        transition_id: str,
+    ) -> CheckpointGeneration:
+        transition_id = _AUTHORITY_IDENTIFIER.validate_python(transition_id)
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                expected_revision,
+                expected_principal_generation,
+            )
+        ):
+            raise ValueError(
+                "rotation requires non-negative integer revision and principal generation"
+            )
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_record(connection, authority)
+                    if record.lifecycle is not SessionLifecycle.ACTIVE:
+                        raise LeaseAdmissionError(LeaseAdmissionReason.LIFECYCLE_REJECTED)
+                    generations = await self._checkpoint_generations(connection, record)
+                    payload = self._restore_payload(record)
+                    rotation = self._rotation_members(generations, transition_id)
+                    if rotation is not None:
+                        source, prior = rotation
+                        if (
+                            prior.source_revision != expected_revision
+                            or prior.principal_generation != expected_principal_generation + 1
+                            or prior.fencing_generation != authority.fencing_generation
+                            or source.principal_generation != expected_principal_generation
+                        ):
+                            raise SessionStateWriteError(SessionStateWriteReason.OPERATION_CONFLICT)
+                        if prior.state == "pending":
+                            if (
+                                source.state != "current"
+                                or payload.principal_retirement is None
+                                or payload.principal_retirement.transition_id != transition_id
+                                or record.session_revision != expected_revision + 1
+                            ):
+                                raise SessionRegistryDataError(
+                                    "rotation allocation has inconsistent state"
+                                )
+                        elif prior.state not in {"current", "retired", "deleted"}:
+                            raise SessionRegistryDataError(
+                                "rotation allocation has an invalid lifecycle"
+                            )
+                        return prior
+                    if (
+                        any(g.state == "pending" for g in generations)
+                        or payload.principal_retirement
+                    ):
+                        raise SessionStateWriteError(SessionStateWriteReason.ROTATION_PENDING)
+                    if record.session_revision != expected_revision:
+                        raise SessionStateWriteError(SessionStateWriteReason.STALE_REVISION)
+                    if record.principal_generation != expected_principal_generation:
+                        raise SessionStateWriteError(SessionStateWriteReason.STALE_PRINCIPAL)
+                    namespace_prefix = _checkpoint_namespace(
+                        record.authority.logical_session_id, record.fencing_generation
+                    )
+                    destination = CheckpointGeneration(
+                        tenant_id=record.tenant_id,
+                        logical_session_id=record.authority.logical_session_id,
+                        deployment_id=record.deployment_id,
+                        graph_contract=record.graph_contract,
+                        checkpoint_namespace=(
+                            f"{namespace_prefix}::principal::{record.principal_generation + 1}"
+                        ),
+                        fencing_generation=record.fencing_generation,
+                        principal_generation=record.principal_generation + 1,
+                        binding_version=1,
+                        state="pending",
+                        transition_id=transition_id,
+                        source_revision=expected_revision,
+                    )
+                    retired_payload = DurableSessionPayload(
+                        principal_retirement=PrincipalRetirementMarker(transition_id=transition_id)
+                    )
+                    envelope = self._cipher.encrypt(
+                        retired_payload.to_bytes(), _envelope_context(record)
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO platform_checkpoint_generations (
+                            tenant_id, logical_session_id, checkpoint_namespace,
+                            fencing_generation, principal_generation, binding_version,
+                            state, transition_id, source_revision
+                        ) VALUES (%s, %s, %s, %s, %s, 1, 'pending', %s, %s)
+                        """,
+                        (
+                            record.tenant_id,
+                            record.authority.logical_session_id,
+                            destination.checkpoint_namespace,
+                            destination.fencing_generation,
+                            destination.principal_generation,
+                            transition_id,
+                            expected_revision,
+                        ),
+                    )
+                    cursor = await connection.execute(
+                        """
+                        WITH authority_time AS (SELECT clock_timestamp() AS now)
+                        UPDATE platform_sessions
+                        SET session_revision = session_revision + 1,
+                            envelope_format = %s, envelope_key_version = %s,
+                            payload_schema_version = %s, envelope_nonce = %s,
+                            encrypted_payload = %s, updated_at = authority_time.now
+                        FROM authority_time
+                        WHERE tenant_id = %s AND logical_session_id = %s
+                            AND lease_expires_at > authority_time.now
+                            AND expires_at > authority_time.now
+                        RETURNING tenant_id
+                        """,
+                        (
+                            envelope.format,
+                            envelope.key_version,
+                            envelope.payload_schema_version,
+                            envelope.nonce,
+                            envelope.ciphertext,
+                            record.tenant_id,
+                            record.authority.logical_session_id,
+                        ),
+                    )
+                    if await cursor.fetchone() is None:
+                        database_now = await _database_now(connection)
+                        raise LeaseAdmissionError(
+                            LeaseAdmissionReason.SESSION_EXPIRED
+                            if record.expires_at <= database_now
+                            else LeaseAdmissionReason.LEASE_EXPIRED
+                        )
+                    return destination
+        except PsycopgError as exc:
+            raise SessionRegistryError("checkpoint rotation allocation failed") from exc
+
+    async def switch_checkpoint_generation(
+        self,
+        authority: SessionLeaseAuthority,
+        transition_id: str,
+    ) -> CheckpointRotation:
+        transition_id = _AUTHORITY_IDENTIFIER.validate_python(transition_id)
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_record(connection, authority)
+                    if record.lifecycle is not SessionLifecycle.ACTIVE:
+                        raise LeaseAdmissionError(LeaseAdmissionReason.LIFECYCLE_REJECTED)
+                    generations = await self._checkpoint_generations(connection, record)
+                    members = self._rotation_members(generations, transition_id)
+                    if members is None:
+                        raise SessionStateWriteError(SessionStateWriteReason.ROTATION_NOT_FOUND)
+                    source, destination = members
+                    payload = self._restore_payload(record)
+                    assert destination.source_revision is not None
+                    if destination.state != "pending":
+                        if (
+                            source.state not in {"retired", "deleted"}
+                            or record.session_revision < destination.source_revision + 2
+                        ):
+                            raise SessionRegistryDataError(
+                                "completed checkpoint rotation is inconsistent"
+                            )
+                        return CheckpointRotation(source=source, destination=destination)
+                    if (
+                        destination.state != "pending"
+                        or source.state != "current"
+                        or record.checkpoint_namespace != source.checkpoint_namespace
+                        or record.principal_generation != source.principal_generation
+                        or record.session_revision != destination.source_revision + 1
+                        or payload.principal_retirement is None
+                        or payload.principal_retirement.transition_id != transition_id
+                    ):
+                        raise SessionRegistryDataError(
+                            "pending checkpoint rotation is inconsistent"
+                        )
+                    switched_payload = DurableSessionPayload()
+                    envelope = self._cipher.encrypt(
+                        switched_payload.to_bytes(),
+                        _envelope_context(
+                            record,
+                            checkpoint_namespace=destination.checkpoint_namespace,
+                        ),
+                    )
+                    async with connection.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute(
+                            """
+                            UPDATE platform_checkpoint_generations SET state = 'retired'
+                            WHERE tenant_id = %s AND logical_session_id = %s
+                                AND checkpoint_namespace = %s AND state = 'current'
+                            """,
+                            (
+                                record.tenant_id,
+                                record.authority.logical_session_id,
+                                source.checkpoint_namespace,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise SessionRegistryDataError(
+                                "checkpoint rotation did not retire its source"
+                            )
+                        await cursor.execute(
+                            """
+                            UPDATE platform_checkpoint_generations SET state = 'current'
+                            WHERE tenant_id = %s AND logical_session_id = %s
+                                AND checkpoint_namespace = %s AND state = 'pending'
+                            """,
+                            (
+                                record.tenant_id,
+                                record.authority.logical_session_id,
+                                destination.checkpoint_namespace,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise SessionRegistryDataError(
+                                "checkpoint rotation did not publish its destination"
+                            )
+                        query = sql.SQL(
+                            """
+                            WITH authority_time AS (SELECT clock_timestamp() AS now)
+                            UPDATE platform_sessions
+                            SET checkpoint_namespace = %s,
+                                principal_generation = %s,
+                                session_revision = session_revision + 1,
+                                envelope_format = %s,
+                                envelope_key_version = %s,
+                                payload_schema_version = %s,
+                                envelope_nonce = %s,
+                                encrypted_payload = %s,
+                                updated_at = authority_time.now
+                            FROM authority_time
+                            WHERE tenant_id = %s AND logical_session_id = %s
+                                AND checkpoint_namespace = %s
+                                AND principal_generation = %s
+                                AND session_revision = %s
+                                AND lease_owner_id = %s
+                                AND fencing_generation = %s
+                                AND lease_expires_at > authority_time.now
+                                AND expires_at > authority_time.now
+                            RETURNING {}
+                            """
+                        ).format(sql.SQL(_RETURNING_COLUMNS))
+                        await cursor.execute(
+                            query,
+                            (
+                                destination.checkpoint_namespace,
+                                destination.principal_generation,
+                                envelope.format,
+                                envelope.key_version,
+                                envelope.payload_schema_version,
+                                envelope.nonce,
+                                envelope.ciphertext,
+                                record.tenant_id,
+                                record.authority.logical_session_id,
+                                source.checkpoint_namespace,
+                                source.principal_generation,
+                                destination.source_revision + 1,
+                                authority.lease_owner_id,
+                                authority.fencing_generation,
+                            ),
+                        )
+                        row = await cursor.fetchone()
+                    if row is None:
+                        database_now = await _database_now(connection)
+                        if record.expires_at <= database_now:
+                            raise LeaseAdmissionError(LeaseAdmissionReason.SESSION_EXPIRED)
+                        if (
+                            record.lease_expires_at is None
+                            or record.lease_expires_at <= database_now
+                        ):
+                            raise LeaseAdmissionError(LeaseAdmissionReason.LEASE_EXPIRED)
+                        raise SessionRegistryDataError("checkpoint rotation switch lost authority")
+                    switched = _record_from_row(row)
+                    if (
+                        switched.checkpoint_namespace != destination.checkpoint_namespace
+                        or switched.principal_generation != destination.principal_generation
+                        or switched.session_revision != destination.source_revision + 2
+                    ):
+                        raise SessionRegistryDataError(
+                            "checkpoint rotation returned an inconsistent session"
+                        )
+                    return CheckpointRotation(
+                        source=source.model_copy(update={"state": "retired"}),
+                        destination=destination.model_copy(update={"state": "current"}),
+                    )
+        except PsycopgError as exc:
+            raise SessionRegistryError("checkpoint rotation switch failed") from exc
+
+    async def record_checkpoint_deletion(
+        self,
+        authority: SessionLeaseAuthority,
+        transition_id: str,
+    ) -> CheckpointGeneration:
+        transition_id = _AUTHORITY_IDENTIFIER.validate_python(transition_id)
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_record(connection, authority)
+                    generations = await self._checkpoint_generations(connection, record)
+                    members = self._rotation_members(generations, transition_id)
+                    if members is None:
+                        raise SessionStateWriteError(SessionStateWriteReason.ROTATION_NOT_FOUND)
+                    source, destination = members
+                    if destination.state == "pending" or source.state == "current":
+                        raise SessionRegistryDataError(
+                            "checkpoint deletion requires a completed rotation"
+                        )
+                    if source.state == "deleted":
+                        return source
+                    if source.state != "retired":
+                        raise SessionRegistryDataError("checkpoint deletion source is not retired")
+                    cursor = await connection.execute(
+                        """
+                        UPDATE platform_checkpoint_generations SET state = 'deleted'
+                        WHERE tenant_id = %s AND logical_session_id = %s
+                            AND checkpoint_namespace = %s AND state = 'retired'
+                        """,
+                        (
+                            record.tenant_id,
+                            record.authority.logical_session_id,
+                            source.checkpoint_namespace,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise SessionRegistryDataError("checkpoint deletion was not recorded")
+                    return source.model_copy(update={"state": "deleted"})
+        except PsycopgError as exc:
+            raise SessionRegistryError("checkpoint deletion record failed") from exc
 
     async def activate(self, authority: SessionLeaseAuthority) -> SessionRegistryRecord:
         row = None
@@ -788,6 +1297,15 @@ class PostgresSessionRegistry(SessionRegistryPort):
                     if record.lifecycle is not SessionLifecycle.ACTIVE:
                         raise LeaseAdmissionError(LeaseAdmissionReason.LIFECYCLE_REJECTED)
                     async with connection.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute(
+                            """
+                            SELECT 1 FROM platform_checkpoint_generations
+                            WHERE tenant_id = %s AND logical_session_id = %s AND state = 'pending'
+                            """,
+                            (record.tenant_id, record.authority.logical_session_id),
+                        )
+                        if await cursor.fetchone() is not None:
+                            raise SessionStateWriteError(SessionStateWriteReason.ROTATION_PENDING)
                         await cursor.execute(
                             """
                             SELECT

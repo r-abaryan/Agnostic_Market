@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from psycopg import AsyncConnection, sql
 from psycopg.conninfo import make_conninfo
-from psycopg.errors import CheckViolation, InsufficientPrivilege, NotNullViolation
+from psycopg.errors import CheckViolation, InsufficientPrivilege, NotNullViolation, UndefinedObject
 from psycopg_pool import AsyncConnectionPool
 
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
@@ -37,6 +37,7 @@ from agnostic_market.durability.session_registry import (
     SessionLeaseRequest,
     SessionLifecycle,
     SessionRegistration,
+    SessionRegistryError,
     SessionRegistryRecord,
     SessionRestoreError,
     SessionRestoreReason,
@@ -84,6 +85,559 @@ async def _open_pool(stack: AsyncExitStack, dsn: str) -> AsyncConnectionPool:
     await pool.open(wait=True, timeout=2.0)
     stack.push_async_callback(pool.close)
     return pool
+
+
+@pytest.mark.postgres
+async def test_initial_checkpoint_generation_is_registered_with_its_session() -> None:
+    from agnostic_market.checkpoints import CheckpointBinding
+
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("generation_store", "AD_generation")
+    authority = _lease_authority(registration, "generation-owner")
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        record = await registry.register_and_acquire(
+            registration, _lease("generation-owner"), payload=_empty_payload()
+        )
+        generations = await registry.checkpoint_generations(authority)
+        assert len(generations) == 1
+        generation = generations[0]
+        assert generation.checkpoint_namespace == record.checkpoint_namespace
+        assert generation.fencing_generation == record.fencing_generation
+        assert generation.principal_generation == record.principal_generation
+        assert generation.state == "current"
+        assert generation.transition_id is None
+        assert generation.binding == CheckpointBinding(
+            tenant_id=record.tenant_id,
+            deployment_id=record.deployment_id,
+            graph_contract=record.graph_contract,
+            thread_id=record.checkpoint_namespace,
+        )
+        with pytest.raises(LeaseAdmissionError) as rejected:
+            await registry.checkpoint_generations(
+                authority.model_copy(update={"lease_owner_id": "foreign-owner"})
+            )
+        assert rejected.value.reason is LeaseAdmissionReason.WRONG_LEASE_OWNER
+
+
+@pytest.mark.postgres
+async def test_checkpoint_rotation_allocation_is_atomic_and_replayable() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("rotation_store", "AD_rotation")
+    authority = _lease_authority(registration, "rotation-owner")
+    async with AsyncExitStack() as stack:
+        registries = [
+            PostgresSessionRegistry(
+                await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+            )
+            for _ in range(2)
+        ]
+        original = await registries[0].register_and_acquire(
+            registration,
+            _lease("rotation-owner"),
+            payload=DurableSessionPayload(guest_order_refs=("ORD-OLD",)),
+        )
+        await registries[0].activate(authority)
+        first, duplicate = await asyncio.gather(
+            *(
+                registry.begin_checkpoint_rotation(
+                    authority,
+                    expected_revision=0,
+                    expected_principal_generation=0,
+                    transition_id="identity-change",
+                )
+                for registry in registries
+            )
+        )
+        assert first == duplicate
+        assert first.state == "pending"
+        assert first.principal_generation == 1
+        assert first.fencing_generation == original.fencing_generation
+        assert first.checkpoint_namespace != original.checkpoint_namespace
+        restored = await registries[1].restore(authority)
+        assert restored.record.checkpoint_namespace == original.checkpoint_namespace
+        assert restored.record.principal_generation == 0
+        assert restored.record.session_revision == 1
+        assert restored.payload.guest_order_refs == ()
+        assert restored.payload.principal_retirement.transition_id == "identity-change"
+        assert [g.state for g in await registries[1].checkpoint_generations(authority)] == [
+            "current",
+            "pending",
+        ]
+        for revision, principal, transition in (
+            (1, 0, "identity-change"),
+            (0, 1, "identity-change"),
+            (1, 0, "other-change"),
+        ):
+            with pytest.raises(SessionStateWriteError):
+                await registries[1].begin_checkpoint_rotation(
+                    authority,
+                    expected_revision=revision,
+                    expected_principal_generation=principal,
+                    transition_id=transition,
+                )
+        with pytest.raises(SessionStateWriteError):
+            await registries[1].publish(
+                SessionStatePublication(
+                    **authority.model_dump(),
+                    expected_revision=1,
+                    operation_id="erase-marker",
+                    request_fingerprint="a" * 64,
+                    payload=_empty_payload(),
+                    operation_result=EmptySessionOperationResult(),
+                )
+            )
+        assert await registries[1].restore(authority) == restored
+
+
+@pytest.mark.postgres
+async def test_checkpoint_rotation_switches_atomically_and_records_verified_deletion() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("rotation_switch_store", "AD_rotation_switch")
+    authority = _lease_authority(registration, "rotation-owner")
+    async with AsyncExitStack() as stack:
+        registries = [
+            PostgresSessionRegistry(
+                await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+            )
+            for _ in range(2)
+        ]
+        source = await registries[0].register_and_acquire(
+            registration,
+            _lease("rotation-owner"),
+            payload=DurableSessionPayload(guest_order_refs=("ORD-OLD",)),
+        )
+        await registries[0].activate(authority)
+        destination = await registries[0].begin_checkpoint_rotation(
+            authority,
+            expected_revision=0,
+            expected_principal_generation=0,
+            transition_id="switch-identity",
+        )
+
+        switched, duplicate = await asyncio.gather(
+            *(
+                registry.switch_checkpoint_generation(authority, "switch-identity")
+                for registry in registries
+            )
+        )
+        assert switched == duplicate
+        assert switched.source.checkpoint_namespace == source.checkpoint_namespace
+        assert switched.source.state == "retired"
+        assert switched.destination == destination.model_copy(update={"state": "current"})
+        restored = await registries[1].restore(authority)
+        assert restored.record.checkpoint_namespace == destination.checkpoint_namespace
+        assert restored.record.principal_generation == 1
+        assert restored.record.fencing_generation == authority.fencing_generation
+        assert restored.record.session_revision == 2
+        assert restored.payload == _empty_payload()
+        assert [
+            generation.state for generation in await registries[0].checkpoint_generations(authority)
+        ] == [
+            "retired",
+            "current",
+        ]
+
+        assert (
+            await registries[0].begin_checkpoint_rotation(
+                authority,
+                expected_revision=0,
+                expected_principal_generation=0,
+                transition_id="switch-identity",
+            )
+            == switched.destination
+        )
+        published = await registries[0].publish(
+            SessionStatePublication(
+                **authority.model_dump(),
+                expected_revision=2,
+                operation_id="post-rotation-publication",
+                request_fingerprint="b" * 64,
+                payload=DurableSessionPayload(guest_order_refs=("ORD-NEW",)),
+                operation_result=EmptySessionOperationResult(),
+            )
+        )
+        assert published.record.session_revision == 3
+
+        deleted, duplicate_deleted = await asyncio.gather(
+            *(
+                registry.record_checkpoint_deletion(authority, "switch-identity")
+                for registry in registries
+            )
+        )
+        assert deleted == duplicate_deleted
+        assert deleted.checkpoint_namespace == source.checkpoint_namespace
+        assert deleted.state == "deleted"
+        assert [
+            generation.state for generation in await registries[0].checkpoint_generations(authority)
+        ] == [
+            "deleted",
+            "current",
+        ]
+
+
+@pytest.mark.postgres
+async def test_rotation_preserves_receipt_encryption_context() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("rotation_receipt_store", "AD_rotation_receipt")
+    authority = _lease_authority(registration, "rotation-owner")
+    publication = SessionStatePublication(
+        **authority.model_dump(),
+        expected_revision=0,
+        operation_id="pre-rotation-operation",
+        request_fingerprint="c" * 64,
+        payload=DurableSessionPayload(guest_order_refs=("ORD-BEFORE",)),
+        operation_result=EmptySessionOperationResult(),
+    )
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        await registry.register_and_acquire(
+            registration, _lease("rotation-owner"), payload=_empty_payload()
+        )
+        await registry.activate(authority)
+        await registry.publish(publication)
+        await registry.begin_checkpoint_rotation(
+            authority,
+            expected_revision=1,
+            expected_principal_generation=0,
+            transition_id="receipt-identity",
+        )
+        await registry.switch_checkpoint_generation(authority, "receipt-identity")
+
+        replayed = await registry.publish(publication)
+
+    assert replayed.replayed
+    assert replayed.operation_revision == 1
+    assert replayed.operation_result == EmptySessionOperationResult()
+    assert replayed.record.session_revision == 3
+
+
+@pytest.mark.postgres
+async def test_late_rotation_replay_and_cleanup_survive_a_newer_generation() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("rotation_history_store", "AD_rotation_history")
+    authority = _lease_authority(registration, "rotation-owner")
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        await registry.register_and_acquire(
+            registration, _lease("rotation-owner"), payload=_empty_payload()
+        )
+        await registry.activate(authority)
+        await registry.begin_checkpoint_rotation(
+            authority,
+            expected_revision=0,
+            expected_principal_generation=0,
+            transition_id="first-identity",
+        )
+        first = await registry.switch_checkpoint_generation(authority, "first-identity")
+        await registry.begin_checkpoint_rotation(
+            authority,
+            expected_revision=2,
+            expected_principal_generation=1,
+            transition_id="second-identity",
+        )
+        await registry.switch_checkpoint_generation(authority, "second-identity")
+
+        delayed = await registry.switch_checkpoint_generation(authority, "first-identity")
+        deleted = await registry.record_checkpoint_deletion(authority, "first-identity")
+
+        assert delayed.source == first.source
+        assert delayed.destination.state == "retired"
+        assert deleted.state == "deleted"
+        assert [
+            (generation.principal_generation, generation.state)
+            for generation in await registry.checkpoint_generations(authority)
+        ] == [(0, "deleted"), (1, "retired"), (2, "current")]
+
+
+@pytest.mark.postgres
+async def test_checkpoint_rotation_switch_failure_rolls_back_inventory_and_marker() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+        async with AsyncExitStack() as stack:
+            registry = PostgresSessionRegistry(
+                await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+            )
+            registration = _registration("rotation_switch_failure", "AD_rotation_switch_failure")
+            authority = _lease_authority(registration, "rotation-owner")
+            await registry.register_and_acquire(
+                registration, _lease("rotation-owner"), payload=_empty_payload()
+            )
+            await registry.activate(authority)
+            await registry.begin_checkpoint_rotation(
+                authority,
+                expected_revision=0,
+                expected_principal_generation=0,
+                transition_id="failed-switch",
+            )
+            before = await registry.restore(authority)
+            await connection.execute(
+                """
+                ALTER TABLE platform_sessions ADD CONSTRAINT test_rotation_switch_failure
+                CHECK (tenant_id <> 'rotation_switch_failure' OR principal_generation = 0)
+                """
+            )
+            try:
+                with pytest.raises(SessionRegistryError, match="rotation switch failed"):
+                    await registry.switch_checkpoint_generation(authority, "failed-switch")
+                assert await registry.restore(authority) == before
+                assert [
+                    generation.state
+                    for generation in await registry.checkpoint_generations(authority)
+                ] == ["current", "pending"]
+            finally:
+                await connection.execute(
+                    "ALTER TABLE platform_sessions DROP CONSTRAINT test_rotation_switch_failure"
+                )
+
+
+@pytest.mark.postgres
+async def test_rotation_marker_failure_rolls_back_destination() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+        async with AsyncExitStack() as stack:
+            registry = PostgresSessionRegistry(
+                await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+            )
+            registration = _registration("rotation_failure_store", "AD_rotation_failure")
+            authority = _lease_authority(registration, "rotation-owner")
+            await registry.register_and_acquire(
+                registration, _lease("rotation-owner"), payload=_empty_payload()
+            )
+            await registry.activate(authority)
+            original = await registry.restore(authority)
+            await connection.execute(
+                """
+                ALTER TABLE platform_sessions ADD CONSTRAINT test_rotation_marker_failure
+                CHECK (tenant_id <> 'rotation_failure_store' OR session_revision = 0)
+                """
+            )
+            try:
+                with pytest.raises(SessionRegistryError, match="rotation allocation failed"):
+                    await registry.begin_checkpoint_rotation(
+                        authority,
+                        expected_revision=0,
+                        expected_principal_generation=0,
+                        transition_id="failed-rotation",
+                    )
+                assert await registry.restore(authority) == original
+                assert len(await registry.checkpoint_generations(authority)) == 1
+            finally:
+                await connection.execute(
+                    "ALTER TABLE platform_sessions DROP CONSTRAINT test_rotation_marker_failure"
+                )
+
+
+@pytest.mark.postgres
+async def test_rotation_rejects_stale_authority_before_allocation_or_replay() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        registration = _registration("rotation_authority_store", "AD_rotation_authority")
+        authority = _lease_authority(registration, "rotation-owner")
+        await registry.register_and_acquire(
+            registration, _lease("rotation-owner"), payload=_empty_payload()
+        )
+        with pytest.raises(LeaseAdmissionError) as rejected:
+            await registry.begin_checkpoint_rotation(
+                authority,
+                expected_revision=0,
+                expected_principal_generation=0,
+                transition_id="authority-rotation",
+            )
+        assert rejected.value.reason is LeaseAdmissionReason.LIFECYCLE_REJECTED
+        await registry.activate(authority)
+        for revision, principal, reason in (
+            (1, 0, SessionStateWriteReason.STALE_REVISION),
+            (0, 1, SessionStateWriteReason.STALE_PRINCIPAL),
+        ):
+            with pytest.raises(SessionStateWriteError) as rejected:
+                await registry.begin_checkpoint_rotation(
+                    authority,
+                    expected_revision=revision,
+                    expected_principal_generation=principal,
+                    transition_id="authority-rotation",
+                )
+            assert rejected.value.reason is reason
+        for allocated in (False, True):
+            if allocated:
+                await registry.begin_checkpoint_rotation(
+                    authority,
+                    expected_revision=0,
+                    expected_principal_generation=0,
+                    transition_id="authority-rotation",
+                )
+            for update, reason in (
+                ({"lease_owner_id": "foreign-worker"}, LeaseAdmissionReason.WRONG_LEASE_OWNER),
+                ({"fencing_generation": 2}, LeaseAdmissionReason.STALE_FENCE),
+            ):
+                with pytest.raises(LeaseAdmissionError) as rejected:
+                    await registry.begin_checkpoint_rotation(
+                        authority.model_copy(update=update),
+                        expected_revision=0,
+                        expected_principal_generation=0,
+                        transition_id="authority-rotation",
+                    )
+                assert rejected.value.reason is reason
+            assert len(await registry.checkpoint_generations(authority)) == (2 if allocated else 1)
+
+
+@pytest.mark.postgres
+async def test_generation_insert_failure_rolls_back_initial_lease() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+        await connection.execute(
+            """
+            ALTER TABLE platform_checkpoint_generations ADD CONSTRAINT test_inventory_failure
+            CHECK (tenant_id <> 'inventory_failure_store')
+            """
+        )
+        try:
+            async with AsyncExitStack() as stack:
+                registry = PostgresSessionRegistry(
+                    await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+                )
+                registration = _registration("inventory_failure_store", "AD_inventory_failure")
+                with pytest.raises(SessionRegistryError, match="registration failed"):
+                    await registry.register_and_acquire(
+                        registration, _lease("inventory-owner"), payload=_empty_payload()
+                    )
+                assert (
+                    await registry.get(
+                        registration.tenant_id, registration.authority.logical_session_id
+                    )
+                    is None
+                )
+        finally:
+            await connection.execute(
+                "ALTER TABLE platform_checkpoint_generations DROP CONSTRAINT test_inventory_failure"
+            )
+
+
+@pytest.mark.postgres
+async def test_generation_upgrade_preserves_existing_sessions_and_encryption() -> None:
+    dsn = _dsn()
+    schema = f"generation_upgrade_{uuid.uuid4().hex[:16]}"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await apply_platform_migrations(connection)
+            async with AsyncExitStack() as stack:
+                registry = PostgresSessionRegistry(
+                    await _open_pool(stack, isolated_dsn),
+                    cipher=_cipher(),
+                    operation_timeout_seconds=2.0,
+                )
+                originals = []
+                for tenant in ("upgrade_acme", "upgrade_demo"):
+                    registration = _registration(tenant, "AD_same_session")
+                    originals.append(
+                        await registry.register_and_acquire(
+                            registration, _lease("upgrade-owner"), payload=_empty_payload()
+                        )
+                    )
+                # Restore the schema-4 shape without changing either session or its ciphertext.
+                await connection.execute("DROP TABLE platform_checkpoint_generations")
+                await connection.execute(
+                    """
+                    ALTER TABLE platform_sessions
+                        DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
+                        ADD CONSTRAINT platform_sessions_checkpoint_matches_fence
+                            CHECK (
+                                checkpoint_namespace =
+                                    logical_session_id || '::fence::' || fencing_generation
+                            )
+                    """
+                )
+                await connection.execute("DELETE FROM platform_schema_migrations WHERE version = 5")
+                await apply_platform_migrations(connection)
+                await apply_platform_migrations(connection)
+                for original in originals:
+                    authority = _lease_authority(
+                        _registration(original.tenant_id, original.authority.logical_session_id),
+                        "upgrade-owner",
+                    )
+                    restored = await registry.restore(authority)
+                    assert restored.record == original
+                    assert restored.payload == _empty_payload()
+                    generations = await registry.checkpoint_generations(authority)
+                    assert len(generations) == 1
+                    assert generations[0].checkpoint_namespace == original.checkpoint_namespace
+                cursor = await connection.execute(
+                    """
+                    SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class
+                    WHERE oid IN ('platform_sessions'::regclass,
+                                  'platform_checkpoint_generations'::regclass)
+                    ORDER BY relname
+                    """
+                )
+                assert await cursor.fetchall() == [
+                    ("platform_checkpoint_generations", True, True),
+                    ("platform_sessions", True, True),
+                ]
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.postgres
+async def test_generation_upgrade_rejects_missing_schema4_checkpoint_constraint() -> None:
+    dsn = _dsn()
+    schema = f"generation_drift_{uuid.uuid4().hex[:16]}"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await apply_platform_migrations(connection)
+            await connection.execute("DROP TABLE platform_checkpoint_generations")
+            await connection.execute(
+                """
+                ALTER TABLE platform_sessions
+                    DROP CONSTRAINT platform_sessions_checkpoint_matches_generation
+                """
+            )
+            await connection.execute("DELETE FROM platform_schema_migrations WHERE version = 5")
+
+            with pytest.raises(UndefinedObject, match="checkpoint_matches_fence"):
+                await apply_platform_migrations(connection)
+
+            cursor = await connection.execute(
+                "SELECT to_regclass('platform_checkpoint_generations')"
+            )
+            assert await cursor.fetchone() == (None,)
+            cursor = await connection.execute(
+                "SELECT max(version) FROM platform_schema_migrations"
+            )
+            assert await cursor.fetchone() == (4,)
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
 @pytest.mark.postgres
@@ -172,7 +726,7 @@ async def test_room_authority_migration_refuses_to_invent_identity_for_v1_rows()
                 ALTER TABLE platform_sessions
                     DROP CONSTRAINT platform_sessions_open_requires_lease,
                     DROP CONSTRAINT platform_sessions_open_requires_positive_fence,
-                    DROP CONSTRAINT platform_sessions_checkpoint_matches_fence,
+                    DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
                     DROP CONSTRAINT platform_sessions_lease_starts_before_expiry
                 """
             )
@@ -230,7 +784,7 @@ async def test_initial_lease_migration_refuses_ownerless_open_rows() -> None:
                 ALTER TABLE platform_sessions
                     DROP CONSTRAINT platform_sessions_open_requires_lease,
                     DROP CONSTRAINT platform_sessions_open_requires_positive_fence,
-                    DROP CONSTRAINT platform_sessions_checkpoint_matches_fence,
+                    DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
                     DROP CONSTRAINT platform_sessions_lease_starts_before_expiry
                 """
             )
@@ -886,6 +1440,24 @@ async def test_operation_receipt_survives_a_later_session_fence() -> None:
                 ),
             )
 
+            # Simulate the corresponding inventory switch, not a corrupt current pointer.
+            await connection.execute(
+                """
+                UPDATE platform_checkpoint_generations SET state = 'retired'
+                WHERE tenant_id = %s AND logical_session_id = %s AND state = 'current'
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+            await connection.execute(
+                """
+                INSERT INTO platform_checkpoint_generations (
+                    tenant_id, logical_session_id, checkpoint_namespace, fencing_generation,
+                    principal_generation, binding_version, state
+                ) VALUES (%s, %s, %s, 2, 0, 1, 'current')
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id, next_namespace),
+            )
+
         replayed = await registry.publish(publication.model_copy(update={"fencing_generation": 2}))
 
     assert replayed.replayed
@@ -1277,6 +1849,21 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                 "SELECT tenant_id FROM platform_sessions ORDER BY tenant_id"
             )
             assert await cursor.fetchall() == [("role_test_acme",)]
+            cursor = await application.execute(
+                "SELECT tenant_id FROM platform_checkpoint_generations ORDER BY tenant_id"
+            )
+            assert await cursor.fetchall() == [("role_test_acme",)]
+            with pytest.raises(InsufficientPrivilege):
+                await application.execute(
+                    """
+                    INSERT INTO platform_checkpoint_generations (
+                        tenant_id, logical_session_id, checkpoint_namespace, fencing_generation,
+                        principal_generation, binding_version, state
+                    ) VALUES (
+                        'role_test_demo', 'AD_role_test', 'foreign-generation', 2, 0, 1, 'pending'
+                    )
+                    """
+                )
             await require_platform_schema_version(
                 application,
                 PLATFORM_SESSION_SCHEMA_VERSION,
@@ -1304,6 +1891,24 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                 False,
                 False,
             )
+            cursor = await application.execute(
+                """
+                SELECT
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_generations', 'SELECT'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_generations', 'INSERT'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_generations', 'UPDATE'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_generations', 'DELETE'
+                    )
+                """
+            )
+            assert await cursor.fetchone() == (True, True, True, False)
             cursor = await application.execute(
                 """
                 SELECT
