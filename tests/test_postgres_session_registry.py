@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 from psycopg import AsyncConnection, sql
 from psycopg.conninfo import make_conninfo
-from psycopg.errors import CheckViolation, InsufficientPrivilege, NotNullViolation, UndefinedObject
+from psycopg.errors import (
+    CheckViolation,
+    InsufficientPrivilege,
+    NotNullViolation,
+    UndefinedObject,
+)
 from psycopg_pool import AsyncConnectionPool
 
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
@@ -631,9 +636,7 @@ async def test_generation_upgrade_rejects_missing_schema4_checkpoint_constraint(
                 "SELECT to_regclass('platform_checkpoint_generations')"
             )
             assert await cursor.fetchone() == (None,)
-            cursor = await connection.execute(
-                "SELECT max(version) FROM platform_schema_migrations"
-            )
+            cursor = await connection.execute("SELECT max(version) FROM platform_schema_migrations")
             assert await cursor.fetchone() == (4,)
     finally:
         async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
