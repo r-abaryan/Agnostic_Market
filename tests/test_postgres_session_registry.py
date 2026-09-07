@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import uuid
 from contextlib import AsyncExitStack
@@ -16,9 +17,11 @@ from psycopg.errors import (
     InsufficientPrivilege,
     NotNullViolation,
     UndefinedObject,
+    UniqueViolation,
 )
 from psycopg_pool import AsyncConnectionPool
 
+from agnostic_market.checkpoints import CheckpointBinding
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
 from agnostic_market.durability.encryption import AesGcmSessionCipher, SessionEnvelopeContext
 from agnostic_market.durability.migrations import (
@@ -29,11 +32,15 @@ from agnostic_market.durability.migrations import (
     require_platform_schema_version,
 )
 from agnostic_market.durability.session_payload import (
+    SESSION_OPERATION_RESULT_SCHEMA_VERSION,
     SESSION_PAYLOAD_SCHEMA_VERSION,
     DurableSessionPayload,
     EmptySessionOperationResult,
+    PrincipalRetirementMarker,
+    SessionOperationReceiptPayload,
 )
 from agnostic_market.durability.session_registry import (
+    CheckpointRevisionDisposition,
     LeaseAdmissionError,
     LeaseAdmissionReason,
     PostgresSessionRegistry,
@@ -42,6 +49,7 @@ from agnostic_market.durability.session_registry import (
     SessionLeaseRequest,
     SessionLifecycle,
     SessionRegistration,
+    SessionRegistryDataError,
     SessionRegistryError,
     SessionRegistryRecord,
     SessionRestoreError,
@@ -65,6 +73,50 @@ def _cipher() -> AesGcmSessionCipher:
 
 def _empty_payload() -> DurableSessionPayload:
     return DurableSessionPayload()
+
+
+async def _publish_retirement_marker(
+    registry: PostgresSessionRegistry,
+    authority: SessionLeaseAuthority,
+    *,
+    expected_revision: int,
+    transition_id: str,
+) -> None:
+    await registry.publish(
+        SessionStatePublication(
+            **authority.model_dump(),
+            expected_revision=expected_revision,
+            operation_id=f"principal-retirement:{transition_id}",
+            request_fingerprint=hashlib.sha256(
+                f"begin_principal_retirement:{transition_id}".encode()
+            ).hexdigest(),
+            payload=DurableSessionPayload(
+                principal_retirement=PrincipalRetirementMarker(transition_id=transition_id)
+            ),
+            operation_result=EmptySessionOperationResult(),
+        )
+    )
+
+
+async def _complete_retirement_marker(
+    registry: PostgresSessionRegistry,
+    authority: SessionLeaseAuthority,
+    *,
+    expected_revision: int,
+    transition_id: str,
+) -> None:
+    await registry.publish(
+        SessionStatePublication(
+            **authority.model_dump(),
+            expected_revision=expected_revision,
+            operation_id=f"principal-retirement-complete:{transition_id}",
+            request_fingerprint=hashlib.sha256(
+                f"finish_principal_retirement:{transition_id}".encode()
+            ).hexdigest(),
+            payload=_empty_payload(),
+            operation_result=EmptySessionOperationResult(),
+        )
+    )
 
 
 def _dsn() -> str:
@@ -92,10 +144,33 @@ async def _open_pool(stack: AsyncExitStack, dsn: str) -> AsyncConnectionPool:
     return pool
 
 
+async def _rewind_generation_schema_to_version_4(connection: AsyncConnection) -> None:
+    await connection.execute("DROP TABLE platform_checkpoint_write_manifests")
+    await connection.execute("DROP TABLE platform_checkpoint_generations CASCADE")
+    await connection.execute(
+        """
+        ALTER TABLE platform_session_operations
+        DROP CONSTRAINT platform_session_operations_one_receipt_per_revision,
+        DROP CONSTRAINT platform_session_operations_current_result_schema
+        """
+    )
+    await connection.execute(
+        """
+        ALTER TABLE platform_sessions
+            DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
+            DROP CONSTRAINT platform_sessions_current_payload_schema,
+            ADD CONSTRAINT platform_sessions_checkpoint_matches_fence
+                CHECK (
+                    checkpoint_namespace =
+                        logical_session_id || '::fence::' || fencing_generation
+                )
+        """
+    )
+    await connection.execute("DELETE FROM platform_schema_migrations WHERE version >= 5")
+
+
 @pytest.mark.postgres
 async def test_initial_checkpoint_generation_is_registered_with_its_session() -> None:
-    from agnostic_market.checkpoints import CheckpointBinding
-
     dsn = _dsn()
     async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
         await apply_platform_migrations(connection)
@@ -118,6 +193,7 @@ async def test_initial_checkpoint_generation_is_registered_with_its_session() ->
         assert generation.transition_id is None
         assert generation.binding == CheckpointBinding(
             tenant_id=record.tenant_id,
+            logical_session_id=record.authority.logical_session_id,
             deployment_id=record.deployment_id,
             graph_contract=record.graph_contract,
             thread_id=record.checkpoint_namespace,
@@ -149,11 +225,14 @@ async def test_checkpoint_rotation_allocation_is_atomic_and_replayable() -> None
             payload=DurableSessionPayload(guest_order_refs=("ORD-OLD",)),
         )
         await registries[0].activate(authority)
+        await _publish_retirement_marker(
+            registries[0], authority, expected_revision=0, transition_id="identity-change"
+        )
         first, duplicate = await asyncio.gather(
             *(
                 registry.begin_checkpoint_rotation(
                     authority,
-                    expected_revision=0,
+                    expected_revision=1,
                     expected_principal_generation=0,
                     transition_id="identity-change",
                 )
@@ -176,8 +255,8 @@ async def test_checkpoint_rotation_allocation_is_atomic_and_replayable() -> None
             "pending",
         ]
         for revision, principal, transition in (
-            (1, 0, "identity-change"),
-            (0, 1, "identity-change"),
+            (2, 0, "identity-change"),
+            (1, 1, "identity-change"),
             (1, 0, "other-change"),
         ):
             with pytest.raises(SessionStateWriteError):
@@ -221,9 +300,12 @@ async def test_checkpoint_rotation_switches_atomically_and_records_verified_dele
             payload=DurableSessionPayload(guest_order_refs=("ORD-OLD",)),
         )
         await registries[0].activate(authority)
+        await _publish_retirement_marker(
+            registries[0], authority, expected_revision=0, transition_id="switch-identity"
+        )
         destination = await registries[0].begin_checkpoint_rotation(
             authority,
-            expected_revision=0,
+            expected_revision=1,
             expected_principal_generation=0,
             transition_id="switch-identity",
         )
@@ -242,8 +324,10 @@ async def test_checkpoint_rotation_switches_atomically_and_records_verified_dele
         assert restored.record.checkpoint_namespace == destination.checkpoint_namespace
         assert restored.record.principal_generation == 1
         assert restored.record.fencing_generation == authority.fencing_generation
-        assert restored.record.session_revision == 2
-        assert restored.payload == _empty_payload()
+        assert restored.record.session_revision == 1
+        assert restored.payload.principal_retirement == PrincipalRetirementMarker(
+            transition_id="switch-identity"
+        )
         assert [
             generation.state for generation in await registries[0].checkpoint_generations(authority)
         ] == [
@@ -254,11 +338,14 @@ async def test_checkpoint_rotation_switches_atomically_and_records_verified_dele
         assert (
             await registries[0].begin_checkpoint_rotation(
                 authority,
-                expected_revision=0,
+                expected_revision=1,
                 expected_principal_generation=0,
                 transition_id="switch-identity",
             )
             == switched.destination
+        )
+        await _complete_retirement_marker(
+            registries[0], authority, expected_revision=1, transition_id="switch-identity"
         )
         published = await registries[0].publish(
             SessionStatePublication(
@@ -313,9 +400,12 @@ async def test_rotation_preserves_receipt_encryption_context() -> None:
         )
         await registry.activate(authority)
         await registry.publish(publication)
+        await _publish_retirement_marker(
+            registry, authority, expected_revision=1, transition_id="receipt-identity"
+        )
         await registry.begin_checkpoint_rotation(
             authority,
-            expected_revision=1,
+            expected_revision=2,
             expected_principal_generation=0,
             transition_id="receipt-identity",
         )
@@ -326,7 +416,7 @@ async def test_rotation_preserves_receipt_encryption_context() -> None:
     assert replayed.replayed
     assert replayed.operation_revision == 1
     assert replayed.operation_result == EmptySessionOperationResult()
-    assert replayed.record.session_revision == 3
+    assert replayed.record.session_revision == 2
 
 
 @pytest.mark.postgres
@@ -344,20 +434,32 @@ async def test_late_rotation_replay_and_cleanup_survive_a_newer_generation() -> 
             registration, _lease("rotation-owner"), payload=_empty_payload()
         )
         await registry.activate(authority)
+        await _publish_retirement_marker(
+            registry, authority, expected_revision=0, transition_id="first-identity"
+        )
         await registry.begin_checkpoint_rotation(
             authority,
-            expected_revision=0,
+            expected_revision=1,
             expected_principal_generation=0,
             transition_id="first-identity",
         )
         first = await registry.switch_checkpoint_generation(authority, "first-identity")
+        await _complete_retirement_marker(
+            registry, authority, expected_revision=1, transition_id="first-identity"
+        )
+        await _publish_retirement_marker(
+            registry, authority, expected_revision=2, transition_id="second-identity"
+        )
         await registry.begin_checkpoint_rotation(
             authority,
-            expected_revision=2,
+            expected_revision=3,
             expected_principal_generation=1,
             transition_id="second-identity",
         )
         await registry.switch_checkpoint_generation(authority, "second-identity")
+        await _complete_retirement_marker(
+            registry, authority, expected_revision=3, transition_id="second-identity"
+        )
 
         delayed = await registry.switch_checkpoint_generation(authority, "first-identity")
         deleted = await registry.record_checkpoint_deletion(authority, "first-identity")
@@ -386,9 +488,12 @@ async def test_checkpoint_rotation_switch_failure_rolls_back_inventory_and_marke
                 registration, _lease("rotation-owner"), payload=_empty_payload()
             )
             await registry.activate(authority)
+            await _publish_retirement_marker(
+                registry, authority, expected_revision=0, transition_id="failed-switch"
+            )
             await registry.begin_checkpoint_rotation(
                 authority,
-                expected_revision=0,
+                expected_revision=1,
                 expected_principal_generation=0,
                 transition_id="failed-switch",
             )
@@ -429,25 +534,32 @@ async def test_rotation_marker_failure_rolls_back_destination() -> None:
             )
             await registry.activate(authority)
             original = await registry.restore(authority)
+            await _publish_retirement_marker(
+                registry, authority, expected_revision=0, transition_id="failed-rotation"
+            )
+            marked = await registry.restore(authority)
             await connection.execute(
                 """
-                ALTER TABLE platform_sessions ADD CONSTRAINT test_rotation_marker_failure
-                CHECK (tenant_id <> 'rotation_failure_store' OR session_revision = 0)
+                ALTER TABLE platform_checkpoint_generations
+                ADD CONSTRAINT test_rotation_marker_failure
+                CHECK (tenant_id <> 'rotation_failure_store' OR principal_generation = 0)
                 """
             )
             try:
                 with pytest.raises(SessionRegistryError, match="rotation allocation failed"):
                     await registry.begin_checkpoint_rotation(
                         authority,
-                        expected_revision=0,
+                        expected_revision=1,
                         expected_principal_generation=0,
                         transition_id="failed-rotation",
                     )
-                assert await registry.restore(authority) == original
+                assert original.record.session_revision == 0
+                assert await registry.restore(authority) == marked
                 assert len(await registry.checkpoint_generations(authority)) == 1
             finally:
                 await connection.execute(
-                    "ALTER TABLE platform_sessions DROP CONSTRAINT test_rotation_marker_failure"
+                    "ALTER TABLE platform_checkpoint_generations "
+                    "DROP CONSTRAINT test_rotation_marker_failure"
                 )
 
 
@@ -474,9 +586,20 @@ async def test_rotation_rejects_stale_authority_before_allocation_or_replay() ->
             )
         assert rejected.value.reason is LeaseAdmissionReason.LIFECYCLE_REJECTED
         await registry.activate(authority)
+        with pytest.raises(SessionStateWriteError) as missing_marker:
+            await registry.begin_checkpoint_rotation(
+                authority,
+                expected_revision=0,
+                expected_principal_generation=0,
+                transition_id="authority-rotation",
+            )
+        assert missing_marker.value.reason is SessionStateWriteReason.RETIREMENT_MARKER_MISSING
+        await _publish_retirement_marker(
+            registry, authority, expected_revision=0, transition_id="authority-rotation"
+        )
         for revision, principal, reason in (
-            (1, 0, SessionStateWriteReason.STALE_REVISION),
-            (0, 1, SessionStateWriteReason.STALE_PRINCIPAL),
+            (2, 0, SessionStateWriteReason.STALE_REVISION),
+            (1, 1, SessionStateWriteReason.STALE_PRINCIPAL),
         ):
             with pytest.raises(SessionStateWriteError) as rejected:
                 await registry.begin_checkpoint_rotation(
@@ -490,7 +613,7 @@ async def test_rotation_rejects_stale_authority_before_allocation_or_replay() ->
             if allocated:
                 await registry.begin_checkpoint_rotation(
                     authority,
-                    expected_revision=0,
+                    expected_revision=1,
                     expected_principal_generation=0,
                     transition_id="authority-rotation",
                 )
@@ -501,7 +624,7 @@ async def test_rotation_rejects_stale_authority_before_allocation_or_replay() ->
                 with pytest.raises(LeaseAdmissionError) as rejected:
                     await registry.begin_checkpoint_rotation(
                         authority.model_copy(update=update),
-                        expected_revision=0,
+                        expected_revision=1,
                         expected_principal_generation=0,
                         transition_id="authority-rotation",
                     )
@@ -559,7 +682,7 @@ async def test_generation_upgrade_preserves_existing_sessions_and_encryption() -
                     operation_timeout_seconds=2.0,
                 )
                 originals = []
-                for tenant in ("upgrade_acme", "upgrade_demo"):
+                for tenant in ("upgrade_acme", "café_store", "商店"):
                     registration = _registration(tenant, "AD_same_session")
                     originals.append(
                         await registry.register_and_acquire(
@@ -567,19 +690,7 @@ async def test_generation_upgrade_preserves_existing_sessions_and_encryption() -
                         )
                     )
                 # Restore the schema-4 shape without changing either session or its ciphertext.
-                await connection.execute("DROP TABLE platform_checkpoint_generations")
-                await connection.execute(
-                    """
-                    ALTER TABLE platform_sessions
-                        DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
-                        ADD CONSTRAINT platform_sessions_checkpoint_matches_fence
-                            CHECK (
-                                checkpoint_namespace =
-                                    logical_session_id || '::fence::' || fencing_generation
-                            )
-                    """
-                )
-                await connection.execute("DELETE FROM platform_schema_migrations WHERE version = 5")
+                await _rewind_generation_schema_to_version_4(connection)
                 await apply_platform_migrations(connection)
                 await apply_platform_migrations(connection)
                 for original in originals:
@@ -593,21 +704,159 @@ async def test_generation_upgrade_preserves_existing_sessions_and_encryption() -
                     generations = await registry.checkpoint_generations(authority)
                     assert len(generations) == 1
                     assert generations[0].checkpoint_namespace == original.checkpoint_namespace
+                    assert generations[0].binding == CheckpointBinding(
+                        tenant_id=original.tenant_id,
+                        logical_session_id=original.authority.logical_session_id,
+                        deployment_id=original.deployment_id,
+                        graph_contract=original.graph_contract,
+                        thread_id=original.checkpoint_namespace,
+                    )
                 cursor = await connection.execute(
                     """
                     SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class
                     WHERE oid IN ('platform_sessions'::regclass,
-                                  'platform_checkpoint_generations'::regclass)
+                                  'platform_checkpoint_generations'::regclass,
+                                  'platform_checkpoint_write_manifests'::regclass)
                     ORDER BY relname
                     """
                 )
                 assert await cursor.fetchall() == [
                     ("platform_checkpoint_generations", True, True),
+                    ("platform_checkpoint_write_manifests", True, True),
                     ("platform_sessions", True, True),
                 ]
     finally:
         async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
             await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("payload_surface", ("session", "operation"))
+async def test_generation_upgrade_rejects_unsupported_payloads_atomically(
+    payload_surface: str,
+) -> None:
+    dsn = _dsn()
+    schema = f"generation_payload_cutover_{uuid.uuid4().hex[:16]}"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await apply_platform_migrations(connection)
+            async with AsyncExitStack() as stack:
+                registry = PostgresSessionRegistry(
+                    await _open_pool(stack, isolated_dsn),
+                    cipher=_cipher(),
+                    operation_timeout_seconds=2.0,
+                )
+                registration = _registration("payload_cutover", "AD_payload_cutover")
+                await registry.register_and_acquire(
+                    registration,
+                    _lease("payload-cutover-owner"),
+                    payload=_empty_payload(),
+                )
+                if payload_surface == "operation":
+                    authority = _lease_authority(registration, "payload-cutover-owner")
+                    await registry.activate(authority)
+                    await registry.publish(
+                        SessionStatePublication(
+                            **authority.model_dump(),
+                            expected_revision=0,
+                            operation_id="payload-cutover-operation",
+                            request_fingerprint="c" * 64,
+                            payload=_empty_payload(),
+                            operation_result=EmptySessionOperationResult(),
+                        )
+                    )
+            await _rewind_generation_schema_to_version_4(connection)
+            if payload_surface == "session":
+                await connection.execute(
+                    """
+                    UPDATE platform_sessions SET payload_schema_version = 1
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                    """,
+                    (registration.tenant_id, registration.authority.logical_session_id),
+                )
+            else:
+                await connection.execute(
+                    """
+                    UPDATE platform_session_operations SET result_schema_version = 1
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                    """,
+                    (registration.tenant_id, registration.authority.logical_session_id),
+                )
+
+            with pytest.raises(PlatformSchemaError, match="unsupported encrypted session"):
+                await apply_platform_migrations(connection)
+
+            cursor = await connection.execute("SELECT max(version) FROM platform_schema_migrations")
+            assert await cursor.fetchone() == (4,)
+            cursor = await connection.execute(
+                "SELECT to_regclass('platform_checkpoint_generations')"
+            )
+            assert await cursor.fetchone() == (None,)
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.postgres
+async def test_generation_backfill_runs_as_a_non_bypass_migration_owner() -> None:
+    dsn = _dsn()
+    suffix = uuid.uuid4().hex[:16]
+    role_name = f"phase4c_migration_{suffix}"
+    schema = f"generation_owner_{suffix}"
+    role = sql.Identifier(role_name)
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN NOBYPASSRLS").format(role))
+        await admin.execute(
+            sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
+                sql.Identifier(schema),
+                role,
+            )
+        )
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await connection.execute(sql.SQL("SET ROLE {}").format(role))
+            await apply_platform_migrations(connection)
+            await connection.execute("RESET ROLE")
+            async with AsyncExitStack() as stack:
+                registry = PostgresSessionRegistry(
+                    await _open_pool(stack, isolated_dsn),
+                    cipher=_cipher(),
+                    operation_timeout_seconds=2.0,
+                )
+                registration = _registration("migration_owner", "AD_migration_owner")
+                original = await registry.register_and_acquire(
+                    registration,
+                    _lease("migration-owner"),
+                    payload=_empty_payload(),
+                )
+            await connection.execute(sql.SQL("SET ROLE {}").format(role))
+            await _rewind_generation_schema_to_version_4(connection)
+            await apply_platform_migrations(connection)
+            await connection.execute("RESET ROLE")
+
+            cursor = await connection.execute(
+                """
+                SELECT storage_thread_id FROM platform_checkpoint_generations
+                WHERE tenant_id = %s AND logical_session_id = %s
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+            expected = CheckpointBinding(
+                tenant_id=registration.tenant_id,
+                logical_session_id=registration.authority.logical_session_id,
+                deployment_id=registration.deployment_id,
+                graph_contract=registration.graph_contract,
+                thread_id=original.checkpoint_namespace,
+            ).storage_thread_id
+            assert await cursor.fetchone() == (expected,)
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+            await admin.execute(sql.SQL("DROP ROLE {}").format(role))
 
 
 @pytest.mark.postgres
@@ -620,14 +869,21 @@ async def test_generation_upgrade_rejects_missing_schema4_checkpoint_constraint(
         isolated_dsn = _schema_dsn(dsn, schema)
         async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
             await apply_platform_migrations(connection)
-            await connection.execute("DROP TABLE platform_checkpoint_generations")
+            await connection.execute("DROP TABLE platform_checkpoint_write_manifests")
+            await connection.execute("DROP TABLE platform_checkpoint_generations CASCADE")
+            await connection.execute(
+                """
+                ALTER TABLE platform_session_operations
+                DROP CONSTRAINT platform_session_operations_one_receipt_per_revision
+                """
+            )
             await connection.execute(
                 """
                 ALTER TABLE platform_sessions
                     DROP CONSTRAINT platform_sessions_checkpoint_matches_generation
                 """
             )
-            await connection.execute("DELETE FROM platform_schema_migrations WHERE version = 5")
+            await connection.execute("DELETE FROM platform_schema_migrations WHERE version >= 5")
 
             with pytest.raises(UndefinedObject, match="checkpoint_matches_fence"):
                 await apply_platform_migrations(connection)
@@ -644,7 +900,7 @@ async def test_generation_upgrade_rejects_missing_schema4_checkpoint_constraint(
 
 
 @pytest.mark.postgres
-async def test_platform_migration_commits_without_requiring_autocommit() -> None:
+async def test_platform_migration_preserves_an_idle_connection_transaction_mode() -> None:
     dsn = _dsn()
     schema = f"migration_tx_{uuid.uuid4().hex[:20]}"
     async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
@@ -652,7 +908,9 @@ async def test_platform_migration_commits_without_requiring_autocommit() -> None
     try:
         isolated_dsn = _schema_dsn(dsn, schema)
         async with await AsyncConnection.connect(isolated_dsn) as migration_connection:
+            assert not migration_connection.autocommit
             await apply_platform_migrations(migration_connection)
+            assert not migration_connection.autocommit
             async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as observer:
                 await require_platform_schema_version(
                     observer,
@@ -661,6 +919,104 @@ async def test_platform_migration_commits_without_requiring_autocommit() -> None
     finally:
         async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
             await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.postgres
+async def test_platform_migration_rejects_an_active_caller_transaction() -> None:
+    dsn = _dsn()
+    schema = f"migration_active_tx_{uuid.uuid4().hex[:16]}"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn) as migration_connection:
+            await migration_connection.execute("SELECT 1")
+            with pytest.raises(PlatformSchemaError, match="must be idle"):
+                await apply_platform_migrations(migration_connection)
+            await migration_connection.rollback()
+            await apply_platform_migrations(migration_connection)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as observer:
+            await require_platform_schema_version(observer, PLATFORM_SESSION_SCHEMA_VERSION)
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.postgres
+async def test_platform_migration_retries_after_vendor_signature_repair() -> None:
+    dsn = _dsn()
+    schema = f"migration_vendor_retry_{uuid.uuid4().hex[:16]}"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+        await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        isolated_dsn = _schema_dsn(dsn, schema)
+        async with await AsyncConnection.connect(isolated_dsn, autocommit=True) as connection:
+            await connection.execute(
+                "CREATE TABLE checkpoint_migrations (v integer PRIMARY KEY, unexpected text)"
+            )
+            with pytest.raises(PlatformSchemaError, match="signature"):
+                await apply_platform_migrations(connection)
+            cursor = await connection.execute("SELECT max(v) FROM checkpoint_migrations")
+            assert await cursor.fetchone() == (9,)
+            cursor = await connection.execute("SELECT to_regclass('platform_schema_migrations')")
+            assert await cursor.fetchone() == (None,)
+
+            await connection.execute("ALTER TABLE checkpoint_migrations DROP COLUMN unexpected")
+            await apply_platform_migrations(connection)
+            await require_platform_schema_version(connection, PLATFORM_SESSION_SCHEMA_VERSION)
+    finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as admin:
+            await admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.mark.postgres
+async def test_database_rejects_legacy_session_and_receipt_payload_versions() -> None:
+    dsn = _dsn()
+    suffix = uuid.uuid4().hex
+    registration = _registration(f"schema_v2_{suffix}", f"AD_schema_v2_{suffix}")
+    authority = _lease_authority(registration, "schema-v2-owner")
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        await registry.register_and_acquire(
+            registration, _lease("schema-v2-owner"), payload=_empty_payload()
+        )
+        await registry.activate(authority)
+        await registry.publish(
+            SessionStatePublication(
+                **authority.model_dump(),
+                expected_revision=0,
+                operation_id="schema-v2-operation",
+                request_fingerprint="d" * 64,
+                payload=_empty_payload(),
+                operation_result=EmptySessionOperationResult(),
+            )
+        )
+
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await connection.execute(
+            "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+            (registration.tenant_id,),
+        )
+        with pytest.raises(CheckViolation):
+            await connection.execute(
+                """
+                UPDATE platform_sessions SET payload_schema_version = 1
+                WHERE tenant_id = %s AND logical_session_id = %s
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+        with pytest.raises(CheckViolation):
+            await connection.execute(
+                """
+                UPDATE platform_session_operations SET result_schema_version = 1
+                WHERE tenant_id = %s AND logical_session_id = %s
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
 
 
 @pytest.mark.postgres
@@ -945,6 +1301,8 @@ async def test_platform_migrations_and_registry_are_cross_worker_and_tenant_scop
             logical_session_id="AD_shared",
             checkpoint_namespace="AD_shared::fence::1",
             payload_schema_version=SESSION_PAYLOAD_SCHEMA_VERSION,
+            payload_purpose="session_projection",
+            session_revision=0,
         )
         assert (
             AesGcmSessionCipher(active_key_version="key-v1", keys={"key-v1": _KEY}).decrypt(
@@ -1143,6 +1501,421 @@ async def test_fenced_session_state_publication_is_visible_and_replay_safe() -> 
     assert replayed.record.session_revision == 1
     assert conflict.value.reason is SessionStateWriteReason.OPERATION_CONFLICT
     assert stale.value.reason is SessionStateWriteReason.STALE_REVISION
+
+
+@pytest.mark.postgres
+async def test_session_projection_cannot_replay_at_a_newer_revision() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+        await apply_platform_migrations(migration_connection)
+
+    registration = _registration("projection_replay_store", "AD_projection_replay")
+    authority = _lease_authority(registration, "projection-replay-owner")
+    publication = SessionStatePublication(
+        **authority.model_dump(),
+        expected_revision=0,
+        operation_id="projection-replay-operation",
+        request_fingerprint="a" * 64,
+        payload=DurableSessionPayload(guest_order_refs=("ORD-9001",)),
+        operation_result=EmptySessionOperationResult(),
+    )
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn),
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        initial = await registry.register_and_acquire(
+            registration,
+            _lease("projection-replay-owner"),
+            payload=_empty_payload(),
+        )
+        assert initial.envelope is not None
+        await registry.activate(authority)
+        await registry.publish(publication)
+        async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+                (registration.tenant_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE platform_sessions
+                SET envelope_format = %s,
+                    envelope_key_version = %s,
+                    payload_schema_version = %s,
+                    envelope_nonce = %s,
+                    encrypted_payload = %s
+                WHERE tenant_id = %s AND logical_session_id = %s
+                """,
+                (
+                    initial.envelope.format,
+                    initial.envelope.key_version,
+                    initial.envelope.payload_schema_version,
+                    initial.envelope.nonce,
+                    initial.envelope.ciphertext,
+                    registration.tenant_id,
+                    registration.authority.logical_session_id,
+                ),
+            )
+
+        with pytest.raises(SessionRestoreError) as rejected:
+            await registry.restore(authority)
+
+    assert rejected.value.reason is SessionRestoreReason.DECRYPTION_FAILED
+
+
+@pytest.mark.postgres
+async def test_operation_receipt_revision_is_unique_and_authenticated() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+        await apply_platform_migrations(migration_connection)
+
+    registration = _registration("receipt_revision_store", "AD_receipt_revision")
+    authority = _lease_authority(registration, "receipt-revision-owner")
+    first_publication = SessionStatePublication(
+        **authority.model_dump(),
+        expected_revision=0,
+        operation_id="receipt-revision-one",
+        request_fingerprint="1" * 64,
+        payload=DurableSessionPayload(guest_order_refs=("ORD-9001",)),
+        operation_result=EmptySessionOperationResult(),
+    )
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn),
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("receipt-revision-owner"),
+            payload=_empty_payload(),
+        )
+        await registry.activate(authority)
+        first = await registry.publish(first_publication)
+        await registry.publish(
+            first_publication.model_copy(
+                update={
+                    "expected_revision": first.record.session_revision,
+                    "operation_id": "receipt-revision-two",
+                    "request_fingerprint": "2" * 64,
+                }
+            )
+        )
+        async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+                (registration.tenant_id,),
+            )
+            with pytest.raises(UniqueViolation):
+                await connection.execute(
+                    """
+                    INSERT INTO platform_session_operations (
+                        tenant_id, logical_session_id, operation_id,
+                        request_fingerprint, committed_revision,
+                        committed_checkpoint_namespace, result_envelope_format,
+                        result_envelope_key_version, result_schema_version,
+                        result_envelope_nonce, encrypted_result
+                    )
+                    SELECT tenant_id, logical_session_id, 'receipt-revision-duplicate',
+                        request_fingerprint, committed_revision,
+                        committed_checkpoint_namespace, result_envelope_format,
+                        result_envelope_key_version, result_schema_version,
+                        result_envelope_nonce, encrypted_result
+                    FROM platform_session_operations
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                      AND operation_id = 'receipt-revision-one'
+                    """,
+                    (registration.tenant_id, registration.authority.logical_session_id),
+                )
+            await connection.execute(
+                """
+                DELETE FROM platform_session_operations
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'receipt-revision-two'
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+            await connection.execute(
+                """
+                UPDATE platform_session_operations SET committed_revision = 2
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'receipt-revision-one'
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+
+        with pytest.raises(
+            SessionRegistryDataError,
+            match="operation result could not be authenticated",
+        ):
+            await registry.publish(first_publication)
+
+
+@pytest.mark.postgres
+async def test_checkpoint_revision_reconciliation_distinguishes_seed_and_missing_state() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+        await apply_platform_migrations(migration_connection)
+    registration = _registration("revision_seed_store", "AD_revision_seed")
+    authority = _lease_authority(registration, "revision-seed-owner")
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("revision-seed-owner"),
+            payload=_empty_payload(),
+        )
+
+        seed = await registry.reconcile_checkpoint_revision(authority, None)
+        assert seed.disposition is CheckpointRevisionDisposition.SEED_REQUIRED
+        assert seed.checkpoint_revision is None
+        assert seed.operations == ()
+
+        await registry.activate(authority)
+        with pytest.raises(SessionRestoreError) as missing:
+            await registry.reconcile_checkpoint_revision(authority, None)
+        with pytest.raises(SessionRestoreError) as ahead:
+            await registry.reconcile_checkpoint_revision(authority, 1)
+        with pytest.raises(SessionRestoreError) as malformed:
+            await registry.reconcile_checkpoint_revision(authority, "0")
+        current = await registry.reconcile_checkpoint_revision(authority, 0)
+
+    assert missing.value.reason is SessionRestoreReason.CHECKPOINT_INVALID
+    assert ahead.value.reason is SessionRestoreReason.REVISION_MISMATCH
+    assert malformed.value.reason is SessionRestoreReason.CHECKPOINT_INVALID
+    assert current.disposition is CheckpointRevisionDisposition.CURRENT
+    assert current.operations == ()
+
+
+@pytest.mark.postgres
+async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+        await apply_platform_migrations(migration_connection)
+    registration = _registration("revision_gap_store", "AD_revision_gap")
+    authority = _lease_authority(registration, "revision-gap-owner")
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("revision-gap-owner"),
+            payload=_empty_payload(),
+        )
+        await registry.activate(authority)
+        first = await registry.publish(
+            SessionStatePublication(
+                **authority.model_dump(),
+                expected_revision=0,
+                operation_id="revision-operation-1",
+                request_fingerprint="1" * 64,
+                payload=DurableSessionPayload(guest_order_refs=("ORD-9001",)),
+                operation_result=EmptySessionOperationResult(),
+            )
+        )
+        await registry.publish(
+            SessionStatePublication(
+                **authority.model_dump(),
+                expected_revision=first.record.session_revision,
+                operation_id="revision-operation-2",
+                request_fingerprint="2" * 64,
+                payload=DurableSessionPayload(guest_order_refs=("ORD-9001", "ORD-9002")),
+                operation_result=EmptySessionOperationResult(),
+            )
+        )
+
+        reconciled = await registry.reconcile_checkpoint_revision(authority, 0)
+        assert reconciled.disposition is CheckpointRevisionDisposition.SESSION_AHEAD
+        assert reconciled.payload.guest_order_refs == ("ORD-9001", "ORD-9002")
+        assert [item.operation_id for item in reconciled.operations] == [
+            "revision-operation-1",
+            "revision-operation-2",
+        ]
+        assert [item.committed_revision for item in reconciled.operations] == [1, 2]
+        assert all(
+            item.committed_checkpoint_namespace == reconciled.record.checkpoint_namespace
+            for item in reconciled.operations
+        )
+
+        async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+                (registration.tenant_id,),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT result_envelope_nonce, encrypted_result
+                FROM platform_session_operations
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-2'
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+            original_result = await cursor.fetchone()
+            assert original_result is not None
+            await connection.execute(
+                """
+                UPDATE platform_session_operations
+                SET encrypted_result = set_byte(
+                    encrypted_result, 0, get_byte(encrypted_result, 0) # 1
+                )
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-2'
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+        with pytest.raises(SessionRestoreError) as corrupted:
+            await registry.reconcile_checkpoint_revision(authority, 0)
+        assert corrupted.value.reason is SessionRestoreReason.DECRYPTION_FAILED
+        async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+                (registration.tenant_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE platform_session_operations
+                SET result_envelope_nonce = %s, encrypted_result = %s
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-2'
+                """,
+                (
+                    original_result[0],
+                    original_result[1],
+                    registration.tenant_id,
+                    registration.authority.logical_session_id,
+                ),
+            )
+            operation_context = SessionEnvelopeContext(
+                tenant_id=registration.tenant_id,
+                logical_session_id=registration.authority.logical_session_id,
+                checkpoint_namespace=reconciled.record.checkpoint_namespace,
+                payload_schema_version=SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+                payload_purpose="operation_result",
+                session_revision=2,
+                operation_id="revision-operation-2",
+                request_fingerprint="2" * 64,
+            )
+            malformed = _cipher().encrypt(b'{"schema_version":2}', operation_context)
+            await connection.execute(
+                """
+                UPDATE platform_session_operations
+                SET result_envelope_nonce = %s, encrypted_result = %s
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-2'
+                """,
+                (
+                    malformed.nonce,
+                    malformed.ciphertext,
+                    registration.tenant_id,
+                    registration.authority.logical_session_id,
+                ),
+            )
+        with pytest.raises(SessionRestoreError) as malformed_payload:
+            await registry.reconcile_checkpoint_revision(authority, 0)
+        assert malformed_payload.value.reason is SessionRestoreReason.PAYLOAD_SCHEMA_INVALID
+
+        mismatched_receipt = SessionOperationReceiptPayload(
+            operation_id="different-operation",
+            request_fingerprint="2" * 64,
+            result=EmptySessionOperationResult(),
+        )
+        mismatched = _cipher().encrypt(mismatched_receipt.to_bytes(), operation_context)
+        async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+                (registration.tenant_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE platform_session_operations
+                SET result_envelope_nonce = %s, encrypted_result = %s
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-2'
+                """,
+                (
+                    mismatched.nonce,
+                    mismatched.ciphertext,
+                    registration.tenant_id,
+                    registration.authority.logical_session_id,
+                ),
+            )
+        with pytest.raises(SessionRestoreError) as mismatched_authority:
+            await registry.reconcile_checkpoint_revision(authority, 0)
+        assert mismatched_authority.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
+
+        async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, false)",
+                (registration.tenant_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE platform_session_operations
+                SET result_envelope_nonce = %s, encrypted_result = %s
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-2'
+                """,
+                (
+                    original_result[0],
+                    original_result[1],
+                    registration.tenant_id,
+                    registration.authority.logical_session_id,
+                ),
+            )
+            await connection.execute(
+                """
+                DELETE FROM platform_session_operations
+                WHERE tenant_id = %s AND logical_session_id = %s
+                  AND operation_id = 'revision-operation-1'
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+        with pytest.raises(SessionRestoreError) as unexplained:
+            await registry.reconcile_checkpoint_revision(authority, 0)
+
+    assert unexplained.value.reason is SessionRestoreReason.REVISION_GAP_UNEXPLAINED
+
+
+@pytest.mark.postgres
+async def test_checkpoint_reconciliation_rejects_a_principal_retirement_marker() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+        await apply_platform_migrations(migration_connection)
+    registration = _registration("retirement_reconcile_store", "AD_retirement_reconcile")
+    authority = _lease_authority(registration, "retirement-reconcile-owner")
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn), cipher=_cipher(), operation_timeout_seconds=2.0
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("retirement-reconcile-owner"),
+            payload=_empty_payload(),
+        )
+        await registry.activate(authority)
+        await _publish_retirement_marker(
+            registry,
+            authority,
+            expected_revision=0,
+            transition_id="retirement-reconcile-transition",
+        )
+        await registry.begin_checkpoint_rotation(
+            authority,
+            expected_revision=1,
+            expected_principal_generation=0,
+            transition_id="retirement-reconcile-transition",
+        )
+
+        with pytest.raises(SessionRestoreError) as pending:
+            await registry.reconcile_checkpoint_revision(authority, 0)
+
+    assert pending.value.reason is SessionRestoreReason.PRINCIPAL_RETIREMENT_PENDING
 
 
 @pytest.mark.postgres
@@ -1411,6 +2184,8 @@ async def test_operation_receipt_survives_a_later_session_fence() -> None:
                 logical_session_id=registration.authority.logical_session_id,
                 checkpoint_namespace=next_namespace,
                 payload_schema_version=SESSION_PAYLOAD_SCHEMA_VERSION,
+                payload_purpose="session_projection",
+                session_revision=committed.record.session_revision,
             ),
         )
         async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
@@ -1454,11 +2229,23 @@ async def test_operation_receipt_survives_a_later_session_fence() -> None:
             await connection.execute(
                 """
                 INSERT INTO platform_checkpoint_generations (
-                    tenant_id, logical_session_id, checkpoint_namespace, fencing_generation,
+                    tenant_id, logical_session_id, checkpoint_namespace, storage_thread_id,
+                    fencing_generation,
                     principal_generation, binding_version, state
-                ) VALUES (%s, %s, %s, 2, 0, 1, 'current')
+                ) VALUES (%s, %s, %s, %s, 2, 0, 1, 'current')
                 """,
-                (registration.tenant_id, registration.authority.logical_session_id, next_namespace),
+                (
+                    registration.tenant_id,
+                    registration.authority.logical_session_id,
+                    next_namespace,
+                    CheckpointBinding(
+                        tenant_id=registration.tenant_id,
+                        logical_session_id=registration.authority.logical_session_id,
+                        deployment_id=registration.deployment_id,
+                        graph_contract=registration.graph_contract,
+                        thread_id=next_namespace,
+                    ).storage_thread_id,
+                ),
             )
 
         replayed = await registry.publish(publication.model_copy(update={"fencing_generation": 2}))
@@ -1513,7 +2300,7 @@ async def test_restore_classifies_an_unauthentic_session_payload_without_exposin
 
 
 @pytest.mark.postgres
-async def test_restore_classifies_an_unsupported_payload_schema_separately() -> None:
+async def test_database_rejects_an_unsupported_payload_schema_before_restore() -> None:
     dsn = _dsn()
     async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
         await apply_platform_migrations(migration_connection)
@@ -1536,23 +2323,21 @@ async def test_restore_classifies_an_unsupported_payload_schema_separately() -> 
                 "SELECT set_config('agnostic_market.tenant_id', %s, false)",
                 (registration.tenant_id,),
             )
-            await connection.execute(
-                """
-                UPDATE platform_sessions
-                SET payload_schema_version = %s
-                WHERE tenant_id = %s AND logical_session_id = %s
-                """,
-                (
-                    SESSION_PAYLOAD_SCHEMA_VERSION + 1,
-                    registration.tenant_id,
-                    registration.authority.logical_session_id,
-                ),
-            )
+            with pytest.raises(CheckViolation):
+                await connection.execute(
+                    """
+                    UPDATE platform_sessions
+                    SET payload_schema_version = %s
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                    """,
+                    (
+                        SESSION_PAYLOAD_SCHEMA_VERSION + 1,
+                        registration.tenant_id,
+                        registration.authority.logical_session_id,
+                    ),
+                )
 
-        with pytest.raises(SessionRestoreError) as rejected:
-            await registry.restore(authority)
-
-    assert rejected.value.reason is SessionRestoreReason.PAYLOAD_SCHEMA_INVALID
+        assert (await registry.restore(authority)).payload == _empty_payload()
 
 
 @pytest.mark.postgres
@@ -1817,6 +2602,11 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
             schema_name=schema_name,
             role_name=role_name,
         )
+        cursor = await migration_connection.execute(
+            "SELECT rolconfig FROM pg_roles WHERE rolname = %s",
+            (role_name,),
+        )
+        assert await cursor.fetchone() == (None,)
 
     try:
         async with AsyncExitStack() as stack:
@@ -1856,14 +2646,21 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                 "SELECT tenant_id FROM platform_checkpoint_generations ORDER BY tenant_id"
             )
             assert await cursor.fetchall() == [("role_test_acme",)]
+            cursor = await application.execute(
+                "SELECT tenant_id FROM platform_checkpoint_write_manifests ORDER BY tenant_id"
+            )
+            assert await cursor.fetchall() == []
             with pytest.raises(InsufficientPrivilege):
                 await application.execute(
                     """
                     INSERT INTO platform_checkpoint_generations (
-                        tenant_id, logical_session_id, checkpoint_namespace, fencing_generation,
+                        tenant_id, logical_session_id, checkpoint_namespace, storage_thread_id,
+                        fencing_generation,
                         principal_generation, binding_version, state
                     ) VALUES (
-                        'role_test_demo', 'AD_role_test', 'foreign-generation', 2, 0, 1, 'pending'
+                        'role_test_demo', 'AD_role_test', 'foreign-generation',
+                        'cp_0000000000000000000000000000000000000000000000000000000000000000',
+                        2, 0, 1, 'pending'
                     )
                     """
                 )
@@ -1912,6 +2709,27 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                 """
             )
             assert await cursor.fetchone() == (True, True, True, False)
+            cursor = await application.execute(
+                """
+                SELECT
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_write_manifests', 'SELECT'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_write_manifests', 'INSERT'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_write_manifests', 'UPDATE'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_write_manifests', 'DELETE'
+                    ),
+                    has_table_privilege(
+                        current_user, 'platform_checkpoint_write_manifests', 'TRUNCATE'
+                    )
+                """
+            )
+            assert await cursor.fetchone() == (True, True, True, True, False)
             cursor = await application.execute(
                 """
                 SELECT

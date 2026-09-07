@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import LiteralString
+from enum import StrEnum
+from typing import LiteralString, assert_never
 
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import AsyncConnection, sql
+from psycopg.pq import TransactionStatus
 from pydantic import TypeAdapter
 
+from agnostic_market.checkpoints import CheckpointBinding
 from agnostic_market.dtos.session import AuthorityIdentifier
+from agnostic_market.durability.session_payload import (
+    SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+    SESSION_PAYLOAD_SCHEMA_VERSION,
+)
 
-PLATFORM_SESSION_SCHEMA_VERSION = 5
+PLATFORM_SESSION_SCHEMA_VERSION = 7
 _DATABASE_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
 
 _BOOTSTRAP_SQL: LiteralString = """
@@ -253,20 +261,209 @@ ALTER TABLE platform_sessions
         )
 """
 
+_CREATE_CHECKPOINT_WRITE_MANIFESTS_SQL: LiteralString = """
+CREATE TABLE platform_checkpoint_write_manifests (
+    tenant_id text NOT NULL,
+    logical_session_id text NOT NULL,
+    checkpoint_generation_namespace text NOT NULL,
+    langgraph_checkpoint_namespace text NOT NULL,
+    checkpoint_id text NOT NULL CHECK (checkpoint_id <> ''),
+    envelope_format text NOT NULL CHECK (envelope_format = 'aes_256_gcm_v1'),
+    envelope_key_version text NOT NULL
+        CHECK (envelope_key_version = btrim(envelope_key_version) AND envelope_key_version <> ''),
+    payload_schema_version integer NOT NULL CHECK (payload_schema_version = 1),
+    envelope_nonce bytea NOT NULL CHECK (octet_length(envelope_nonce) = 12),
+    encrypted_manifest bytea NOT NULL CHECK (octet_length(encrypted_manifest) >= 16),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (
+        tenant_id,
+        logical_session_id,
+        checkpoint_generation_namespace,
+        langgraph_checkpoint_namespace,
+        checkpoint_id
+    ),
+    FOREIGN KEY (tenant_id, logical_session_id, checkpoint_generation_namespace)
+        REFERENCES platform_checkpoint_generations (
+            tenant_id, logical_session_id, checkpoint_namespace
+        ) ON DELETE CASCADE
+)
+"""
+
+_CHECKPOINT_WRITE_MANIFESTS_RLS_SQL: LiteralString = """
+ALTER TABLE platform_checkpoint_write_manifests ENABLE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_WRITE_MANIFESTS_FORCE_RLS_SQL: LiteralString = """
+ALTER TABLE platform_checkpoint_write_manifests FORCE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_WRITE_MANIFESTS_POLICY_SQL: LiteralString = """
+CREATE POLICY platform_checkpoint_write_manifests_tenant_isolation
+    ON platform_checkpoint_write_manifests
+    USING (tenant_id = current_setting('agnostic_market.tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('agnostic_market.tenant_id', true))
+"""
+
+_ADD_CHECKPOINT_STORAGE_AUTHORITY_SQL: LiteralString = """
+ALTER TABLE platform_checkpoint_generations ADD COLUMN storage_thread_id text
+"""
+
+_CONSTRAIN_CHECKPOINT_STORAGE_AUTHORITY_SQL: LiteralString = """
+ALTER TABLE platform_checkpoint_generations
+    ALTER COLUMN storage_thread_id SET NOT NULL,
+    ADD CONSTRAINT platform_checkpoint_generations_storage_thread_format
+        CHECK (storage_thread_id ~ '^cp_[0-9a-f]{64}$'),
+    ADD CONSTRAINT platform_checkpoint_generations_storage_thread_unique
+        UNIQUE (storage_thread_id)
+"""
+
+_UNIQUE_OPERATION_REVISION_SQL: LiteralString = """
+ALTER TABLE platform_session_operations
+    ADD CONSTRAINT platform_session_operations_one_receipt_per_revision
+    UNIQUE (tenant_id, logical_session_id, committed_revision)
+"""
+
+_REQUIRE_CURRENT_SESSION_PAYLOAD_SCHEMA_SQL: LiteralString = """
+ALTER TABLE platform_sessions
+    ADD CONSTRAINT platform_sessions_current_payload_schema
+    CHECK (lifecycle = 'closed' OR payload_schema_version = 2)
+"""
+
+_REQUIRE_CURRENT_OPERATION_RESULT_SCHEMA_SQL: LiteralString = """
+ALTER TABLE platform_session_operations
+    ADD CONSTRAINT platform_session_operations_current_result_schema
+    CHECK (result_schema_version = 2)
+"""
+
+_CHECKPOINTS_RLS_SQL: LiteralString = """
+ALTER TABLE checkpoints ENABLE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINTS_FORCE_RLS_SQL: LiteralString = """
+ALTER TABLE checkpoints FORCE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINTS_POLICY_SQL: LiteralString = """
+CREATE POLICY checkpoints_tenant_isolation ON checkpoints
+    USING (
+        EXISTS (
+            SELECT 1 FROM platform_checkpoint_generations AS generation
+            WHERE generation.storage_thread_id = checkpoints.thread_id
+              AND generation.tenant_id = current_setting('agnostic_market.tenant_id', true)
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM platform_checkpoint_generations AS generation
+            WHERE generation.storage_thread_id = checkpoints.thread_id
+              AND generation.tenant_id = current_setting('agnostic_market.tenant_id', true)
+        )
+    )
+"""
+
+_CHECKPOINT_BLOBS_RLS_SQL: LiteralString = """
+ALTER TABLE checkpoint_blobs ENABLE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_BLOBS_FORCE_RLS_SQL: LiteralString = """
+ALTER TABLE checkpoint_blobs FORCE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_BLOBS_POLICY_SQL: LiteralString = """
+CREATE POLICY checkpoint_blobs_tenant_isolation ON checkpoint_blobs
+    USING (
+        EXISTS (
+            SELECT 1 FROM platform_checkpoint_generations AS generation
+            WHERE generation.storage_thread_id = checkpoint_blobs.thread_id
+              AND generation.tenant_id = current_setting('agnostic_market.tenant_id', true)
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM platform_checkpoint_generations AS generation
+            WHERE generation.storage_thread_id = checkpoint_blobs.thread_id
+              AND generation.tenant_id = current_setting('agnostic_market.tenant_id', true)
+        )
+    )
+"""
+
+_CHECKPOINT_WRITES_RLS_SQL: LiteralString = """
+ALTER TABLE checkpoint_writes ENABLE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_WRITES_FORCE_RLS_SQL: LiteralString = """
+ALTER TABLE checkpoint_writes FORCE ROW LEVEL SECURITY
+"""
+
+_CHECKPOINT_WRITES_POLICY_SQL: LiteralString = """
+CREATE POLICY checkpoint_writes_tenant_isolation ON checkpoint_writes
+    USING (
+        EXISTS (
+            SELECT 1 FROM platform_checkpoint_generations AS generation
+            WHERE generation.storage_thread_id = checkpoint_writes.thread_id
+              AND generation.tenant_id = current_setting('agnostic_market.tenant_id', true)
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM platform_checkpoint_generations AS generation
+            WHERE generation.storage_thread_id = checkpoint_writes.thread_id
+              AND generation.tenant_id = current_setting('agnostic_market.tenant_id', true)
+        )
+    )
+"""
+
+_CHECKPOINT_VENDOR_COLUMNS = {
+    "checkpoint_migrations": ("v",),
+    "checkpoints": (
+        "thread_id",
+        "checkpoint_ns",
+        "checkpoint_id",
+        "parent_checkpoint_id",
+        "type",
+        "checkpoint",
+        "metadata",
+    ),
+    "checkpoint_blobs": ("thread_id", "checkpoint_ns", "channel", "version", "type", "blob"),
+    "checkpoint_writes": (
+        "thread_id",
+        "checkpoint_ns",
+        "checkpoint_id",
+        "task_id",
+        "idx",
+        "channel",
+        "type",
+        "blob",
+        "task_path",
+    ),
+}
+_CHECKPOINT_VENDOR_MIGRATION_VERSION = 9
+
 
 class PlatformSchemaError(RuntimeError):
     """The installed platform schema is absent, divergent, or incompatible."""
+
+
+class PlatformDataMigration(StrEnum):
+    REQUIRE_CURRENT_ENCRYPTED_PAYLOADS = "require_current_encrypted_payloads"
+    CHECKPOINT_STORAGE_AUTHORITY_V1 = "checkpoint_storage_authority_v1"
+
+
+type PlatformMigrationStep = LiteralString | PlatformDataMigration
 
 
 @dataclass(frozen=True, slots=True)
 class PlatformMigration:
     version: int
     name: str
-    statements: tuple[LiteralString, ...]
+    steps: tuple[PlatformMigrationStep, ...]
 
     @property
     def checksum(self) -> str:
-        payload = "\n-- statement --\n".join(statement.strip() for statement in self.statements)
+        payload = "\n-- statement --\n".join(
+            f"data:{step.value}" if isinstance(step, PlatformDataMigration) else step.strip()
+            for step in self.steps
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -274,7 +471,7 @@ PLATFORM_MIGRATIONS = (
     PlatformMigration(
         version=1,
         name="platform_session_registry",
-        statements=(
+        steps=(
             _CREATE_SESSION_REGISTRY_SQL,
             _ENABLE_SESSION_RLS_SQL,
             _FORCE_SESSION_RLS_SQL,
@@ -284,17 +481,17 @@ PLATFORM_MIGRATIONS = (
     PlatformMigration(
         version=2,
         name="transport_room_authority",
-        statements=(_ADD_TRANSPORT_ROOM_ID_SQL,),
+        steps=(_ADD_TRANSPORT_ROOM_ID_SQL,),
     ),
     PlatformMigration(
         version=3,
         name="atomic_initial_session_lease",
-        statements=(_REQUIRE_OPEN_LEASE_SQL,),
+        steps=(_REQUIRE_OPEN_LEASE_SQL,),
     ),
     PlatformMigration(
         version=4,
         name="session_state_operation_receipts",
-        statements=(
+        steps=(
             _CREATE_SESSION_OPERATIONS_SQL,
             _ENABLE_SESSION_OPERATIONS_RLS_SQL,
             _FORCE_SESSION_OPERATIONS_RLS_SQL,
@@ -304,7 +501,7 @@ PLATFORM_MIGRATIONS = (
     PlatformMigration(
         version=5,
         name="checkpoint_generation_inventory",
-        statements=(
+        steps=(
             _CREATE_CHECKPOINT_GENERATIONS_SQL,
             _ALLOW_PRINCIPAL_CHECKPOINT_GENERATIONS_SQL,
             # The migration owner inventories every tenant inside the migration transaction.
@@ -316,6 +513,42 @@ PLATFORM_MIGRATIONS = (
             _CHECKPOINT_GENERATIONS_RLS_SQL,
             _CHECKPOINT_GENERATIONS_FORCE_RLS_SQL,
             _CHECKPOINT_GENERATIONS_POLICY_SQL,
+        ),
+    ),
+    PlatformMigration(
+        version=6,
+        name="checkpoint_pending_write_manifests",
+        steps=(
+            _CREATE_CHECKPOINT_WRITE_MANIFESTS_SQL,
+            _CHECKPOINT_WRITE_MANIFESTS_RLS_SQL,
+            _CHECKPOINT_WRITE_MANIFESTS_FORCE_RLS_SQL,
+            _CHECKPOINT_WRITE_MANIFESTS_POLICY_SQL,
+        ),
+    ),
+    PlatformMigration(
+        version=7,
+        name="checkpoint_storage_authority",
+        steps=(
+            _ADD_CHECKPOINT_STORAGE_AUTHORITY_SQL,
+            "ALTER TABLE platform_checkpoint_generations NO FORCE ROW LEVEL SECURITY",
+            "ALTER TABLE platform_sessions NO FORCE ROW LEVEL SECURITY",
+            PlatformDataMigration.REQUIRE_CURRENT_ENCRYPTED_PAYLOADS,
+            PlatformDataMigration.CHECKPOINT_STORAGE_AUTHORITY_V1,
+            "ALTER TABLE platform_sessions FORCE ROW LEVEL SECURITY",
+            "ALTER TABLE platform_checkpoint_generations FORCE ROW LEVEL SECURITY",
+            _CONSTRAIN_CHECKPOINT_STORAGE_AUTHORITY_SQL,
+            _UNIQUE_OPERATION_REVISION_SQL,
+            _REQUIRE_CURRENT_SESSION_PAYLOAD_SCHEMA_SQL,
+            _REQUIRE_CURRENT_OPERATION_RESULT_SCHEMA_SQL,
+            _CHECKPOINTS_RLS_SQL,
+            _CHECKPOINTS_FORCE_RLS_SQL,
+            _CHECKPOINTS_POLICY_SQL,
+            _CHECKPOINT_BLOBS_RLS_SQL,
+            _CHECKPOINT_BLOBS_FORCE_RLS_SQL,
+            _CHECKPOINT_BLOBS_POLICY_SQL,
+            _CHECKPOINT_WRITES_RLS_SQL,
+            _CHECKPOINT_WRITES_FORCE_RLS_SQL,
+            _CHECKPOINT_WRITES_POLICY_SQL,
         ),
     ),
 )
@@ -341,6 +574,87 @@ async def _read_installed_migrations(
     return {int(row[0]): (str(row[1]), str(row[2])) for row in await cursor.fetchall()}
 
 
+async def _backfill_checkpoint_storage_authority_v1(connection: AsyncConnection) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT generation.tenant_id, generation.logical_session_id,
+            generation.checkpoint_namespace, session_row.deployment_id,
+            session_row.graph_contract
+        FROM platform_checkpoint_generations AS generation
+        JOIN platform_sessions AS session_row
+          ON session_row.tenant_id = generation.tenant_id
+         AND session_row.logical_session_id = generation.logical_session_id
+        WHERE generation.storage_thread_id IS NULL
+        ORDER BY generation.tenant_id, generation.logical_session_id,
+            generation.checkpoint_namespace
+        """
+    )
+    rows = await cursor.fetchall()
+    for tenant_id, logical_session_id, checkpoint_namespace, deployment_id, graph_contract in rows:
+        binding = CheckpointBinding(
+            tenant_id=tenant_id,
+            logical_session_id=logical_session_id,
+            deployment_id=deployment_id,
+            graph_contract=graph_contract,
+            thread_id=checkpoint_namespace,
+        )
+        cursor = await connection.execute(
+            """
+            UPDATE platform_checkpoint_generations
+            SET storage_thread_id = %s
+            WHERE tenant_id = %s AND logical_session_id = %s
+              AND checkpoint_namespace = %s AND storage_thread_id IS NULL
+            """,
+            (
+                binding.storage_thread_id,
+                binding.tenant_id,
+                binding.logical_session_id,
+                binding.thread_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise PlatformSchemaError("checkpoint storage-authority backfill lost its target")
+
+
+async def _require_current_encrypted_payloads(connection: AsyncConnection) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT
+            EXISTS (
+                SELECT 1 FROM platform_sessions
+                WHERE lifecycle <> 'closed'
+                  AND payload_schema_version IS DISTINCT FROM %s
+            ),
+            EXISTS (
+                SELECT 1 FROM platform_session_operations
+                WHERE result_schema_version IS DISTINCT FROM %s
+            )
+        """,
+        (SESSION_PAYLOAD_SCHEMA_VERSION, SESSION_OPERATION_RESULT_SCHEMA_VERSION),
+    )
+    row = await cursor.fetchone()
+    if row is None or row[0] or row[1]:
+        raise PlatformSchemaError(
+            "platform migration cannot retain unsupported encrypted session payloads"
+        )
+
+
+async def _apply_migration_step(
+    connection: AsyncConnection,
+    step: PlatformMigrationStep,
+) -> None:
+    if not isinstance(step, PlatformDataMigration):
+        await connection.execute(sql.SQL(step))
+        return
+    match step:
+        case PlatformDataMigration.REQUIRE_CURRENT_ENCRYPTED_PAYLOADS:
+            await _require_current_encrypted_payloads(connection)
+        case PlatformDataMigration.CHECKPOINT_STORAGE_AUTHORITY_V1:
+            await _backfill_checkpoint_storage_authority_v1(connection)
+        case _ as unhandled:
+            assert_never(unhandled)
+
+
 def _validate_installed_migrations(installed: dict[int, tuple[str, str]]) -> None:
     installed_versions = tuple(installed)
     if installed_versions != tuple(range(1, len(installed_versions) + 1)):
@@ -360,6 +674,17 @@ def _validate_installed_migrations(installed: dict[int, tuple[str, str]]) -> Non
 
 async def apply_platform_migrations(connection: AsyncConnection) -> None:
     """Apply migrations through an explicit migration-owner connection."""
+    if connection.info.transaction_status is not TransactionStatus.IDLE:
+        raise PlatformSchemaError("platform migration connection must be idle")
+    restore_transaction_mode = not connection.autocommit
+    if restore_transaction_mode:
+        await connection.set_autocommit(True)
+    try:
+        await AsyncPostgresSaver(connection).setup()
+        await _require_checkpoint_vendor_schema(connection)
+    finally:
+        if restore_transaction_mode:
+            await connection.set_autocommit(False)
     async with connection.transaction():
         await connection.execute(_BOOTSTRAP_SQL)
         await connection.execute(
@@ -372,8 +697,8 @@ async def apply_platform_migrations(connection: AsyncConnection) -> None:
             applied = installed.get(migration.version)
             if applied is not None:
                 continue
-            for statement in migration.statements:
-                await connection.execute(sql.SQL(statement))
+            for step in migration.steps:
+                await _apply_migration_step(connection, step)
             await connection.execute(
                 """
                 INSERT INTO platform_schema_migrations (version, name, checksum)
@@ -381,6 +706,29 @@ async def apply_platform_migrations(connection: AsyncConnection) -> None:
                 """,
                 (migration.version, migration.name, migration.checksum),
             )
+
+
+async def _require_checkpoint_vendor_schema(connection: AsyncConnection) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = ANY(%s)
+        ORDER BY table_name, ordinal_position
+        """,
+        (list(_CHECKPOINT_VENDOR_COLUMNS),),
+    )
+    observed: dict[str, list[str]] = {}
+    for table_name, column_name in await cursor.fetchall():
+        observed.setdefault(str(table_name), []).append(str(column_name))
+    expected = {table: list(columns) for table, columns in _CHECKPOINT_VENDOR_COLUMNS.items()}
+    if observed != expected:
+        raise PlatformSchemaError("pinned checkpoint schema signature does not match the database")
+    cursor = await connection.execute("SELECT max(v) FROM checkpoint_migrations")
+    row = await cursor.fetchone()
+    if row is None or row[0] != _CHECKPOINT_VENDOR_MIGRATION_VERSION:
+        raise PlatformSchemaError("pinned checkpoint migration version does not match the database")
 
 
 async def read_platform_schema_version(connection: AsyncConnection) -> int:
@@ -425,22 +773,60 @@ async def grant_platform_application_role(
     sessions = sql.Identifier(schema_name, "platform_sessions")
     operations = sql.Identifier(schema_name, "platform_session_operations")
     generations = sql.Identifier(schema_name, "platform_checkpoint_generations")
+    write_manifests = sql.Identifier(schema_name, "platform_checkpoint_write_manifests")
     migrations = sql.Identifier(schema_name, "platform_schema_migrations")
+    checkpoints = sql.Identifier(schema_name, "checkpoints")
+    checkpoint_blobs = sql.Identifier(schema_name, "checkpoint_blobs")
+    checkpoint_writes = sql.Identifier(schema_name, "checkpoint_writes")
     async with connection.transaction():
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(sessions))
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(operations))
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(generations))
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(migrations))
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(sessions, role))
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(operations, role))
-        await connection.execute(
-            sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(generations, role)
+        cursor = await connection.execute(
+            "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = %s",
+            (role_name,),
         )
-        await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(migrations, role))
+        role_attributes = await cursor.fetchone()
+        if role_attributes is None:
+            raise PlatformSchemaError("platform application role does not exist")
+        if role_attributes[0] or role_attributes[1]:
+            raise PlatformSchemaError("platform application role bypasses row-level security")
+        cursor = await connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_class AS relation
+                JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                JOIN pg_roles AS owner_role ON owner_role.oid = relation.relowner
+                WHERE namespace.nspname = %s AND owner_role.rolname = %s
+            )
+            """,
+            (schema_name, role_name),
+        )
+        owns_relation = await cursor.fetchone()
+        if owns_relation is None or owns_relation[0]:
+            raise PlatformSchemaError("platform application role must not own runtime relations")
+        runtime_tables = (
+            sessions,
+            operations,
+            generations,
+            write_manifests,
+            checkpoints,
+            checkpoint_blobs,
+            checkpoint_writes,
+        )
+        for table in (*runtime_tables, migrations):
+            await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(table))
+            await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(table, role))
+        await connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC").format(schema))
+        await connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(schema, role))
         await connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema, role))
         await connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(migrations, role))
         await connection.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {} TO {}").format(generations, role)
+        )
+        await connection.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
+                write_manifests,
+                role,
+            )
         )
         await connection.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
@@ -451,6 +837,24 @@ async def grant_platform_application_role(
         await connection.execute(
             sql.SQL("GRANT SELECT, INSERT, DELETE ON TABLE {} TO {}").format(
                 operations,
+                role,
+            )
+        )
+        await connection.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
+                checkpoints,
+                role,
+            )
+        )
+        await connection.execute(
+            sql.SQL("GRANT SELECT, INSERT, DELETE ON TABLE {} TO {}").format(
+                checkpoint_blobs,
+                role,
+            )
+        )
+        await connection.execute(
+            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
+                checkpoint_writes,
                 role,
             )
         )

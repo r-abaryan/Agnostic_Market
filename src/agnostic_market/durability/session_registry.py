@@ -38,7 +38,6 @@ from agnostic_market.durability.session_payload import (
     SESSION_OPERATION_RESULT_SCHEMA_VERSION,
     SESSION_PAYLOAD_SCHEMA_VERSION,
     DurableSessionPayload,
-    PrincipalRetirementMarker,
     SessionOperationReceiptPayload,
     SessionOperationResult,
 )
@@ -112,6 +111,8 @@ class SessionRestoreReason(StrEnum):
     REVISION_MISMATCH = "revision_mismatch"
     CHECKPOINT_INVALID = "checkpoint_invalid"
     RECONSTRUCTION_FAILED = "reconstruction_failed"
+    REVISION_GAP_UNEXPLAINED = "revision_gap_unexplained"
+    PRINCIPAL_RETIREMENT_PENDING = "principal_retirement_pending"
 
 
 class SessionRestoreError(SessionRegistryError):
@@ -120,10 +121,42 @@ class SessionRestoreError(SessionRegistryError):
         super().__init__(f"session restore rejected: {reason.value}")
 
 
+class _SessionOperationDataError(SessionRegistryDataError):
+    def __init__(self, restore_reason: SessionRestoreReason, message: str) -> None:
+        self.restore_reason = restore_reason
+        super().__init__(message)
+
+
+class CheckpointRevisionDisposition(StrEnum):
+    SEED_REQUIRED = "seed_required"
+    CURRENT = "current"
+    SESSION_AHEAD = "session_ahead"
+
+
+def classify_checkpoint_revision(
+    checkpoint_revision: object,
+    session_revision: int,
+) -> CheckpointRevisionDisposition:
+    if (
+        isinstance(checkpoint_revision, bool)
+        or not isinstance(checkpoint_revision, int)
+        or checkpoint_revision < 0
+    ):
+        raise SessionRestoreError(SessionRestoreReason.CHECKPOINT_INVALID)
+    if session_revision < 0:
+        raise ValueError("session revision must not be negative")
+    if checkpoint_revision > session_revision:
+        raise SessionRestoreError(SessionRestoreReason.REVISION_MISMATCH)
+    if checkpoint_revision < session_revision:
+        return CheckpointRevisionDisposition.SESSION_AHEAD
+    return CheckpointRevisionDisposition.CURRENT
+
+
 class SessionStateWriteReason(StrEnum):
     STALE_REVISION = "stale_revision"
     OPERATION_CONFLICT = "operation_conflict"
     ROTATION_PENDING = "rotation_pending"
+    RETIREMENT_MARKER_MISSING = "retirement_marker_missing"
     STALE_PRINCIPAL = "stale_principal"
     ROTATION_NOT_FOUND = "rotation_not_found"
 
@@ -254,6 +287,7 @@ class CheckpointGeneration(BaseModel):
     deployment_id: AuthorityIdentifier
     graph_contract: AuthorityIdentifier
     checkpoint_namespace: AuthorityIdentifier
+    storage_thread_id: AuthorityIdentifier
     fencing_generation: int = Field(ge=0)
     principal_generation: int = Field(ge=0)
     binding_version: Literal[1]
@@ -261,10 +295,17 @@ class CheckpointGeneration(BaseModel):
     transition_id: AuthorityIdentifier | None
     source_revision: int | None = Field(ge=0)
 
+    @model_validator(mode="after")
+    def storage_authority_matches_binding(self) -> Self:
+        if self.storage_thread_id != self.binding.storage_thread_id:
+            raise ValueError("checkpoint storage authority does not match its binding")
+        return self
+
     @property
     def binding(self) -> CheckpointBinding:
         return CheckpointBinding(
             tenant_id=self.tenant_id,
+            logical_session_id=self.logical_session_id,
             deployment_id=self.deployment_id,
             graph_contract=self.graph_contract,
             thread_id=self.checkpoint_namespace,
@@ -328,8 +369,59 @@ class RestoredSessionState(BaseModel):
         return self
 
 
+class SessionOperationEvidence(BaseModel):
+    model_config = _STRICT
+
+    operation_id: AuthorityIdentifier
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    committed_revision: int = Field(ge=1)
+    committed_checkpoint_namespace: AuthorityIdentifier
+    result: SessionOperationResult
+
+
+class CheckpointRevisionReconciliation(BaseModel):
+    model_config = _STRICT
+
+    record: SessionRegistryRecord
+    payload: DurableSessionPayload
+    checkpoint_revision: int | None = Field(default=None, ge=0)
+    disposition: CheckpointRevisionDisposition
+    operations: tuple[SessionOperationEvidence, ...] = ()
+
+    @model_validator(mode="after")
+    def evidence_is_complete(self) -> Self:
+        if self.disposition is CheckpointRevisionDisposition.SEED_REQUIRED:
+            if (
+                self.record.lifecycle is not SessionLifecycle.OPENING
+                or self.record.session_revision != 0
+                or self.checkpoint_revision is not None
+                or self.operations
+            ):
+                raise ValueError("checkpoint seed evidence is inconsistent")
+            return self
+        if self.checkpoint_revision is None:
+            raise ValueError("restored checkpoint evidence requires a revision")
+        if self.disposition is CheckpointRevisionDisposition.CURRENT:
+            if self.checkpoint_revision != self.record.session_revision or self.operations:
+                raise ValueError("current checkpoint evidence is inconsistent")
+            return self
+        expected = tuple(range(self.checkpoint_revision + 1, self.record.session_revision + 1))
+        if tuple(item.committed_revision for item in self.operations) != expected or any(
+            item.committed_checkpoint_namespace != self.record.checkpoint_namespace
+            for item in self.operations
+        ):
+            raise ValueError("session-ahead checkpoint evidence is not contiguous")
+        return self
+
+
 @runtime_checkable
 class SessionRegistryPort(Protocol):
+    async def reconcile_checkpoint_revision(
+        self,
+        authority: SessionLeaseAuthority,
+        checkpoint_revision: object | None,
+    ) -> CheckpointRevisionReconciliation: ...
+
     async def begin_checkpoint_rotation(
         self,
         authority: SessionLeaseAuthority,
@@ -493,6 +585,10 @@ def _envelope_context(
     *,
     checkpoint_namespace: str | None = None,
     payload_schema_version: int = SESSION_PAYLOAD_SCHEMA_VERSION,
+    session_revision: int | None = None,
+    payload_purpose: Literal["session_projection", "operation_result"] = "session_projection",
+    operation_id: str | None = None,
+    request_fingerprint: str | None = None,
 ) -> SessionEnvelopeContext:
     return SessionEnvelopeContext(
         tenant_id=record.tenant_id,
@@ -503,6 +599,10 @@ def _envelope_context(
             else _AUTHORITY_IDENTIFIER.validate_python(checkpoint_namespace)
         ),
         payload_schema_version=payload_schema_version,
+        payload_purpose=payload_purpose,
+        session_revision=record.session_revision if session_revision is None else session_revision,
+        operation_id=operation_id,
+        request_fingerprint=request_fingerprint,
     )
 
 
@@ -524,13 +624,28 @@ def _operation_result_from_row(
                 "ciphertext": row["encrypted_result"],
             }
         )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _SessionOperationDataError(
+            SessionRestoreReason.PAYLOAD_SCHEMA_INVALID,
+            "stored session operation envelope is invalid",
+        ) from exc
+    if envelope.payload_schema_version != SESSION_OPERATION_RESULT_SCHEMA_VERSION:
+        raise _SessionOperationDataError(
+            SessionRestoreReason.PAYLOAD_SCHEMA_INVALID,
+            "stored session operation result has an unsupported schema",
+        )
+    try:
         committed_checkpoint_namespace = _AUTHORITY_IDENTIFIER.validate_python(
             row["committed_checkpoint_namespace"]
         )
+        committed_revision = row["committed_revision"]
+        if type(committed_revision) is not int or committed_revision <= 0:
+            raise TypeError("session operation result has an invalid revision")
     except (KeyError, TypeError, ValueError) as exc:
-        raise SessionRegistryDataError("stored session operation result is invalid") from exc
-    if envelope.payload_schema_version != SESSION_OPERATION_RESULT_SCHEMA_VERSION:
-        raise SessionRegistryDataError("stored session operation result has an unsupported schema")
+        raise _SessionOperationDataError(
+            SessionRestoreReason.RECONSTRUCTION_FAILED,
+            "stored session operation authority is invalid",
+        ) from exc
     try:
         plaintext = cipher.decrypt(
             envelope,
@@ -538,14 +653,63 @@ def _operation_result_from_row(
                 record,
                 checkpoint_namespace=committed_checkpoint_namespace,
                 payload_schema_version=SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+                session_revision=committed_revision,
+                payload_purpose="operation_result",
+                operation_id=operation_id,
+                request_fingerprint=request_fingerprint,
             ),
         )
+    except SessionEnvelopeError as exc:
+        raise _SessionOperationDataError(
+            SessionRestoreReason.DECRYPTION_FAILED,
+            "stored session operation result could not be authenticated",
+        ) from exc
+    try:
         receipt = SessionOperationReceiptPayload.from_bytes(plaintext)
-    except (SessionEnvelopeError, TypeError, ValueError) as exc:
-        raise SessionRegistryDataError("stored session operation result is invalid") from exc
+    except (TypeError, ValueError) as exc:
+        raise _SessionOperationDataError(
+            SessionRestoreReason.PAYLOAD_SCHEMA_INVALID,
+            "stored session operation payload is invalid",
+        ) from exc
     if receipt.operation_id != operation_id or receipt.request_fingerprint != request_fingerprint:
-        raise SessionRegistryDataError("stored session operation result has invalid authority")
+        raise _SessionOperationDataError(
+            SessionRestoreReason.RECONSTRUCTION_FAILED,
+            "stored session operation result has invalid authority",
+        )
     return receipt.result
+
+
+def _operation_evidence_from_row(
+    cipher: AesGcmSessionCipher,
+    record: SessionRegistryRecord,
+    row: Mapping[str, object],
+) -> SessionOperationEvidence:
+    try:
+        operation_id = _AUTHORITY_IDENTIFIER.validate_python(row["operation_id"])
+        request_fingerprint = row["request_fingerprint"]
+        committed_revision = row["committed_revision"]
+        if not isinstance(request_fingerprint, str) or not isinstance(committed_revision, int):
+            raise TypeError("session operation evidence has invalid scalar fields")
+        committed_checkpoint_namespace = _AUTHORITY_IDENTIFIER.validate_python(
+            row["committed_checkpoint_namespace"]
+        )
+        return SessionOperationEvidence(
+            operation_id=operation_id,
+            request_fingerprint=request_fingerprint,
+            committed_revision=committed_revision,
+            committed_checkpoint_namespace=committed_checkpoint_namespace,
+            result=_operation_result_from_row(
+                cipher,
+                record,
+                row,
+                operation_id=operation_id,
+                request_fingerprint=request_fingerprint,
+            ),
+        )
+    except _SessionOperationDataError as exc:
+        raise SessionRestoreError(exc.restore_reason) from exc
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED) from exc
 
 
 class PostgresSessionRegistry(SessionRegistryPort):
@@ -590,6 +754,8 @@ class PostgresSessionRegistry(SessionRegistryPort):
                         logical_session_id=registration.authority.logical_session_id,
                         checkpoint_namespace=checkpoint_namespace,
                         payload_schema_version=SESSION_PAYLOAD_SCHEMA_VERSION,
+                        payload_purpose="session_projection",
+                        session_revision=registration.session_revision,
                     ),
                 )
                 async with (
@@ -667,13 +833,21 @@ class PostgresSessionRegistry(SessionRegistryPort):
                             """
                             INSERT INTO platform_checkpoint_generations (
                                 tenant_id, logical_session_id, checkpoint_namespace,
+                                storage_thread_id,
                                 fencing_generation, principal_generation, binding_version, state
-                            ) VALUES (%s, %s, %s, %s, %s, 1, 'current')
+                            ) VALUES (%s, %s, %s, %s, %s, %s, 1, 'current')
                             """,
                             (
                                 registration.tenant_id,
                                 registration.authority.logical_session_id,
                                 checkpoint_namespace,
+                                CheckpointBinding(
+                                    tenant_id=registration.tenant_id,
+                                    logical_session_id=registration.authority.logical_session_id,
+                                    deployment_id=registration.deployment_id,
+                                    graph_contract=registration.graph_contract,
+                                    thread_id=checkpoint_namespace,
+                                ).storage_thread_id,
                                 fencing_generation,
                                 registration.principal_generation,
                             ),
@@ -751,7 +925,8 @@ class PostgresSessionRegistry(SessionRegistryPort):
         async with connection.cursor(row_factory=dict_row) as cursor:
             await cursor.execute(
                 """
-                SELECT checkpoint_namespace, fencing_generation, principal_generation,
+                SELECT checkpoint_namespace, storage_thread_id, fencing_generation,
+                    principal_generation,
                     binding_version, state, transition_id, source_revision
                 FROM platform_checkpoint_generations
                 WHERE tenant_id = %s AND logical_session_id = %s
@@ -843,7 +1018,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 source.state != "current"
                                 or payload.principal_retirement is None
                                 or payload.principal_retirement.transition_id != transition_id
-                                or record.session_revision != expected_revision + 1
+                                or record.session_revision != expected_revision
                             ):
                                 raise SessionRegistryDataError(
                                     "rotation allocation has inconsistent state"
@@ -853,11 +1028,14 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 "rotation allocation has an invalid lifecycle"
                             )
                         return prior
-                    if (
-                        any(g.state == "pending" for g in generations)
-                        or payload.principal_retirement
-                    ):
+                    if any(g.state == "pending" for g in generations):
                         raise SessionStateWriteError(SessionStateWriteReason.ROTATION_PENDING)
+                    if payload.principal_retirement is None:
+                        raise SessionStateWriteError(
+                            SessionStateWriteReason.RETIREMENT_MARKER_MISSING
+                        )
+                    if payload.principal_retirement.transition_id != transition_id:
+                        raise SessionStateWriteError(SessionStateWriteReason.OPERATION_CONFLICT)
                     if record.session_revision != expected_revision:
                         raise SessionStateWriteError(SessionStateWriteReason.STALE_REVISION)
                     if record.principal_generation != expected_principal_generation:
@@ -873,6 +1051,15 @@ class PostgresSessionRegistry(SessionRegistryPort):
                         checkpoint_namespace=(
                             f"{namespace_prefix}::principal::{record.principal_generation + 1}"
                         ),
+                        storage_thread_id=CheckpointBinding(
+                            tenant_id=record.tenant_id,
+                            logical_session_id=record.authority.logical_session_id,
+                            deployment_id=record.deployment_id,
+                            graph_contract=record.graph_contract,
+                            thread_id=(
+                                f"{namespace_prefix}::principal::{record.principal_generation + 1}"
+                            ),
+                        ).storage_thread_id,
                         fencing_generation=record.fencing_generation,
                         principal_generation=record.principal_generation + 1,
                         binding_version=1,
@@ -880,61 +1067,25 @@ class PostgresSessionRegistry(SessionRegistryPort):
                         transition_id=transition_id,
                         source_revision=expected_revision,
                     )
-                    retired_payload = DurableSessionPayload(
-                        principal_retirement=PrincipalRetirementMarker(transition_id=transition_id)
-                    )
-                    envelope = self._cipher.encrypt(
-                        retired_payload.to_bytes(), _envelope_context(record)
-                    )
                     await connection.execute(
                         """
                         INSERT INTO platform_checkpoint_generations (
-                            tenant_id, logical_session_id, checkpoint_namespace,
+                            tenant_id, logical_session_id, checkpoint_namespace, storage_thread_id,
                             fencing_generation, principal_generation, binding_version,
                             state, transition_id, source_revision
-                        ) VALUES (%s, %s, %s, %s, %s, 1, 'pending', %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, 1, 'pending', %s, %s)
                         """,
                         (
                             record.tenant_id,
                             record.authority.logical_session_id,
                             destination.checkpoint_namespace,
+                            destination.storage_thread_id,
                             destination.fencing_generation,
                             destination.principal_generation,
                             transition_id,
                             expected_revision,
                         ),
                     )
-                    cursor = await connection.execute(
-                        """
-                        WITH authority_time AS (SELECT clock_timestamp() AS now)
-                        UPDATE platform_sessions
-                        SET session_revision = session_revision + 1,
-                            envelope_format = %s, envelope_key_version = %s,
-                            payload_schema_version = %s, envelope_nonce = %s,
-                            encrypted_payload = %s, updated_at = authority_time.now
-                        FROM authority_time
-                        WHERE tenant_id = %s AND logical_session_id = %s
-                            AND lease_expires_at > authority_time.now
-                            AND expires_at > authority_time.now
-                        RETURNING tenant_id
-                        """,
-                        (
-                            envelope.format,
-                            envelope.key_version,
-                            envelope.payload_schema_version,
-                            envelope.nonce,
-                            envelope.ciphertext,
-                            record.tenant_id,
-                            record.authority.logical_session_id,
-                        ),
-                    )
-                    if await cursor.fetchone() is None:
-                        database_now = await _database_now(connection)
-                        raise LeaseAdmissionError(
-                            LeaseAdmissionReason.SESSION_EXPIRED
-                            if record.expires_at <= database_now
-                            else LeaseAdmissionReason.LEASE_EXPIRED
-                        )
                     return destination
         except PsycopgError as exc:
             raise SessionRegistryError("checkpoint rotation allocation failed") from exc
@@ -961,7 +1112,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                     if destination.state != "pending":
                         if (
                             source.state not in {"retired", "deleted"}
-                            or record.session_revision < destination.source_revision + 2
+                            or record.session_revision < destination.source_revision
                         ):
                             raise SessionRegistryDataError(
                                 "completed checkpoint rotation is inconsistent"
@@ -972,19 +1123,19 @@ class PostgresSessionRegistry(SessionRegistryPort):
                         or source.state != "current"
                         or record.checkpoint_namespace != source.checkpoint_namespace
                         or record.principal_generation != source.principal_generation
-                        or record.session_revision != destination.source_revision + 1
+                        or record.session_revision != destination.source_revision
                         or payload.principal_retirement is None
                         or payload.principal_retirement.transition_id != transition_id
                     ):
                         raise SessionRegistryDataError(
                             "pending checkpoint rotation is inconsistent"
                         )
-                    switched_payload = DurableSessionPayload()
                     envelope = self._cipher.encrypt(
-                        switched_payload.to_bytes(),
+                        payload.to_bytes(),
                         _envelope_context(
                             record,
                             checkpoint_namespace=destination.checkpoint_namespace,
+                            session_revision=record.session_revision,
                         ),
                     )
                     async with connection.cursor(row_factory=dict_row) as cursor:
@@ -1026,7 +1177,6 @@ class PostgresSessionRegistry(SessionRegistryPort):
                             UPDATE platform_sessions
                             SET checkpoint_namespace = %s,
                                 principal_generation = %s,
-                                session_revision = session_revision + 1,
                                 envelope_format = %s,
                                 envelope_key_version = %s,
                                 payload_schema_version = %s,
@@ -1059,7 +1209,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                                 record.authority.logical_session_id,
                                 source.checkpoint_namespace,
                                 source.principal_generation,
-                                destination.source_revision + 1,
+                                destination.source_revision,
                                 authority.lease_owner_id,
                                 authority.fencing_generation,
                             ),
@@ -1079,7 +1229,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                     if (
                         switched.checkpoint_namespace != destination.checkpoint_namespace
                         or switched.principal_generation != destination.principal_generation
-                        or switched.session_revision != destination.source_revision + 2
+                        or switched.session_revision != destination.source_revision
                     ):
                         raise SessionRegistryDataError(
                             "checkpoint rotation returned an inconsistent session"
@@ -1268,6 +1418,97 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except (TypeError, ValueError) as exc:
             raise SessionRestoreError(SessionRestoreReason.PAYLOAD_SCHEMA_INVALID) from exc
 
+    async def reconcile_checkpoint_revision(
+        self,
+        authority: SessionLeaseAuthority,
+        checkpoint_revision: object | None,
+    ) -> CheckpointRevisionReconciliation:
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_record(connection, authority)
+                    payload = self._restore_payload(record)
+                    if payload.principal_retirement is not None:
+                        raise SessionRestoreError(SessionRestoreReason.PRINCIPAL_RETIREMENT_PENDING)
+                    if checkpoint_revision is None:
+                        if (
+                            record.lifecycle is not SessionLifecycle.OPENING
+                            or record.session_revision != 0
+                        ):
+                            raise SessionRestoreError(SessionRestoreReason.CHECKPOINT_INVALID)
+                        return CheckpointRevisionReconciliation(
+                            record=record,
+                            payload=payload,
+                            checkpoint_revision=None,
+                            disposition=CheckpointRevisionDisposition.SEED_REQUIRED,
+                        )
+                    disposition = classify_checkpoint_revision(
+                        checkpoint_revision,
+                        record.session_revision,
+                    )
+                    assert isinstance(checkpoint_revision, int) and not isinstance(
+                        checkpoint_revision, bool
+                    )
+                    if disposition is CheckpointRevisionDisposition.CURRENT:
+                        return CheckpointRevisionReconciliation(
+                            record=record,
+                            payload=payload,
+                            checkpoint_revision=checkpoint_revision,
+                            disposition=disposition,
+                        )
+                    async with connection.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute(
+                            """
+                            SELECT operation_id, request_fingerprint, committed_revision,
+                                committed_checkpoint_namespace, result_envelope_format,
+                                result_envelope_key_version, result_schema_version,
+                                result_envelope_nonce, encrypted_result
+                            FROM platform_session_operations
+                            WHERE tenant_id = %s AND logical_session_id = %s
+                              AND committed_revision > %s AND committed_revision <= %s
+                            ORDER BY committed_revision
+                            """,
+                            (
+                                record.tenant_id,
+                                record.authority.logical_session_id,
+                                checkpoint_revision,
+                                record.session_revision,
+                            ),
+                        )
+                        operations = tuple(
+                            _operation_evidence_from_row(self._cipher, record, row)
+                            for row in await cursor.fetchall()
+                        )
+                    expected_revisions = tuple(
+                        range(checkpoint_revision + 1, record.session_revision + 1)
+                    )
+                    if tuple(
+                        item.committed_revision for item in operations
+                    ) != expected_revisions or any(
+                        item.committed_checkpoint_namespace != record.checkpoint_namespace
+                        for item in operations
+                    ):
+                        raise SessionRestoreError(SessionRestoreReason.REVISION_GAP_UNEXPLAINED)
+                    return CheckpointRevisionReconciliation(
+                        record=record,
+                        payload=payload,
+                        checkpoint_revision=checkpoint_revision,
+                        disposition=disposition,
+                        operations=operations,
+                    )
+        except (
+            LeaseAdmissionError,
+            SessionRegistryDataError,
+            SessionRestoreError,
+        ):
+            raise
+        except TimeoutError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise SessionRegistryDataError("checkpoint revision reconciliation is invalid") from exc
+        except PsycopgError as exc:
+            raise SessionRegistryError("checkpoint revision reconciliation failed") from exc
+
     async def restore(self, authority: SessionLeaseAuthority) -> RestoredSessionState:
         try:
             async with asyncio.timeout(self._operation_timeout_seconds):
@@ -1360,7 +1601,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
                         next_revision = record.session_revision + 1
                         envelope = self._cipher.encrypt(
                             publication.payload.to_bytes(),
-                            _envelope_context(record),
+                            _envelope_context(record, session_revision=next_revision),
                         )
                         operation_result = SessionOperationReceiptPayload(
                             operation_id=publication.operation_id,
@@ -1372,6 +1613,10 @@ class PostgresSessionRegistry(SessionRegistryPort):
                             _envelope_context(
                                 record,
                                 payload_schema_version=SESSION_OPERATION_RESULT_SCHEMA_VERSION,
+                                session_revision=next_revision,
+                                payload_purpose="operation_result",
+                                operation_id=publication.operation_id,
+                                request_fingerprint=publication.request_fingerprint,
                             ),
                         )
                         query = sql.SQL(

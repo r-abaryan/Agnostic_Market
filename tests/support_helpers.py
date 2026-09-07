@@ -154,6 +154,7 @@ def build_support_engine(
     engine = ReasoningEngine(
         assembly.graph,
         tenant_id="acme_store",
+        logical_session_id=thread_id,
         deployment_id="test-deployment",
         thread_id=thread_id,
         checkpoint_io_timeout_seconds=2.0,

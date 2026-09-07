@@ -157,6 +157,7 @@ def _reasoning_engine(graph) -> ReasoningEngine:
     return ReasoningEngine(
         graph,
         tenant_id="acme_store",
+        logical_session_id="t1",
         deployment_id="test-deployment",
         thread_id="t1",
         checkpoint_io_timeout_seconds=2.0,

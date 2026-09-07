@@ -7,11 +7,11 @@ import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, Self
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from agnostic_market.dtos.platform import ConfigIdentifier
 from agnostic_market.dtos.session import AuthorityIdentifier
@@ -27,13 +27,53 @@ class SessionEnvelopeError(RuntimeError):
     """A session envelope cannot be safely opened."""
 
 
-class SessionEnvelopeContext(BaseModel):
+class _EnvelopeContext(BaseModel):
     model_config = _STRICT
 
     tenant_id: AuthorityIdentifier
     logical_session_id: AuthorityIdentifier
     checkpoint_namespace: AuthorityIdentifier
     payload_schema_version: int = Field(ge=1)
+
+
+type SessionPayloadPurpose = Literal["session_projection", "operation_result"]
+
+
+class SessionEnvelopeContext(_EnvelopeContext):
+    payload_purpose: SessionPayloadPurpose
+    session_revision: int = Field(ge=0)
+    operation_id: AuthorityIdentifier | None = None
+    request_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_purpose(self) -> Self:
+        has_operation_authority = (
+            self.operation_id is not None and self.request_fingerprint is not None
+        )
+        if self.payload_purpose == "operation_result" and not has_operation_authority:
+            raise ValueError("operation-result context requires operation authority")
+        if self.payload_purpose == "session_projection" and (
+            self.operation_id is not None or self.request_fingerprint is not None
+        ):
+            raise ValueError("session-projection context cannot carry operation authority")
+        return self
+
+
+type CheckpointPayloadSurface = Literal[
+    "checkpoint",
+    "metadata",
+    "channel_value",
+    "pending_write",
+    "pending_write_manifest",
+]
+
+
+class CheckpointEnvelopeContext(_EnvelopeContext):
+    deployment_id: AuthorityIdentifier
+    graph_contract: AuthorityIdentifier
+    langgraph_checkpoint_namespace: str
+    payload_surface: CheckpointPayloadSurface
+    payload_reference: str = Field(min_length=1, max_length=512)
 
 
 class SessionEnvelope(BaseModel):
@@ -47,19 +87,20 @@ class SessionEnvelope(BaseModel):
 
 
 def _associated_data(
-    context: SessionEnvelopeContext,
+    context: _EnvelopeContext,
     key_version: str,
     payload_schema_version: int,
 ) -> bytes:
-    return json.dumps(
+    values = context.model_dump(mode="json")
+    values.update(
         {
-            "checkpoint_namespace": context.checkpoint_namespace,
             "envelope_format": _ENVELOPE_FORMAT,
             "key_version": key_version,
-            "logical_session_id": context.logical_session_id,
             "payload_schema_version": payload_schema_version,
-            "tenant_id": context.tenant_id,
-        },
+        }
+    )
+    return json.dumps(
+        values,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -87,7 +128,7 @@ class AesGcmSessionCipher:
     def encrypt(
         self,
         plaintext: bytes,
-        context: SessionEnvelopeContext,
+        context: _EnvelopeContext,
     ) -> SessionEnvelope:
         if not isinstance(plaintext, bytes) or not plaintext:
             raise ValueError("session plaintext must be non-empty bytes")
@@ -113,7 +154,7 @@ class AesGcmSessionCipher:
     def decrypt(
         self,
         envelope: SessionEnvelope,
-        context: SessionEnvelopeContext,
+        context: _EnvelopeContext,
     ) -> bytes:
         key = self.keys.get(envelope.key_version)
         if key is None:

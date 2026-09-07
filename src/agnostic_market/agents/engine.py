@@ -369,6 +369,7 @@ class ReasoningEngine:
         graph: CompiledStateGraph,
         *,
         tenant_id: str,
+        logical_session_id: str,
         deployment_id: str,
         thread_id: str,
         checkpoint_io_timeout_seconds: float,
@@ -386,6 +387,7 @@ class ReasoningEngine:
             raise ValueError("ReasoningEngine requires a schema-validating checkpointer")
         binding = CheckpointBinding(
             tenant_id=tenant_id,
+            logical_session_id=logical_session_id,
             deployment_id=deployment_id,
             graph_contract=graph_contract_fingerprint(graph),
             thread_id=thread_id,

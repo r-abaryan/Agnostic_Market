@@ -467,6 +467,7 @@ async def build_application_session(
     engine = ReasoningEngine(
         assembly.graph,
         tenant_id=tenant.tenant_id,
+        logical_session_id=state.session_id,
         deployment_id=deployment_id,
         thread_id=state.thread_id,
         checkpoint_io_timeout_seconds=settings.checkpoint_io_timeout_seconds,

@@ -13,6 +13,11 @@ from agnostic_market.durability.migrations import (
     PLATFORM_MIGRATIONS,
     PLATFORM_SESSION_SCHEMA_VERSION,
 )
+from agnostic_market.durability.session_payload import (
+    SESSION_PAYLOAD_SCHEMA_VERSION,
+    DurableSessionPayload,
+    SessionOperationReceiptPayload,
+)
 from agnostic_market.durability.session_registry import (
     LeaseAdmissionError,
     LeaseAdmissionReason,
@@ -44,7 +49,9 @@ def _envelope():
         tenant_id="acme_store",
         logical_session_id="AD_session",
         checkpoint_namespace="cp_generation_0",
-        payload_schema_version=1,
+        payload_schema_version=SESSION_PAYLOAD_SCHEMA_VERSION,
+        payload_purpose="session_projection",
+        session_revision=0,
     )
     return AesGcmSessionCipher(active_key_version="key-v1", keys={"key-v1": _KEY}).encrypt(
         b'{"cart":[]}',
@@ -57,6 +64,12 @@ def test_platform_migration_inventory_is_contiguous_and_complete() -> None:
         range(1, PLATFORM_SESSION_SCHEMA_VERSION + 1)
     )
     assert all(len(migration.checksum) == 64 for migration in PLATFORM_MIGRATIONS)
+
+
+@pytest.mark.parametrize("payload_type", [DurableSessionPayload, SessionOperationReceiptPayload])
+def test_current_session_payload_models_reject_version_1(payload_type: type) -> None:
+    with pytest.raises(ValidationError, match="schema_version"):
+        payload_type.model_validate({"schema_version": 1})
 
 
 def test_transport_authority_requires_a_room_identity() -> None:
