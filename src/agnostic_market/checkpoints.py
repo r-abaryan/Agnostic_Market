@@ -29,11 +29,13 @@ from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
+    get_serializable_checkpoint_metadata,
 )
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.serde.types import SCHEDULED
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import TypeAdapter
 
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
@@ -43,6 +45,7 @@ from agnostic_market.dtos.orchestration import (
     RouterNoActionEnvelope,
 )
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
+from agnostic_market.dtos.session import AuthorityIdentifier
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
     CartClarification,
@@ -63,9 +66,15 @@ from agnostic_market.dtos.state import (
     SupportClarification,
     validate_reasoning_state_keys,
 )
+from agnostic_market.durability.checkpoint_encryption import (
+    CheckpointCipherScope,
+    EncryptedCheckpointCodec,
+)
+from agnostic_market.durability.encryption import AesGcmSessionCipher
 
 CHECKPOINT_EXECUTION_CONTRACT_VERSION = "1"
 _STORAGE_THREAD_RE = re.compile(r"cp_[0-9a-f]{64}\Z")
+_AUTHORITY_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
 _LANGGRAPH_PENDING_WRITE_CHANNELS = frozenset(
     {
         INPUT,
@@ -159,11 +168,34 @@ class CheckpointBinding:
     deployment_id: str
     graph_contract: str
     thread_id: str
+    logical_session_id: str | None = None
 
     def __post_init__(self) -> None:
-        values = (self.tenant_id, self.deployment_id, self.graph_contract, self.thread_id)
-        if any(not value.strip() for value in values):
-            raise ValueError("checkpoint binding values must be non-empty")
+        values = {
+            "tenant_id": self.tenant_id,
+            "deployment_id": self.deployment_id,
+            "graph_contract": self.graph_contract,
+            "thread_id": self.thread_id,
+        }
+        if self.logical_session_id is not None:
+            values["logical_session_id"] = self.logical_session_id
+        for name, value in values.items():
+            try:
+                _AUTHORITY_IDENTIFIER.validate_python(value, strict=True)
+            except ValueError as exc:
+                raise ValueError(f"checkpoint binding has an invalid {name}") from exc
+
+    def encryption_scope(self, langgraph_checkpoint_namespace: str) -> CheckpointCipherScope:
+        if self.logical_session_id is None:
+            raise ValueError("encrypted checkpoints require an explicit logical session id")
+        return CheckpointCipherScope(
+            tenant_id=self.tenant_id,
+            logical_session_id=self.logical_session_id,
+            checkpoint_generation_namespace=self.thread_id,
+            langgraph_checkpoint_namespace=langgraph_checkpoint_namespace,
+            deployment_id=self.deployment_id,
+            graph_contract=self.graph_contract,
+        )
 
     @property
     def namespace(self) -> str:
@@ -201,6 +233,7 @@ class CheckpointBinding:
             deployment_id=self.deployment_id,
             graph_contract=self.graph_contract,
             thread_id=thread_id,
+            logical_session_id=self.logical_session_id,
         )
 
 
@@ -212,13 +245,17 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         backend: BaseCheckpointSaver,
         *,
         synchronous_operations: bool = True,
+        cipher: AesGcmSessionCipher | None = None,
     ) -> None:
         super().__init__(serde=backend.serde)
         self._backend = backend
         self._synchronous_operations = synchronous_operations
+        self._checkpoint_codec = (
+            EncryptedCheckpointCodec(self.serde, cipher) if cipher is not None else None
+        )
         self._allowed_checkpoint_channels: frozenset[str] | None = None
         self._graph_contract: str | None = None
-        self._authorized_thread_ids: set[str] = set()
+        self._bindings: dict[str, CheckpointBinding] = {}
         self._io_timeout_seconds: float | None = None
         self._binding_lock = threading.RLock()
 
@@ -255,10 +292,15 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
                 raise ValueError("checkpointer is already bound to a different graph contract")
             if self._io_timeout_seconds not in (None, io_timeout_seconds):
                 raise ValueError("checkpointer is already bound to a different I/O timeout")
+            if self._checkpoint_codec is not None and binding.logical_session_id is None:
+                raise ValueError("encrypted checkpoints require an explicit logical session id")
             self._allowed_checkpoint_channels = allowed
             self._graph_contract = binding.graph_contract
             self._io_timeout_seconds = io_timeout_seconds
-            self._authorized_thread_ids.add(binding.storage_thread_id)
+            prior_binding = self._bindings.get(binding.storage_thread_id)
+            if prior_binding is not None and prior_binding != binding:
+                raise ValueError("checkpoint storage key is already bound to another context")
+            self._bindings[binding.storage_thread_id] = binding
 
     async def _bounded(self, operation):
         if self._io_timeout_seconds is None:
@@ -266,7 +308,7 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         async with asyncio.timeout(self._io_timeout_seconds):
             return await operation
 
-    def _validate_config(self, config: RunnableConfig) -> None:
+    def _binding_for_config(self, config: RunnableConfig) -> CheckpointBinding:
         configurable = config.get("configurable")
         if not isinstance(configurable, Mapping):
             raise CheckpointScopeError("checkpoint configuration has no namespace")
@@ -277,11 +319,122 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
             if (
                 not isinstance(thread_id, str)
                 or _STORAGE_THREAD_RE.fullmatch(thread_id) is None
-                or thread_id not in self._authorized_thread_ids
+                or thread_id not in self._bindings
             ):
                 raise CheckpointScopeError(
                     "checkpoint thread is outside the bound tenant and deployment namespace"
                 )
+            return self._bindings[thread_id]
+
+    def _validate_config(self, config: RunnableConfig) -> None:
+        self._binding_for_config(config)
+
+    @staticmethod
+    def _configured_checkpoint_namespace(config: RunnableConfig) -> str | None:
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            raise CheckpointScopeError("checkpoint configuration has no namespace")
+        checkpoint_ns = configurable.get("checkpoint_ns")
+        if checkpoint_ns is not None and not isinstance(checkpoint_ns, str):
+            raise CheckpointScopeError("checkpoint storage configuration is malformed")
+        return checkpoint_ns
+
+    @classmethod
+    def _required_checkpoint_namespace(cls, config: RunnableConfig) -> str:
+        checkpoint_ns = cls._configured_checkpoint_namespace(config)
+        if checkpoint_ns is None:
+            raise CheckpointScopeError("checkpoint storage configuration is malformed")
+        return checkpoint_ns
+
+    @classmethod
+    def _storage_config(cls, config: RunnableConfig) -> RunnableConfig:
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            raise CheckpointScopeError("checkpoint configuration has no namespace")
+        thread_id = configurable.get("thread_id")
+        checkpoint_ns = cls._required_checkpoint_namespace(config)
+        if not isinstance(thread_id, str):
+            raise CheckpointScopeError("checkpoint storage configuration is malformed")
+        storage_values = {
+            "thread_id": thread_id,
+            "checkpoint_ns": checkpoint_ns,
+        }
+        checkpoint_id = configurable.get("checkpoint_id")
+        if checkpoint_id is not None:
+            if not isinstance(checkpoint_id, str) or not checkpoint_id:
+                raise CheckpointScopeError("checkpoint storage configuration is malformed")
+            storage_values["checkpoint_id"] = checkpoint_id
+        return {"configurable": storage_values}
+
+    def _prepare_checkpoint_put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+        binding: CheckpointBinding,
+    ) -> tuple[RunnableConfig, Checkpoint, CheckpointMetadata]:
+        if self._checkpoint_codec is None:
+            return config, checkpoint, metadata
+        storage_config = self._storage_config(config)
+        encryption_scope = binding.encryption_scope(
+            self._required_checkpoint_namespace(storage_config)
+        )
+        effective_metadata = get_serializable_checkpoint_metadata(config, metadata)
+        encrypted_checkpoint = self._checkpoint_codec.encrypt_checkpoint(
+            checkpoint,
+            encryption_scope,
+            parent_config=storage_config,
+            new_versions=new_versions,
+        )
+        encrypted_metadata = self._checkpoint_codec.encrypt_metadata(
+            effective_metadata,
+            encrypted_checkpoint["id"],
+            encryption_scope,
+        )
+        return storage_config, encrypted_checkpoint, encrypted_metadata
+
+    def _prepare_pending_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        binding: CheckpointBinding,
+    ) -> Sequence[tuple[str, Any]]:
+        self._validate_pending_write_channels([channel for channel, _value in writes])
+        if self._checkpoint_codec is None:
+            return writes
+        return self._checkpoint_codec.encrypt_writes(
+            config,
+            writes,
+            task_id,
+            binding.encryption_scope(self._required_checkpoint_namespace(config)),
+        )
+
+    def _decrypt_saved_tuple(
+        self,
+        saved: CheckpointTuple | None,
+        binding: CheckpointBinding,
+        *,
+        expected_namespace: str | None,
+    ) -> CheckpointTuple | None:
+        if self._checkpoint_codec is None or saved is None:
+            return saved
+        saved_namespace = self._configured_checkpoint_namespace(saved.config)
+        if saved_namespace is None:
+            if expected_namespace is None:
+                raise CheckpointScopeError("checkpoint backend returned no storage namespace")
+            saved_namespace = expected_namespace
+        if expected_namespace is not None and saved_namespace != expected_namespace:
+            raise CheckpointScopeError("checkpoint backend returned an unexpected namespace")
+        return self._checkpoint_codec.decrypt_tuple(
+            saved,
+            binding.encryption_scope(saved_namespace),
+        )
+
+    def _reject_unsupported_filter(self, filter: dict[str, Any] | None) -> None:
+        if self._checkpoint_codec is not None and filter is not None:
+            raise NotImplementedError("metadata filtering is unavailable for encrypted checkpoints")
 
     def _validate_checkpoint(self, checkpoint: Checkpoint) -> None:
         if self._allowed_checkpoint_channels is None:
@@ -318,19 +471,14 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
 
     def _validate_storage_thread_id(self, thread_id: str) -> None:
         with self._binding_lock:
-            if (
-                _STORAGE_THREAD_RE.fullmatch(thread_id) is None
-                or thread_id not in self._authorized_thread_ids
-            ):
+            if _STORAGE_THREAD_RE.fullmatch(thread_id) is None or thread_id not in self._bindings:
                 raise CheckpointScopeError(
                     "checkpoint deletion is outside the bound tenant and deployment namespace"
                 )
 
     def thread_authorized(self, thread_id: str) -> bool:
         with self._binding_lock:
-            return bool(
-                _STORAGE_THREAD_RE.fullmatch(thread_id) and thread_id in self._authorized_thread_ids
-            )
+            return bool(_STORAGE_THREAD_RE.fullmatch(thread_id) and thread_id in self._bindings)
 
     @staticmethod
     def _thread_listing_config(thread_id: str) -> RunnableConfig:
@@ -365,8 +513,15 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         self._require_synchronous_operations()
-        self._validate_config(config)
-        return self._validate_tuple(self._backend.get_tuple(config))
+        binding = self._binding_for_config(config)
+        saved = self._backend.get_tuple(config)
+        expected_namespace = self._configured_checkpoint_namespace(config)
+        saved = self._decrypt_saved_tuple(
+            saved,
+            binding,
+            expected_namespace="" if expected_namespace is None else expected_namespace,
+        )
+        return self._validate_tuple(saved)
 
     def list(
         self,
@@ -379,10 +534,18 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         self._require_synchronous_operations()
         if config is None:
             raise CheckpointScopeError("unscoped checkpoint listing is forbidden")
-        self._validate_config(config)
+        binding = self._binding_for_config(config)
+        expected_namespace = self._configured_checkpoint_namespace(config)
         if before is not None:
             self._validate_config(before)
+        self._reject_unsupported_filter(filter)
         for saved in self._backend.list(config, filter=filter, before=before, limit=limit):
+            saved = self._decrypt_saved_tuple(
+                saved,
+                binding,
+                expected_namespace=expected_namespace,
+            )
+            assert saved is not None
             yield self._validate_tuple(saved)  # type: ignore[misc]
 
     def put(
@@ -393,8 +556,15 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
         self._require_synchronous_operations()
-        self._validate_config(config)
+        binding = self._binding_for_config(config)
         self._validate_checkpoint(checkpoint)
+        config, checkpoint, metadata = self._prepare_checkpoint_put(
+            config,
+            checkpoint,
+            metadata,
+            new_versions,
+            binding,
+        )
         return self._backend.put(config, checkpoint, metadata, new_versions)
 
     def put_writes(
@@ -405,8 +575,8 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         task_path: str = "",
     ) -> None:
         self._require_synchronous_operations()
-        self._validate_config(config)
-        self._validate_pending_write_channels([channel for channel, _value in writes])
+        binding = self._binding_for_config(config)
+        writes = self._prepare_pending_writes(config, writes, task_id, binding)
         self._backend.put_writes(config, writes, task_id, task_path)
 
     def delete_thread(self, thread_id: str) -> None:
@@ -415,11 +585,18 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         self._backend.delete_thread(thread_id)
         self._verify_thread_deleted(thread_id)
         with self._binding_lock:
-            self._authorized_thread_ids.discard(thread_id)
+            self._bindings.pop(thread_id, None)
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
-        self._validate_config(config)
-        return self._validate_tuple(await self._bounded(self._backend.aget_tuple(config)))
+        binding = self._binding_for_config(config)
+        saved = await self._bounded(self._backend.aget_tuple(config))
+        expected_namespace = self._configured_checkpoint_namespace(config)
+        saved = self._decrypt_saved_tuple(
+            saved,
+            binding,
+            expected_namespace="" if expected_namespace is None else expected_namespace,
+        )
+        return self._validate_tuple(saved)
 
     async def alist(
         self,
@@ -431,9 +608,11 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
     ) -> AsyncIterator[CheckpointTuple]:
         if config is None:
             raise CheckpointScopeError("unscoped checkpoint listing is forbidden")
-        self._validate_config(config)
+        binding = self._binding_for_config(config)
+        expected_namespace = self._configured_checkpoint_namespace(config)
         if before is not None:
             self._validate_config(before)
+        self._reject_unsupported_filter(filter)
         listing = self._backend.alist(
             config,
             filter=filter,
@@ -445,6 +624,12 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
                 saved = await self._bounded(anext(listing))
             except StopAsyncIteration:
                 return
+            saved = self._decrypt_saved_tuple(
+                saved,
+                binding,
+                expected_namespace=expected_namespace,
+            )
+            assert saved is not None
             validated = self._validate_tuple(saved)
             assert validated is not None
             yield validated
@@ -456,8 +641,15 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
-        self._validate_config(config)
+        binding = self._binding_for_config(config)
         self._validate_checkpoint(checkpoint)
+        config, checkpoint, metadata = self._prepare_checkpoint_put(
+            config,
+            checkpoint,
+            metadata,
+            new_versions,
+            binding,
+        )
         return await self._bounded(self._backend.aput(config, checkpoint, metadata, new_versions))
 
     async def aput_writes(
@@ -467,8 +659,8 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        self._validate_config(config)
-        self._validate_pending_write_channels([channel for channel, _value in writes])
+        binding = self._binding_for_config(config)
+        writes = self._prepare_pending_writes(config, writes, task_id, binding)
         await self._bounded(self._backend.aput_writes(config, writes, task_id, task_path))
 
     async def adelete_thread(self, thread_id: str) -> None:
@@ -476,7 +668,7 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         await self._bounded(self._backend.adelete_thread(thread_id))
         await self._averify_thread_deleted(thread_id)
         with self._binding_lock:
-            self._authorized_thread_ids.discard(thread_id)
+            self._bindings.pop(thread_id, None)
 
     async def aclear_thread(self, thread_id: str) -> None:
         """Delete persisted contents while retaining authority to rebuild the thread."""
@@ -492,6 +684,7 @@ def build_checkpointer(
     backend: BaseCheckpointSaver | None = None,
     *,
     synchronous_operations: bool = True,
+    cipher: AesGcmSessionCipher | None = None,
 ) -> SchemaValidatedCheckpointSaver:
     """Build the strict boundary over an in-memory or injected durable saver."""
     if backend is None:
@@ -499,6 +692,7 @@ def build_checkpointer(
     return SchemaValidatedCheckpointSaver(
         backend,
         synchronous_operations=synchronous_operations,
+        cipher=cipher,
     )
 
 

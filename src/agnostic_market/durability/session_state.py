@@ -7,7 +7,6 @@ import hashlib
 import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Protocol, cast
 
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
@@ -22,15 +21,19 @@ from agnostic_market.durability.session_payload import (
     SessionOperationResult,
 )
 from agnostic_market.durability.session_registry import (
+    CheckpointRevisionDisposition as CheckpointRevisionDisposition,
+)
+from agnostic_market.durability.session_registry import (
     PostgresSessionRegistry,
     RestoredSessionState,
     SessionLeaseAuthority,
     SessionRegistryDataError,
-    SessionRestoreError,
-    SessionRestoreReason,
     SessionStatePublication,
     SessionStateWriteError,
     SessionStateWriteReason,
+)
+from agnostic_market.durability.session_registry import (
+    classify_checkpoint_revision as classify_checkpoint_revision,
 )
 
 
@@ -38,30 +41,6 @@ from agnostic_market.durability.session_registry import (
 class VersionedSessionResult[T]:
     value: T
     session_revision: int
-
-
-class CheckpointRevisionDisposition(StrEnum):
-    CURRENT = "current"
-    SESSION_AHEAD = "session_ahead"
-
-
-def classify_checkpoint_revision(
-    checkpoint_revision: object,
-    session_revision: int,
-) -> CheckpointRevisionDisposition:
-    if (
-        isinstance(checkpoint_revision, bool)
-        or not isinstance(checkpoint_revision, int)
-        or checkpoint_revision < 0
-    ):
-        raise SessionRestoreError(SessionRestoreReason.CHECKPOINT_INVALID)
-    if session_revision < 0:
-        raise ValueError("session revision must not be negative")
-    if checkpoint_revision > session_revision:
-        raise SessionRestoreError(SessionRestoreReason.REVISION_MISMATCH)
-    if checkpoint_revision < session_revision:
-        return CheckpointRevisionDisposition.SESSION_AHEAD
-    return CheckpointRevisionDisposition.CURRENT
 
 
 class SessionStatePersistencePort(Protocol):

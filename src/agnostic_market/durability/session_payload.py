@@ -10,8 +10,8 @@ from agnostic_market.commerce.cart import CartMutationRecord, CartSessionState
 from agnostic_market.commerce.orders import RecentOrderSnapshot
 from agnostic_market.dtos.session import AuthorityIdentifier
 
-SESSION_PAYLOAD_SCHEMA_VERSION = 1
-SESSION_OPERATION_RESULT_SCHEMA_VERSION = 1
+SESSION_PAYLOAD_SCHEMA_VERSION = 2
+SESSION_OPERATION_RESULT_SCHEMA_VERSION = 2
 _STRICT = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
@@ -30,7 +30,7 @@ class PrincipalRetirementMarker(BaseModel):
 class DurableSessionPayload(BaseModel):
     model_config = _STRICT
 
-    schema_version: Literal[1] = SESSION_PAYLOAD_SCHEMA_VERSION
+    schema_version: Literal[2] = SESSION_PAYLOAD_SCHEMA_VERSION
     cart: CartSessionState = Field(default_factory=CartSessionState)
     recent_orders: RecentOrderSnapshot = Field(
         default_factory=lambda: RecentOrderSnapshot(
@@ -82,7 +82,7 @@ SessionOperationResult = Annotated[
 class SessionOperationReceiptPayload(BaseModel):
     model_config = _STRICT
 
-    schema_version: Literal[1] = SESSION_OPERATION_RESULT_SCHEMA_VERSION
+    schema_version: Literal[2] = SESSION_OPERATION_RESULT_SCHEMA_VERSION
     operation_id: AuthorityIdentifier
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     result: SessionOperationResult
