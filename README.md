@@ -166,18 +166,20 @@ still depends on obtaining and checksum-verifying the archive from the PostgreSQ
 provider. Setting both alternatives is rejected as ambiguous configuration.
 
 Production composition still uses the in-memory saver. Encrypted session payloads, registry leases
-and fencing, and revisioned reconstruction are implemented and backend-tested. Production wiring,
-encrypted checkpoint integration, shared durable close/reaping, and crash certification remain open. The
-same four checkpoint contracts have passed through a schema-isolated remote service, a fresh native
-Windows cluster, and the digest-pinned Docker path in the repository workflow. Each provisioner
-removes only the database resources it owns.
+and fencing, revisioned reconstruction, encrypted fenced checkpoints, and shared durable
+close/reaping are implemented and backend-tested through the common application builder. Production
+worker activation, operational reaper scheduling, crash/concurrency certification, durable-path
+latency, and live transport evidence remain open. The checkpoint and session-registry contracts
+have passed through a schema-isolated remote service, a fresh native Windows cluster, and the
+digest-pinned Docker path in the repository workflow. Each provisioner removes only the database
+resources it owns.
 
 Milestone 3 now has native async application construction, registry and encryption contracts,
 lease supervision, and revisioned session-state adapters. The same harness also exercises registry
 fencing, encrypted operation replay, and committed-but-unacknowledged principal retirement.
 These are component and lifecycle contracts, not proof of a production durable voice session.
-The next integration connects admitted authority, lease supervision, session/checkpoint revision
-checks, and verified durable close/reaping before enabling the production path.
+The next boundary is the frozen crash, concurrency, latency, and live transport certification that
+decides whether the durable production path can be enabled.
 Durable verification later owns full principal recovery. Durable commerce owns
 post-effect receipt reconciliation and the transactional commerce-success outbox. Telemetry
 delivery drains that outbox asynchronously and never decides whether an effect committed.

@@ -2986,7 +2986,11 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
 
     assert isinstance(policies, MappingProxyType)
     assert RECOVERY_NODE_NAME in graph.get_graph().nodes
-    assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (graph.recovery_entry_node, END)
+    assert graph.builder.nodes[RECOVERY_NODE_NAME].ends == (
+        *sorted(graph.restore_reconfirmation_nodes),
+        graph.recovery_entry_node,
+        END,
+    )
     assert not any(source == RECOVERY_NODE_NAME for source, _target in graph.builder.edges)
     assert RECOVERY_NODE_NAME not in graph.builder.branches
     assert graph.recovery_infrastructure_nodes == frozenset(
@@ -3011,6 +3015,16 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         "support_return_confirm": "standard",
         "support_profile_confirm": "standard",
     }
+    assert graph.restore_reconfirmation_nodes == frozenset(
+        {
+            "order_status_target_confirm",
+            "cart_mutation_confirm",
+            "cart_confirm",
+            "support_confirm",
+            "support_cancel_confirm",
+            "support_return_confirm",
+        }
+    )
     assert graph.node_execution_tracker.tracked_node_names == frozenset(
         set(policies) - expected_abandonment[AbandonmentKind.PURE_ABORT]
     )

@@ -21,7 +21,12 @@ from agnostic_market.agents.telemetry import (
     SessionTelemetry,
     TenantTelemetry,
 )
-from agnostic_market.checkpoints import SchemaValidatedCheckpointSaver, build_checkpointer
+from agnostic_market.checkpoints import (
+    CheckpointBinding,
+    SchemaValidatedCheckpointSaver,
+    build_checkpointer,
+    graph_contract_fingerprint,
+)
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
 from agnostic_market.commerce.identity import (
@@ -60,7 +65,11 @@ from agnostic_market.commerce.verification import (
 )
 from agnostic_market.dtos.config import MerchantConfig
 from agnostic_market.dtos.llm import StructuredOutputMethod
+from agnostic_market.durability.platform_runtime import DurableSessionResources
 from agnostic_market.durability.session_registry import (
+    CheckpointGenerationAuthority,
+    CheckpointRevisionDisposition,
+    InMemoryCheckpointGenerationAuthority,
     RestoredSessionState,
     SessionLeaseAuthority,
     SessionRestoreError,
@@ -70,7 +79,7 @@ from agnostic_market.durability.session_state import (
     SessionStateCoordinator,
     SessionStatePersistencePort,
 )
-from agnostic_market.session import CallerContext
+from agnostic_market.session import CallerContext, DurableSessionCloser
 from agnostic_market.tenancy.context import TenantBound, TenantContext
 
 
@@ -310,6 +319,7 @@ def _assemble_application_session_state(
     session_id: str,
     thread_id: str,
     session_state: SessionStateCoordinator,
+    durable_closer: DurableSessionCloser | None = None,
 ) -> ApplicationSessionState:
     verification_store = VerificationStore(services.otp, session_id=session_id)
     identity_store = CallerIdentityStore()
@@ -319,6 +329,7 @@ def _assemble_application_session_state(
         session_state=session_state,
         identity_store=identity_store,
         telemetry=telemetry.operational,
+        durable_closer=durable_closer,
     )
     return ApplicationSessionState(
         session_id=session_id,
@@ -363,6 +374,7 @@ async def build_restored_session_state(
     *,
     restored: RestoredSessionState,
     persistence: SessionStatePersistencePort,
+    durable_closer: DurableSessionCloser,
 ) -> ApplicationSessionState:
     """Reconstruct non-authority session state after registry admission."""
     record = restored.record
@@ -400,6 +412,7 @@ async def build_restored_session_state(
         session_id=session_id,
         thread_id=record.checkpoint_namespace,
         session_state=session_state,
+        durable_closer=durable_closer,
     )
 
 
@@ -411,7 +424,9 @@ async def build_application_session(
     *,
     deployment_id: str,
     routing_factory: RoutingFactory,
-    session_state_factory: SessionStateFactory = build_in_memory_session_state,
+    session_state_factory: SessionStateFactory | None = None,
+    checkpoint_authority: CheckpointGenerationAuthority | None = None,
+    durable_session: DurableSessionResources | None = None,
 ) -> ApplicationSession:
     """Construct the one graph, router, engine, and caller lifecycle."""
     if services.tenant_id != tenant.tenant_id:
@@ -429,7 +444,22 @@ async def build_application_session(
         raise ValueError(
             "tenant services do not match the application tenant: " + ", ".join(mismatched_services)
         )
-    state = await session_state_factory(tenant, services)
+    if durable_session is None:
+        state_factory = session_state_factory or build_in_memory_session_state
+        state = await state_factory(tenant, services)
+    else:
+        if session_state_factory is not None or checkpoint_authority is not None:
+            raise ValueError("durable session composition owns state and checkpoint authority")
+        if services.checkpointer is not durable_session.checkpointer:
+            raise ValueError("durable session checkpointer does not match tenant services")
+        state = await build_restored_session_state(
+            tenant,
+            services,
+            restored=durable_session.restored,
+            persistence=durable_session.persistence,
+            durable_closer=durable_session.closer,
+        )
+        checkpoint_authority = durable_session.generation_authority
     _validate_session_state(tenant, services, state)
     assembly = build_frontline_graph(
         models.response,
@@ -464,18 +494,43 @@ async def build_application_session(
         registry=assembly.capability_registry,
         telemetry=state.telemetry.routing_evidence,
     )
-    engine = ReasoningEngine(
-        assembly.graph,
+    expected_binding = CheckpointBinding(
         tenant_id=tenant.tenant_id,
         logical_session_id=state.session_id,
         deployment_id=deployment_id,
+        graph_contract=graph_contract_fingerprint(assembly.graph),
         thread_id=state.thread_id,
+    )
+    if checkpoint_authority is None:
+        checkpoint_authority = InMemoryCheckpointGenerationAuthority.from_binding(expected_binding)
+    elif checkpoint_authority.current_generation.binding != expected_binding:
+        raise ValueError("checkpoint authority does not match the application session")
+    engine = ReasoningEngine(
+        assembly.graph,
+        checkpoint_authority=checkpoint_authority,
         checkpoint_io_timeout_seconds=settings.checkpoint_io_timeout_seconds,
         cancellation_quiescence_timeout_seconds=(settings.cancellation_quiescence_timeout_seconds),
         routing=routing,
         telemetry=state.telemetry.operational,
         lifecycle=state.caller_context,
     )
+    if durable_session is None:
+        await engine.arequire_fresh_checkpoint()
+    else:
+        if durable_session.reconciliation is None:
+            checkpoint_revision = await engine.arestored_checkpoint_revision()
+            reconciliation = await durable_session.reconcile_restored(checkpoint_revision)
+            if reconciliation.disposition is CheckpointRevisionDisposition.SESSION_AHEAD:
+                await engine.aprepare_session_ahead_recovery(reconciliation)
+            elif reconciliation.disposition is CheckpointRevisionDisposition.CURRENT:
+                await engine.aprepare_current_restore(reconciliation.record.session_revision)
+            else:
+                raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+        else:
+            seeded_revision = await engine.aseed_initial_checkpoint(
+                durable_session.restored.record.session_revision
+            )
+            await durable_session.activate_seeded(seeded_revision)
     state.caller_context.attach_engine(engine)
     return ApplicationSession(
         assembly=assembly,

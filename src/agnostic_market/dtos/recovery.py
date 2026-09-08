@@ -45,7 +45,7 @@ class PendingRecovery(BaseModel):
 
     origin_node: str = Field(min_length=1)
     action: ExceptionAction
-    trigger: Literal["node_exception", "stream_cancelled"]
+    trigger: Literal["node_exception", "stream_cancelled", "session_restored"]
     abandoned_message_id: str | None = None
 
     @model_validator(mode="after")
@@ -56,5 +56,5 @@ class PendingRecovery(BaseModel):
                     "stream-cancelled recovery requires a nonblank abandoned message ID"
                 )
         elif self.abandoned_message_id is not None:
-            raise ValueError("node-exception recovery forbids an abandoned message ID")
+            raise ValueError("non-stream recovery forbids an abandoned message ID")
         return self

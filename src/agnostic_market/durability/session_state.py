@@ -102,6 +102,14 @@ def _decode_operation_result(result: SessionOperationResult) -> object:
     return result.record
 
 
+def recent_orders_operation_id(operation: OrderContextOperation, owner_id: str) -> str:
+    """Derive the receipt identity for one recent-order projection update."""
+    normalized_owner = owner_id.strip()
+    if not normalized_owner:
+        raise ValueError("recent-order operation owner must not be blank")
+    return f"recent-orders:{operation}:{normalized_owner}"
+
+
 class SessionStateCoordinator:
     """Commit each mutation before replacing the current fenced local projection."""
 

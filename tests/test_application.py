@@ -252,6 +252,14 @@ def _restored_session(
     )
 
 
+class _NoopDurableCloser:
+    async def begin_close(self) -> None:
+        pass
+
+    async def finalize_close(self) -> None:
+        pass
+
+
 def test_application_composition_fields_have_one_explicit_owner() -> None:
     declared_fields = {
         (owner.__name__, field.name)
@@ -305,6 +313,7 @@ async def test_restored_session_reconstructs_state_without_restoring_authority(
         services,
         restored=restored,
         persistence=persistence,
+        durable_closer=_NoopDurableCloser(),
     )
 
     assert state.session_id == "restored-session"
@@ -338,6 +347,7 @@ async def test_restored_session_rejects_an_unreconciled_principal_retirement(
             services,
             restored=restored,
             persistence=persistence,
+            durable_closer=_NoopDurableCloser(),
         )
 
     assert rejected.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
@@ -363,6 +373,7 @@ async def test_restored_session_rejects_a_mismatched_persistence_authority(
             services,
             restored=restored,
             persistence=persistence,
+            durable_closer=_NoopDurableCloser(),
         )
 
     assert rejected.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
@@ -1062,7 +1073,7 @@ async def test_application_reconciles_receipt_after_external_effect_cancellation
 
 
 @pytest.mark.asyncio
-async def test_application_engine_reconstruction_resumes_the_same_session_dependencies(
+async def test_in_memory_application_rejects_checkpoint_reconstruction(
     config_root: Path,
 ) -> None:
     tenant = _tenant()
@@ -1102,8 +1113,6 @@ async def test_application_engine_reconstruction_resumes_the_same_session_depend
         price_usd=product.price_usd,
         quantity=1,
     )
-    reconstructed = None
-
     try:
         await committed_turn_events(
             first.engine,
@@ -1115,53 +1124,26 @@ async def test_application_engine_reconstruction_resumes_the_same_session_depend
         pending = paused.pending_placement
         assert pending is not None
 
-        reconstructed = await build_application_session(
-            tenant,
-            _settings(),
-            ApplicationModels(
-                response=response,
-                reasoning=reasoning,
-                response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
-            ),
-            services,
-            deployment_id=_TEST_DEPLOYMENT_ID,
-            routing_factory=_routing_factory,
-            session_state_factory=fixed_identity_state,
-        )
+        with pytest.raises(SessionRestoreError) as rejected:
+            await build_application_session(
+                tenant,
+                _settings(),
+                ApplicationModels(
+                    response=response,
+                    reasoning=reasoning,
+                    response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+                ),
+                services,
+                deployment_id=_TEST_DEPLOYMENT_ID,
+                routing_factory=_routing_factory,
+                session_state_factory=fixed_identity_state,
+            )
 
-        assert reconstructed.state is not first.state
-        assert reconstructed.state.caller_context is not first.state.caller_context
-        assert reconstructed.state.cart_store is not first.state.cart_store
-        assert reconstructed.state.session_id == first.state.session_id
-        assert reconstructed.state.thread_id == first.state.thread_id
-        assert reconstructed.engine is not first.engine
-        assert await reconstructed.engine.apending_interrupt()
-
-        outcome = await committed_turn_events(
-            reconstructed.engine,
-            CommittedTurn(text="yes", message_id="reconstructed-consent"),
-        )
-        receipt = services.order_store.placement_receipt(
-            pending.idempotency_key,
-            lines=pending.lines,
-            total_usd=pending.total_usd,
-        )
-
-        assert receipt.kind == "committed"
-        assert _fixture_order_store(services).placed_count == 1
-        assert reconstructed.state.guest_orders.order_refs == (receipt.record.order_id,)
-        assert any(
-            isinstance(event, SpokenMessageEvent) and receipt.record.order_id in event.text
-            for event in outcome
-        )
+        assert rejected.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
+        assert _fixture_order_store(services).placed_count == 0
         assert response.invoke_count == 0 and reasoning.invoke_count == 0
     finally:
-        if reconstructed is None:
-            await first.state.caller_context.aclose_session()
-        else:
-            # The first context represents the lost worker. Only its replacement closes the
-            # recovered checkpoint namespace.
-            await reconstructed.state.caller_context.aclose_session()
+        await first.state.caller_context.aclose_session()
 
 
 @pytest.mark.asyncio
@@ -1453,34 +1435,25 @@ async def test_application_checkpoint_read_outage_prevents_admission_and_effects
     response = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(raise_transport=True)
     recognizer = ArchitectureRoutingRecognizer()
-    application = await build_application_session(
-        tenant,
-        _settings(),
-        ApplicationModels(
-            response=response,
-            reasoning=reasoning,
-            response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
-        ),
-        services,
-        deployment_id=_TEST_DEPLOYMENT_ID,
-        routing_factory=lambda _registry: recognizer,
-    )
+    with pytest.raises(OSError, match="injected checkpoint read outage"):
+        await build_application_session(
+            tenant,
+            _settings(),
+            ApplicationModels(
+                response=response,
+                reasoning=reasoning,
+                response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+            ),
+            services,
+            deployment_id=_TEST_DEPLOYMENT_ID,
+            routing_factory=lambda _registry: recognizer,
+        )
 
-    try:
-        events = await engine_events(application.engine, "place my order")
-
-        assert [event.text for event in events if isinstance(event, SpokenMessageEvent)] == [
-            AUTOMATION_TERMINAL_LINE
-        ]
-        assert backend.read_attempts >= 1
-        assert backend.delete_attempts == 0
-        assert recognizer.contexts == []
-        assert response.invoke_count == 0 and reasoning.invoke_count == 0
-        assert application.state.cart_store.is_empty()
-        assert _fixture_order_store(services).placed_count == 0
-        assert application.engine._terminal_latched
-    finally:
-        await application.state.caller_context.aclose_session()
+    assert backend.read_attempts == 1
+    assert backend.delete_attempts == 0
+    assert recognizer.contexts == []
+    assert response.invoke_count == 0 and reasoning.invoke_count == 0
+    assert _fixture_order_store(services).placed_count == 0
 
 
 async def test_application_rejects_services_from_another_tenant(config_root: Path) -> None:

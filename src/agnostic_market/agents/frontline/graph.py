@@ -982,6 +982,7 @@ def build_frontline_graph(
         ExceptionAction.CART_REVIEW,
         AbandonmentKind.LIFECYCLE_SPECIAL,
         consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
     )
     node_registry.register(
         "cart_mutation_apply",
@@ -998,6 +999,7 @@ def build_frontline_graph(
         ExceptionAction.ABORT_PLACEMENT_CONFIRMATION,
         AbandonmentKind.LIFECYCLE_SPECIAL,
         consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
     )
     node_registry.register(
         "cart_place",
@@ -1126,6 +1128,7 @@ def build_frontline_graph(
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.LIFECYCLE_SPECIAL,
         consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
         destinations=(ORDER_STATUS_TARGET_REJECT_NODE, ORDER_STATUS_FULFILL_NODE, "handover"),
     )
     node_registry.register(
@@ -1183,6 +1186,7 @@ def build_frontline_graph(
         ExceptionAction.ABORT_REFUND_CONFIRMATION,
         AbandonmentKind.LIFECYCLE_SPECIAL,
         consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
     )
     node_registry.register(
         "support_place",
@@ -1202,6 +1206,7 @@ def build_frontline_graph(
         ExceptionAction.ABORT_CANCEL_CONFIRMATION,
         AbandonmentKind.LIFECYCLE_SPECIAL,
         consent_interrupt_kind="cancel",
+        restore_reconfirmation=True,
     )
     node_registry.register(
         "support_cancel_void",
@@ -1227,6 +1232,7 @@ def build_frontline_graph(
         ExceptionAction.ABORT_RETURN_CONFIRMATION,
         AbandonmentKind.LIFECYCLE_SPECIAL,
         consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
     )
     node_registry.register(
         "support_return_place",
@@ -1319,11 +1325,13 @@ def build_frontline_graph(
         ExceptionAction.RECONCILE_PRINCIPAL_TRANSITION,
         AbandonmentKind.LIFECYCLE_SPECIAL,
     )
+    restore_reconfirmation_nodes = node_registry.registered_restore_reconfirmation_nodes()
     node_registry.register_infrastructure(
         RECOVERY_NODE_NAME,
         build_recovery_node(
             node_registry.validated_policies,
             node_registry.validated_handled_nodes,
+            restore_reconfirmation_nodes,
             entry_node_name,
             cart_store,
             store,
@@ -1342,7 +1350,7 @@ def build_frontline_graph(
             telemetry,
         ),
         error_handler=build_recovery_infrastructure_handler,
-        destinations=(entry_node_name, END),
+        destinations=(*sorted(restore_reconfirmation_nodes), entry_node_name, END),
     )
     node_registry.register_infrastructure(
         RECOVERY_TERMINALIZER_NODE_NAME,
@@ -1623,6 +1631,7 @@ def build_frontline_graph(
     handled_infrastructure_nodes = node_registry.validated_handled_infrastructure_nodes()
     node_execution_tracker = node_registry.validated_execution_tracker()
     consent_interrupt_kinds = node_registry.validated_consent_interrupt_kinds()
+    restore_reconfirmation_nodes = node_registry.validated_restore_reconfirmation_nodes()
     compiled = graph.compile(checkpointer=checkpointer)
     speakable_nodes = (
         FRONTLINE_SPEAKABLE_NODES
@@ -1651,6 +1660,7 @@ def build_frontline_graph(
     compiled.recovery_entry_node = entry_node_name  # type: ignore[attr-defined]
     compiled.node_execution_tracker = node_execution_tracker  # type: ignore[attr-defined]
     compiled.consent_interrupt_kinds = consent_interrupt_kinds  # type: ignore[attr-defined]
+    compiled.restore_reconfirmation_nodes = restore_reconfirmation_nodes  # type: ignore[attr-defined]
     overlap = speakable_nodes & model_speech_nodes
     if overlap:
         raise RuntimeError(f"code/model speech source sets overlap: {sorted(overlap)!r}")

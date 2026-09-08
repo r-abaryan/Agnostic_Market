@@ -808,7 +808,9 @@ async def test_rotation_failure_during_stream_close_latches_terminal_for_next_tu
             event = await anext(stream)
             if isinstance(event, SpokenMessageEvent) and event.node == "identity_apply":
                 break
-        assert h.caller_context.pending_transition() is not None
+        pending_transition = h.caller_context.pending_transition()
+        assert pending_transition is not None
+        transition_id = pending_transition.transition_id
 
         old_storage_thread_id = old_config["configurable"]["thread_id"]
         real_delete = h.engine._graph.checkpointer.adelete_thread
@@ -826,7 +828,12 @@ async def test_rotation_failure_during_stream_close_latches_terminal_for_next_tu
     snapshot = h.engine._graph.get_state(h.engine._config)
 
     assert [event.text for event in _spoken(next_turn)] == [AUTOMATION_TERMINAL_LINE]
-    assert h.engine.thread_id == old_thread_id
+    assert h.engine.thread_id != old_thread_id
+    assert (
+        h.engine._checkpoint_authority.current_generation.checkpoint_namespace == h.engine.thread_id
+    )
+    assert h.engine._checkpoint_authority.current_generation.transition_id == transition_id
+    assert h.engine._checkpoint_authority.current_generation.state == "current"
     assert h.caller_context.pending_transition() is None
     assert h.identity.current() is None
     assert h.verification.current_level() == 1

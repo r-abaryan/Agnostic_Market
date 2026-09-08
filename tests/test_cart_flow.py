@@ -36,6 +36,7 @@ from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
+from agnostic_market.checkpoints import CheckpointBinding, graph_contract_fingerprint
 from agnostic_market.commerce.cart import CartMutationError, CartStore
 from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
@@ -65,6 +66,7 @@ from agnostic_market.dtos.orchestration import (
     PlaceOrder,
 )
 from agnostic_market.dtos.state import PendingCartMutation
+from agnostic_market.durability.session_registry import InMemoryCheckpointGenerationAuthority
 from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
 
@@ -156,10 +158,15 @@ def _reasoning_engine(graph) -> ReasoningEngine:
     telemetry = make_session_telemetry("acme_store", "t1")
     return ReasoningEngine(
         graph,
-        tenant_id="acme_store",
-        logical_session_id="t1",
-        deployment_id="test-deployment",
-        thread_id="t1",
+        checkpoint_authority=InMemoryCheckpointGenerationAuthority.from_binding(
+            CheckpointBinding(
+                tenant_id="acme_store",
+                logical_session_id="t1",
+                deployment_id="test-deployment",
+                graph_contract=graph_contract_fingerprint(graph),
+                thread_id="t1",
+            )
+        ),
         checkpoint_io_timeout_seconds=2.0,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         routing=make_routing_session(

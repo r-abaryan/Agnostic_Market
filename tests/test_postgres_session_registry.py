@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
 import uuid
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.base import empty_checkpoint
+from llm_fakes import (
+    TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+    TEST_STRUCTURED_OUTPUT_METHOD,
+    FakeChatModel,
+)
 from psycopg import AsyncConnection, sql
 from psycopg.conninfo import make_conninfo
 from psycopg.errors import (
@@ -20,17 +29,43 @@ from psycopg.errors import (
     UniqueViolation,
 )
 from psycopg_pool import AsyncConnectionPool
+from routing_helpers import ArchitectureRoutingRecognizer
+from telemetry_helpers import make_tenant_telemetry
+from turn_helpers import (
+    TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
+    committed_turn_events,
+    engine_events,
+)
 
-from agnostic_market.checkpoints import CheckpointBinding
+from agnostic_market.application import (
+    ApplicationModels,
+    ApplicationSettings,
+    build_application_session,
+    build_fixture_tenant_services,
+)
+from agnostic_market.checkpoints import (
+    CheckpointBinding,
+    build_checkpoint_serializer,
+    build_checkpointer,
+    graph_contract_fingerprint,
+)
+from agnostic_market.config.registry import ConfigRegistry
+from agnostic_market.dtos.events import CommittedTurn, InterruptEvent, TurnFacts
+from agnostic_market.dtos.platform import PlatformRuntimeConfig
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
+from agnostic_market.dtos.state import PendingCartMutation, ReasoningState
 from agnostic_market.durability.encryption import AesGcmSessionCipher, SessionEnvelopeContext
 from agnostic_market.durability.migrations import (
     PLATFORM_SESSION_SCHEMA_VERSION,
     PlatformSchemaError,
     apply_platform_migrations,
     grant_platform_application_role,
+    require_platform_application_role,
     require_platform_schema_version,
 )
+from agnostic_market.durability.platform_runtime import DurablePlatformResources
+from agnostic_market.durability.postgres_checkpoints import FencedPostgresCheckpointSaver
+from agnostic_market.durability.session_lifecycle import DurableSessionLifecycleCoordinator
 from agnostic_market.durability.session_payload import (
     SESSION_OPERATION_RESULT_SCHEMA_VERSION,
     SESSION_PAYLOAD_SCHEMA_VERSION,
@@ -44,6 +79,9 @@ from agnostic_market.durability.session_registry import (
     LeaseAdmissionError,
     LeaseAdmissionReason,
     PostgresSessionRegistry,
+    SessionCloseError,
+    SessionCloseReason,
+    SessionCloseRequest,
     SessionLeaseAuthority,
     SessionLeaseRenewal,
     SessionLeaseRequest,
@@ -62,6 +100,7 @@ from agnostic_market.durability.session_state import (
     BoundPostgresSessionStatePersistence,
     SessionStateCoordinator,
 )
+from agnostic_market.tenancy.context import build_tenant_context
 
 _POSTGRES_DSN_ENV = "PHASE4C_POSTGRES_DSN"
 _KEY = bytes(range(32))
@@ -158,7 +197,9 @@ async def _rewind_generation_schema_to_version_4(connection: AsyncConnection) ->
         """
         ALTER TABLE platform_sessions
             DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
+            DROP CONSTRAINT platform_sessions_close_operation_format,
             DROP CONSTRAINT platform_sessions_current_payload_schema,
+            DROP COLUMN close_operation_id,
             ADD CONSTRAINT platform_sessions_checkpoint_matches_fence
                 CHECK (
                     checkpoint_namespace =
@@ -1237,6 +1278,459 @@ def _lease_authority(
         lease_owner_id=owner_id,
         fencing_generation=fencing_generation,
     )
+
+
+@pytest.mark.postgres
+async def test_durable_close_fences_writers_deletes_state_and_replays_safely() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("close_store", f"AD_close_{uuid.uuid4().hex}")
+    live_authority = _lease_authority(registration, "live-owner")
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registry = PostgresSessionRegistry(
+            pool,
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("live-owner"),
+            payload=_empty_payload(),
+        )
+        await registry.activate(live_authority)
+        await registry.publish(
+            SessionStatePublication(
+                **live_authority.model_dump(),
+                expected_revision=0,
+                operation_id="pre-close-publication",
+                request_fingerprint="d" * 64,
+                payload=DurableSessionPayload(guest_order_refs=("ORD-CLOSE",)),
+                operation_result=EmptySessionOperationResult(),
+            )
+        )
+        coordinator = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=30.0,
+            tombstone_retention_seconds=3600.0,
+        )
+
+        claim = await coordinator.begin_live_close(
+            live_authority,
+            "close-operation",
+            "close-lease-owner",
+        )
+        replayed = await coordinator.begin_live_close(
+            live_authority,
+            "close-operation",
+            "close-lease-owner",
+        )
+
+        assert replayed == claim
+        assert claim.record.lifecycle is SessionLifecycle.CLOSING
+        assert claim.authority.fencing_generation == live_authority.fencing_generation + 1
+        with pytest.raises(LeaseAdmissionError) as closing_restore:
+            await registry.restore(live_authority)
+        assert closing_restore.value.reason is LeaseAdmissionReason.LIFECYCLE_REJECTED
+        with pytest.raises(LeaseAdmissionError) as stale_writer:
+            await registry.publish(
+                SessionStatePublication(
+                    **live_authority.model_dump(),
+                    expected_revision=1,
+                    operation_id="stale-publication",
+                    request_fingerprint="e" * 64,
+                    payload=_empty_payload(),
+                    operation_result=EmptySessionOperationResult(),
+                )
+            )
+        assert stale_writer.value.reason is LeaseAdmissionReason.LIFECYCLE_REJECTED
+
+        closed = await coordinator.finalize(claim)
+        duplicate = await coordinator.finalize(claim)
+
+        assert duplicate == closed
+        assert closed.lifecycle is SessionLifecycle.CLOSED
+        assert closed.envelope is None
+        assert closed.lease_owner_id is None
+        assert closed.close_operation_id == "close-operation"
+        with pytest.raises(LeaseAdmissionError) as closed_restore:
+            await registry.restore(live_authority)
+        assert closed_restore.value.reason is LeaseAdmissionReason.LIFECYCLE_REJECTED
+        async with pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+                (registration.tenant_id,),
+            )
+            operation_count = await (
+                await connection.execute(
+                    """
+                    SELECT count(*) FROM platform_session_operations
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                    """,
+                    (registration.tenant_id, registration.authority.logical_session_id),
+                )
+            ).fetchone()
+            generation_count = await (
+                await connection.execute(
+                    """
+                    SELECT count(*) FROM platform_checkpoint_generations
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                    """,
+                    (registration.tenant_id, registration.authority.logical_session_id),
+                )
+            ).fetchone()
+        assert operation_count == (0,)
+        assert generation_count == (0,)
+
+
+@pytest.mark.postgres
+async def test_durable_close_reclaims_its_expired_lease_before_finalization() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("close_progress_store", f"AD_close_{uuid.uuid4().hex}")
+    live_authority = _lease_authority(registration, "live-owner")
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registry = PostgresSessionRegistry(
+            pool,
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("live-owner"),
+            payload=_empty_payload(),
+        )
+        coordinator = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=30.0,
+            tombstone_retention_seconds=3600.0,
+        )
+        claim = await coordinator.begin_live_close(
+            live_authority,
+            "close-operation",
+            "close-lease-owner",
+        )
+        refreshed = await registry.refresh_close(
+            claim.authority,
+            duration_seconds=1.0,
+        )
+        assert refreshed.authority.fencing_generation == claim.authority.fencing_generation
+        assert refreshed.record.lease_expires_at is not None
+        assert claim.record.lease_expires_at is not None
+        assert refreshed.record.lease_expires_at >= claim.record.lease_expires_at
+        claim = refreshed
+        async with pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+                (registration.tenant_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE platform_sessions
+                SET created_at = created_at - interval '1 hour',
+                    lease_expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = %s AND logical_session_id = %s
+                """,
+                (registration.tenant_id, registration.authority.logical_session_id),
+            )
+
+        closed = await coordinator.finalize(claim)
+
+        assert closed.lifecycle is SessionLifecycle.CLOSED
+        assert closed.close_operation_id == claim.authority.operation_id
+        assert closed.fencing_generation == claim.authority.fencing_generation + 1
+
+
+@pytest.mark.postgres
+async def test_reaper_claims_only_expired_sessions_through_the_close_coordinator() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    expired = _registration("reaper_store", f"AD_expired_{uuid.uuid4().hex}")
+    live = _registration("reaper_store", f"AD_live_{uuid.uuid4().hex}")
+    foreign = _registration("foreign_reaper_store", expired.authority.logical_session_id)
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registry = PostgresSessionRegistry(
+            pool,
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            expired,
+            _lease("expired-owner", duration_seconds=0.01),
+            payload=_empty_payload(),
+        )
+        await registry.register_and_acquire(
+            live,
+            _lease("live-owner"),
+            payload=_empty_payload(),
+        )
+        await registry.register_and_acquire(
+            foreign,
+            _lease("foreign-expired-owner", duration_seconds=0.01),
+            payload=_empty_payload(),
+        )
+        await asyncio.sleep(0.02)
+        coordinator = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=30.0,
+            tombstone_retention_seconds=3600.0,
+        )
+
+        assert await coordinator.reap_expired("reaper_store") == 1
+        expired_record = await registry.get(
+            expired.tenant_id,
+            expired.authority.logical_session_id,
+        )
+        live_record = await registry.get(live.tenant_id, live.authority.logical_session_id)
+        foreign_record = await registry.get(
+            foreign.tenant_id,
+            foreign.authority.logical_session_id,
+        )
+
+        assert expired_record is not None
+        assert expired_record.lifecycle is SessionLifecycle.CLOSED
+        assert live_record is not None
+        assert live_record.lifecycle is SessionLifecycle.OPENING
+        assert foreign_record is not None
+        assert foreign_record.lifecycle is SessionLifecycle.OPENING
+
+
+@pytest.mark.postgres
+async def test_expired_close_reclaim_keeps_operation_identity_and_advances_owner_fence() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("close_reclaim_store", f"AD_reclaim_{uuid.uuid4().hex}")
+    async with AsyncExitStack() as stack:
+        registry = PostgresSessionRegistry(
+            await _open_pool(stack, dsn),
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("expired-live-owner", duration_seconds=0.01),
+            payload=_empty_payload(),
+        )
+        await asyncio.sleep(0.02)
+        candidate = (await registry.expired_sessions(registration.tenant_id, limit=10))[0]
+        first = await registry.claim_expired(
+            candidate,
+            SessionCloseRequest(
+                operation_id="stable-reap-operation",
+                lease_owner_id="reaper-owner-a",
+                duration_seconds=0.01,
+            ),
+        )
+
+        assert await registry.expired_sessions(registration.tenant_id, limit=10) == ()
+        await asyncio.sleep(0.02)
+        abandoned = (await registry.expired_sessions(registration.tenant_id, limit=10))[0]
+        assert abandoned.close_operation_id == "stable-reap-operation"
+        second = await registry.claim_expired(
+            abandoned,
+            SessionCloseRequest(
+                operation_id=abandoned.close_operation_id,
+                lease_owner_id="reaper-owner-b",
+                duration_seconds=30.0,
+            ),
+        )
+
+        assert second.authority.operation_id == first.authority.operation_id
+        assert second.authority.lease_owner_id == "reaper-owner-b"
+        assert second.authority.fencing_generation == first.authority.fencing_generation + 1
+        with pytest.raises(SessionCloseError) as stale_cleanup:
+            await registry.close_checkpoint_generations(first.authority)
+        assert stale_cleanup.value.reason is SessionCloseReason.WRONG_CLOSE_OWNER
+
+
+@pytest.mark.postgres
+async def test_lost_begin_acknowledgement_recognizes_reaper_completed_close() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("close_ack_store", f"AD_close_ack_{uuid.uuid4().hex}")
+    authority = _lease_authority(registration, "close-ack-live-owner")
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registry = PostgresSessionRegistry(
+            pool,
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("close-ack-live-owner"),
+            payload=_empty_payload(),
+        )
+        coordinator = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=0.01,
+            tombstone_retention_seconds=3600.0,
+        )
+        closer = coordinator.bind(authority)
+
+        await coordinator.begin_live_close(
+            authority,
+            closer.operation_id,
+            closer.lease_owner_id,
+        )
+        await asyncio.sleep(0.02)
+        reaper = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=30.0,
+            tombstone_retention_seconds=3600.0,
+        )
+        assert await reaper.reap_expired(registration.tenant_id) == 1
+
+        await closer.begin_close()
+        await closer.finalize_close()
+
+        closed = await registry.get(
+            registration.tenant_id,
+            registration.authority.logical_session_id,
+        )
+        assert closed is not None
+        assert closed.lifecycle is SessionLifecycle.CLOSED
+        assert closed.close_operation_id == closer.operation_id
+
+
+@pytest.mark.postgres
+async def test_close_verifies_checkpoint_absence_before_accepting_a_deletion_marker() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("partial_close_store", f"AD_partial_{uuid.uuid4().hex}")
+    authority = _lease_authority(registration, "partial-live-owner")
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registry = PostgresSessionRegistry(
+            pool,
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("partial-live-owner"),
+            payload=_empty_payload(),
+        )
+        generation = (await registry.checkpoint_generations(authority))[0]
+        saver = build_checkpointer(
+            FencedPostgresCheckpointSaver(
+                pool,
+                authority=authority,
+                cipher=_cipher(),
+                serde=build_checkpoint_serializer(),
+            ),
+            synchronous_operations=False,
+            cipher=_cipher(),
+        )
+        saver.bind_checkpoint_contract(
+            ReasoningState.model_fields,
+            binding=generation.binding,
+            io_timeout_seconds=2.0,
+        )
+        saved_config = await saver.aput(generation.binding.config, empty_checkpoint(), {}, {})
+        await saver.aput_writes(
+            saved_config,
+            (("__interrupt__", "pending confirmation"),),
+            "interrupted-task",
+        )
+        coordinator = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=30.0,
+            tombstone_retention_seconds=3600.0,
+        )
+        claim = await coordinator.begin_live_close(
+            authority,
+            "partial-close-operation",
+            "partial-close-owner",
+        )
+        assert await coordinator.checkpoint_has_pending_interrupt(claim)
+        await registry.record_close_checkpoint_deletion(
+            claim.authority,
+            generation.checkpoint_namespace,
+        )
+
+        with pytest.raises(SessionCloseError) as incomplete:
+            await registry.finalize_close(
+                claim.authority,
+                tombstone_retention_seconds=3600.0,
+            )
+        assert incomplete.value.reason is SessionCloseReason.CLEANUP_INCOMPLETE
+
+        closed = await coordinator.finalize(claim)
+        assert closed.lifecycle is SessionLifecycle.CLOSED
+
+
+@pytest.mark.postgres
+async def test_concurrent_close_claims_have_one_fence_owner() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    registration = _registration("close_race_store", f"AD_close_race_{uuid.uuid4().hex}")
+    authority = _lease_authority(registration, "race-live-owner")
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registries = [
+            PostgresSessionRegistry(pool, cipher=_cipher(), operation_timeout_seconds=2.0)
+            for _ in range(2)
+        ]
+        await registries[0].register_and_acquire(
+            registration,
+            _lease("race-live-owner"),
+            payload=_empty_payload(),
+        )
+
+        outcomes = await asyncio.gather(
+            registries[0].begin_close(
+                authority,
+                SessionCloseRequest(
+                    operation_id="close-a",
+                    lease_owner_id="close-owner-a",
+                    duration_seconds=30.0,
+                ),
+            ),
+            registries[1].begin_close(
+                authority,
+                SessionCloseRequest(
+                    operation_id="close-b",
+                    lease_owner_id="close-owner-b",
+                    duration_seconds=30.0,
+                ),
+            ),
+            return_exceptions=True,
+        )
+
+        claims = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+        errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        assert len(claims) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], SessionCloseError)
+        assert errors[0].reason is SessionCloseReason.WRONG_CLOSE_OWNER
 
 
 @pytest.mark.postgres
@@ -2496,7 +2990,7 @@ async def test_renewal_rejects_changed_physical_transport() -> None:
     ("database_change", "reason"),
     (
         (
-            "lifecycle = 'closing'",
+            "lifecycle = 'closing', close_operation_id = 'test-close'",
             LeaseAdmissionReason.LIFECYCLE_REJECTED,
         ),
         (
@@ -2646,6 +3140,13 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                 "SELECT tenant_id FROM platform_checkpoint_generations ORDER BY tenant_id"
             )
             assert await cursor.fetchall() == [("role_test_acme",)]
+            hidden_delete = await application.execute(
+                """
+                DELETE FROM platform_checkpoint_generations
+                WHERE tenant_id = 'role_test_demo'
+                """
+            )
+            assert hidden_delete.rowcount == 0
             cursor = await application.execute(
                 "SELECT tenant_id FROM platform_checkpoint_write_manifests ORDER BY tenant_id"
             )
@@ -2667,6 +3168,10 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
             await require_platform_schema_version(
                 application,
                 PLATFORM_SESSION_SCHEMA_VERSION,
+            )
+            await require_platform_application_role(
+                application,
+                schema_name=schema_name,
             )
             cursor = await application.execute(
                 """
@@ -2708,7 +3213,7 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                     )
                 """
             )
-            assert await cursor.fetchone() == (True, True, True, False)
+            assert await cursor.fetchone() == (True, True, True, True)
             cursor = await application.execute(
                 """
                 SELECT
@@ -2778,6 +3283,363 @@ async def test_platform_application_role_can_check_but_not_modify_schema_history
                     (99, "unauthorized", "0" * 64),
                 )
     finally:
+        async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+            role = sql.Identifier(role_name)
+            await migration_connection.execute(sql.SQL("DROP OWNED BY {}").format(role))
+            await migration_connection.execute(sql.SQL("DROP ROLE {}").format(role))
+
+
+@pytest.mark.postgres
+async def test_durable_platform_resources_open_with_the_pinned_application_role(
+    config_root: Path,
+) -> None:
+    dsn = _dsn()
+    config_registry = ConfigRegistry(config_root).load()
+    resolved = config_registry.get("acme_store")
+    tenant = build_tenant_context(config_registry, "acme_store")
+    models = ApplicationModels(
+        response=FakeChatModel(),
+        reasoning=FakeChatModel(),
+        response_structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+    )
+    settings = ApplicationSettings(
+        display_name=resolved.config.display_name,
+        caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
+        checkpoint_io_timeout_seconds=2.0,
+        response_model_node_timeout_seconds=2.0,
+        reasoning_model_node_timeout_seconds=6.0,
+        cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
+    )
+    probe_services = build_fixture_tenant_services(
+        config_root,
+        tenant,
+        telemetry=make_tenant_telemetry(tenant.tenant_id),
+    )
+    probe = await build_application_session(
+        tenant,
+        settings,
+        models,
+        probe_services,
+        deployment_id="deployment-a",
+        routing_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+    )
+    graph_contract = graph_contract_fingerprint(probe.assembly.graph)
+    await probe.state.caller_context.aclose_session()
+    role_name = f"phase4c_runtime_{uuid.uuid4().hex[:20]}"
+    password = "synthetic-runtime-password"
+    async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
+        await apply_platform_migrations(migration_connection)
+        cursor = await migration_connection.execute("SELECT current_schema()")
+        schema_row = await cursor.fetchone()
+        assert schema_row is not None
+        schema_name = str(schema_row[0])
+        await migration_connection.execute(
+            sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                sql.Identifier(role_name),
+                sql.Literal(password),
+            )
+        )
+        await grant_platform_application_role(
+            migration_connection,
+            schema_name=schema_name,
+            role_name=role_name,
+        )
+
+    application_dsn = make_conninfo(dsn, user=role_name, password=password)
+    key = base64.b64encode(bytes(range(32))).decode("ascii")
+    resolved_secrets = {
+        "env://PLATFORM_POSTGRES_DSN": application_dsn,
+        "env://PLATFORM_SESSION_KEY": key,
+    }
+
+    class RuntimeSecrets:
+        def resolve(self, ref: str) -> str:
+            return resolved_secrets[ref]
+
+    config = PlatformRuntimeConfig.model_validate(
+        {
+            "schema_version": 1,
+            "graph_contract": graph_contract,
+            "database": {
+                "application_dsn_ref": {
+                    "provider": "env",
+                    "locator": "PLATFORM_POSTGRES_DSN",
+                },
+                "schema_name": schema_name,
+                "minimum_pool_size": 1,
+                "maximum_pool_size": 2,
+                "connection_timeout_seconds": 2.0,
+                "pool_acquisition_timeout_seconds": 0.5,
+                "statement_timeout_seconds": 1.0,
+                "transaction_timeout_seconds": 2.0,
+                "operation_timeout_seconds": 3.0,
+                "expected_schema_version": PLATFORM_SESSION_SCHEMA_VERSION,
+            },
+            "sessions": {
+                "lease_duration_seconds": 30.0,
+                "lease_renewal_interval_seconds": 10.0,
+                "session_retention_seconds": 3600,
+                "closed_tombstone_retention_seconds": 7200,
+            },
+            "encryption": {
+                "envelope_format": "aes_256_gcm_v1",
+                "key_ref": {
+                    "provider": "env",
+                    "locator": "PLATFORM_SESSION_KEY",
+                },
+                "key_version": "runtime-key-v1",
+                "key_encoding": "base64",
+            },
+        }
+    )
+
+    resources: DurablePlatformResources | None = None
+    try:
+        resources = await DurablePlatformResources.open(config, RuntimeSecrets())
+        async with resources.pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT current_schema(), current_schemas(false),
+                    current_setting('statement_timeout'),
+                    current_setting('transaction_timeout')
+                """
+            )
+            assert await cursor.fetchone() == (schema_name, [schema_name], "1s", "2s")
+        assert resources.registry is not None
+        assert resources.cipher.active_key_version == "runtime-key-v1"
+        admitted_authority = AdmittedSessionAuthority(
+            logical_session_id="AD_runtime_application",
+            transport=TransportAuthority(
+                provider="livekit",
+                room_id="RM_runtime_application",
+                assignment_id="AJ_runtime_application",
+                worker_id="AW_runtime_application",
+            ),
+        )
+        durable_session = await resources.acquire_fresh_session(
+            tenant_id=tenant.tenant_id,
+            admitted_authority=admitted_authority,
+            deployment_id="deployment-a",
+            config_version=tenant.config_version,
+        )
+        with pytest.raises(ValueError, match="registry-fenced checkpoints"):
+            replace(
+                durable_session,
+                checkpointer=build_checkpointer(cipher=resources.cipher),
+            )
+        services = build_fixture_tenant_services(
+            config_root,
+            tenant,
+            telemetry=make_tenant_telemetry(tenant.tenant_id),
+            checkpointer=durable_session.checkpointer,
+        )
+        application = await build_application_session(
+            tenant,
+            settings,
+            models,
+            services,
+            deployment_id="deployment-a",
+            routing_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+            durable_session=durable_session,
+        )
+        snapshot = await application.assembly.graph.aget_state(application.engine._config)
+        restored = await resources.registry.restore(durable_session.authority)
+
+        assert application.state.session_id == admitted_authority.logical_session_id
+        assert ReasoningState.from_checkpoint(snapshot.values) == ReasoningState()
+        assert restored.record.lifecycle is SessionLifecycle.ACTIVE
+        assert restored.record.session_revision == 0
+
+        restored_session = await resources.restore_owned_session(durable_session.authority)
+        reconstructed_services = build_fixture_tenant_services(
+            config_root,
+            tenant,
+            telemetry=make_tenant_telemetry(tenant.tenant_id),
+            checkpointer=restored_session.checkpointer,
+        )
+        reconstructed = await build_application_session(
+            tenant,
+            settings,
+            models,
+            reconstructed_services,
+            deployment_id="deployment-a",
+            routing_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+            durable_session=restored_session,
+        )
+        reconstructed_snapshot = await reconstructed.assembly.graph.aget_state(
+            reconstructed.engine._config
+        )
+
+        assert reconstructed.state.session_id == application.state.session_id
+        assert reconstructed.state.thread_id == application.state.thread_id
+        assert ReasoningState.from_checkpoint(reconstructed_snapshot.values) == ReasoningState()
+
+        pending_mutation = PendingCartMutation(
+            operation="add",
+            sku="SKU-SESSION-AHEAD",
+            name="Synthetic Session Ahead Item",
+            price_usd="17.25",
+            quantity=1,
+            pre_confirm_quantity=0,
+            idempotency_key="session-ahead-cart-mutation",
+            created_at=1.0,
+        )
+        await reconstructed.assembly.graph.aupdate_state(
+            reconstructed.engine._config,
+            {
+                "pending_cart_mutation": pending_mutation,
+                "execution_owner": "cart",
+            },
+            as_node="cart_mutation_confirm",
+        )
+        before_publication = await reconstructed.assembly.graph.aget_state(
+            reconstructed.engine._config
+        )
+        assert before_publication.next == ("cart_mutation_apply",)
+        assert ReasoningState.from_checkpoint(before_publication.values).session_revision == 0
+
+        committed = await reconstructed.state.session_state.apply_cart_mutation(
+            pending_mutation.idempotency_key,
+            operation=pending_mutation.operation,
+            sku=pending_mutation.sku,
+            name=pending_mutation.name,
+            price_usd=pending_mutation.price_usd,
+            quantity=pending_mutation.quantity,
+            pre_confirm_quantity=pending_mutation.pre_confirm_quantity,
+        )
+        assert committed.session_revision == 1
+
+        session_ahead = await resources.restore_owned_session(durable_session.authority)
+        recovery_services = build_fixture_tenant_services(
+            config_root,
+            tenant,
+            telemetry=make_tenant_telemetry(tenant.tenant_id),
+            checkpointer=session_ahead.checkpointer,
+        )
+        recovered = await build_application_session(
+            tenant,
+            settings,
+            models,
+            recovery_services,
+            deployment_id="deployment-a",
+            routing_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+            durable_session=session_ahead,
+        )
+        prepared = await recovered.assembly.graph.aget_state(recovered.engine._config)
+        prepared_state = ReasoningState.from_checkpoint(prepared.values)
+
+        assert prepared.next == ("entry",)
+        assert prepared_state.session_revision == 1
+        assert prepared_state.pending_recovery is not None
+        assert prepared_state.pending_recovery.origin_node == "cart_mutation_apply"
+
+        await engine_events(recovered.engine, "continue", TurnFacts())
+        completed = ReasoningState.from_checkpoint(
+            (await recovered.assembly.graph.aget_state(recovered.engine._config)).values
+        )
+        durable_after_recovery = await resources.registry.restore(durable_session.authority)
+
+        assert completed.pending_recovery is None
+        assert completed.pending_cart_mutation is None
+        assert completed.session_revision == 1
+        assert recovered.state.cart_store.view()[0].quantity == 1
+        assert durable_after_recovery.record.session_revision == 1
+
+        readback = await engine_events(recovered.engine, "place my order", TurnFacts())
+        paused = ReasoningState.from_checkpoint(
+            (await recovered.assembly.graph.aget_state(recovered.engine._config)).values
+        )
+        assert paused.pending_placement is not None
+        assert len([event for event in readback if isinstance(event, InterruptEvent)]) == 1
+
+        confirmation_restore = await resources.restore_owned_session(durable_session.authority)
+        confirmation_services = build_fixture_tenant_services(
+            config_root,
+            tenant,
+            telemetry=make_tenant_telemetry(tenant.tenant_id),
+            checkpointer=confirmation_restore.checkpointer,
+        )
+        confirmation_application = await build_application_session(
+            tenant,
+            settings,
+            models,
+            confirmation_services,
+            deployment_id="deployment-a",
+            routing_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+            durable_session=confirmation_restore,
+        )
+        prepared_confirmation = ReasoningState.from_checkpoint(
+            (
+                await confirmation_application.assembly.graph.aget_state(
+                    confirmation_application.engine._config
+                )
+            ).values
+        )
+        assert prepared_confirmation.pending_recovery is not None
+        assert prepared_confirmation.pending_recovery.trigger == "session_restored"
+
+        stale_consent = await committed_turn_events(
+            confirmation_application.engine,
+            CommittedTurn(text="yes", message_id="restored-stale-confirmation"),
+            TurnFacts(),
+        )
+        after_stale_consent = ReasoningState.from_checkpoint(
+            (
+                await confirmation_application.assembly.graph.aget_state(
+                    confirmation_application.engine._config
+                )
+            ).values
+        )
+        assert len([event for event in stale_consent if isinstance(event, InterruptEvent)]) == 1
+        assert not any(
+            isinstance(message, HumanMessage) and message.content == "yes"
+            for message in after_stale_consent.messages
+        )
+        assert (
+            confirmation_services.order_store.placement_receipt(
+                paused.pending_placement.idempotency_key,
+                lines=paused.pending_placement.lines,
+                total_usd=paused.pending_placement.total_usd,
+            ).kind
+            == "not_committed"
+        )
+
+        await committed_turn_events(
+            confirmation_application.engine,
+            CommittedTurn(text="yes", message_id="restored-fresh-confirmation"),
+            TurnFacts(),
+        )
+        assert (
+            confirmation_services.order_store.placement_receipt(
+                paused.pending_placement.idempotency_key,
+                lines=paused.pending_placement.lines,
+                total_usd=paused.pending_placement.total_usd,
+            ).kind
+            == "committed"
+        )
+
+        await confirmation_application.state.caller_context.aclose_session()
+        closed = await resources.registry.get(
+            tenant.tenant_id,
+            admitted_authority.logical_session_id,
+        )
+
+        assert closed is not None
+        assert closed.lifecycle is SessionLifecycle.CLOSED
+        assert closed.envelope is None
+        assert confirmation_application.state.caller_context._closed is True
+        assert (
+            confirmation_services.order_store.placement_receipt(
+                paused.pending_placement.idempotency_key,
+                lines=paused.pending_placement.lines,
+                total_usd=paused.pending_placement.total_usd,
+            ).kind
+            == "committed"
+        )
+    finally:
+        if resources is not None:
+            await resources.aclose()
+            await resources.aclose()
         async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
             role = sql.Identifier(role_name)
             await migration_connection.execute(sql.SQL("DROP OWNED BY {}").format(role))

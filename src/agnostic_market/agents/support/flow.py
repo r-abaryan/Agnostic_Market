@@ -149,7 +149,10 @@ from agnostic_market.dtos.state import (
     SupportQuestionDetail,
     open_active_invocation,
 )
-from agnostic_market.durability.session_state import SessionStateCoordinator
+from agnostic_market.durability.session_state import (
+    SessionStateCoordinator,
+    recent_orders_operation_id,
+)
 
 logger = logging.getLogger("agnostic_market.agents.support")
 
@@ -599,7 +602,7 @@ def build_support_nodes(
                 raise TypeError("account order rendering requires a bound identity")
             orders = order_store.owned_orders(bound.customer_ref, guest_orders)
             close = warm_close()
-        operation_id = f"recent-orders:list:{invocation.invocation_id}"
+        operation_id = recent_orders_operation_id("list", invocation.invocation_id)
         if orders:
             committed = await session_state.record_recent_orders(
                 operation_id,
@@ -1542,7 +1545,7 @@ def build_support_nodes(
         }
         verification = [grant.method for grant in verification_store.grants]
         committed = await session_state.record_recent_orders(
-            f"recent-orders:refund:{idempotency_key}",
+            recent_orders_operation_id("refund", idempotency_key),
             [record.order_id],
             operation="refund",
         )
@@ -1794,7 +1797,7 @@ def build_support_nodes(
                 "messages": [AIMessage(render_batch_cancel_outcome(all_outcomes))],
             }
             committed = await session_state.record_recent_orders(
-                f"recent-orders:cancel:{pending.targets[done].idempotency_key}",
+                recent_orders_operation_id("cancel", pending.targets[done].idempotency_key),
                 [result.order_id for result in all_outcomes],
                 operation="cancel",
                 focused_order_ref=all_outcomes[-1].order_id,
@@ -2121,7 +2124,7 @@ def build_support_nodes(
             ],
         }
         committed = await session_state.record_recent_orders(
-            f"recent-orders:return:{idempotency_key}",
+            recent_orders_operation_id("return", idempotency_key),
             [record.order_id],
             operation="return",
         )

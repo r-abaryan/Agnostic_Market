@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -61,7 +60,6 @@ from agnostic_market.agents.recovery import (
 from agnostic_market.agents.routing import RoutingSession
 from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.checkpoints import (
-    CheckpointBinding,
     CheckpointScopeError,
     SchemaValidatedCheckpointSaver,
     graph_contract_fingerprint,
@@ -90,18 +88,38 @@ from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
     CheckpointSchemaError,
     HandoffSource,
+    PendingCartMutation,
     ReasoningState,
     StateSchemaError,
     merge_consumed_turn_ids,
     open_active_invocation,
     validate_reasoning_state_keys,
 )
+from agnostic_market.durability.session_payload import (
+    CartMutationSessionOperationResult,
+    EmptySessionOperationResult,
+)
+from agnostic_market.durability.session_registry import (
+    CheckpointGenerationAuthority,
+    CheckpointRevisionDisposition,
+    CheckpointRevisionReconciliation,
+    SessionOperationEvidence,
+    SessionRestoreError,
+    SessionRestoreReason,
+)
+from agnostic_market.durability.session_state import recent_orders_operation_id
 
 logger = logging.getLogger("agnostic_market.agents.engine")
 
-
-def _new_thread_id() -> str:
-    return uuid.uuid4().hex
+_QUIESCENT_RESTORE_FIELDS = frozenset(
+    {
+        "active_invocation",
+        "identity_claim_misses",
+        "execution_owner",
+        "pending_clarification",
+        "clarification_liveness",
+    }
+)
 
 
 def _write_ingress_rejection(
@@ -304,6 +322,64 @@ def _interrupt_node(
     return task.name
 
 
+def _session_ahead_evidence_matches(
+    state: ReasoningState,
+    action: ExceptionAction,
+    operations: tuple[SessionOperationEvidence, ...],
+) -> bool:
+    latest = operations[-1]
+    result = latest.result
+    if action is ExceptionAction.CART_REVIEW:
+        pending = state.pending_cart_mutation
+        return bool(
+            isinstance(pending, PendingCartMutation)
+            and isinstance(result, CartMutationSessionOperationResult)
+            and latest.operation_id == pending.idempotency_key
+            and result.record.operation == pending.operation
+            and result.record.sku == pending.sku
+            and result.record.name == pending.name
+            and result.record.price_usd == pending.price_usd
+            and result.record.quantity == pending.quantity
+            and result.record.pre_confirm_quantity == pending.pre_confirm_quantity
+        )
+    if not isinstance(result, EmptySessionOperationResult):
+        return False
+    if action is ExceptionAction.RECONCILE_PLACEMENT:
+        pending = state.pending_placement
+        return bool(pending is not None and latest.operation_id == pending.idempotency_key)
+    if action is ExceptionAction.RECONCILE_REFUND:
+        pending = state.pending_refund
+        return bool(
+            pending is not None
+            and latest.operation_id == recent_orders_operation_id("refund", pending.idempotency_key)
+        )
+    if action is ExceptionAction.RECONCILE_CANCEL:
+        pending = state.pending_cancel
+        if pending is None or len(pending.outcomes) >= len(pending.targets):
+            return False
+        return latest.operation_id == recent_orders_operation_id(
+            "cancel",
+            pending.targets[len(pending.outcomes)].idempotency_key,
+        )
+    if action is ExceptionAction.RECONCILE_RETURN:
+        pending = state.pending_return
+        return bool(
+            pending is not None
+            and latest.operation_id == recent_orders_operation_id("return", pending.idempotency_key)
+        )
+    if action is ExceptionAction.SAFE_ABORT:
+        invocation = state.active_invocation
+        return bool(
+            invocation is not None
+            and latest.operation_id
+            in {
+                recent_orders_operation_id("read", invocation.invocation_id),
+                recent_orders_operation_id("list", invocation.invocation_id),
+            }
+        )
+    return False
+
+
 def _classify_cancelled_checkpoint(
     snapshot: StateSnapshot,
     *,
@@ -368,10 +444,7 @@ class ReasoningEngine:
         self,
         graph: CompiledStateGraph,
         *,
-        tenant_id: str,
-        logical_session_id: str,
-        deployment_id: str,
-        thread_id: str,
+        checkpoint_authority: CheckpointGenerationAuthority,
         checkpoint_io_timeout_seconds: float,
         cancellation_quiescence_timeout_seconds: float,
         routing: RoutingSession,
@@ -385,22 +458,24 @@ class ReasoningEngine:
             )
         if not isinstance(graph.checkpointer, SchemaValidatedCheckpointSaver):
             raise ValueError("ReasoningEngine requires a schema-validating checkpointer")
-        binding = CheckpointBinding(
-            tenant_id=tenant_id,
-            logical_session_id=logical_session_id,
-            deployment_id=deployment_id,
-            graph_contract=graph_contract_fingerprint(graph),
-            thread_id=thread_id,
-        )
+        if not isinstance(checkpoint_authority, CheckpointGenerationAuthority):
+            raise TypeError("ReasoningEngine requires checkpoint-generation authority")
+        generation = checkpoint_authority.current_generation
+        if generation.state != "current":
+            raise ValueError("ReasoningEngine requires the current checkpoint generation")
+        if generation.graph_contract != graph_contract_fingerprint(graph):
+            raise ValueError("checkpoint generation does not match the reasoning graph")
+        binding = generation.binding
         graph.checkpointer.bind_checkpoint_contract(
             graph.channels,
             binding=binding,
             io_timeout_seconds=checkpoint_io_timeout_seconds,
         )
         self._graph = graph
+        self._checkpoint_authority = checkpoint_authority
         self._checkpoint_io_timeout_seconds = checkpoint_io_timeout_seconds
         self._checkpoint_binding = binding
-        self._thread_id = thread_id
+        self._thread_id = generation.checkpoint_namespace
         self._config = binding.config
         self._speakable: frozenset[str] = getattr(graph, "speakable_nodes", frozenset())
         self._model_speech: frozenset[str] = getattr(graph, "model_speech_nodes", frozenset())
@@ -449,6 +524,14 @@ class ReasoningEngine:
         self._consent_interrupt_kinds: Mapping[str, Literal["standard", "cancel"]] = dict(
             consent_interrupt_kinds
         )
+        restore_reconfirmation_nodes = getattr(graph, "restore_reconfirmation_nodes", None)
+        if (
+            not isinstance(restore_reconfirmation_nodes, frozenset)
+            or not all(isinstance(name, str) and name for name in restore_reconfirmation_nodes)
+            or not restore_reconfirmation_nodes <= frozenset(self._consent_interrupt_kinds)
+        ):
+            raise ValueError("ReasoningEngine requires graph-declared restore confirmations")
+        self._restore_reconfirmation_nodes: frozenset[str] = restore_reconfirmation_nodes
         infrastructure_nodes = getattr(graph, "recovery_infrastructure_nodes", None)
         if not isinstance(infrastructure_nodes, frozenset) or not all(
             isinstance(name, str) for name in infrastructure_nodes
@@ -477,6 +560,179 @@ class ReasoningEngine:
     def thread_id(self) -> str:
         return self._thread_id
 
+    async def aseed_initial_checkpoint(self, expected_session_revision: int) -> int:
+        """Create and verify the sole checkpoint for a fresh durable session."""
+        if expected_session_revision != 0:
+            raise ValueError("initial checkpoint seed requires session revision zero")
+        if (
+            self._lifecycle is not None
+            and self._lifecycle.session_revision != expected_session_revision
+        ):
+            raise RuntimeError("session projection changed before initial checkpoint seed")
+        existing = await self._graph.aget_state(self._config)
+        if existing.values or existing.next or existing.tasks or existing.interrupts:
+            raise RuntimeError("initial checkpoint seed requires an empty generation")
+
+        await self._aupdate_state(
+            self._config,
+            {
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "session_revision": expected_session_revision,
+            },
+            as_node=self._principal_seed_complete_node,
+        )
+        seeded = await self._graph.aget_state(self._config)
+        seeded_state = ReasoningState.from_checkpoint(seeded.values)
+        if (
+            seeded_state != ReasoningState(session_revision=expected_session_revision)
+            or seeded.next
+            or seeded.tasks
+            or seeded.interrupts
+        ):
+            raise RuntimeError("initial checkpoint seed did not round-trip exactly")
+        return seeded_state.session_revision
+
+    async def arestored_checkpoint_revision(self) -> int:
+        """Validate an existing checkpoint and return its observed session revision."""
+        snapshot = await self._graph.aget_state(self._config)
+        if not snapshot.values:
+            raise CheckpointSchemaError("restored session has no checkpoint state")
+        return ReasoningState.from_checkpoint(snapshot.values).session_revision
+
+    async def arequire_fresh_checkpoint(self) -> None:
+        """Reject checkpoint reuse outside the durable restore boundary."""
+        snapshot = await self._graph.aget_state(self._config)
+        if snapshot.values or snapshot.next or snapshot.tasks or snapshot.interrupts:
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+
+    async def aprepare_current_restore(self, expected_session_revision: int) -> None:
+        """Validate a current checkpoint and re-issue a recoverable confirmation."""
+        if expected_session_revision < 0:
+            raise ValueError("restored session revision must not be negative")
+        snapshot = await self._graph.aget_state(self._config)
+        if not snapshot.values:
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+        state = ReasoningState.from_checkpoint(snapshot.values)
+        if state.session_revision != expected_session_revision:
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+        if state.pending_recovery is not None:
+            try:
+                self._validated_pending_recovery(snapshot, state)
+            except RuntimeError as exc:
+                raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED) from exc
+            return
+
+        if snapshot.interrupts:
+            origin_node = _interrupt_node(snapshot, self._node_recovery_policies)
+            if origin_node is None or origin_node not in self._restore_reconfirmation_nodes:
+                raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+            policy = self._node_recovery_policies[origin_node]
+            marker = PendingRecovery(
+                origin_node=origin_node,
+                action=policy.on_exception,
+                trigger="session_restored",
+            )
+            await self._aupdate_state(
+                self._config,
+                {
+                    "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                    "pending_recovery": marker,
+                },
+                as_node="__start__",
+            )
+            prepared = await self._graph.aget_state(self._config)
+            prepared_state = ReasoningState.from_checkpoint(prepared.values)
+            try:
+                prepared_marker = self._validated_pending_recovery(prepared, prepared_state)
+            except RuntimeError as exc:
+                raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED) from exc
+            if (
+                prepared_marker != marker
+                or prepared_state.session_revision != expected_session_revision
+            ):
+                raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+            self._telemetry.record(
+                {
+                    "event": "turn_recovery_seeded",
+                    "node": origin_node,
+                    "action": policy.on_exception,
+                    "reason": "session_restored",
+                }
+            )
+            return
+
+        if snapshot.next or snapshot.tasks:
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+        unsafe_residuals = {
+            field
+            for field, cleared_value in clear_automation_state().items()
+            if field not in _QUIESCENT_RESTORE_FIELDS and getattr(state, field) != cleared_value
+        }
+        if unsafe_residuals:
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+
+    async def aprepare_session_ahead_recovery(
+        self,
+        reconciliation: CheckpointRevisionReconciliation,
+    ) -> None:
+        """Route a receipt-proven revision gap through the graph's recovery owner."""
+        if (
+            reconciliation.disposition is not CheckpointRevisionDisposition.SESSION_AHEAD
+            or reconciliation.checkpoint_revision is None
+            or not reconciliation.operations
+        ):
+            raise ValueError("session-ahead recovery requires contiguous operation evidence")
+
+        snapshot = await self._graph.aget_state(self._config)
+        state = ReasoningState.from_checkpoint(snapshot.values)
+        if (
+            state.session_revision != reconciliation.checkpoint_revision
+            or state.pending_recovery is not None
+            or state.automation_terminal
+            or snapshot.interrupts
+            or len(snapshot.next) != 1
+        ):
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+        origin_node = snapshot.next[0]
+        policy = self._node_recovery_policies.get(origin_node)
+        if (
+            policy is None
+            or origin_node not in self._recovery_handled_nodes
+            or not _task_matches(snapshot, origin_node, interrupted=False)
+            or not _session_ahead_evidence_matches(
+                state,
+                policy.on_exception,
+                reconciliation.operations,
+            )
+        ):
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+
+        marker = PendingRecovery(
+            origin_node=origin_node,
+            action=policy.on_exception,
+            trigger="node_exception",
+        )
+        await self._aupdate_state(
+            self._config,
+            {
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "pending_recovery": marker,
+                "session_revision": reconciliation.record.session_revision,
+            },
+            as_node="__start__",
+        )
+        prepared = await self._graph.aget_state(self._config)
+        prepared_state = ReasoningState.from_checkpoint(prepared.values)
+        try:
+            prepared_marker = self._validated_pending_recovery(prepared, prepared_state)
+        except RuntimeError as exc:
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED) from exc
+        if (
+            prepared_marker != marker
+            or prepared_state.session_revision != reconciliation.record.session_revision
+        ):
+            raise SessionRestoreError(SessionRestoreReason.RECONSTRUCTION_FAILED)
+
     async def apending_interrupt(self) -> bool:
         """Async voice-path check for a pending confirmation interrupt."""
         if not self._node_execution_tracker.turn_admission_open or self._terminal_latched:
@@ -486,7 +742,9 @@ class ReasoningEngine:
     async def acheckpoint_has_pending_interrupt(self) -> bool:
         """Inspect persisted interruption state without implying that a turn may resume it."""
         try:
-            return bool((await self._graph.aget_state(self._config)).interrupts)
+            checkpointer = self._graph.checkpointer
+            assert isinstance(checkpointer, SchemaValidatedCheckpointSaver)
+            return await checkpointer.acheckpoint_has_pending_interrupt(self._config)
         except (CheckpointSchemaError, CheckpointScopeError):
             return False
 
@@ -529,9 +787,12 @@ class ReasoningEngine:
             await self._lifecycle.invalidate_principal_transition(transition.transition_id)
             raise RuntimeError("principal transition is inconsistent")
 
-        new_thread_id = _new_thread_id()
         old_binding = self._checkpoint_binding
-        new_binding = old_binding.rotate(new_thread_id)
+        destination = await self._checkpoint_authority.begin_checkpoint_rotation(
+            expected_revision=self._lifecycle.session_revision,
+            transition_id=transition.transition_id,
+        )
+        new_binding = destination.binding
         assert isinstance(self._graph.checkpointer, SchemaValidatedCheckpointSaver)
         self._graph.checkpointer.bind_checkpoint_contract(
             self._graph.channels,
@@ -582,11 +843,27 @@ class ReasoningEngine:
             rechecked = self._lifecycle.inspect_principal_transition()
             if rechecked.outcome != "coherent" or rechecked.transition != transition:
                 raise RuntimeError("principal transition changed during rotation")
-            await self._graph.checkpointer.adelete_thread(old_binding.storage_thread_id)
-            self._thread_id = new_thread_id
+            rotation = await self._checkpoint_authority.switch_checkpoint_generation(
+                transition.transition_id
+            )
+            if (
+                rotation.source.binding != old_binding
+                or rotation.destination != destination.model_copy(update={"state": "current"})
+            ):
+                raise RuntimeError("checkpoint authority returned an inconsistent rotation")
+            self._thread_id = rotation.destination.checkpoint_namespace
             self._checkpoint_binding = new_binding
             self._config = new_config
             switched = True
+            await self._graph.checkpointer.adelete_thread(rotation.source.storage_thread_id)
+            deleted = await self._checkpoint_authority.record_checkpoint_deletion(
+                transition.transition_id
+            )
+            if (
+                deleted.checkpoint_namespace != rotation.source.checkpoint_namespace
+                or deleted.state != "deleted"
+            ):
+                raise RuntimeError("checkpoint authority did not record source deletion")
             completed_revision = await self._lifecycle.complete_transition(transition.transition_id)
             await self._aupdate_state(
                 new_config,
@@ -759,6 +1036,11 @@ class ReasoningEngine:
                     and marker.origin_node in self._recovery_handled_nodes
                     and marker.action == policy.on_exception
                 )
+                or (
+                    marker.trigger == "session_restored"
+                    and marker.origin_node in self._restore_reconfirmation_nodes
+                    and marker.action == policy.on_exception
+                )
             )
         )
         valid = bool(
@@ -769,7 +1051,7 @@ class ReasoningEngine:
             and _task_matches(snapshot, self._recovery_entry_node, interrupted=False)
         )
         if not valid:
-            raise RuntimeError("pending stream recovery checkpoint is invalid")
+            raise RuntimeError("pending recovery checkpoint is invalid")
         return marker
 
     def _is_pristine_principal_continuation(

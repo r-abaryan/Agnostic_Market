@@ -23,6 +23,7 @@ class PlatformDatabaseConfig(BaseModel):
     model_config = _STRICT
 
     application_dsn_ref: SecretReference
+    schema_name: ConfigIdentifier
     minimum_pool_size: int = Field(ge=0)
     maximum_pool_size: int = Field(ge=1)
     connection_timeout_seconds: float = Field(gt=0)
@@ -66,6 +67,7 @@ class SessionEncryptionConfig(BaseModel):
     envelope_format: Literal["aes_256_gcm_v1"]
     key_ref: SecretReference
     key_version: ConfigIdentifier
+    key_encoding: Literal["base64"]
 
 
 class PlatformRuntimeConfig(BaseModel):
@@ -74,6 +76,7 @@ class PlatformRuntimeConfig(BaseModel):
     model_config = _STRICT
 
     schema_version: Literal[1]
+    graph_contract: str = Field(pattern=r"^[0-9a-f]{64}$")
     database: PlatformDatabaseConfig
     sessions: DurableSessionConfig
     encryption: SessionEncryptionConfig

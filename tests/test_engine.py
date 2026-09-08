@@ -43,6 +43,8 @@ from agnostic_market.agents.engine import (
     ReasoningEngine,
     _classify_cancelled_checkpoint,
     _GraphSpans,
+    _interrupt_node,
+    _session_ahead_evidence_matches,
     _TurnSpeech,
 )
 from agnostic_market.agents.frontline import MODEL_SPEECH_NODES, build_frontline_graph
@@ -62,12 +64,15 @@ from agnostic_market.agents.telemetry import InMemoryTelemetrySink
 from agnostic_market.checkpoints import (
     _CHECKPOINT_CHANNEL_DTOS,
     _CHECKPOINT_NESTED_ENUMS,
+    CheckpointBinding,
     CheckpointScopeError,
     build_checkpointer,
+    graph_contract_fingerprint,
 )
-from agnostic_market.commerce.cart import CartStore
+from agnostic_market.commerce.cart import CartMutationRecord, CartStore
 from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
+    BoundIdentity,
     CallerIdentityStore,
     CustomerDirectory,
     load_customers_fixture,
@@ -113,6 +118,7 @@ from agnostic_market.dtos.orchestration import (
     RouterNoActionEnvelope,
     RoutingContext,
     RoutingFailure,
+    SwitchAccount,
     VerifyOrderStatus,
     ViewCart,
     ViewIdentityStatus,
@@ -139,6 +145,16 @@ from agnostic_market.dtos.state import (
     StateSchemaError,
     SupportClarification,
     open_active_invocation,
+)
+from agnostic_market.durability.session_payload import (
+    CartMutationSessionOperationResult,
+    EmptySessionOperationResult,
+)
+from agnostic_market.durability.session_registry import (
+    InMemoryCheckpointGenerationAuthority,
+    SessionOperationEvidence,
+    SessionRestoreError,
+    SessionRestoreReason,
 )
 from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
@@ -325,10 +341,15 @@ def _engine(
     )
     engine = ReasoningEngine(
         assembly.graph,
-        tenant_id="acme_store",
-        logical_session_id=thread_id,
-        deployment_id="test-deployment",
-        thread_id=thread_id,
+        checkpoint_authority=InMemoryCheckpointGenerationAuthority.from_binding(
+            CheckpointBinding(
+                tenant_id="acme_store",
+                logical_session_id=thread_id,
+                deployment_id="test-deployment",
+                graph_contract=graph_contract_fingerprint(assembly.graph),
+                thread_id=thread_id,
+            )
+        ),
         checkpoint_io_timeout_seconds=2.0,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         lifecycle=caller_context,
@@ -407,6 +428,111 @@ async def test_first_admitted_turn_persists_checkpoint_schema_version(
         engine._graph.get_state(engine._config).values["checkpoint_schema_version"]
         == CHECKPOINT_SCHEMA_VERSION
     )
+
+
+async def test_initial_checkpoint_seed_is_exact_and_cannot_overwrite_state(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(config_root, thread_id="initial-durable-seed")
+
+    revision = await engine.aseed_initial_checkpoint(0)
+    snapshot = await engine._graph.aget_state(engine._config)
+
+    assert revision == 0
+    assert ReasoningState.from_checkpoint(snapshot.values) == ReasoningState()
+    assert snapshot.next == ()
+    assert snapshot.tasks == ()
+    assert snapshot.interrupts == ()
+    with pytest.raises(RuntimeError, match="empty generation"):
+        await engine.aseed_initial_checkpoint(0)
+
+
+async def test_current_restore_reissues_confirmation_before_accepting_new_consent(
+    config_root: Path,
+) -> None:
+    engine, store = _engine(
+        config_root,
+        cart=_checkout_cart(),
+        thread_id="current-restore-confirmation",
+    )
+    await _pause_at_confirmation(engine)
+    paused = await engine._graph.aget_state(engine._config)
+    assert _interrupt_node(paused, engine._node_recovery_policies) == "cart_confirm"
+
+    await engine.aprepare_current_restore(0)
+    prepared = await engine._graph.aget_state(engine._config)
+    marker = ReasoningState.from_checkpoint(prepared.values).pending_recovery
+    assert isinstance(marker, PendingRecovery)
+    assert marker.trigger == "session_restored"
+    assert prepared.interrupts == ()
+    assert prepared.next == (engine._recovery_entry_node,)
+
+    stale_consent = await _events(engine, "yes")
+    assert store.placed_count == 0
+    assert [event for event in stale_consent if isinstance(event, InterruptEvent)]
+    assert await engine.apending_interrupt()
+    reconfirmed = ReasoningState.from_checkpoint(
+        (await engine._graph.aget_state(engine._config)).values
+    )
+    assert not any(
+        isinstance(message, HumanMessage) and message.content == "yes"
+        for message in reconfirmed.messages
+    )
+
+    fresh_consent = await _events(engine, "yes")
+    assert store.placed_count == 1
+    assert any(
+        isinstance(event, SpokenMessageEvent) and "order number" in event.text
+        for event in fresh_consent
+    )
+
+
+async def test_current_restore_rejects_non_restorable_confirmation(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    engine, _store = _engine(
+        config_root,
+        cart=_checkout_cart(),
+        identity=identity,
+        thread_id="non-restorable-confirmation",
+        routing_recognizer=_DeterministicRoutingRecognizer(
+            _routing_attempt(RouteDecision.direct(SwitchAccount()))
+        ),
+    )
+    await _events(engine, "switch accounts")
+    snapshot = await engine._graph.aget_state(engine._config)
+    assert _interrupt_node(snapshot, engine._node_recovery_policies) == "principal_warning"
+
+    with pytest.raises(SessionRestoreError) as rejected:
+        await engine.aprepare_current_restore(0)
+
+    assert rejected.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
+
+
+async def test_current_restore_keeps_quiescent_conversation_context(
+    config_root: Path,
+) -> None:
+    engine, _store = _engine(config_root, thread_id="quiescent-current-restore")
+    invocation = open_active_invocation(
+        AnswerQuestion(topic="policy"),
+        consumed_turn_ids=("quiescent-origin",),
+    )
+    await engine._aupdate_state(
+        engine._config,
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "consumed_turn_ids": ("quiescent-origin",),
+            "active_invocation": invocation,
+        },
+        as_node=engine._principal_seed_complete_node,
+    )
+
+    await engine.aprepare_current_restore(0)
+
+    state = ReasoningState.from_checkpoint((await engine._graph.aget_state(engine._config)).values)
+    assert state.active_invocation == invocation
 
 
 async def test_native_async_model_deadline_keeps_loop_live_and_recovers_in_code(
@@ -2615,6 +2741,54 @@ async def test_post_close_turn_stops_before_every_engine_boundary(
 
 
 _PROJECT_MODULE_PREFIX = "agnostic_market."
+
+
+def test_session_ahead_cart_recovery_requires_the_matching_typed_receipt() -> None:
+    pending = PendingCartMutation(
+        operation="add",
+        sku="SKU-1",
+        name="Trail Jacket",
+        price_usd=79.0,
+        quantity=1,
+        pre_confirm_quantity=0,
+        idempotency_key="cart-operation-1",
+        created_at=1.0,
+    )
+    record = CartMutationRecord(
+        operation=pending.operation,
+        sku=pending.sku,
+        name=pending.name,
+        price_usd=pending.price_usd,
+        quantity=pending.quantity,
+        pre_confirm_quantity=pending.pre_confirm_quantity,
+        previous_quantity=0,
+        final_quantity=1,
+        outcome="applied",
+    )
+    evidence = SessionOperationEvidence(
+        operation_id=pending.idempotency_key,
+        request_fingerprint="a" * 64,
+        committed_revision=1,
+        committed_checkpoint_namespace="session-1",
+        result=CartMutationSessionOperationResult(record=record),
+    )
+    state = ReasoningState(pending_cart_mutation=pending, execution_owner="cart")
+
+    assert _session_ahead_evidence_matches(
+        state,
+        ExceptionAction.CART_REVIEW,
+        (evidence,),
+    )
+    assert not _session_ahead_evidence_matches(
+        state,
+        ExceptionAction.CART_REVIEW,
+        (evidence.model_copy(update={"operation_id": "another-operation"}),),
+    )
+    assert not _session_ahead_evidence_matches(
+        state,
+        ExceptionAction.CART_REVIEW,
+        (evidence.model_copy(update={"result": EmptySessionOperationResult()}),),
+    )
 
 
 def _direct_state_model_types(annotation: object) -> set[type[BaseModel]]:

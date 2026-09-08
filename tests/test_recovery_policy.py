@@ -214,6 +214,30 @@ def test_consent_interrupt_requires_lifecycle_special_abandonment() -> None:
         )
 
 
+def test_restore_reconfirmation_is_closed_and_requires_a_consent_interrupt() -> None:
+    graph = StateGraph(ReasoningState)
+    registry = NodePolicyRegistry(graph)
+    registry.register(
+        "confirm",
+        lambda _state: {},
+        ExceptionAction.ABORT_PLACEMENT_CONFIRMATION,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+        consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
+    )
+
+    assert registry.validated_restore_reconfirmation_nodes() == frozenset({"confirm"})
+    with pytest.raises(ValueError, match="requires a consent interrupt"):
+        other = NodePolicyRegistry(StateGraph(ReasoningState))
+        other.register(
+            "not_confirm",
+            lambda _state: {},
+            ExceptionAction.SAFE_ABORT,
+            AbandonmentKind.LIFECYCLE_SPECIAL,
+            restore_reconfirmation=True,
+        )
+
+
 def test_registry_destinations_are_rendering_only() -> None:
     visited: list[str] = []
 

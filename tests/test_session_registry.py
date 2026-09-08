@@ -7,29 +7,66 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from agnostic_market.checkpoints import CheckpointBinding
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
 from agnostic_market.durability.encryption import AesGcmSessionCipher, SessionEnvelopeContext
 from agnostic_market.durability.migrations import (
     PLATFORM_MIGRATIONS,
     PLATFORM_SESSION_SCHEMA_VERSION,
 )
+from agnostic_market.durability.session_lifecycle import DurableSessionLifecycleCoordinator
 from agnostic_market.durability.session_payload import (
     SESSION_PAYLOAD_SCHEMA_VERSION,
     DurableSessionPayload,
     SessionOperationReceiptPayload,
 )
 from agnostic_market.durability.session_registry import (
+    ExpiredSessionCandidate,
+    InMemoryCheckpointGenerationAuthority,
     LeaseAdmissionError,
     LeaseAdmissionReason,
+    SessionCloseError,
+    SessionCloseReason,
     SessionLeaseAuthority,
     SessionLeaseRenewal,
     SessionLeaseRequest,
     SessionLifecycle,
     SessionRegistration,
     SessionRegistryRecord,
+    SessionStateWriteError,
+    SessionStateWriteReason,
 )
 
 _KEY = bytes(range(32))
+
+
+class _ReaperRegistry:
+    def __init__(self) -> None:
+        self.candidates = (
+            ExpiredSessionCandidate(
+                tenant_id="acme_store",
+                logical_session_id="AD_poisoned",
+            ),
+            ExpiredSessionCandidate(
+                tenant_id="acme_store",
+                logical_session_id="AD_healthy",
+            ),
+        )
+        self.purge_calls = 0
+
+    async def expired_sessions(self, tenant_id: str, *, limit: int):
+        assert tenant_id == "acme_store"
+        assert limit == 100
+        return self.candidates
+
+    async def claim_expired(self, candidate, _request):
+        return candidate
+
+    async def purge_closed_tombstones(self, tenant_id: str, *, limit: int) -> int:
+        assert tenant_id == "acme_store"
+        assert limit == 100
+        self.purge_calls += 1
+        return 0
 
 
 def _authority() -> AdmittedSessionAuthority:
@@ -64,6 +101,148 @@ def test_platform_migration_inventory_is_contiguous_and_complete() -> None:
         range(1, PLATFORM_SESSION_SCHEMA_VERSION + 1)
     )
     assert all(len(migration.checksum) == 64 for migration in PLATFORM_MIGRATIONS)
+
+
+async def test_reaper_isolates_candidate_failures_and_still_purges_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _ReaperRegistry()
+    coordinator = DurableSessionLifecycleCoordinator(
+        None,  # type: ignore[arg-type]
+        registry,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        checkpoint_io_timeout_seconds=1.0,
+        close_lease_duration_seconds=1.0,
+        tombstone_retention_seconds=1.0,
+    )
+    finalized: list[str] = []
+
+    async def finalize(candidate: ExpiredSessionCandidate):
+        finalized.append(candidate.logical_session_id)
+        if candidate.logical_session_id == "AD_poisoned":
+            raise RuntimeError("poisoned checkpoint")
+
+    monkeypatch.setattr(coordinator, "finalize", finalize)
+
+    with pytest.raises(ExceptionGroup, match="cleanup operations failed") as failed:
+        await coordinator.reap_expired("acme_store")
+
+    assert finalized == ["AD_poisoned", "AD_healthy"]
+    assert registry.purge_calls == 1
+    assert len(failed.value.exceptions) == 1
+    assert failed.value.exceptions[0].__notes__ == [
+        "failed reaper candidate acme_store/AD_poisoned"
+    ]
+
+
+async def test_reaper_treats_a_concurrent_close_claim_as_a_benign_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _ReaperRegistry()
+    coordinator = DurableSessionLifecycleCoordinator(
+        None,  # type: ignore[arg-type]
+        registry,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        checkpoint_io_timeout_seconds=1.0,
+        close_lease_duration_seconds=1.0,
+        tombstone_retention_seconds=1.0,
+    )
+    finalized: list[str] = []
+
+    async def claim_expired(candidate: ExpiredSessionCandidate, _request):
+        if candidate.logical_session_id == "AD_poisoned":
+            raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+        return candidate
+
+    async def finalize(candidate: ExpiredSessionCandidate):
+        finalized.append(candidate.logical_session_id)
+
+    monkeypatch.setattr(registry, "claim_expired", claim_expired)
+    monkeypatch.setattr(coordinator, "finalize", finalize)
+
+    assert await coordinator.reap_expired("acme_store") == 1
+    assert finalized == ["AD_healthy"]
+    assert registry.purge_calls == 1
+
+
+async def test_reaper_treats_ownership_loss_during_finalization_as_a_benign_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _ReaperRegistry()
+    coordinator = DurableSessionLifecycleCoordinator(
+        None,  # type: ignore[arg-type]
+        registry,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        checkpoint_io_timeout_seconds=1.0,
+        close_lease_duration_seconds=1.0,
+        tombstone_retention_seconds=1.0,
+    )
+    finalized: list[str] = []
+
+    async def finalize(candidate: ExpiredSessionCandidate):
+        finalized.append(candidate.logical_session_id)
+        if candidate.logical_session_id == "AD_poisoned":
+            raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+
+    monkeypatch.setattr(coordinator, "finalize", finalize)
+
+    assert await coordinator.reap_expired("acme_store") == 1
+    assert finalized == ["AD_poisoned", "AD_healthy"]
+    assert registry.purge_calls == 1
+
+
+async def test_in_memory_checkpoint_authority_models_one_registry_owned_rotation() -> None:
+    authority = InMemoryCheckpointGenerationAuthority.from_binding(
+        CheckpointBinding(
+            tenant_id="acme_store",
+            logical_session_id="AD_session",
+            deployment_id="deployment-a",
+            graph_contract="graph-a",
+            thread_id="AD_session::fence::0",
+        )
+    )
+
+    destination = await authority.begin_checkpoint_rotation(
+        expected_revision=1,
+        transition_id="principal-transition-a",
+    )
+    replay = await authority.begin_checkpoint_rotation(
+        expected_revision=1,
+        transition_id="principal-transition-a",
+    )
+
+    assert replay == destination
+    assert destination.state == "pending"
+    assert authority.current_generation.principal_generation == 0
+    with pytest.raises(SessionStateWriteError) as pending_rejected:
+        await authority.begin_checkpoint_rotation(
+            expected_revision=1,
+            transition_id="principal-transition-b",
+        )
+    assert pending_rejected.value.reason is SessionStateWriteReason.ROTATION_PENDING
+
+    rotation = await authority.switch_checkpoint_generation("principal-transition-a")
+    deleted = await authority.record_checkpoint_deletion("principal-transition-a")
+
+    assert rotation.source.state == "retired"
+    assert rotation.destination.state == "current"
+    assert authority.current_generation == rotation.destination
+    assert deleted.checkpoint_namespace == rotation.source.checkpoint_namespace
+    assert deleted.state == "deleted"
+
+    second = await authority.begin_checkpoint_rotation(
+        expected_revision=2,
+        transition_id="principal-transition-b",
+    )
+    await authority.switch_checkpoint_generation("principal-transition-b")
+
+    assert second.principal_generation == 2
+    with pytest.raises(SessionStateWriteError) as replay_rejected:
+        await authority.begin_checkpoint_rotation(
+            expected_revision=1,
+            transition_id="principal-transition-a",
+        )
+    assert replay_rejected.value.reason is SessionStateWriteReason.OPERATION_CONFLICT
 
 
 @pytest.mark.parametrize("payload_type", [DurableSessionPayload, SessionOperationReceiptPayload])

@@ -429,6 +429,7 @@ class NodePolicyRegistry:
         self._handled: set[str] = set()
         self._handled_infrastructure: set[str] = set()
         self._consent_interrupt_kinds: dict[str, Literal["standard", "cancel"]] = {}
+        self._restore_reconfirmation_nodes: set[str] = set()
         self._execution_tracker = execution_tracker or NodeExecutionTracker()
         self._validated: Mapping[str, NodeRecoveryPolicy] | None = None
 
@@ -464,6 +465,7 @@ class NodePolicyRegistry:
         on_abandonment: AbandonmentKind,
         *,
         consent_interrupt_kind: Literal["standard", "cancel"] | None = None,
+        restore_reconfirmation: bool = False,
         destinations: tuple[str, ...] | None = None,
     ) -> None:
         self._ensure_open_and_unique(name)
@@ -472,6 +474,8 @@ class NodePolicyRegistry:
             and on_abandonment != AbandonmentKind.LIFECYCLE_SPECIAL
         ):
             raise ValueError("a consent interrupt must use lifecycle-special abandonment")
+        if restore_reconfirmation and consent_interrupt_kind is None:
+            raise ValueError("restore re-confirmation requires a consent interrupt")
         policy = NodeRecoveryPolicy(
             on_exception=on_exception,
             on_abandonment=on_abandonment,
@@ -497,6 +501,8 @@ class NodePolicyRegistry:
         self._policies[name] = policy
         if consent_interrupt_kind is not None:
             self._consent_interrupt_kinds[name] = consent_interrupt_kind
+        if restore_reconfirmation:
+            self._restore_reconfirmation_nodes.add(name)
         if handler is not None:
             self._handled.add(name)
 
@@ -588,6 +594,16 @@ class NodePolicyRegistry:
         self.validated_policies()
         return MappingProxyType(dict(self._consent_interrupt_kinds))
 
+    def registered_restore_reconfirmation_nodes(self) -> frozenset[str]:
+        return frozenset(self._restore_reconfirmation_nodes)
+
+    def validated_restore_reconfirmation_nodes(self) -> frozenset[str]:
+        self.validated_policies()
+        nodes = frozenset(self._restore_reconfirmation_nodes)
+        if not nodes <= frozenset(self._consent_interrupt_kinds):
+            raise RuntimeError("restore re-confirmation nodes are not consent interrupts")
+        return nodes
+
 
 def ordinary_exception_handler_enabled(action: ExceptionAction) -> bool:
     return action in _ORDINARY_EXCEPTION_ACTIONS
@@ -640,6 +656,7 @@ def build_recovery_terminalizer(_state: ReasoningState) -> dict[str, object]:
 def build_recovery_node(
     policies: Callable[[], Mapping[str, NodeRecoveryPolicy]],
     handled_nodes: Callable[[], frozenset[str]],
+    restore_reconfirmation_nodes: frozenset[str],
     safe_abort_continue_node: str,
     cart_store: CartStore,
     order_store: OrderPort,
@@ -848,8 +865,19 @@ def build_recovery_node(
             and marker.action == policy.on_cancellation
             and marker.abandoned_message_id in state.consumed_turn_ids
         )
-        if not (node_exception_valid or stream_cancellation_valid):
+        restored_confirmation_valid = bool(
+            marker.trigger == "session_restored"
+            and marker.origin_node in restore_reconfirmation_nodes
+            and policy is not None
+            and marker.action == policy.on_exception
+        )
+        if not (node_exception_valid or stream_cancellation_valid or restored_confirmation_valid):
             return terminal_result()
+        if restored_confirmation_valid:
+            return Command(
+                update={"pending_recovery": None},
+                goto=marker.origin_node,
+            )
 
         update = clear_automation_state()
         if marker.action == ExceptionAction.TERMINAL:

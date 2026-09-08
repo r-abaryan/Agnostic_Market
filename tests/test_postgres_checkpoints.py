@@ -47,6 +47,7 @@ from agnostic_market.durability.session_payload import (
     PrincipalRetirementMarker,
 )
 from agnostic_market.durability.session_registry import (
+    BoundCheckpointGenerationAuthority,
     PostgresSessionRegistry,
     SessionLeaseAuthority,
     SessionLeaseRequest,
@@ -1124,6 +1125,65 @@ async def test_fenced_checkpoint_requires_an_encrypted_pending_write_manifest() 
             await saver.aget_tuple(saved_config)
         assert rejected.value.reason is CheckpointDataPlaneReason.MANIFEST_MISSING
 
+        with pytest.raises(CheckpointDataPlaneError) as write_rejected:
+            await saver.aput_writes(
+                saved_config,
+                (("value", "unsealed-write"),),
+                "unsealed-write-task",
+                "pull/unsealed-write-task",
+            )
+        assert write_rejected.value.reason is CheckpointDataPlaneReason.MANIFEST_MISSING
+
+
+@pytest.mark.postgres
+async def test_fenced_checkpoint_accepts_langgraph_write_before_checkpoint_ordering() -> None:
+    logical_session_id = f"write-before-checkpoint-{uuid.uuid4().hex}"
+    async with AsyncExitStack() as stack:
+        _pool, _raw_backend, saver, authority, _registry = await _open_fenced_boundary(
+            stack,
+            _dsn(),
+            logical_session_id=logical_session_id,
+        )
+        binding = CheckpointBinding(
+            tenant_id=authority.tenant_id,
+            logical_session_id=logical_session_id,
+            deployment_id=authority.deployment_id,
+            graph_contract=authority.graph_contract,
+            thread_id=f"{logical_session_id}::fence::1",
+        )
+        saver.bind_checkpoint_contract(
+            {"value"},
+            binding=binding,
+            io_timeout_seconds=_CHECKPOINT_IO_TIMEOUT_SECONDS,
+            required_state_keys=_SensitiveState.__annotations__,
+        )
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"value": "checkpoint-value"}
+        checkpoint["channel_versions"] = {"value": "1"}
+        write_config = {
+            "configurable": {
+                **binding.config["configurable"],
+                "checkpoint_id": checkpoint["id"],
+            }
+        }
+
+        await saver.aput_writes(
+            write_config,
+            (("value", "pending-value"),),
+            "write-before-checkpoint-task",
+            "pull/write-before-checkpoint-task",
+        )
+        saved_config = await saver.aput(
+            binding.config,
+            checkpoint,
+            CheckpointMetadata(),
+            {"value": "1"},
+        )
+
+        restored = await saver.aget_tuple(saved_config)
+        assert restored is not None
+        assert any(write[1:] == ("value", "pending-value") for write in restored.pending_writes)
+
 
 @pytest.mark.postgres
 async def test_registry_generation_switch_retires_source_checkpoint_write_authority() -> None:
@@ -1148,10 +1208,14 @@ async def test_registry_generation_switch_retires_source_checkpoint_write_author
             required_state_keys=_SensitiveState.__annotations__,
         )
         await _publish_retirement_marker(registry, authority, "checkpoint-data-plane-rotation")
-        destination_generation = await registry.begin_checkpoint_rotation(
+        generations = await registry.checkpoint_generations(authority)
+        generation_authority = BoundCheckpointGenerationAuthority(
+            registry,
             authority,
+            generations[0],
+        )
+        destination_generation = await generation_authority.begin_checkpoint_rotation(
             expected_revision=1,
-            expected_principal_generation=0,
             transition_id="checkpoint-data-plane-rotation",
         )
         destination = destination_generation.binding
@@ -1170,8 +1234,7 @@ async def test_registry_generation_switch_retires_source_checkpoint_write_author
             CheckpointMetadata(),
             {"value": "1"},
         )
-        await registry.switch_checkpoint_generation(
-            authority,
+        await generation_authority.switch_checkpoint_generation(
             "checkpoint-data-plane-rotation",
         )
 
@@ -1189,11 +1252,13 @@ async def test_registry_generation_switch_retires_source_checkpoint_write_author
         assert await saver.aget_tuple(destination_config) is not None
 
         await saver.adelete_thread(source.storage_thread_id)
-        deleted = await registry.record_checkpoint_deletion(
-            authority,
+        deleted = await generation_authority.record_checkpoint_deletion(
             "checkpoint-data-plane-rotation",
         )
         assert deleted.state == "deleted"
+        assert generation_authority.current_generation == destination_generation.model_copy(
+            update={"state": "current"}
+        )
 
 
 @pytest.mark.postgres
