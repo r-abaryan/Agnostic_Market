@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, TypedDict, get_args, get_origin
@@ -40,6 +41,7 @@ from verification_helpers import make_otp_provider
 
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
+    GraphTurnLatencyMeasurement,
     ReasoningEngine,
     _classify_cancelled_checkpoint,
     _GraphSpans,
@@ -271,6 +273,7 @@ def _engine(
     checkpointer: BaseCheckpointSaver | None = None,
     response_model_node_timeout_seconds: float = 2.0,
     reasoning_model_node_timeout_seconds: float = 6.0,
+    turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
 ) -> tuple[ReasoningEngine, OrderStore]:
     fixture = load_orders_fixture(config_root, "acme_store")
     catalog = FixtureCatalog("acme_store", fixture)
@@ -355,6 +358,7 @@ def _engine(
         lifecycle=caller_context,
         routing=routing,
         telemetry=telemetry.operational,
+        turn_latency_observer=turn_latency_observer,
     )
     caller_context.attach_engine(engine)
     return engine, store
@@ -2782,6 +2786,14 @@ def test_session_ahead_cart_recovery_requires_the_matching_typed_receipt() -> No
     assert not _session_ahead_evidence_matches(
         state,
         ExceptionAction.CART_REVIEW,
+        (
+            evidence.model_copy(update={"committed_revision": 1}),
+            evidence.model_copy(update={"committed_revision": 2}),
+        ),
+    )
+    assert not _session_ahead_evidence_matches(
+        state,
+        ExceptionAction.CART_REVIEW,
         (evidence.model_copy(update={"operation_id": "another-operation"}),),
     )
     assert not _session_ahead_evidence_matches(
@@ -3099,6 +3111,20 @@ async def test_cart_view_owner_is_audible_once_through_the_engine(config_root: P
         is None
     )
     assert len(cart.snapshot()) == 1
+
+
+async def test_engine_exposes_its_existing_graph_span_measurement(config_root: Path) -> None:
+    observed: list[GraphTurnLatencyMeasurement] = []
+    engine, _ = _engine(
+        config_root,
+        thread_id="graph-latency-observer",
+        turn_latency_observer=observed.append,
+    )
+
+    await engine_events(engine, "hello")
+
+    assert len(observed) == 1
+    assert observed[0].total_seconds >= 0
 
 
 async def test_identity_status_owner_is_audible_once_through_the_engine(

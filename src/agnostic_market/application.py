@@ -14,8 +14,12 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
-from agnostic_market.agents.engine import ReasoningEngine
-from agnostic_market.agents.frontline import FrontlineGraphAssembly, build_frontline_graph
+from agnostic_market.agents.engine import GraphTurnLatencyMeasurement, ReasoningEngine
+from agnostic_market.agents.frontline import (
+    FrontlineGraphAssembly,
+    build_frontline_capability_registry,
+    build_frontline_graph,
+)
 from agnostic_market.agents.routing import RoutingRecognizer, RoutingSession
 from agnostic_market.agents.telemetry import (
     SessionTelemetry,
@@ -206,6 +210,24 @@ type SessionStateFactory = Callable[
     [TenantContext, TenantServices], Awaitable[ApplicationSessionState]
 ]
 type RoutingFactory = Callable[[CapabilityRegistry], RoutingRecognizer]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedApplicationRouting:
+    """One recognizer bound to the exact registry used by graph assembly."""
+
+    capability_registry: CapabilityRegistry
+    recognizer: RoutingRecognizer
+
+
+def prepare_application_routing(
+    routing_factory: RoutingFactory,
+) -> PreparedApplicationRouting:
+    capability_registry = build_frontline_capability_registry()
+    return PreparedApplicationRouting(
+        capability_registry=capability_registry,
+        recognizer=routing_factory(capability_registry),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,10 +445,11 @@ async def build_application_session(
     services: TenantServices,
     *,
     deployment_id: str,
-    routing_factory: RoutingFactory,
+    routing_factory: RoutingFactory | PreparedApplicationRouting,
     session_state_factory: SessionStateFactory | None = None,
     checkpoint_authority: CheckpointGenerationAuthority | None = None,
     durable_session: DurableSessionResources | None = None,
+    graph_turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
 ) -> ApplicationSession:
     """Construct the one graph, router, engine, and caller lifecycle."""
     if services.tenant_id != tenant.tenant_id:
@@ -461,6 +484,11 @@ async def build_application_session(
         )
         checkpoint_authority = durable_session.generation_authority
     _validate_session_state(tenant, services, state)
+    prepared_routing = (
+        routing_factory
+        if isinstance(routing_factory, PreparedApplicationRouting)
+        else prepare_application_routing(routing_factory)
+    )
     assembly = build_frontline_graph(
         models.response,
         display_name=settings.display_name,
@@ -485,9 +513,10 @@ async def build_application_session(
         reasoning_model_node_timeout_seconds=settings.reasoning_model_node_timeout_seconds,
         session_telemetry=state.telemetry,
         checkpointer=services.checkpointer,
+        capability_registry=prepared_routing.capability_registry,
     )
     routing = RoutingSession(
-        routing_factory(assembly.capability_registry),
+        prepared_routing.recognizer,
         identity_store=state.identity_store,
         cart_store=state.cart_store,
         recent_orders=state.recent_orders,
@@ -513,6 +542,7 @@ async def build_application_session(
         routing=routing,
         telemetry=state.telemetry.operational,
         lifecycle=state.caller_context,
+        turn_latency_observer=graph_turn_latency_observer,
     )
     if durable_session is None:
         await engine.arequire_fresh_checkpoint()

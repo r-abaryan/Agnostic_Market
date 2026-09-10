@@ -142,7 +142,8 @@ class FrontlineGraphAssembly:
     capability_registry: CapabilityRegistry
 
 
-def _build_frontline_capability_registry() -> CapabilityRegistry:
+def build_frontline_capability_registry() -> CapabilityRegistry:
+    """Build the immutable capability contract shared by routing and graph assembly."""
     support_entry = CapabilityEntry(_SUPPORT_CAPABILITY_ENTRY_NODE)
     identity_entry = CapabilityEntry(_IDENTITY_CAPABILITY_ENTRY_NODE)
     cart_entry = CapabilityEntry(_CART_CAPABILITY_ENTRY_NODE)
@@ -246,6 +247,7 @@ def build_frontline_graph(
     reasoning_model_node_timeout_seconds: float,
     session_telemetry: SessionTelemetry,
     checkpointer: BaseCheckpointSaver | None = None,
+    capability_registry: CapabilityRegistry | None = None,
 ) -> FrontlineGraphAssembly:
     """Compile the reasoning graph (frontline routing tier + the cart, support, and identity
     flows) and return it with the capability registry its dispatcher resolves against.
@@ -576,7 +578,8 @@ def build_frontline_graph(
         telemetry=telemetry,
         routing_telemetry=routing_telemetry,
     )
-    capability_registry = _build_frontline_capability_registry()
+    if capability_registry is None:
+        capability_registry = build_frontline_capability_registry()
 
     def capability_dispatch(state: ReasoningState) -> Command:
         """Consume one admitted dispatch or resume one already-open invocation."""

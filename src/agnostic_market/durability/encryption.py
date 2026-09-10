@@ -15,6 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from agnostic_market.dtos.platform import ConfigIdentifier
 from agnostic_market.dtos.session import AuthorityIdentifier
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingObserver,
+    observe_duration,
+)
 
 _ENVELOPE_FORMAT = "aes_256_gcm_v1"
 _NONCE_BYTES = 12
@@ -112,6 +117,11 @@ class AesGcmSessionCipher:
 
     active_key_version: str
     keys: Mapping[str, bytes] = field(repr=False)
+    durability_timing: DurabilityTimingObserver | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         active_key_version = _KEY_VERSION.validate_python(self.active_key_version)
@@ -134,15 +144,19 @@ class AesGcmSessionCipher:
             raise ValueError("session plaintext must be non-empty bytes")
         nonce = secrets.token_bytes(_NONCE_BYTES)
         key = self.keys[self.active_key_version]
-        ciphertext = AESGCM(key).encrypt(
-            nonce,
-            plaintext,
-            _associated_data(
-                context,
-                self.active_key_version,
-                context.payload_schema_version,
-            ),
-        )
+        with observe_duration(
+            self.durability_timing,
+            DurabilityOperation.ENVELOPE_ENCRYPT,
+        ):
+            ciphertext = AESGCM(key).encrypt(
+                nonce,
+                plaintext,
+                _associated_data(
+                    context,
+                    self.active_key_version,
+                    context.payload_schema_version,
+                ),
+            )
         return SessionEnvelope(
             format=_ENVELOPE_FORMAT,
             key_version=self.active_key_version,
@@ -162,14 +176,18 @@ class AesGcmSessionCipher:
         if envelope.payload_schema_version != context.payload_schema_version:
             raise SessionEnvelopeError("session envelope could not be authenticated")
         try:
-            return AESGCM(key).decrypt(
-                envelope.nonce,
-                envelope.ciphertext,
-                _associated_data(
-                    context,
-                    envelope.key_version,
-                    envelope.payload_schema_version,
-                ),
-            )
+            with observe_duration(
+                self.durability_timing,
+                DurabilityOperation.ENVELOPE_DECRYPT,
+            ):
+                return AESGCM(key).decrypt(
+                    envelope.nonce,
+                    envelope.ciphertext,
+                    _associated_data(
+                        context,
+                        envelope.key_version,
+                        envelope.payload_schema_version,
+                    ),
+                )
         except InvalidTag as exc:
             raise SessionEnvelopeError("session envelope could not be authenticated") from exc

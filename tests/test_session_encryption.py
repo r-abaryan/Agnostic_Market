@@ -12,6 +12,11 @@ from agnostic_market.durability.encryption import (
     SessionEnvelopeError,
 )
 from agnostic_market.durability.session_payload import SESSION_PAYLOAD_SCHEMA_VERSION
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingOutcome,
+    InMemoryDurabilityTimingObserver,
+)
 
 _KEY_V1 = bytes(range(32))
 _KEY_V2 = bytes(reversed(range(32)))
@@ -41,6 +46,24 @@ def test_session_envelope_round_trip_hides_plaintext() -> None:
     assert envelope.payload_schema_version == SESSION_PAYLOAD_SCHEMA_VERSION
     assert plaintext not in envelope.ciphertext
     assert cipher.decrypt(envelope, _context()) == plaintext
+
+
+def test_session_cipher_attributes_synchronous_encryption_work() -> None:
+    observer = InMemoryDurabilityTimingObserver()
+    cipher = AesGcmSessionCipher(
+        active_key_version="key-v1",
+        keys={"key-v1": _KEY_V1},
+        durability_timing=observer,
+    )
+
+    envelope = cipher.encrypt(b"session payload", _context())
+    assert cipher.decrypt(envelope, _context()) == b"session payload"
+
+    assert [sample.operation for sample in observer.samples] == [
+        DurabilityOperation.ENVELOPE_ENCRYPT,
+        DurabilityOperation.ENVELOPE_DECRYPT,
+    ]
+    assert all(sample.outcome is DurabilityTimingOutcome.SUCCESS for sample in observer.samples)
 
 
 @pytest.mark.parametrize(

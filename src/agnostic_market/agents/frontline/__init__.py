@@ -11,6 +11,7 @@ from agnostic_market.agents.frontline.graph import (
     MODEL_SPEECH_NODES,
     NON_SPEAKING_MODEL_NODES,
     FrontlineGraphAssembly,
+    build_frontline_capability_registry,
     build_frontline_graph,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "MODEL_SPEECH_NODES",
     "NON_SPEAKING_MODEL_NODES",
     "FrontlineGraphAssembly",
+    "build_frontline_capability_registry",
     "build_frontline_graph",
 ]

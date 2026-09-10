@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import math
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from psycopg_pool import AsyncConnectionPool
+from pydantic import TypeAdapter
 
 from agnostic_market.checkpoints import (
     SchemaValidatedCheckpointSaver,
     build_checkpoint_serializer,
     build_checkpointer,
 )
+from agnostic_market.dtos.session import AuthorityIdentifier
 from agnostic_market.dtos.state import ReasoningState
 from agnostic_market.durability.encryption import AesGcmSessionCipher
 from agnostic_market.durability.postgres_checkpoints import FencedPostgresCheckpointSaver
@@ -29,6 +36,78 @@ from agnostic_market.durability.session_registry import (
     SessionRegistryPort,
     SessionRegistryRecord,
 )
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingObserver,
+    observe_duration,
+)
+
+logger = logging.getLogger("agnostic_market.durability.session_lifecycle")
+
+_AUTHORITY_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
+
+
+class SessionReapCoordinator(Protocol):
+    async def reap_expired(self, tenant_id: str, *, limit: int = 100) -> int: ...
+
+
+class OperationalSessionReaper:
+    """Schedule bounded tenant sweeps through the shared close coordinator."""
+
+    def __init__(
+        self,
+        coordinator: SessionReapCoordinator,
+        *,
+        tenant_ids: Sequence[str],
+        interval_seconds: float,
+        batch_size: int,
+    ) -> None:
+        validated_tenants = tuple(
+            _AUTHORITY_IDENTIFIER.validate_python(tenant_id) for tenant_id in tenant_ids
+        )
+        if not validated_tenants:
+            raise ValueError("session reaper requires at least one tenant")
+        if len(set(validated_tenants)) != len(validated_tenants):
+            raise ValueError("session reaper tenant ids must be unique")
+        if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+            raise ValueError("session reaper interval must be positive and finite")
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("session reaper batch size must be a positive integer")
+        self._coordinator = coordinator
+        self._tenant_ids = tuple(sorted(validated_tenants))
+        self._interval_seconds = interval_seconds
+        self._batch_size = batch_size
+
+    async def run_once(self) -> int:
+        closed = 0
+        failures: list[Exception] = []
+        for tenant_id in self._tenant_ids:
+            try:
+                closed += await self._coordinator.reap_expired(
+                    tenant_id,
+                    limit=self._batch_size,
+                )
+            except Exception as exc:
+                exc.add_note(f"failed reaper tenant {tenant_id}")
+                failures.append(exc)
+        if failures:
+            raise ExceptionGroup("one or more tenant cleanup operations failed", failures)
+        return closed
+
+    async def serve(self, stop: asyncio.Event) -> None:
+        """Run immediately, then at the configured cadence until stopped."""
+        while not stop.is_set():
+            try:
+                await self.run_once()
+            except Exception:
+                logger.exception("durable session reaper cycle failed")
+            if stop.is_set():
+                return
+            try:
+                async with asyncio.timeout(self._interval_seconds):
+                    await stop.wait()
+            except TimeoutError:
+                pass
 
 
 class DurableSessionLifecycleCoordinator:
@@ -43,6 +122,7 @@ class DurableSessionLifecycleCoordinator:
         checkpoint_io_timeout_seconds: float,
         close_lease_duration_seconds: float,
         tombstone_retention_seconds: float,
+        durability_timing: DurabilityTimingObserver | None = None,
     ) -> None:
         if checkpoint_io_timeout_seconds <= 0:
             raise ValueError("checkpoint close timeout must be positive")
@@ -56,6 +136,7 @@ class DurableSessionLifecycleCoordinator:
         self._checkpoint_io_timeout_seconds = checkpoint_io_timeout_seconds
         self._close_lease_duration_seconds = close_lease_duration_seconds
         self._tombstone_retention_seconds = tombstone_retention_seconds
+        self._durability_timing = durability_timing
 
     def bind(self, authority: SessionLeaseAuthority) -> BoundDurableSessionCloser:
         return BoundDurableSessionCloser(
@@ -127,17 +208,22 @@ class DurableSessionLifecycleCoordinator:
         authority: SessionCloseAuthority,
         generation: CheckpointGeneration,
     ) -> SchemaValidatedCheckpointSaver:
-        backend = FencedPostgresCheckpointSaver(
-            self._pool,
-            authority=authority,
-            cipher=self._cipher,
-            serde=build_checkpoint_serializer(),
-        )
-        checkpointer = build_checkpointer(
-            backend,
-            synchronous_operations=False,
-            cipher=self._cipher,
-        )
+        with observe_duration(
+            self._durability_timing,
+            DurabilityOperation.CHECKPOINT_BIND,
+        ):
+            backend = FencedPostgresCheckpointSaver(
+                self._pool,
+                authority=authority,
+                cipher=self._cipher,
+                serde=build_checkpoint_serializer(),
+                durability_timing=self._durability_timing,
+            )
+            checkpointer = build_checkpointer(
+                backend,
+                synchronous_operations=False,
+                cipher=self._cipher,
+            )
         checkpointer.bind_checkpoint_contract(
             ReasoningState.model_fields,
             binding=generation.binding,

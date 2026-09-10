@@ -19,6 +19,7 @@ from agnostic_market.agents.routing import (
 )
 from agnostic_market.agents.routing_activation import (
     SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
+    ConfiguredSemanticRouterFactory,
     QualifiedSemanticRouterFactory,
     RoutingActivationError,
 )
@@ -198,3 +199,32 @@ def test_exact_current_cutover_report_activates_configured_router(
     recognizer = _factory(config_root, path)(registry)
 
     assert isinstance(recognizer, SemanticRouter)
+
+
+def test_configured_router_factory_does_not_claim_or_require_qualification(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agnostic_market.agents import routing_activation
+
+    registry = CapabilityRegistry(())
+
+    class FakeGateway:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def chat_model(self, selection: ProviderModel) -> FakeChatModel:
+            assert selection == ProviderModel(provider="fake", model="development-router")
+            return FakeChatModel()
+
+    monkeypatch.setattr(routing_activation, "LLMGateway", FakeGateway)
+    factory = ConfiguredSemanticRouterFactory(
+        selection=ProviderModel(provider="fake", model="development-router"),
+        credentials=load_provider_credentials(config_root / "base" / "providers.yaml"),
+        secrets=RecordingResolver(),
+        structured_output_method="function_calling",
+        timeout_seconds=2.0,
+        input_max_chars=2048,
+    )
+
+    assert isinstance(factory(registry), SemanticRouter)

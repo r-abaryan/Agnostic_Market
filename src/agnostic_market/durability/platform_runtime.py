@@ -35,6 +35,7 @@ from agnostic_market.durability.session_lease import (
 from agnostic_market.durability.session_lifecycle import (
     BoundDurableSessionCloser,
     DurableSessionLifecycleCoordinator,
+    OperationalSessionReaper,
 )
 from agnostic_market.durability.session_payload import DurableSessionPayload
 from agnostic_market.durability.session_registry import (
@@ -53,6 +54,11 @@ from agnostic_market.durability.session_registry import (
     SessionRegistryRecord,
 )
 from agnostic_market.durability.session_state import BoundPostgresSessionStatePersistence
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingObserver,
+    observe_duration,
+)
 from agnostic_market.secrets.base import SecretResolver
 
 _AES_256_KEY_BYTES = 32
@@ -75,6 +81,29 @@ def _decode_session_key(encoded: str) -> bytes:
 
 def _milliseconds(seconds: float) -> str:
     return str(math.ceil(seconds * 1000))
+
+
+async def _finish_pool_close(
+    close_task: asyncio.Task[None],
+) -> asyncio.CancelledError | None:
+    deferred_cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as cancellation:
+            if close_task.cancelled():
+                break
+            if deferred_cancellation is None:
+                deferred_cancellation = cancellation
+            if close_task.done():
+                break
+    try:
+        close_task.result()
+    except BaseException as cleanup_failure:
+        if deferred_cancellation is not None:
+            raise deferred_cancellation from cleanup_failure
+        raise
+    return deferred_cancellation
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +210,7 @@ class DurablePlatformResources:
         config: PlatformRuntimeConfig,
         pool: AsyncConnectionPool,
         cipher: AesGcmSessionCipher,
+        durability_timing: DurabilityTimingObserver | None = None,
     ) -> None:
         self.config = config
         self.pool = pool
@@ -189,7 +219,9 @@ class DurablePlatformResources:
             pool,
             cipher=cipher,
             operation_timeout_seconds=config.database.operation_timeout_seconds,
+            durability_timing=durability_timing,
         )
+        self._durability_timing = durability_timing
         self.lifecycle = DurableSessionLifecycleCoordinator(
             pool,
             self.registry,
@@ -197,6 +229,7 @@ class DurablePlatformResources:
             checkpoint_io_timeout_seconds=config.database.operation_timeout_seconds,
             close_lease_duration_seconds=config.sessions.lease_duration_seconds,
             tombstone_retention_seconds=config.sessions.closed_tombstone_retention_seconds,
+            durability_timing=durability_timing,
         )
         self._close_lock = asyncio.Lock()
         self._closed = False
@@ -206,14 +239,22 @@ class DurablePlatformResources:
         cls,
         config: PlatformRuntimeConfig,
         secrets: SecretResolver,
+        *,
+        durability_timing: DurabilityTimingObserver | None = None,
+        application_dsn: str | None = None,
     ) -> Self:
         database = config.database
         encoded_key = secrets.resolve(config.encryption.key_ref.uri)
         cipher = AesGcmSessionCipher(
             active_key_version=config.encryption.key_version,
             keys={config.encryption.key_version: _decode_session_key(encoded_key)},
+            durability_timing=durability_timing,
         )
-        dsn = secrets.resolve(database.application_dsn_ref.uri)
+        dsn = (
+            secrets.resolve(database.application_dsn_ref.uri)
+            if application_dsn is None
+            else application_dsn
+        )
 
         async def configure(connection: AsyncConnection) -> None:
             await connection.execute(
@@ -229,7 +270,7 @@ class DurablePlatformResources:
                 (_milliseconds(database.transaction_timeout_seconds),),
             )
 
-        pool = AsyncConnectionPool(
+        pool: AsyncConnectionPool = AsyncConnectionPool(
             dsn,
             min_size=database.minimum_pool_size,
             max_size=database.maximum_pool_size,
@@ -243,23 +284,33 @@ class DurablePlatformResources:
             open=False,
         )
         try:
-            await pool.open(wait=True, timeout=database.connection_timeout_seconds)
-            async with asyncio.timeout(database.operation_timeout_seconds):
-                async with pool.connection(
-                    timeout=database.pool_acquisition_timeout_seconds
-                ) as connection:
-                    await require_platform_schema_version(
-                        connection,
-                        database.expected_schema_version,
-                    )
-                    await require_platform_application_role(
-                        connection,
-                        schema_name=database.schema_name,
-                    )
-        except BaseException:
-            await pool.close(timeout=database.operation_timeout_seconds)
+            with observe_duration(durability_timing, DurabilityOperation.POOL_OPEN):
+                await pool.open(wait=True, timeout=database.connection_timeout_seconds)
+            with observe_duration(durability_timing, DurabilityOperation.STARTUP_GATES):
+                async with asyncio.timeout(database.operation_timeout_seconds):
+                    async with pool.connection(
+                        timeout=database.pool_acquisition_timeout_seconds
+                    ) as connection:
+                        await require_platform_schema_version(
+                            connection,
+                            database.expected_schema_version,
+                        )
+                        await require_platform_application_role(
+                            connection,
+                            schema_name=database.schema_name,
+                        )
+        except BaseException as failure:
+            close_task = asyncio.create_task(pool.close(timeout=database.operation_timeout_seconds))
+            try:
+                deferred_cancellation = await _finish_pool_close(close_task)
+            except BaseException as cleanup_failure:
+                raise failure from cleanup_failure
+            if deferred_cancellation is not None:
+                if isinstance(failure, asyncio.CancelledError):
+                    raise failure from deferred_cancellation
+                raise deferred_cancellation from failure
             raise
-        return cls(config, pool, cipher)
+        return cls(config, pool, cipher, durability_timing)
 
     async def acquire_fresh_session(
         self,
@@ -299,9 +350,28 @@ class DurablePlatformResources:
             lease_owner_id=lease_owner_id,
             fencing_generation=record.fencing_generation,
         )
-        restored = await self.registry.restore(authority)
-        reconciliation = await self.registry.reconcile_checkpoint_revision(authority, None)
-        return await self._bind_session_resources(authority, restored, reconciliation)
+        try:
+            restored = await self.registry.restore(authority)
+            reconciliation = await self.registry.reconcile_checkpoint_revision(authority, None)
+            return await self._bind_session_resources(authority, restored, reconciliation)
+        except BaseException as failure:
+            # Registration was acknowledged; close only this confirmed lease authority.
+            try:
+                closer = self.lifecycle.bind(authority)
+                await closer.begin_close()
+                await closer.finalize_close()
+            except BaseException as cleanup_failure:
+                raise failure from cleanup_failure
+            raise
+
+    def build_reaper(self, tenant_ids: tuple[str, ...]) -> OperationalSessionReaper:
+        sessions = self.config.sessions
+        return OperationalSessionReaper(
+            self.lifecycle,
+            tenant_ids=tenant_ids,
+            interval_seconds=sessions.reaper_interval_seconds,
+            batch_size=sessions.reaper_batch_size,
+        )
 
     async def restore_owned_session(
         self,
@@ -329,18 +399,23 @@ class DurablePlatformResources:
             authority,
             generation,
         )
-        serializer = build_checkpoint_serializer()
-        backend = FencedPostgresCheckpointSaver(
-            self.pool,
-            authority=authority,
-            cipher=self.cipher,
-            serde=serializer,
-        )
-        checkpointer = build_checkpointer(
-            backend,
-            synchronous_operations=False,
-            cipher=self.cipher,
-        )
+        with observe_duration(
+            self._durability_timing,
+            DurabilityOperation.CHECKPOINT_BIND,
+        ):
+            serializer = build_checkpoint_serializer()
+            backend = FencedPostgresCheckpointSaver(
+                self.pool,
+                authority=authority,
+                cipher=self.cipher,
+                serde=serializer,
+                durability_timing=self._durability_timing,
+            )
+            checkpointer = build_checkpointer(
+                backend,
+                synchronous_operations=False,
+                cipher=self.cipher,
+            )
         return DurableSessionResources(
             authority=authority,
             registry=self.registry,
@@ -348,7 +423,11 @@ class DurablePlatformResources:
             reconciliation=reconciliation,
             generation=generation,
             generation_authority=generation_authority,
-            persistence=BoundPostgresSessionStatePersistence(self.registry, authority),
+            persistence=BoundPostgresSessionStatePersistence(
+                self.registry,
+                authority,
+                self._durability_timing,
+            ),
             checkpointer=checkpointer,
             closer=self.lifecycle.bind(authority),
             lease_duration_seconds=self.config.sessions.lease_duration_seconds,
@@ -359,5 +438,10 @@ class DurablePlatformResources:
         async with self._close_lock:
             if self._closed:
                 return
+            close_task = asyncio.create_task(
+                self.pool.close(timeout=self.config.database.operation_timeout_seconds)
+            )
+            deferred_cancellation = await _finish_pool_close(close_task)
             self._closed = True
-            await self.pool.close(timeout=self.config.database.operation_timeout_seconds)
+            if deferred_cancellation is not None:
+                raise deferred_cancellation

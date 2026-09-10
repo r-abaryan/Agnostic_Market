@@ -20,12 +20,13 @@ from livekit.agents.voice.background_audio import AudioConfig, BackgroundAudioPl
 from livekit.plugins import langchain as lk_langchain
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
-from agnostic_market.agents.engine import ReasoningEngine
+from agnostic_market.agents.engine import GraphTurnLatencyMeasurement, ReasoningEngine
 from agnostic_market.agents.routing_activation import RoutingRecognizerFactory
 from agnostic_market.application import (
     ApplicationModels,
     ApplicationSession,
     ApplicationSettings,
+    PreparedApplicationRouting,
     SessionStateFactory,
     TenantServices,
     build_application_session,
@@ -43,6 +44,15 @@ from agnostic_market.voice.stt_engine import build_stt
 from agnostic_market.voice.tts_engine import build_tts
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnLatencyMeasurement:
+    """Correlated LiveKit timing with endpointing separated from processing."""
+
+    end_to_end_seconds: float
+    endpointing_seconds: float
+    processing_seconds: float
 
 
 class DisclosureFirstAgent(Agent):
@@ -123,17 +133,28 @@ class VoiceLoop:
         """Make job shutdown await the caller lifecycle's idempotent teardown."""
 
         async def shutdown() -> None:
-            try:
-                try:
-                    if self.lease_supervisor is not None:
-                        await self.lease_supervisor.aclose()
-                finally:
-                    await self.application.state.caller_context.aclose_session()
-            finally:
-                if release_job_resources is not None:
-                    await release_job_resources()
+            await self.aclose(release_job_resources=release_job_resources)
 
         job_context.add_shutdown_callback(shutdown)
+
+    async def aclose(
+        self,
+        *,
+        release_job_resources: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Close voice and session state before releasing job resources."""
+        try:
+            try:
+                if self.lease_supervisor is not None:
+                    await self.lease_supervisor.aclose()
+            finally:
+                try:
+                    await self.application.state.caller_context.aclose_session()
+                finally:
+                    await self.background_audio.aclose()
+        finally:
+            if release_job_resources is not None:
+                await release_job_resources()
 
 
 async def retire_voice_transport(
@@ -188,9 +209,11 @@ async def build_voice_loop(
     *,
     deployment_id: str,
     tenant_services: TenantServices,
-    routing_recognizer_factory: RoutingRecognizerFactory,
+    routing_recognizer_factory: RoutingRecognizerFactory | PreparedApplicationRouting,
     session_state_factory: SessionStateFactory | None = None,
     durable_session: DurableSessionResources | None = None,
+    turn_latency_observer: Callable[[TurnLatencyMeasurement], None] | None = None,
+    graph_turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
@@ -212,6 +235,7 @@ async def build_voice_loop(
         routing_factory=routing_recognizer_factory,
         session_state_factory=session_state_factory,
         durable_session=durable_session,
+        graph_turn_latency_observer=graph_turn_latency_observer,
     )
     adapter = GraphVoiceAdapter(application.engine)
 
@@ -241,7 +265,7 @@ async def build_voice_loop(
         },
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
-    _attach_turn_metrics_logger(session)
+    _attach_turn_metrics_logger(session, turn_latency_observer)
     _attach_thread_reaper(session, application.state.caller_context)
 
     agent = DisclosureFirstAgent(
@@ -300,7 +324,10 @@ def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) 
         task.add_done_callback(completed)
 
 
-def _attach_turn_metrics_logger(session: AgentSession) -> None:
+def _attach_turn_metrics_logger(
+    session: AgentSession,
+    turn_latency_observer: Callable[[TurnLatencyMeasurement], None] | None = None,
+) -> None:
     """Log per-turn latency (BUILD_PLAN Phase 2 'measure turn latency'; OTel backend = Phase 6).
 
     `ChatMessage.metrics` is the current per-turn source (`metrics_collected` is
@@ -308,9 +335,52 @@ def _attach_turn_metrics_logger(session: AgentSession) -> None:
     assistant messages carry `llm_node_ttft`/`tts_node_ttfb`/`e2e_latency`.
     """
 
+    pending_endpointing: list[float | None] = []
+
+    def metric_value(value: object) -> float | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return None
+        return float(value)
+
     @session.on("conversation_item_added")
     def _log_turn_metrics(ev: ConversationItemAddedEvent) -> None:
         metrics = getattr(ev.item, "metrics", None) or {}
+        role = ev.item.role
+        if turn_latency_observer is not None and role == "user":
+            pending_endpointing.append(metric_value(metrics.get("end_of_turn_delay")))
+        elif turn_latency_observer is not None and role == "assistant":
+            if (e2e_latency := metrics.get("e2e_latency")) is not None:
+                end_to_end_seconds = metric_value(e2e_latency)
+                if end_to_end_seconds is None:
+                    logger.warning("ignored invalid assistant end-to-end latency metric")
+                elif len(pending_endpointing) != 1 or pending_endpointing[0] is None:
+                    logger.warning(
+                        "ignored assistant latency without one correlated endpointing metric"
+                    )
+                else:
+                    endpointing_seconds = pending_endpointing[0]
+                    processing_seconds = end_to_end_seconds - endpointing_seconds
+                    if processing_seconds < 0:
+                        logger.warning(
+                            "ignored contradictory assistant and endpointing latency metrics"
+                        )
+                    else:
+                        try:
+                            turn_latency_observer(
+                                TurnLatencyMeasurement(
+                                    end_to_end_seconds=end_to_end_seconds,
+                                    endpointing_seconds=endpointing_seconds,
+                                    processing_seconds=processing_seconds,
+                                )
+                            )
+                        except Exception:
+                            logger.exception("turn latency observer failed")
+            pending_endpointing.clear()
         if not metrics:
             return
         fields = ", ".join(
