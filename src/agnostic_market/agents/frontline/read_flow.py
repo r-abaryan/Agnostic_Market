@@ -51,7 +51,10 @@ from agnostic_market.dtos.orchestration import (
     VerifyOrderStatus,
 )
 from agnostic_market.dtos.state import HandoffRequest, PolicyContext, ReasoningState
-from agnostic_market.durability.session_state import SessionStateCoordinator
+from agnostic_market.durability.session_state import (
+    SessionStateCoordinator,
+    recent_orders_operation_id,
+)
 
 CATALOG_ENTRY_NODE = "catalog_entry"
 CATALOG_QUERY_REJECT_NODE = "catalog_query_reject"
@@ -376,7 +379,7 @@ def build_read_flow_nodes(
         )
         line = f"{line} {warm_close()}"
         committed = await session_state.record_recent_orders(
-            f"recent-orders:read:{invocation.invocation_id}",
+            recent_orders_operation_id("read", invocation.invocation_id),
             order_ids,
             operation="read",
         )

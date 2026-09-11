@@ -18,7 +18,11 @@ from verification_helpers import make_otp_provider
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
-from agnostic_market.checkpoints import build_checkpointer
+from agnostic_market.checkpoints import (
+    CheckpointBinding,
+    build_checkpointer,
+    graph_contract_fingerprint,
+)
 from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.catalog import FixtureCatalog
 from agnostic_market.commerce.identity import (
@@ -48,6 +52,7 @@ from agnostic_market.commerce.verification import (
 )
 from agnostic_market.dtos.orchestration import RouteResolution
 from agnostic_market.dtos.state import PolicyContext
+from agnostic_market.durability.session_registry import InMemoryCheckpointGenerationAuthority
 from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
 
@@ -153,10 +158,15 @@ def build_support_engine(
     )
     engine = ReasoningEngine(
         assembly.graph,
-        tenant_id="acme_store",
-        logical_session_id=thread_id,
-        deployment_id="test-deployment",
-        thread_id=thread_id,
+        checkpoint_authority=InMemoryCheckpointGenerationAuthority.from_binding(
+            CheckpointBinding(
+                tenant_id="acme_store",
+                logical_session_id=thread_id,
+                deployment_id="test-deployment",
+                graph_contract=graph_contract_fingerprint(assembly.graph),
+                thread_id=thread_id,
+            )
+        ),
         checkpoint_io_timeout_seconds=2.0,
         cancellation_quiescence_timeout_seconds=(TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS),
         routing=make_routing_session(

@@ -19,8 +19,29 @@ from agnostic_market.durability.session_payload import (
     SESSION_PAYLOAD_SCHEMA_VERSION,
 )
 
-PLATFORM_SESSION_SCHEMA_VERSION = 7
+PLATFORM_SESSION_SCHEMA_VERSION = 8
 _DATABASE_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
+
+_TABLE_PRIVILEGES = (
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "TRUNCATE",
+    "REFERENCES",
+    "TRIGGER",
+    "MAINTAIN",
+)
+_APPLICATION_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    "platform_schema_migrations": ("SELECT",),
+    "platform_sessions": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "platform_session_operations": ("SELECT", "INSERT", "DELETE"),
+    "platform_checkpoint_generations": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "platform_checkpoint_write_manifests": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "checkpoints": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+    "checkpoint_blobs": ("SELECT", "INSERT", "DELETE"),
+    "checkpoint_writes": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+}
 
 _BOOTSTRAP_SQL: LiteralString = """
 CREATE TABLE IF NOT EXISTS platform_schema_migrations (
@@ -335,6 +356,41 @@ ALTER TABLE platform_session_operations
     CHECK (result_schema_version = 2)
 """
 
+_ALLOW_FENCED_SESSION_CLOSE_SQL: LiteralString = """
+ALTER TABLE platform_sessions
+    ADD COLUMN close_operation_id text,
+    DROP CONSTRAINT platform_sessions_checkpoint_matches_generation,
+    DROP CONSTRAINT platform_sessions_lease_starts_before_expiry,
+    ADD CONSTRAINT platform_sessions_checkpoint_matches_generation
+        CHECK (
+            lifecycle IN ('closing', 'closed')
+            OR checkpoint_namespace =
+                logical_session_id || '::fence::' || fencing_generation
+            OR checkpoint_namespace =
+                logical_session_id || '::fence::' || fencing_generation
+                || '::principal::' || principal_generation
+        ),
+    ADD CONSTRAINT platform_sessions_lease_starts_before_expiry
+        CHECK (
+            lease_expires_at IS NULL
+            OR (
+                lease_expires_at > created_at
+                AND (
+                    lifecycle = 'closing'
+                    OR lease_expires_at <= expires_at
+                )
+            )
+        ),
+    ADD CONSTRAINT platform_sessions_close_operation_format
+        CHECK (
+            close_operation_id IS NULL
+            OR (
+                close_operation_id = btrim(close_operation_id)
+                AND close_operation_id <> ''
+            )
+        )
+"""
+
 _CHECKPOINTS_RLS_SQL: LiteralString = """
 ALTER TABLE checkpoints ENABLE ROW LEVEL SECURITY
 """
@@ -551,6 +607,11 @@ PLATFORM_MIGRATIONS = (
             _CHECKPOINT_WRITES_POLICY_SQL,
         ),
     ),
+    PlatformMigration(
+        version=8,
+        name="fenced_session_close",
+        steps=(_ALLOW_FENCED_SESSION_CLOSE_SQL,),
+    ),
 )
 
 
@@ -759,6 +820,87 @@ async def require_platform_schema_version(
         )
 
 
+async def require_platform_application_role(
+    connection: AsyncConnection,
+    *,
+    schema_name: str,
+) -> None:
+    """Verify the connected role and search path without changing database state."""
+    schema_name = _DATABASE_IDENTIFIER.validate_python(schema_name)
+    cursor = await connection.execute(
+        """
+        SELECT current_user, current_schema(), current_schemas(false),
+            role.rolsuper, role.rolbypassrls,
+            has_schema_privilege(current_user, %s, 'USAGE'),
+            has_schema_privilege(current_user, %s, 'CREATE'),
+            EXISTS (
+                SELECT 1
+                FROM pg_class AS relation
+                JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = %s
+                  AND pg_get_userbyid(relation.relowner) = current_user
+            )
+        FROM pg_roles AS role
+        WHERE role.rolname = current_user
+        """,
+        (schema_name, schema_name, schema_name),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise PlatformSchemaError("platform application role is unavailable")
+    (
+        _role_name,
+        current_schema,
+        current_schemas,
+        is_superuser,
+        bypasses_rls,
+        has_schema_usage,
+        has_schema_create,
+        owns_relation,
+    ) = row
+    if current_schema != schema_name or current_schemas != [schema_name]:
+        raise PlatformSchemaError("platform application search path is not trusted")
+    if is_superuser or bypasses_rls:
+        raise PlatformSchemaError("platform application role bypasses row-level security")
+    if not has_schema_usage or has_schema_create or owns_relation:
+        raise PlatformSchemaError("platform application role has unsafe schema authority")
+
+    privilege_contract = tuple(
+        (table_name, privilege, privilege in allowed)
+        for table_name, allowed in _APPLICATION_TABLE_PRIVILEGES.items()
+        for privilege in _TABLE_PRIVILEGES
+    )
+    cursor = await connection.execute(
+        """
+        WITH expected(table_name, privilege, allowed) AS (
+            SELECT * FROM unnest(%s::text[], %s::text[], %s::boolean[])
+        ), observed AS (
+            SELECT allowed,
+                to_regclass(format('%%I.%%I', %s::text, table_name)) AS relation,
+                privilege
+            FROM expected
+        )
+        SELECT bool_and(
+            relation IS NOT NULL
+            AND has_table_privilege(current_user, relation, privilege)
+                IS NOT DISTINCT FROM allowed
+        )
+        FROM observed
+        """,
+        (
+            [item[0] for item in privilege_contract],
+            [item[1] for item in privilege_contract],
+            [item[2] for item in privilege_contract],
+            schema_name,
+        ),
+    )
+    privilege_row = await cursor.fetchone()
+    if privilege_row is None or privilege_row[0] is not True:
+        raise PlatformSchemaError(
+            "platform application role privileges do not match the runtime contract"
+        )
+
+
 async def grant_platform_application_role(
     connection: AsyncConnection,
     *,
@@ -770,14 +912,10 @@ async def grant_platform_application_role(
     role_name = _DATABASE_IDENTIFIER.validate_python(role_name)
     schema = sql.Identifier(schema_name)
     role = sql.Identifier(role_name)
-    sessions = sql.Identifier(schema_name, "platform_sessions")
-    operations = sql.Identifier(schema_name, "platform_session_operations")
-    generations = sql.Identifier(schema_name, "platform_checkpoint_generations")
-    write_manifests = sql.Identifier(schema_name, "platform_checkpoint_write_manifests")
-    migrations = sql.Identifier(schema_name, "platform_schema_migrations")
-    checkpoints = sql.Identifier(schema_name, "checkpoints")
-    checkpoint_blobs = sql.Identifier(schema_name, "checkpoint_blobs")
-    checkpoint_writes = sql.Identifier(schema_name, "checkpoint_writes")
+    tables = {
+        table_name: sql.Identifier(schema_name, table_name)
+        for table_name in _APPLICATION_TABLE_PRIVILEGES
+    }
     async with connection.transaction():
         cursor = await connection.execute(
             "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = %s",
@@ -803,58 +941,17 @@ async def grant_platform_application_role(
         owns_relation = await cursor.fetchone()
         if owns_relation is None or owns_relation[0]:
             raise PlatformSchemaError("platform application role must not own runtime relations")
-        runtime_tables = (
-            sessions,
-            operations,
-            generations,
-            write_manifests,
-            checkpoints,
-            checkpoint_blobs,
-            checkpoint_writes,
-        )
-        for table in (*runtime_tables, migrations):
+        for table in tables.values():
             await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM PUBLIC").format(table))
             await connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(table, role))
         await connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC").format(schema))
         await connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(schema, role))
         await connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema, role))
-        await connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(migrations, role))
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE ON TABLE {} TO {}").format(generations, role)
-        )
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
-                write_manifests,
-                role,
+        for table_name, privileges in _APPLICATION_TABLE_PRIVILEGES.items():
+            await connection.execute(
+                sql.SQL("GRANT {} ON TABLE {} TO {}").format(
+                    sql.SQL(", ").join(sql.SQL(privilege) for privilege in privileges),
+                    tables[table_name],
+                    role,
+                )
             )
-        )
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
-                sessions,
-                role,
-            )
-        )
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, DELETE ON TABLE {} TO {}").format(
-                operations,
-                role,
-            )
-        )
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
-                checkpoints,
-                role,
-            )
-        )
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, DELETE ON TABLE {} TO {}").format(
-                checkpoint_blobs,
-                role,
-            )
-        )
-        await connection.execute(
-            sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
-                checkpoint_writes,
-                role,
-            )
-        )

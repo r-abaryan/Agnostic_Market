@@ -36,6 +36,7 @@ from agnostic_market.durability.checkpoint_encryption import (
 from agnostic_market.durability.encryption import AesGcmSessionCipher, SessionEnvelope
 from agnostic_market.durability.session_registry import (
     CheckpointGeneration,
+    SessionCloseAuthority,
     SessionLeaseAuthority,
     SessionLifecycle,
 )
@@ -65,6 +66,7 @@ class CheckpointDataPlaneError(RuntimeError):
 
 
 type CheckpointOperation = Literal["read", "write", "delete"]
+type CheckpointAuthority = SessionLeaseAuthority | SessionCloseAuthority
 
 
 def _config_value(config: RunnableConfig, name: str, *, default: str | None = None) -> str:
@@ -105,7 +107,7 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
         self,
         pool: AsyncConnectionPool,
         *,
-        authority: SessionLeaseAuthority,
+        authority: CheckpointAuthority,
         cipher: AesGcmSessionCipher,
         serde: SerializerProtocol,
     ) -> None:
@@ -160,14 +162,21 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
             or row.get("transport_worker_id") != transport.worker_id
         ):
             raise CheckpointDataPlaneError(CheckpointDataPlaneReason.WRONG_TRANSPORT)
-        expires_at = row.get("expires_at")
-        if not isinstance(expires_at, datetime) or expires_at <= now:
-            raise CheckpointDataPlaneError(CheckpointDataPlaneReason.SESSION_EXPIRED)
-        if row.get("lifecycle") not in {
-            SessionLifecycle.OPENING.value,
-            SessionLifecycle.ACTIVE.value,
-        }:
-            raise CheckpointDataPlaneError(CheckpointDataPlaneReason.LIFECYCLE_REJECTED)
+        lifecycle = row.get("lifecycle")
+        if isinstance(authority, SessionCloseAuthority):
+            if lifecycle != SessionLifecycle.CLOSING.value:
+                raise CheckpointDataPlaneError(CheckpointDataPlaneReason.LIFECYCLE_REJECTED)
+            if row.get("close_operation_id") != authority.operation_id:
+                raise CheckpointDataPlaneError(CheckpointDataPlaneReason.WRONG_LEASE_OWNER)
+        else:
+            expires_at = row.get("expires_at")
+            if not isinstance(expires_at, datetime) or expires_at <= now:
+                raise CheckpointDataPlaneError(CheckpointDataPlaneReason.SESSION_EXPIRED)
+            if lifecycle not in {
+                SessionLifecycle.OPENING.value,
+                SessionLifecycle.ACTIVE.value,
+            }:
+                raise CheckpointDataPlaneError(CheckpointDataPlaneReason.LIFECYCLE_REJECTED)
         lease_expires_at = row.get("lease_expires_at")
         if not isinstance(lease_expires_at, datetime) or lease_expires_at <= now:
             raise CheckpointDataPlaneError(CheckpointDataPlaneReason.LEASE_EXPIRED)
@@ -199,6 +208,7 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
                     session_row.fencing_generation AS session_fence,
                     session_row.lease_owner_id,
                     session_row.lease_expires_at,
+                    session_row.close_operation_id,
                     session_row.expires_at,
                     session_row.transport_provider,
                     session_row.transport_room_id,
@@ -238,9 +248,16 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
         )
         if generation is None:
             raise CheckpointDataPlaneError(CheckpointDataPlaneReason.UNREGISTERED_GENERATION)
-        if operation == "write" and generation.state not in {"current", "pending"}:
+        if operation == "write" and (
+            isinstance(authority, SessionCloseAuthority)
+            or generation.state not in {"current", "pending"}
+        ):
             raise CheckpointDataPlaneError(CheckpointDataPlaneReason.GENERATION_NOT_WRITABLE)
-        if operation == "delete" and generation.state not in {"retired", "deleted"}:
+        if (
+            operation == "delete"
+            and not isinstance(authority, SessionCloseAuthority)
+            and generation.state not in {"retired", "deleted"}
+        ):
             raise CheckpointDataPlaneError(CheckpointDataPlaneReason.GENERATION_NOT_DELETABLE)
         return generation
 
@@ -593,7 +610,7 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
             delegate,
             generation,
         ):
-            await self._verify_manifest(
+            await self._authorize_checkpoint_manifest_transition(
                 connection,
                 generation,
                 thread_id=thread_id,

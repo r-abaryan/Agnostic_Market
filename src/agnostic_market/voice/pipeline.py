@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,11 +26,14 @@ from agnostic_market.application import (
     ApplicationModels,
     ApplicationSession,
     ApplicationSettings,
+    SessionStateFactory,
     TenantServices,
     build_application_session,
 )
 from agnostic_market.config.registry import ResolvedConfig
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
+from agnostic_market.durability.platform_runtime import DurableSessionResources
+from agnostic_market.durability.session_lease import LeaseLoss, SessionLeaseSupervisor
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
 from agnostic_market.session import CallerContext
@@ -64,7 +68,7 @@ class DisclosureFirstAgent(Agent):
         await self.session.say(self.disclosure, allow_interruptions=False)
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class VoiceLoop:
     """Everything the worker needs to serve one merchant's call."""
 
@@ -76,6 +80,8 @@ class VoiceLoop:
     # search, multi-intent). CONSTRUCTED here from config; STARTED in the worker entrypoint
     # where the room lives (`background_audio.start(room=..., agent_session=...)`).
     background_audio: BackgroundAudioPlayer
+    durable_session: DurableSessionResources | None = None
+    lease_supervisor: SessionLeaseSupervisor | None = None
 
     @property
     def engine(self) -> ReasoningEngine:
@@ -85,9 +91,49 @@ class VoiceLoop:
     def capability_registry(self) -> CapabilityRegistry:
         return self.application.assembly.capability_registry
 
-    def register_shutdown(self, job_context: JobContext) -> None:
+    def start_lease_supervision(
+        self,
+        room: rtc.Room,
+        *,
+        transport_retirement_timeout_seconds: float,
+    ) -> None:
+        """Start the sole renewal task after the durable voice session is ready."""
+        if self.durable_session is None:
+            raise RuntimeError("in-memory voice sessions do not own a durable lease")
+        if self.lease_supervisor is not None:
+            raise RuntimeError("voice session lease supervision is already started")
+
+        async def retire(_loss: LeaseLoss) -> None:
+            await retire_voice_transport(
+                self.session,
+                room,
+                self.application.state.caller_context,
+                timeout_seconds=transport_retirement_timeout_seconds,
+            )
+
+        self.lease_supervisor = self.durable_session.build_lease_supervisor(retire)
+        self.lease_supervisor.start()
+
+    def register_shutdown(
+        self,
+        job_context: JobContext,
+        *,
+        release_job_resources: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Make job shutdown await the caller lifecycle's idempotent teardown."""
-        job_context.add_shutdown_callback(self.application.state.caller_context.aclose_session)
+
+        async def shutdown() -> None:
+            try:
+                try:
+                    if self.lease_supervisor is not None:
+                        await self.lease_supervisor.aclose()
+                finally:
+                    await self.application.state.caller_context.aclose_session()
+            finally:
+                if release_job_resources is not None:
+                    await release_job_resources()
+
+        job_context.add_shutdown_callback(shutdown)
 
 
 async def retire_voice_transport(
@@ -100,7 +146,7 @@ async def retire_voice_transport(
     """Stop caller work and output, then retire the current room transport."""
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("transport retirement timeout must be positive")
-    caller_context.stop_turn_admission()
+    caller_context.stop_for_authority_loss()
     try:
         try:
             session.shutdown(drain=False)
@@ -108,7 +154,7 @@ async def retire_voice_transport(
             async with asyncio.timeout(timeout_seconds):
                 await room.disconnect()
     finally:
-        await caller_context.aclose_session()
+        await caller_context.aabandon_session()
 
 
 # The thinking earcon: a subtle double-blip (assets/audio/, reproducible via its generator
@@ -143,6 +189,8 @@ async def build_voice_loop(
     deployment_id: str,
     tenant_services: TenantServices,
     routing_recognizer_factory: RoutingRecognizerFactory,
+    session_state_factory: SessionStateFactory | None = None,
+    durable_session: DurableSessionResources | None = None,
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
     config = resolved.config
@@ -162,6 +210,8 @@ async def build_voice_loop(
         tenant_services,
         deployment_id=deployment_id,
         routing_factory=routing_recognizer_factory,
+        session_state_factory=session_state_factory,
+        durable_session=durable_session,
     )
     adapter = GraphVoiceAdapter(application.engine)
 
@@ -207,6 +257,7 @@ async def build_voice_loop(
         agent=agent,
         application=application,
         background_audio=_build_background_audio(),
+        durable_session=durable_session,
     )
 
 

@@ -19,6 +19,7 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.types import SCHEDULED
 from langgraph.graph import START, StateGraph
+from langgraph.types import interrupt
 
 from agnostic_market.checkpoints import (
     CheckpointBinding,
@@ -1014,6 +1015,50 @@ async def test_langgraph_reserved_pending_write_channels_remain_accepted() -> No
 
     await saver.aput_writes(saved.config, ((SCHEDULED, None),), "scheduled-task")
     assert await saver.aget_tuple(binding.config) is not None
+
+
+@pytest.mark.asyncio
+async def test_interrupt_observation_does_not_project_graph_internal_state_channels() -> None:
+    backend = InMemorySaver()
+    graph_saver = SchemaValidatedCheckpointSaver(backend)
+    graph = StateGraph(_State)
+    graph.add_node("choose", lambda state: {"value": state.get("value", 0) + 1})
+    graph.add_node("confirm", lambda _state: interrupt("confirm"))
+    graph.add_edge(START, "choose")
+    graph.add_conditional_edges(
+        "choose",
+        lambda _state: "confirm",
+        {"confirm": "confirm"},
+    )
+    compiled = graph.compile(checkpointer=graph_saver)
+    binding = CheckpointBinding(
+        tenant_id="tenant-a",
+        deployment_id="deployment-a",
+        graph_contract=graph_contract_fingerprint(compiled),
+        thread_id="thread-a",
+    )
+    graph_saver.bind_checkpoint_contract(
+        compiled.channels,
+        binding=binding,
+        io_timeout_seconds=0.5,
+        required_state_keys=_State.__annotations__,
+    )
+    await compiled.ainvoke({"value": 1}, binding.config)
+    raw = await backend.aget_tuple(binding.config)
+    assert raw is not None
+    assert any(channel.startswith("branch:to:") for channel in raw.checkpoint["channel_values"])
+
+    observer = SchemaValidatedCheckpointSaver(backend)
+    observer.bind_checkpoint_contract(
+        _State.__annotations__,
+        binding=binding,
+        io_timeout_seconds=0.5,
+        required_state_keys=_State.__annotations__,
+    )
+
+    assert await observer.acheckpoint_has_pending_interrupt(binding.config) is True
+    with pytest.raises(CheckpointSchemaError, match="unknown channels"):
+        await observer.aget_tuple(binding.config)
 
 
 @pytest.mark.asyncio

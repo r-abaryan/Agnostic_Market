@@ -14,7 +14,6 @@ from support_helpers import SupportHarness, build_support_engine
 from turn_helpers import engine_events
 from verification_helpers import TEST_FACTOR_REFS, TEST_OTP_CODES, grant_verification
 
-from agnostic_market.agents import engine as engine_module
 from agnostic_market.agents import recovery
 from agnostic_market.agents.identity import flow as identity_flow
 from agnostic_market.agents.recovery import (
@@ -951,7 +950,7 @@ async def test_terminal_response_failure_escapes_once_to_engine_takeover(
     (
         ("seed", False),
         ("contamination", False),
-        ("delete", False),
+        ("delete", True),
         ("complete", True),
     ),
 )
@@ -974,14 +973,21 @@ async def test_rotation_failure_is_one_shot_and_terminal(
         harness.verification.grants[-1],
         ListOrders(scope="account"),
     )
-    generated_ids: list[str] = []
+    rotation_begins: list[str] = []
+    real_begin = engine._checkpoint_authority.begin_checkpoint_rotation
 
-    def one_thread_id() -> str:
-        value = f"new-thread-{len(generated_ids) + 1}"
-        generated_ids.append(value)
-        return value
+    async def record_begin(*, expected_revision: int, transition_id: str):
+        rotation_begins.append(transition_id)
+        return await real_begin(
+            expected_revision=expected_revision,
+            transition_id=transition_id,
+        )
 
-    monkeypatch.setattr(engine_module, "_new_thread_id", one_thread_id)
+    monkeypatch.setattr(
+        engine._checkpoint_authority,
+        "begin_checkpoint_rotation",
+        record_begin,
+    )
     if failure_point in {"seed", "contamination"}:
         real_update = engine._graph.aupdate_state
 
@@ -1020,7 +1026,7 @@ async def test_rotation_failure_is_one_shot_and_terminal(
 
     assert [event.text for event in _spoken(events)] == [AUTOMATION_TERMINAL_LINE]
     assert [event.text for event in _spoken(repeated)] == [AUTOMATION_TERMINAL_LINE]
-    assert generated_ids == ["new-thread-1"]
+    assert rotation_begins == [transition.transition_id]
     assert (engine.thread_id != old_thread) is thread_switches
     assert harness.caller_context.pending_transition() is None
     assert harness.identity.current() is None
@@ -1028,3 +1034,63 @@ async def test_rotation_failure_is_one_shot_and_terminal(
     snapshot = engine._graph.get_state(engine._config)
     assert snapshot.values["automation_terminal"] is True
     assert snapshot.next == ()
+
+
+async def test_principal_rotation_uses_generation_authority_in_commit_order(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _identity_harness(config_root, thread_id="authority-owned-rotation")
+    engine = harness.engine
+    authority = engine._checkpoint_authority
+    checkpointer = engine._graph.checkpointer
+    assert checkpointer is not None
+    events: list[str] = []
+
+    real_begin = authority.begin_checkpoint_rotation
+    real_switch = authority.switch_checkpoint_generation
+    real_delete = checkpointer.adelete_thread
+    real_record = authority.record_checkpoint_deletion
+    real_complete = harness.caller_context.complete_transition
+
+    async def begin(*, expected_revision: int, transition_id: str):
+        events.append("begin")
+        return await real_begin(
+            expected_revision=expected_revision,
+            transition_id=transition_id,
+        )
+
+    async def switch(transition_id: str):
+        events.append("switch")
+        return await real_switch(transition_id)
+
+    async def delete(thread_id: str) -> None:
+        events.append("delete")
+        await real_delete(thread_id)
+
+    async def record(transition_id: str):
+        events.append("record")
+        return await real_record(transition_id)
+
+    async def complete(transition_id: str) -> int:
+        events.append("complete")
+        return await real_complete(transition_id)
+
+    monkeypatch.setattr(authority, "begin_checkpoint_rotation", begin)
+    monkeypatch.setattr(authority, "switch_checkpoint_generation", switch)
+    monkeypatch.setattr(checkpointer, "adelete_thread", delete)
+    monkeypatch.setattr(authority, "record_checkpoint_deletion", record)
+    monkeypatch.setattr(harness.caller_context, "complete_transition", complete)
+
+    await grant_verification(harness.verification)
+    transition = await harness.caller_context.transition_principal(
+        _CUST1,
+        harness.verification.grants[-1],
+        ListOrders(scope="account"),
+    )
+    await _events(harness, "queued request")
+
+    assert events == ["begin", "switch", "delete", "record", "complete"]
+    assert authority.current_generation.transition_id == transition.transition_id
+    assert engine.thread_id == authority.current_generation.checkpoint_namespace
+    assert authority.current_generation.state == "current"

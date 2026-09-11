@@ -62,6 +62,7 @@ session_revision,
 fencing_generation,
 lease_owner_id,
 lease_expires_at,
+close_operation_id,
 transport_provider,
 transport_room_id,
 transport_assignment_id,
@@ -167,6 +168,19 @@ class SessionStateWriteError(SessionRegistryError):
         super().__init__(f"session state publication rejected: {reason.value}")
 
 
+class SessionCloseReason(StrEnum):
+    NOT_ELIGIBLE = "not_eligible"
+    WRONG_CLOSE_OWNER = "wrong_close_owner"
+    STALE_FENCE = "stale_fence"
+    CLEANUP_INCOMPLETE = "cleanup_incomplete"
+
+
+class SessionCloseError(SessionRegistryError):
+    def __init__(self, reason: SessionCloseReason) -> None:
+        self.reason = reason
+        super().__init__(f"session close rejected: {reason.value}")
+
+
 class SessionLifecycle(StrEnum):
     OPENING = "opening"
     ACTIVE = "active"
@@ -214,6 +228,20 @@ class SessionLeaseRenewal(SessionLeaseAuthority):
     duration_seconds: DurationSeconds
 
 
+class SessionCloseRequest(BaseModel):
+    model_config = _STRICT
+
+    operation_id: AuthorityIdentifier
+    lease_owner_id: AuthorityIdentifier
+    duration_seconds: DurationSeconds
+
+
+class SessionCloseAuthority(SessionContract):
+    operation_id: AuthorityIdentifier
+    lease_owner_id: AuthorityIdentifier
+    fencing_generation: int = Field(ge=1)
+
+
 class SessionStatePublication(SessionLeaseAuthority):
     expected_revision: int = Field(ge=0)
     operation_id: AuthorityIdentifier
@@ -237,6 +265,7 @@ class SessionRegistryRecord(BaseModel):
     fencing_generation: int = Field(ge=0)
     lease_owner_id: AuthorityIdentifier | None
     lease_expires_at: datetime | None
+    close_operation_id: AuthorityIdentifier | None = None
     expires_at: datetime
     envelope: SessionEnvelope | None
     created_at: datetime
@@ -263,16 +292,27 @@ class SessionRegistryRecord(BaseModel):
             raise ValueError("open sessions require a lease")
         if self.lifecycle is not SessionLifecycle.CLOSED and self.fencing_generation < 1:
             raise ValueError("open sessions require a positive fencing generation")
-        if not _checkpoint_namespace_matches(
-            self.checkpoint_namespace,
-            logical_session_id=self.authority.logical_session_id,
-            fencing_generation=self.fencing_generation,
-            principal_generation=self.principal_generation,
+        if self.lifecycle is SessionLifecycle.CLOSING:
+            if self.close_operation_id is None:
+                raise ValueError("closing sessions require a stable close operation")
+        elif self.lifecycle is not SessionLifecycle.CLOSED and self.close_operation_id is not None:
+            raise ValueError("open sessions cannot carry a close operation")
+        if self.lifecycle in {SessionLifecycle.OPENING, SessionLifecycle.ACTIVE} and not (
+            _checkpoint_namespace_matches(
+                self.checkpoint_namespace,
+                logical_session_id=self.authority.logical_session_id,
+                fencing_generation=self.fencing_generation,
+                principal_generation=self.principal_generation,
+            )
         ):
             raise ValueError("checkpoint namespace does not match the session generation")
         if self.lease_expires_at is not None and self.lease_expires_at <= self.created_at:
             raise ValueError("lease expiry must follow session creation")
-        if self.lease_expires_at is not None and self.lease_expires_at > self.expires_at:
+        if (
+            self.lifecycle in {SessionLifecycle.OPENING, SessionLifecycle.ACTIVE}
+            and self.lease_expires_at is not None
+            and self.lease_expires_at > self.expires_at
+        ):
             raise ValueError("lease expiry cannot exceed session expiry")
         if self.updated_at < self.created_at:
             raise ValueError("session update time cannot precede creation")
@@ -338,6 +378,43 @@ class CheckpointRotation(BaseModel):
         ):
             raise ValueError("checkpoint generations do not form a completed rotation")
         return self
+
+
+class SessionCloseClaim(BaseModel):
+    model_config = _STRICT
+
+    authority: SessionCloseAuthority
+    record: SessionRegistryRecord
+    generations: tuple[CheckpointGeneration, ...]
+
+    @model_validator(mode="after")
+    def claim_matches_registry_state(self) -> Self:
+        if (
+            self.record.lifecycle is not SessionLifecycle.CLOSING
+            or self.record.tenant_id != self.authority.tenant_id
+            or self.record.authority != self.authority.authority
+            or self.record.deployment_id != self.authority.deployment_id
+            or self.record.graph_contract != self.authority.graph_contract
+            or self.record.config_version != self.authority.config_version
+            or self.record.close_operation_id != self.authority.operation_id
+            or self.record.lease_owner_id != self.authority.lease_owner_id
+            or self.record.fencing_generation != self.authority.fencing_generation
+            or any(
+                generation.tenant_id != self.record.tenant_id
+                or generation.logical_session_id != self.record.authority.logical_session_id
+                for generation in self.generations
+            )
+        ):
+            raise ValueError("session close claim is inconsistent")
+        return self
+
+
+class ExpiredSessionCandidate(BaseModel):
+    model_config = _STRICT
+
+    tenant_id: AuthorityIdentifier
+    logical_session_id: AuthorityIdentifier
+    close_operation_id: AuthorityIdentifier | None = None
 
 
 class RestoredSessionState(BaseModel):
@@ -416,6 +493,52 @@ class CheckpointRevisionReconciliation(BaseModel):
 
 @runtime_checkable
 class SessionRegistryPort(Protocol):
+    async def begin_close(
+        self,
+        authority: SessionLeaseAuthority,
+        request: SessionCloseRequest,
+    ) -> SessionCloseClaim: ...
+
+    async def claim_expired(
+        self,
+        candidate: ExpiredSessionCandidate,
+        request: SessionCloseRequest,
+    ) -> SessionCloseClaim: ...
+
+    async def refresh_close(
+        self,
+        authority: SessionCloseAuthority,
+        *,
+        duration_seconds: float,
+    ) -> SessionCloseClaim: ...
+
+    async def close_checkpoint_generations(
+        self,
+        authority: SessionCloseAuthority,
+    ) -> tuple[CheckpointGeneration, ...]: ...
+
+    async def record_close_checkpoint_deletion(
+        self,
+        authority: SessionCloseAuthority,
+        checkpoint_namespace: str,
+    ) -> CheckpointGeneration: ...
+
+    async def finalize_close(
+        self,
+        authority: SessionCloseAuthority,
+        *,
+        tombstone_retention_seconds: float,
+    ) -> SessionRegistryRecord: ...
+
+    async def expired_sessions(
+        self,
+        tenant_id: str,
+        *,
+        limit: int,
+    ) -> tuple[ExpiredSessionCandidate, ...]: ...
+
+    async def purge_closed_tombstones(self, tenant_id: str, *, limit: int) -> int: ...
+
     async def reconcile_checkpoint_revision(
         self,
         authority: SessionLeaseAuthority,
@@ -466,6 +589,265 @@ class SessionRegistryPort(Protocol):
     ) -> SessionRegistryRecord | None: ...
 
 
+@runtime_checkable
+class CheckpointGenerationAuthority(Protocol):
+    @property
+    def current_generation(self) -> CheckpointGeneration: ...
+
+    async def begin_checkpoint_rotation(
+        self,
+        *,
+        expected_revision: int,
+        transition_id: str,
+    ) -> CheckpointGeneration: ...
+
+    async def switch_checkpoint_generation(
+        self,
+        transition_id: str,
+    ) -> CheckpointRotation: ...
+
+    async def record_checkpoint_deletion(
+        self,
+        transition_id: str,
+    ) -> CheckpointGeneration: ...
+
+
+class BoundCheckpointGenerationAuthority:
+    """Bind registry generation operations to one live lease authority."""
+
+    def __init__(
+        self,
+        registry: SessionRegistryPort,
+        authority: SessionLeaseAuthority,
+        current_generation: CheckpointGeneration,
+    ) -> None:
+        self._registry = registry
+        self._authority = authority
+        self._current_generation = current_generation
+        self._validate_scope(current_generation)
+        if current_generation.state != "current":
+            raise ValueError("checkpoint authority requires the current generation")
+
+    @property
+    def current_generation(self) -> CheckpointGeneration:
+        return self._current_generation
+
+    def _validate_scope(self, generation: CheckpointGeneration) -> None:
+        if (
+            generation.tenant_id != self._authority.tenant_id
+            or generation.logical_session_id != self._authority.authority.logical_session_id
+            or generation.deployment_id != self._authority.deployment_id
+            or generation.graph_contract != self._authority.graph_contract
+            or generation.fencing_generation != self._authority.fencing_generation
+        ):
+            raise ValueError("checkpoint generation does not match lease authority")
+
+    async def begin_checkpoint_rotation(
+        self,
+        *,
+        expected_revision: int,
+        transition_id: str,
+    ) -> CheckpointGeneration:
+        destination = await self._registry.begin_checkpoint_rotation(
+            self._authority,
+            expected_revision=expected_revision,
+            expected_principal_generation=self._current_generation.principal_generation,
+            transition_id=transition_id,
+        )
+        self._validate_scope(destination)
+        if (
+            destination.state not in {"pending", "current"}
+            or destination.transition_id != transition_id
+            or destination.source_revision != expected_revision
+            or destination.principal_generation != self._current_generation.principal_generation + 1
+        ):
+            raise SessionRegistryDataError("checkpoint rotation returned an unusable destination")
+        return destination
+
+    async def switch_checkpoint_generation(
+        self,
+        transition_id: str,
+    ) -> CheckpointRotation:
+        rotation = await self._registry.switch_checkpoint_generation(
+            self._authority,
+            transition_id,
+        )
+        self._validate_scope(rotation.source)
+        self._validate_scope(rotation.destination)
+        if (
+            rotation.source.checkpoint_namespace != self._current_generation.checkpoint_namespace
+            or rotation.destination.state != "current"
+            or rotation.destination.transition_id != transition_id
+        ):
+            raise SessionRegistryDataError("checkpoint rotation switched an unexpected source")
+        self._current_generation = rotation.destination
+        return rotation
+
+    async def record_checkpoint_deletion(
+        self,
+        transition_id: str,
+    ) -> CheckpointGeneration:
+        deleted = await self._registry.record_checkpoint_deletion(
+            self._authority,
+            transition_id,
+        )
+        self._validate_scope(deleted)
+        if deleted.state != "deleted":
+            raise SessionRegistryDataError("checkpoint deletion was not durably recorded")
+        return deleted
+
+
+class InMemoryCheckpointGenerationAuthority:
+    """Model registry-owned generation transitions for isolated runtime tests."""
+
+    def __init__(self, current_generation: CheckpointGeneration) -> None:
+        if current_generation.state != "current":
+            raise ValueError("checkpoint authority requires the current generation")
+        self._current_generation = current_generation
+        self._pending: dict[
+            str,
+            tuple[CheckpointGeneration, CheckpointGeneration],
+        ] = {}
+        self._completed: dict[str, CheckpointRotation] = {}
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    def from_binding(
+        cls,
+        binding: CheckpointBinding,
+        *,
+        fencing_generation: int = 0,
+        principal_generation: int = 0,
+    ) -> InMemoryCheckpointGenerationAuthority:
+        if binding.logical_session_id is None:
+            raise ValueError("checkpoint authority requires a logical session id")
+        return cls(
+            CheckpointGeneration(
+                tenant_id=binding.tenant_id,
+                logical_session_id=binding.logical_session_id,
+                deployment_id=binding.deployment_id,
+                graph_contract=binding.graph_contract,
+                checkpoint_namespace=binding.thread_id,
+                storage_thread_id=binding.storage_thread_id,
+                fencing_generation=fencing_generation,
+                principal_generation=principal_generation,
+                binding_version=1,
+                state="current",
+                transition_id=None,
+                source_revision=None,
+            )
+        )
+
+    @property
+    def current_generation(self) -> CheckpointGeneration:
+        return self._current_generation
+
+    async def begin_checkpoint_rotation(
+        self,
+        *,
+        expected_revision: int,
+        transition_id: str,
+    ) -> CheckpointGeneration:
+        transition_id = _AUTHORITY_IDENTIFIER.validate_python(transition_id)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("rotation requires a non-negative integer revision")
+        async with self._lock:
+            pending = self._pending.get(transition_id)
+            completed = self._completed.get(transition_id)
+            prior_destination = pending[1] if pending is not None else None
+            if completed is not None:
+                prior_destination = completed.destination
+            if prior_destination is not None:
+                if (
+                    prior_destination.source_revision != expected_revision
+                    or prior_destination.state not in {"pending", "current"}
+                ):
+                    raise SessionStateWriteError(SessionStateWriteReason.OPERATION_CONFLICT)
+                return prior_destination
+            if self._pending:
+                raise SessionStateWriteError(SessionStateWriteReason.ROTATION_PENDING)
+            source = self._current_generation
+            namespace = (
+                f"{source.logical_session_id}::fence::{source.fencing_generation}"
+                f"::principal::{source.principal_generation + 1}"
+            )
+            binding = CheckpointBinding(
+                tenant_id=source.tenant_id,
+                logical_session_id=source.logical_session_id,
+                deployment_id=source.deployment_id,
+                graph_contract=source.graph_contract,
+                thread_id=namespace,
+            )
+            destination = CheckpointGeneration(
+                tenant_id=source.tenant_id,
+                logical_session_id=source.logical_session_id,
+                deployment_id=source.deployment_id,
+                graph_contract=source.graph_contract,
+                checkpoint_namespace=namespace,
+                storage_thread_id=binding.storage_thread_id,
+                fencing_generation=source.fencing_generation,
+                principal_generation=source.principal_generation + 1,
+                binding_version=source.binding_version,
+                state="pending",
+                transition_id=transition_id,
+                source_revision=expected_revision,
+            )
+            self._pending[transition_id] = (source, destination)
+            return destination
+
+    async def switch_checkpoint_generation(
+        self,
+        transition_id: str,
+    ) -> CheckpointRotation:
+        transition_id = _AUTHORITY_IDENTIFIER.validate_python(transition_id)
+        async with self._lock:
+            completed = self._completed.get(transition_id)
+            if completed is not None:
+                return completed
+            pending = self._pending.pop(transition_id, None)
+            if pending is None:
+                raise SessionStateWriteError(SessionStateWriteReason.ROTATION_NOT_FOUND)
+            source, destination = pending
+            if source.transition_id is not None:
+                prior_rotation = self._completed.get(source.transition_id)
+                if (
+                    prior_rotation is None
+                    or prior_rotation.destination.checkpoint_namespace
+                    != source.checkpoint_namespace
+                ):
+                    raise SessionRegistryDataError(
+                        "checkpoint rotation history does not contain its current generation"
+                    )
+                self._completed[source.transition_id] = prior_rotation.model_copy(
+                    update={"destination": source.model_copy(update={"state": "retired"})}
+                )
+            rotation = CheckpointRotation(
+                source=source.model_copy(update={"state": "retired"}),
+                destination=destination.model_copy(update={"state": "current"}),
+            )
+            self._current_generation = rotation.destination
+            self._completed[transition_id] = rotation
+            return rotation
+
+    async def record_checkpoint_deletion(
+        self,
+        transition_id: str,
+    ) -> CheckpointGeneration:
+        transition_id = _AUTHORITY_IDENTIFIER.validate_python(transition_id)
+        async with self._lock:
+            rotation = self._completed.get(transition_id)
+            if rotation is None:
+                raise SessionStateWriteError(SessionStateWriteReason.ROTATION_NOT_FOUND)
+            if rotation.source.state == "deleted":
+                return rotation.source
+            deleted = rotation.source.model_copy(update={"state": "deleted"})
+            self._completed[transition_id] = CheckpointRotation(
+                source=deleted,
+                destination=rotation.destination,
+            )
+            return deleted
+
+
 def _record_from_row(row: Mapping[str, object]) -> SessionRegistryRecord:
     try:
         envelope = None
@@ -499,6 +881,7 @@ def _record_from_row(row: Mapping[str, object]) -> SessionRegistryRecord:
                 "fencing_generation": row["fencing_generation"],
                 "lease_owner_id": row["lease_owner_id"],
                 "lease_expires_at": row["lease_expires_at"],
+                "close_operation_id": row["close_operation_id"],
                 "expires_at": row["expires_at"],
                 "envelope": envelope,
                 "created_at": row["created_at"],
@@ -567,6 +950,31 @@ def _lease_authority_rejection(
         return LeaseAdmissionReason.WRONG_LEASE_OWNER
     if record.fencing_generation != authority.fencing_generation:
         return LeaseAdmissionReason.STALE_FENCE
+    return None
+
+
+def _close_authority_rejection(
+    record: SessionRegistryRecord,
+    authority: SessionCloseAuthority,
+    *,
+    database_now: datetime,
+) -> SessionCloseReason | None:
+    if record.lifecycle is not SessionLifecycle.CLOSING:
+        return SessionCloseReason.NOT_ELIGIBLE
+    if record.tenant_id != authority.tenant_id or record.authority != authority.authority:
+        return SessionCloseReason.WRONG_CLOSE_OWNER
+    if (
+        record.deployment_id != authority.deployment_id
+        or record.graph_contract != authority.graph_contract
+        or record.config_version != authority.config_version
+        or record.lease_owner_id != authority.lease_owner_id
+        or record.close_operation_id != authority.operation_id
+    ):
+        return SessionCloseReason.WRONG_CLOSE_OWNER
+    if record.fencing_generation != authority.fencing_generation:
+        return SessionCloseReason.STALE_FENCE
+    if record.lease_expires_at is None or record.lease_expires_at <= database_now:
+        return SessionCloseReason.NOT_ELIGIBLE
     return None
 
 
@@ -869,9 +1277,29 @@ class PostgresSessionRegistry(SessionRegistryPort):
         connection: AsyncConnection,
         authority: SessionLeaseAuthority,
     ) -> tuple[SessionRegistryRecord, datetime]:
+        record, database_now = await self._locked_session(
+            connection,
+            tenant_id=authority.tenant_id,
+            logical_session_id=authority.authority.logical_session_id,
+        )
+        if reason := _lease_authority_rejection(
+            record,
+            authority,
+            database_now=database_now,
+        ):
+            raise LeaseAdmissionError(reason)
+        return record, database_now
+
+    async def _locked_session(
+        self,
+        connection: AsyncConnection,
+        *,
+        tenant_id: str,
+        logical_session_id: str,
+    ) -> tuple[SessionRegistryRecord, datetime]:
         await connection.execute(
             "SELECT set_config('agnostic_market.tenant_id', %s, true)",
-            (authority.tenant_id,),
+            (tenant_id,),
         )
         async with connection.cursor(row_factory=dict_row) as cursor:
             query = sql.SQL(
@@ -885,8 +1313,8 @@ class PostgresSessionRegistry(SessionRegistryPort):
             await cursor.execute(
                 query,
                 (
-                    authority.tenant_id,
-                    authority.authority.logical_session_id,
+                    tenant_id,
+                    logical_session_id,
                 ),
             )
             locked = await cursor.fetchone()
@@ -896,13 +1324,521 @@ class PostgresSessionRegistry(SessionRegistryPort):
         database_now = locked.get("database_now")
         if not isinstance(database_now, datetime):
             raise SessionRegistryDataError("session lease read returned no database time")
-        if reason := _lease_authority_rejection(
+        return record, database_now
+
+    async def _locked_close_record(
+        self,
+        connection: AsyncConnection,
+        authority: SessionCloseAuthority,
+    ) -> tuple[SessionRegistryRecord, datetime]:
+        record, database_now = await self._locked_session(
+            connection,
+            tenant_id=authority.tenant_id,
+            logical_session_id=authority.authority.logical_session_id,
+        )
+        if reason := _close_authority_rejection(
             record,
             authority,
             database_now=database_now,
         ):
-            raise LeaseAdmissionError(reason)
+            raise SessionCloseError(reason)
         return record, database_now
+
+    @staticmethod
+    def _close_authority(record: SessionRegistryRecord) -> SessionCloseAuthority:
+        if record.close_operation_id is None or record.lease_owner_id is None:
+            raise SessionRegistryDataError("closing session is missing cleanup authority")
+        return SessionCloseAuthority(
+            tenant_id=record.tenant_id,
+            authority=record.authority,
+            deployment_id=record.deployment_id,
+            graph_contract=record.graph_contract,
+            config_version=record.config_version,
+            operation_id=record.close_operation_id,
+            lease_owner_id=record.lease_owner_id,
+            fencing_generation=record.fencing_generation,
+        )
+
+    async def _close_claim(
+        self,
+        connection: AsyncConnection,
+        record: SessionRegistryRecord,
+    ) -> SessionCloseClaim:
+        return SessionCloseClaim(
+            authority=self._close_authority(record),
+            record=record,
+            generations=await self._checkpoint_generations(
+                connection,
+                record,
+                require_current=False,
+            ),
+        )
+
+    async def _take_close_lease(
+        self,
+        connection: AsyncConnection,
+        record: SessionRegistryRecord,
+        request: SessionCloseRequest,
+        *,
+        database_now: datetime,
+    ) -> SessionRegistryRecord:
+        close_operation_id = record.close_operation_id or request.operation_id
+        if (
+            record.close_operation_id is not None
+            and record.close_operation_id != request.operation_id
+        ):
+            raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+        lease_expires_at = database_now + _lease_duration(request.duration_seconds)
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            query = sql.SQL(
+                """
+                UPDATE platform_sessions
+                SET lifecycle = 'closing',
+                    fencing_generation = fencing_generation + 1,
+                    lease_owner_id = %s,
+                    lease_expires_at = %s,
+                    close_operation_id = %s,
+                    updated_at = %s
+                WHERE tenant_id = %s AND logical_session_id = %s
+                RETURNING {}
+                """
+            ).format(sql.SQL(_RETURNING_COLUMNS))
+            await cursor.execute(
+                query,
+                (
+                    request.lease_owner_id,
+                    lease_expires_at,
+                    close_operation_id,
+                    database_now,
+                    record.tenant_id,
+                    record.authority.logical_session_id,
+                ),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise SessionRegistryError("session close claim returned no authoritative row")
+        return _record_from_row(row)
+
+    async def begin_close(
+        self,
+        authority: SessionLeaseAuthority,
+        request: SessionCloseRequest,
+    ) -> SessionCloseClaim:
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, database_now = await self._locked_session(
+                        connection,
+                        tenant_id=authority.tenant_id,
+                        logical_session_id=authority.authority.logical_session_id,
+                    )
+                    replay = (
+                        record.lifecycle is SessionLifecycle.CLOSING
+                        and record.close_operation_id == request.operation_id
+                        and record.lease_owner_id == request.lease_owner_id
+                        and record.lease_expires_at is not None
+                        and record.lease_expires_at > database_now
+                    )
+                    if not replay:
+                        reclaim = (
+                            record.lifecycle is SessionLifecycle.CLOSING
+                            and record.close_operation_id == request.operation_id
+                            and (
+                                record.lease_expires_at is None
+                                or record.lease_expires_at <= database_now
+                            )
+                        )
+                        if record.lifecycle is SessionLifecycle.CLOSING and not reclaim:
+                            raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+                        if not reclaim:
+                            reason = _lease_authority_rejection(
+                                record,
+                                authority,
+                                database_now=database_now,
+                            )
+                            if reason is not None:
+                                raise LeaseAdmissionError(reason)
+                        record = await self._take_close_lease(
+                            connection,
+                            record,
+                            request,
+                            database_now=database_now,
+                        )
+                    return await self._close_claim(connection, record)
+        except (LeaseAdmissionError, SessionCloseError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session close transition failed") from exc
+
+    async def claim_expired(
+        self,
+        candidate: ExpiredSessionCandidate,
+        request: SessionCloseRequest,
+    ) -> SessionCloseClaim:
+        tenant_id = candidate.tenant_id
+        logical_session_id = candidate.logical_session_id
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, database_now = await self._locked_session(
+                        connection,
+                        tenant_id=tenant_id,
+                        logical_session_id=logical_session_id,
+                    )
+                    if record.lifecycle is SessionLifecycle.CLOSED:
+                        raise SessionCloseError(SessionCloseReason.NOT_ELIGIBLE)
+                    lease_expired = (
+                        record.lease_expires_at is None or record.lease_expires_at <= database_now
+                    )
+                    eligible = lease_expired or (
+                        record.lifecycle is not SessionLifecycle.CLOSING
+                        and record.expires_at <= database_now
+                    )
+                    if not eligible:
+                        raise SessionCloseError(SessionCloseReason.NOT_ELIGIBLE)
+                    record = await self._take_close_lease(
+                        connection,
+                        record,
+                        request,
+                        database_now=database_now,
+                    )
+                    return await self._close_claim(connection, record)
+        except (SessionCloseError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("expired session claim failed") from exc
+
+    async def refresh_close(
+        self,
+        authority: SessionCloseAuthority,
+        *,
+        duration_seconds: float,
+    ) -> SessionCloseClaim:
+        duration = _lease_duration(duration_seconds)
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, database_now = await self._locked_session(
+                        connection,
+                        tenant_id=authority.tenant_id,
+                        logical_session_id=authority.authority.logical_session_id,
+                    )
+                    if record.lifecycle is not SessionLifecycle.CLOSING:
+                        raise SessionCloseError(SessionCloseReason.NOT_ELIGIBLE)
+                    if (
+                        record.authority != authority.authority
+                        or record.deployment_id != authority.deployment_id
+                        or record.graph_contract != authority.graph_contract
+                        or record.config_version != authority.config_version
+                        or record.close_operation_id != authority.operation_id
+                    ):
+                        raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+                    lease_expired = (
+                        record.lease_expires_at is None or record.lease_expires_at <= database_now
+                    )
+                    if lease_expired:
+                        record = await self._take_close_lease(
+                            connection,
+                            record,
+                            SessionCloseRequest(
+                                operation_id=authority.operation_id,
+                                lease_owner_id=authority.lease_owner_id,
+                                duration_seconds=duration_seconds,
+                            ),
+                            database_now=database_now,
+                        )
+                    else:
+                        if record.lease_owner_id != authority.lease_owner_id:
+                            raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+                        async with connection.cursor(row_factory=dict_row) as cursor:
+                            query = sql.SQL(
+                                """
+                                UPDATE platform_sessions
+                                SET lease_expires_at = GREATEST(lease_expires_at, %s),
+                                    updated_at = %s
+                                WHERE tenant_id = %s AND logical_session_id = %s
+                                RETURNING {}
+                                """
+                            ).format(sql.SQL(_RETURNING_COLUMNS))
+                            await cursor.execute(
+                                query,
+                                (
+                                    database_now + duration,
+                                    database_now,
+                                    record.tenant_id,
+                                    record.authority.logical_session_id,
+                                ),
+                            )
+                            row = await cursor.fetchone()
+                        if row is None:
+                            raise SessionRegistryError(
+                                "session close renewal returned no authoritative row"
+                            )
+                        record = _record_from_row(row)
+                    return await self._close_claim(connection, record)
+        except (SessionCloseError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session close renewal failed") from exc
+
+    async def close_checkpoint_generations(
+        self,
+        authority: SessionCloseAuthority,
+    ) -> tuple[CheckpointGeneration, ...]:
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_close_record(connection, authority)
+                    return await self._checkpoint_generations(
+                        connection,
+                        record,
+                        require_current=False,
+                    )
+        except (SessionCloseError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session close inventory failed") from exc
+
+    async def record_close_checkpoint_deletion(
+        self,
+        authority: SessionCloseAuthority,
+        checkpoint_namespace: str,
+    ) -> CheckpointGeneration:
+        checkpoint_namespace = _AUTHORITY_IDENTIFIER.validate_python(checkpoint_namespace)
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, _ = await self._locked_close_record(connection, authority)
+                    async with connection.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute(
+                            """
+                            UPDATE platform_checkpoint_generations
+                            SET state = 'deleted'
+                            WHERE tenant_id = %s AND logical_session_id = %s
+                              AND checkpoint_namespace = %s
+                            RETURNING checkpoint_namespace, storage_thread_id,
+                                fencing_generation, principal_generation, binding_version,
+                                state, transition_id, source_revision
+                            """,
+                            (
+                                record.tenant_id,
+                                record.authority.logical_session_id,
+                                checkpoint_namespace,
+                            ),
+                        )
+                        row = await cursor.fetchone()
+                    if row is None:
+                        raise SessionCloseError(SessionCloseReason.CLEANUP_INCOMPLETE)
+                    return CheckpointGeneration(
+                        **row,
+                        tenant_id=record.tenant_id,
+                        logical_session_id=record.authority.logical_session_id,
+                        deployment_id=record.deployment_id,
+                        graph_contract=record.graph_contract,
+                    )
+        except (SessionCloseError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise SessionRegistryDataError("session close checkpoint record is invalid") from exc
+        except PsycopgError as exc:
+            raise SessionRegistryError("session close checkpoint update failed") from exc
+
+    async def finalize_close(
+        self,
+        authority: SessionCloseAuthority,
+        *,
+        tombstone_retention_seconds: float,
+    ) -> SessionRegistryRecord:
+        tombstone_duration = _lease_duration(tombstone_retention_seconds)
+        row = None
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    record, database_now = await self._locked_session(
+                        connection,
+                        tenant_id=authority.tenant_id,
+                        logical_session_id=authority.authority.logical_session_id,
+                    )
+                    if record.lifecycle is SessionLifecycle.CLOSED:
+                        if record.close_operation_id != authority.operation_id:
+                            raise SessionCloseError(SessionCloseReason.WRONG_CLOSE_OWNER)
+                        return record
+                    if reason := _close_authority_rejection(
+                        record,
+                        authority,
+                        database_now=database_now,
+                    ):
+                        raise SessionCloseError(reason)
+                    generations = await self._checkpoint_generations(
+                        connection,
+                        record,
+                        require_current=False,
+                    )
+                    if not generations or any(
+                        generation.state != "deleted" for generation in generations
+                    ):
+                        raise SessionCloseError(SessionCloseReason.CLEANUP_INCOMPLETE)
+                    storage_ids = [generation.storage_thread_id for generation in generations]
+                    cursor = await connection.execute(
+                        """
+                        SELECT
+                            (SELECT count(*) FROM checkpoints WHERE thread_id = ANY(%s)),
+                            (SELECT count(*) FROM checkpoint_blobs WHERE thread_id = ANY(%s)),
+                            (SELECT count(*) FROM checkpoint_writes WHERE thread_id = ANY(%s)),
+                            (
+                                SELECT count(*)
+                                FROM platform_checkpoint_write_manifests
+                                WHERE tenant_id = %s AND logical_session_id = %s
+                            )
+                        """,
+                        (
+                            storage_ids,
+                            storage_ids,
+                            storage_ids,
+                            record.tenant_id,
+                            record.authority.logical_session_id,
+                        ),
+                    )
+                    counts = await cursor.fetchone()
+                    if counts is None or any(int(value) for value in counts):
+                        raise SessionCloseError(SessionCloseReason.CLEANUP_INCOMPLETE)
+                    await connection.execute(
+                        """
+                        DELETE FROM platform_session_operations
+                        WHERE tenant_id = %s AND logical_session_id = %s
+                        """,
+                        (record.tenant_id, record.authority.logical_session_id),
+                    )
+                    await connection.execute(
+                        """
+                        DELETE FROM platform_checkpoint_generations
+                        WHERE tenant_id = %s AND logical_session_id = %s
+                        """,
+                        (record.tenant_id, record.authority.logical_session_id),
+                    )
+                    async with connection.cursor(row_factory=dict_row) as result_cursor:
+                        query = sql.SQL(
+                            """
+                            UPDATE platform_sessions
+                            SET lifecycle = 'closed', lease_owner_id = NULL,
+                                lease_expires_at = NULL, envelope_format = NULL,
+                                envelope_key_version = NULL, payload_schema_version = NULL,
+                                envelope_nonce = NULL, encrypted_payload = NULL,
+                                expires_at = %s, updated_at = %s
+                            WHERE tenant_id = %s AND logical_session_id = %s
+                            RETURNING {}
+                            """
+                        ).format(sql.SQL(_RETURNING_COLUMNS))
+                        await result_cursor.execute(
+                            query,
+                            (
+                                database_now + tombstone_duration,
+                                database_now,
+                                record.tenant_id,
+                                record.authority.logical_session_id,
+                            ),
+                        )
+                        row = await result_cursor.fetchone()
+        except (SessionCloseError, SessionRegistryDataError):
+            raise
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("session close finalization failed") from exc
+        if row is None:
+            raise SessionRegistryError("session close finalization returned no row")
+        return _record_from_row(row)
+
+    async def expired_sessions(
+        self,
+        tenant_id: str,
+        *,
+        limit: int,
+    ) -> tuple[ExpiredSessionCandidate, ...]:
+        tenant_id = _AUTHORITY_IDENTIFIER.validate_python(tenant_id)
+        if type(limit) is not int or limit < 1:
+            raise ValueError("expired session limit must be a positive integer")
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    await connection.execute(
+                        "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+                        (tenant_id,),
+                    )
+                    cursor = await connection.execute(
+                        """
+                        SELECT tenant_id, logical_session_id, close_operation_id
+                        FROM platform_sessions
+                        WHERE tenant_id = %s AND lifecycle <> 'closed'
+                          AND (
+                              lease_expires_at <= clock_timestamp()
+                              OR (
+                                  lifecycle <> 'closing'
+                                  AND expires_at <= clock_timestamp()
+                              )
+                          )
+                        ORDER BY COALESCE(lease_expires_at, expires_at), logical_session_id
+                        LIMIT %s
+                        """,
+                        (tenant_id, limit),
+                    )
+                    return tuple(
+                        ExpiredSessionCandidate(
+                            tenant_id=str(row[0]),
+                            logical_session_id=str(row[1]),
+                            close_operation_id=(None if row[2] is None else str(row[2])),
+                        )
+                        for row in await cursor.fetchall()
+                    )
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("expired session lookup failed") from exc
+
+    async def purge_closed_tombstones(self, tenant_id: str, *, limit: int) -> int:
+        tenant_id = _AUTHORITY_IDENTIFIER.validate_python(tenant_id)
+        if type(limit) is not int or limit < 1:
+            raise ValueError("closed tombstone limit must be a positive integer")
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    await connection.execute(
+                        "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+                        (tenant_id,),
+                    )
+                    cursor = await connection.execute(
+                        """
+                        WITH expired AS (
+                            SELECT tenant_id, logical_session_id
+                            FROM platform_sessions
+                            WHERE tenant_id = %s AND lifecycle = 'closed'
+                              AND expires_at <= clock_timestamp()
+                            ORDER BY expires_at, logical_session_id
+                            LIMIT %s
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        DELETE FROM platform_sessions AS session_row
+                        USING expired
+                        WHERE session_row.tenant_id = expired.tenant_id
+                          AND session_row.logical_session_id = expired.logical_session_id
+                        """,
+                        (tenant_id, limit),
+                    )
+                    return cursor.rowcount
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("closed session tombstone purge failed") from exc
 
     async def checkpoint_generations(
         self, authority: SessionLeaseAuthority
@@ -921,6 +1857,8 @@ class PostgresSessionRegistry(SessionRegistryPort):
         self,
         connection: AsyncConnection,
         record: SessionRegistryRecord,
+        *,
+        require_current: bool = True,
     ) -> tuple[CheckpointGeneration, ...]:
         async with connection.cursor(row_factory=dict_row) as cursor:
             await cursor.execute(
@@ -945,8 +1883,9 @@ class PostgresSessionRegistry(SessionRegistryPort):
                 for row in await cursor.fetchall()
             )
         current = [item for item in generations if item.state == "current"]
-        if len(current) != 1 or (
-            current[0].checkpoint_namespace != record.checkpoint_namespace
+        if require_current and (
+            len(current) != 1
+            or current[0].checkpoint_namespace != record.checkpoint_namespace
             or current[0].fencing_generation != record.fencing_generation
             or current[0].principal_generation != record.principal_generation
         ):

@@ -263,6 +263,13 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
     def config_specs(self) -> list:
         return self._backend.config_specs
 
+    @property
+    def encryption_enabled(self) -> bool:
+        return self._checkpoint_codec is not None
+
+    def uses_storage_backend(self, backend_type: type[BaseCheckpointSaver]) -> bool:
+        return isinstance(self._backend, backend_type)
+
     def _require_synchronous_operations(self) -> None:
         if not self._synchronous_operations:
             raise SynchronousCheckpointOperationError(
@@ -587,16 +594,32 @@ class SchemaValidatedCheckpointSaver(BaseCheckpointSaver):
         with self._binding_lock:
             self._bindings.pop(thread_id, None)
 
-    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+    async def _aget_decrypted_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         binding = self._binding_for_config(config)
         saved = await self._bounded(self._backend.aget_tuple(config))
         expected_namespace = self._configured_checkpoint_namespace(config)
-        saved = self._decrypt_saved_tuple(
+        return self._decrypt_saved_tuple(
             saved,
             binding,
             expected_namespace="" if expected_namespace is None else expected_namespace,
         )
-        return self._validate_tuple(saved)
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        return self._validate_tuple(await self._aget_decrypted_tuple(config))
+
+    async def acheckpoint_has_pending_interrupt(self, config: RunnableConfig) -> bool:
+        """Read the persisted LangGraph interrupt signal through this saver authority."""
+        saved = await self._aget_decrypted_tuple(config)
+        if saved is not None:
+            self._validate_pending_write_channels(
+                [write[1] for write in saved.pending_writes or ()]
+            )
+        return bool(
+            saved is not None
+            and any(
+                channel == INTERRUPT for _task_id, channel, _value in saved.pending_writes or ()
+            )
+        )
 
     async def alist(
         self,

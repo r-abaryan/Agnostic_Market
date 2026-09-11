@@ -17,11 +17,13 @@ from agnostic_market.durability.migrations import PLATFORM_SESSION_SCHEMA_VERSIO
 def _valid_config() -> dict[str, object]:
     return {
         "schema_version": 1,
+        "graph_contract": "a" * 64,
         "database": {
             "application_dsn_ref": {
                 "provider": "env",
                 "locator": "PLATFORM_POSTGRES_DSN",
             },
+            "schema_name": "agnostic_market",
             "minimum_pool_size": 2,
             "maximum_pool_size": 12,
             "connection_timeout_seconds": 3.0,
@@ -44,6 +46,7 @@ def _valid_config() -> dict[str, object]:
                 "locator": "PLATFORM_SESSION_KEY",
             },
             "key_version": "key-2026-09",
+            "key_encoding": "base64",
         },
     }
 
@@ -51,8 +54,11 @@ def _valid_config() -> dict[str, object]:
 def test_platform_runtime_config_is_strict_and_uses_structured_secret_references() -> None:
     config = PlatformRuntimeConfig.model_validate(_valid_config())
 
+    assert config.graph_contract == "a" * 64
     assert config.database.application_dsn_ref.uri == "env://PLATFORM_POSTGRES_DSN"
+    assert config.database.schema_name == "agnostic_market"
     assert config.encryption.key_ref.uri == "env://PLATFORM_SESSION_KEY"
+    assert config.encryption.key_encoding == "base64"
     assert config.sessions.lease_renewal_interval_seconds < config.sessions.lease_duration_seconds
 
     with pytest.raises(ValidationError, match="extra_forbidden"):

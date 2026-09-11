@@ -322,6 +322,15 @@ class _FakeJobContext:
         self.shutdown_callbacks.append(callback)
 
 
+class _FailingLeaseSupervisor:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("injected lease-supervisor close failure")
+
+
 class _RetirementSession:
     def __init__(self, tracker: NodeExecutionTracker, *, fail_shutdown: bool = False) -> None:
         self.tracker = tracker
@@ -365,13 +374,21 @@ class _FakeAsyncClearable:
 
 
 class _FakeSessionState:
-    def __init__(self, *, clear_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        clear_error: Exception | None = None,
+        discard_error: Exception | None = None,
+    ) -> None:
         self.cart = _FakeClearable()
         self.recent_orders = _FakeClearable()
         self.guest_orders = _FakeClearable()
         self.clear_error = clear_error
+        self.discard_error = discard_error
 
     async def discard_local_projection(self) -> None:
+        if self.discard_error is not None:
+            raise self.discard_error
         self.cart.clear()
         self.recent_orders.clear()
         self.guest_orders.clear()
@@ -385,7 +402,60 @@ class _FakeSessionState:
         return SimpleNamespace(session_revision=1)
 
 
-def _fake_caller_context(engine=None, *, session_state=None):
+class _BlockingDiscardSessionState(_FakeSessionState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.discard_entered = asyncio.Event()
+
+    async def discard_local_projection(self) -> None:
+        self.discard_entered.set()
+        await asyncio.Event().wait()
+
+
+class _FakeDurableCloser:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        finalize_error: Exception | None = None,
+        pending_interrupt: bool = False,
+    ) -> None:
+        self.events = events
+        self.finalize_error = finalize_error
+        self.pending_interrupt = pending_interrupt
+
+    async def begin_close(self) -> None:
+        self.events.append("begin")
+
+    async def finalize_close(self) -> None:
+        self.events.append("finalize")
+        if self.finalize_error is not None:
+            raise self.finalize_error
+
+    async def checkpoint_has_pending_interrupt(self) -> bool:
+        return self.pending_interrupt
+
+
+class _BlockingDurableCloser:
+    def __init__(self, blocked_stage: str) -> None:
+        self.blocked_stage = blocked_stage
+        self.entered = asyncio.Event()
+
+    async def begin_close(self) -> None:
+        if self.blocked_stage == "begin":
+            self.entered.set()
+            await asyncio.Event().wait()
+
+    async def finalize_close(self) -> None:
+        if self.blocked_stage == "finalize":
+            self.entered.set()
+            await asyncio.Event().wait()
+
+    async def checkpoint_has_pending_interrupt(self) -> bool:
+        return False
+
+
+def _fake_caller_context(engine=None, *, session_state=None, durable_closer=None):
     from agnostic_market.session import CallerContext
 
     telemetry = make_session_telemetry("acme_store", "fake-caller")
@@ -396,6 +466,7 @@ def _fake_caller_context(engine=None, *, session_state=None):
         session_state=session_state,  # type: ignore[arg-type]
         identity_store=_FakeClearable(),  # type: ignore[arg-type]
         telemetry=telemetry.operational,
+        durable_closer=durable_closer,
     )
 
 
@@ -412,6 +483,132 @@ async def test_close_session_clears_every_caller_store_and_thread() -> None:
     assert ctx.engine.deletes == 1  # type: ignore[attr-defined]
 
 
+async def test_durable_close_fences_before_quiescence_and_never_uses_live_cleanup() -> None:
+    events: list[str] = []
+    closer = _FakeDurableCloser(events)
+    state = _FakeSessionState(clear_error=AssertionError("durable close must not publish"))
+    ctx = _fake_caller_context(session_state=state, durable_closer=closer)
+    tracker = NodeExecutionTracker()
+    ctx.attach_execution_quiescence(tracker, timeout_seconds=1.0)
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        closing = asyncio.create_task(ctx.aclose_session())
+        await asyncio.sleep(0)
+        assert events == ["begin"]
+        assert ctx.cart_store.clears == 0  # type: ignore[attr-defined]
+
+    await closing
+
+    assert events == ["begin", "finalize"]
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 0  # type: ignore[attr-defined]
+    assert ctx._closed is True
+
+
+async def test_durable_close_observes_an_interrupt_after_fencing_and_quiescence() -> None:
+    events: list[str] = []
+    closer = _FakeDurableCloser(events)
+    ctx = _fake_caller_context(durable_closer=closer)
+    tracker = NodeExecutionTracker()
+    ctx.attach_execution_quiescence(tracker, timeout_seconds=1.0)
+
+    with tracker.turn_span() as admitted:
+        assert admitted is True
+        closing = asyncio.create_task(ctx.aclose_session())
+        await asyncio.sleep(0)
+        assert events == ["begin"]
+        closer.pending_interrupt = True
+
+    await closing
+
+    assert ctx.close_had_pending_interrupt is True
+
+
+async def test_durable_close_failure_still_destroys_local_authority() -> None:
+    events: list[str] = []
+    closer = _FakeDurableCloser(events, finalize_error=TimeoutError("lost close acknowledgement"))
+    ctx = _fake_caller_context(durable_closer=closer)
+
+    with pytest.raises(TimeoutError, match="lost close acknowledgement"):
+        await ctx.aclose_session()
+
+    assert events == ["begin", "finalize"]
+    assert ctx.cart_store.clears >= 1  # type: ignore[attr-defined]
+    assert ctx.identity_store.clears >= 1  # type: ignore[attr-defined]
+    assert ctx.verification_store.clears >= 1  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 0  # type: ignore[attr-defined]
+    assert ctx._closed is False
+
+
+async def test_local_disposal_failure_does_not_skip_durable_finalization() -> None:
+    events: list[str] = []
+    closer = _FakeDurableCloser(events)
+    state = _FakeSessionState(discard_error=RuntimeError("injected local disposal failure"))
+    ctx = _fake_caller_context(session_state=state, durable_closer=closer)
+
+    with pytest.raises(RuntimeError, match="local disposal failure"):
+        await ctx.aclose_session()
+
+    assert events == ["begin", "finalize"]
+    assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx._closed is False
+
+
+@pytest.mark.parametrize("blocked_stage", ["begin", "finalize"])
+async def test_durable_close_cancellation_discards_local_authority(
+    blocked_stage: str,
+) -> None:
+    closer = _BlockingDurableCloser(blocked_stage)
+    ctx = _fake_caller_context(durable_closer=closer)
+    closing = asyncio.create_task(ctx.aclose_session())
+    await closer.entered.wait()
+
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert ctx.cart_store.clears >= 1  # type: ignore[attr-defined]
+    assert ctx.identity_store.clears >= 1  # type: ignore[attr-defined]
+    assert ctx.verification_store.clears >= 1  # type: ignore[attr-defined]
+    assert ctx._closed is False
+
+
+async def test_durable_close_cancellation_remains_direct_when_local_disposal_fails() -> None:
+    closer = _BlockingDurableCloser("begin")
+    disposal_error = RuntimeError("injected local disposal failure")
+    ctx = _fake_caller_context(
+        session_state=_FakeSessionState(discard_error=disposal_error),
+        durable_closer=closer,
+    )
+    closing = asyncio.create_task(ctx.aclose_session())
+    await closer.entered.wait()
+
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+
+    assert cancelled.value.__cause__ is disposal_error
+
+
+async def test_local_disposal_cancellation_remains_direct_when_durable_finalize_fails() -> None:
+    finalize_error = RuntimeError("injected durable finalization failure")
+    state = _BlockingDiscardSessionState()
+    ctx = _fake_caller_context(
+        session_state=state,
+        durable_closer=_FakeDurableCloser([], finalize_error=finalize_error),
+    )
+    closing = asyncio.create_task(ctx.aclose_session())
+    await state.discard_entered.wait()
+
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await closing
+
+    assert cancelled.value.__cause__ is finalize_error
+
+
 async def test_close_destroys_local_authority_when_durable_clear_is_rejected() -> None:
     session_state = _FakeSessionState(
         clear_error=SessionStateWriteError(SessionStateWriteReason.STALE_REVISION)
@@ -426,6 +623,33 @@ async def test_close_destroys_local_authority_when_durable_clear_is_rejected() -
     assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
     assert ctx.engine.deletes == 0  # type: ignore[attr-defined]
     assert ctx._closed is False
+
+
+async def test_abandonment_never_writes_or_deletes_through_lost_authority() -> None:
+    session_state = _FakeSessionState(clear_error=AssertionError("lost authority must not publish"))
+    ctx = _fake_caller_context(session_state=session_state)
+
+    await ctx.aabandon_session()
+
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.recent_orders.clears == 1  # type: ignore[attr-defined]
+    assert ctx.guest_orders.clears == 1  # type: ignore[attr-defined]
+    assert ctx.verification_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.identity_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 0  # type: ignore[attr-defined]
+    assert ctx._closed is True
+
+
+async def test_close_hook_observes_authority_loss_before_transport_shutdown() -> None:
+    session_state = _FakeSessionState(clear_error=AssertionError("lost authority must not publish"))
+    ctx = _fake_caller_context(session_state=session_state)
+
+    ctx.stop_for_authority_loss()
+    await ctx.aclose_session()
+
+    assert ctx.cart_store.clears == 1  # type: ignore[attr-defined]
+    assert ctx.engine.deletes == 0  # type: ignore[attr-defined]
+    assert ctx._closed is True
 
 
 async def test_close_session_is_idempotent() -> None:
@@ -570,17 +794,54 @@ async def test_voice_loop_registers_awaited_caller_teardown_for_job_shutdown(
     engine = _DelayedDeleteEngine()
     loop.application.state.caller_context.engine = engine  # type: ignore[assignment]
     job = _FakeJobContext()
+    resources_released = asyncio.Event()
 
-    loop.register_shutdown(job)  # type: ignore[arg-type]
+    async def release_resources() -> None:
+        assert engine.deletes == 1
+        resources_released.set()
+
+    loop.register_shutdown(  # type: ignore[arg-type]
+        job,
+        release_job_resources=release_resources,
+    )
     assert len(job.shutdown_callbacks) == 1
 
     shutdown = asyncio.create_task(job.shutdown_callbacks[0]())
     await engine.delete_entered.wait()
     assert shutdown.done() is False
+    assert not resources_released.is_set()
 
     engine.release_delete.set()
     await shutdown
     assert engine.deletes == 1
+    assert resources_released.is_set()
+
+
+async def test_job_shutdown_releases_session_after_lease_supervisor_failure(
+    config_root: Path,
+) -> None:
+    loop = await _loop(config_root, RecordingResolver())
+    engine = _FakeEngine(pending=False)
+    loop.application.state.caller_context.engine = engine  # type: ignore[assignment]
+    supervisor = _FailingLeaseSupervisor()
+    loop.lease_supervisor = supervisor  # type: ignore[assignment]
+    job = _FakeJobContext()
+    resources_released = asyncio.Event()
+
+    async def release_resources() -> None:
+        resources_released.set()
+
+    loop.register_shutdown(  # type: ignore[arg-type]
+        job,
+        release_job_resources=release_resources,
+    )
+
+    with pytest.raises(RuntimeError, match="lease-supervisor close failure"):
+        await job.shutdown_callbacks[0]()
+
+    assert supervisor.close_calls == 1
+    assert engine.deletes == 1
+    assert resources_released.is_set()
 
 
 async def test_lease_loss_stops_turns_and_output_before_transport_disconnect() -> None:
@@ -599,7 +860,9 @@ async def test_lease_loss_stops_turns_and_output_before_transport_disconnect() -
 
     assert session.shutdown_calls == [False]
     assert room.disconnect_calls == 1
-    assert context.engine.deletes == 1
+    assert context.engine.deletes == 0
+    assert context.cart_store.clears == 1  # type: ignore[attr-defined]
+    assert context.verification_store.clears == 1  # type: ignore[attr-defined]
 
 
 async def test_transport_retirement_timeout_still_closes_local_caller_state() -> None:
@@ -619,7 +882,8 @@ async def test_transport_retirement_timeout_still_closes_local_caller_state() ->
 
     assert session.shutdown_calls == [False]
     assert room.disconnect_calls == 1
-    assert context.engine.deletes == 1
+    assert context.engine.deletes == 0
+    assert context.cart_store.clears == 1  # type: ignore[attr-defined]
 
 
 async def test_transport_retirement_attempts_disconnect_after_output_shutdown_failure() -> None:
@@ -639,7 +903,8 @@ async def test_transport_retirement_attempts_disconnect_after_output_shutdown_fa
 
     assert session.shutdown_calls == [False]
     assert room.disconnect_calls == 1
-    assert context.engine.deletes == 1
+    assert context.engine.deletes == 0
+    assert context.cart_store.clears == 1  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

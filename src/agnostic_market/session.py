@@ -21,6 +21,7 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.lifecycle import ExecutionQuiescence
@@ -38,6 +39,36 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.durability.session_state import SessionStateCoordinator
 
 
+class DurableSessionCloser(Protocol):
+    async def begin_close(self) -> None: ...
+
+    async def finalize_close(self) -> None: ...
+
+    async def checkpoint_has_pending_interrupt(self) -> bool: ...
+
+
+def _raise_lifecycle_failures(message: str, failures: list[BaseException]) -> None:
+    if not failures:
+        return
+    cancellation = next(
+        (failure for failure in failures if isinstance(failure, asyncio.CancelledError)),
+        None,
+    )
+    if cancellation is not None:
+        secondary = [failure for failure in failures if failure is not cancellation]
+        if not secondary:
+            raise cancellation
+        cause: BaseException
+        if len(secondary) == 1:
+            cause = secondary[0]
+        else:
+            cause = BaseExceptionGroup(f"{message}: secondary failures", secondary)
+        raise cancellation from cause
+    if len(failures) == 1:
+        raise failures[0]
+    raise BaseExceptionGroup(message, failures)
+
+
 @dataclass
 class CallerContext:
     """Owns the per-call caller-ephemeral stores + the reasoning engine, and the operations that
@@ -49,12 +80,14 @@ class CallerContext:
     session_state: SessionStateCoordinator
     identity_store: CallerIdentityStore
     telemetry: TelemetryRecorder
+    durable_closer: DurableSessionCloser | None = None
     engine: ReasoningEngine | None = None
     _pending_transition: PrincipalTransition | None = field(default=None, init=False)
     _execution_quiescence: ExecutionQuiescence | None = field(default=None, init=False, repr=False)
     _close_quiescence_timeout_seconds: float | None = field(default=None, init=False, repr=False)
     _close_had_pending_interrupt: bool | None = field(default=None, init=False, repr=False)
     _close_started: bool = field(default=False, init=False, repr=False)
+    _durable_authority_lost: bool = field(default=False, init=False, repr=False)
     _active_cancellation_takeovers: int = field(default=0, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
@@ -273,53 +306,130 @@ class CallerContext:
             if self._execution_quiescence is not None:
                 self._execution_quiescence.stop_turn_admission()
 
+    def stop_for_authority_loss(self) -> None:
+        """Latch lost durability authority before transport shutdown can fire close hooks."""
+        with self._close_lock:
+            self._durable_authority_lost = True
+            if self._close_started:
+                return
+            self._close_started = True
+            if self._execution_quiescence is not None:
+                self._execution_quiescence.stop_turn_admission()
+
     async def _acomplete_close(self) -> None:
+        if self.durable_closer is not None:
+            failures: list[BaseException] = []
+            try:
+                await self._adiscard_local_authority()
+            except BaseException as exc:
+                failures.append(exc)
+            try:
+                await self.durable_closer.finalize_close()
+            except BaseException as exc:
+                failures.append(exc)
+            _raise_lifecycle_failures("durable and local session close failed", failures)
+            self.telemetry.record({"event": "caller_context_closed"})
+            self._mark_closed()
+            return
         try:
             await self._clear_ephemeral("session-close")
         except BaseException:
             await self.session_state.discard_local_projection()
             raise
         finally:
-            try:
-                await self.verification_store.clear()
-            finally:
-                self.identity_store.clear()
-                self._pending_transition = None
+            await self._aclear_local_authority()
         if self.engine is not None:
             await self.engine.adelete_thread()
         self.telemetry.record({"event": "caller_context_closed"})
+        self._mark_closed()
+
+    async def _aclear_local_authority(self) -> None:
+        try:
+            await self.verification_store.clear()
+        finally:
+            self.identity_store.clear()
+            self._pending_transition = None
+
+    async def _adiscard_local_authority(self) -> None:
+        try:
+            await self.session_state.discard_local_projection()
+        finally:
+            await self._aclear_local_authority()
+
+    def _mark_closed(self) -> None:
         with self._close_lock:
             self._closed = True
+
+    async def _await_close_quiescence(self, tracker: ExecutionQuiescence | None) -> None:
+        timeout_seconds = self._close_quiescence_timeout_seconds
+        if timeout_seconds is None:
+            await self._await_fully_idle(tracker)
+            await self._await_takeovers_idle()
+            return
+        async with asyncio.timeout(timeout_seconds):
+            await self._await_fully_idle(tracker)
+            await self._await_takeovers_idle()
 
     async def aclose_session(self) -> None:
         """Stop admission, await quiescence, and delete the checkpoint asynchronously."""
         self.stop_turn_admission()
         with self._close_lock:
             tracker = self._execution_quiescence
+            authority_lost = self._durable_authority_lost
+        if authority_lost:
+            await self.aabandon_session()
+            return
         async with self._async_close_lock:
             with self._close_lock:
                 if self._closed:
                     return
-            timeout_seconds = self._close_quiescence_timeout_seconds
-            if timeout_seconds is None:
-                await self._await_fully_idle(tracker)
-                await self._await_takeovers_idle()
-            else:
-                async with asyncio.timeout(timeout_seconds):
-                    await self._await_fully_idle(tracker)
-                    await self._await_takeovers_idle()
-            if self._close_had_pending_interrupt is None:
-                try:
-                    self._close_had_pending_interrupt = bool(
-                        self.engine is not None
-                        and await self.engine.acheckpoint_has_pending_interrupt()
-                    )
-                except Exception:
-                    self._close_had_pending_interrupt = False
-                    self.telemetry.record(
-                        {
-                            "event": "flow_abandonment_observation_failed",
-                            "reason": "checkpoint_unavailable",
-                        }
-                    )
-            await self._acomplete_close()
+            durable_completion_started = False
+            try:
+                if self.durable_closer is not None:
+                    await self.durable_closer.begin_close()
+                await self._await_close_quiescence(tracker)
+                if self._close_had_pending_interrupt is None:
+                    try:
+                        if self.durable_closer is not None:
+                            self._close_had_pending_interrupt = bool(
+                                await self.durable_closer.checkpoint_has_pending_interrupt()
+                            )
+                        else:
+                            self._close_had_pending_interrupt = bool(
+                                self.engine is not None
+                                and await self.engine.acheckpoint_has_pending_interrupt()
+                            )
+                    except Exception:
+                        self._close_had_pending_interrupt = False
+                        self.telemetry.record(
+                            {
+                                "event": "flow_abandonment_observation_failed",
+                                "reason": "checkpoint_unavailable",
+                            }
+                        )
+                durable_completion_started = True
+                await self._acomplete_close()
+            except BaseException as close_error:
+                if self.durable_closer is not None and not durable_completion_started:
+                    try:
+                        await self._adiscard_local_authority()
+                    except BaseException as local_error:
+                        _raise_lifecycle_failures(
+                            "durable session close and local disposal failed",
+                            [close_error, local_error],
+                        )
+                raise
+
+    async def aabandon_session(self) -> None:
+        """Destroy local authority without writing through a lost durable lease."""
+        self.stop_for_authority_loss()
+        with self._close_lock:
+            tracker = self._execution_quiescence
+        async with self._async_close_lock:
+            with self._close_lock:
+                if self._closed:
+                    return
+            await self._await_close_quiescence(tracker)
+            await self._adiscard_local_authority()
+            self.telemetry.record({"event": "caller_context_closed", "reason": "authority_lost"})
+            self._mark_closed()
