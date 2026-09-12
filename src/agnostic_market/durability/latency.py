@@ -6,8 +6,6 @@ import asyncio
 import hashlib
 import json
 import math
-import os
-import tempfile
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
@@ -21,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.platform import ConfigIdentifier, PlatformRuntimeConfig
+from agnostic_market.durability.evidence import ExceptionTypeName, write_immutable_evidence
 from agnostic_market.durability.timing import (
     DurabilityOperation,
     DurabilityTimingOutcome,
@@ -206,7 +205,7 @@ class LatencyObservation(BaseModel):
     thermal_state: ThermalState
     elapsed_seconds: float | None = Field(default=None, ge=0)
     outcome: LatencyObservationOutcome = LatencyObservationOutcome.SUCCESS
-    error_type: ConfigIdentifier | None = None
+    error_type: ExceptionTypeName | None = None
     journey_id: ConfigIdentifier | None = None
     tier: LatencyTier | None = None
     components: tuple[DurabilityComponentObservation, ...]
@@ -360,8 +359,8 @@ class LatencyCertificationAbort(BaseModel):
     stage: LatencyAbortStage
     sample_id: ConfigIdentifier
     journey_id: ConfigIdentifier
-    error_type: ConfigIdentifier
-    cleanup_error_type: ConfigIdentifier | None = None
+    error_type: ExceptionTypeName
+    cleanup_error_type: ExceptionTypeName | None = None
 
 
 class DurableLatencyCertificationRun(BaseModel):
@@ -555,28 +554,8 @@ def write_latency_certification_run(
     path: Path,
     run: DurableLatencyCertificationRun,
 ) -> None:
-    """Create one immutable evidence artifact using an atomic same-directory replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise FileExistsError("durable latency report path already exists")
-    descriptor, raw_temp = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    temp_path = Path(raw_temp)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(run.model_dump_json(indent=2))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        if path.exists():
-            raise FileExistsError("durable latency report path already exists")
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    """Publish one immutable evidence artifact atomically without replacement."""
+    write_immutable_evidence(path, run)
 
 
 def require_deployment_latency_report(

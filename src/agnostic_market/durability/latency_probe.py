@@ -1,4 +1,9 @@
-"""Concrete deployment-shaped probes for durable voice-session latency certification."""
+"""Concrete deployment-shaped probes for durable reasoning-graph latency certification.
+
+These probes measure the reasoning graph's whole-turn span. They do not cover LiveKit
+voice processing or TTS, so their evidence cannot authorize network startup; that
+requires a separately produced voice-processing artifact.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from agnostic_market.agents.engine import GraphTurnLatencyMeasurement
-from agnostic_market.agents.routing_activation import ConfiguredSemanticRouterFactory
+from agnostic_market.agents.routing_activation import build_qualified_semantic_router_factory
 from agnostic_market.agents.telemetry import DisabledTelemetrySink, TenantTelemetry
 from agnostic_market.application import (
     TenantServices,
@@ -184,7 +189,8 @@ class DeploymentLatencyProbeFactory:
             require_llm_certification(resolved.config, conformance)
             gateway = LLMGateway(credentials, dependencies.secrets)
             routing = prepare_application_routing(
-                ConfiguredSemanticRouterFactory(
+                build_qualified_semantic_router_factory(
+                    dependencies.config_root,
                     selection=resolved.config.llm.routing,
                     credentials=credentials,
                     secrets=dependencies.secrets,
@@ -193,6 +199,7 @@ class DeploymentLatencyProbeFactory:
                     ),
                     timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
                     input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
+                    max_report_age_days=targets.max_report_age_days,
                 )
             )
             resources = await DurablePlatformResources.open(

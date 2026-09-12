@@ -297,3 +297,62 @@ def test_main_uses_the_container_when_no_alternative_is_configured(
     harness.main()
 
     assert observed == ["postgresql://container/isolated"]
+
+
+def test_main_runs_crash_matrix_through_the_selected_provisioner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: list[tuple[str, Path, Path, str]] = []
+    report = tmp_path / "crash-report.json"
+    methodology = tmp_path / "crash-methodology.yaml"
+
+    @contextmanager
+    def container_postgres():
+        yield "postgresql://container/isolated"
+
+    def run_crash_contracts(
+        dsn: str,
+        *,
+        report: Path,
+        methodology: Path,
+        implementation_id: str,
+    ) -> None:
+        observed.append((dsn, report, methodology, implementation_id))
+
+    monkeypatch.setattr(harness, "_container_postgres", container_postgres)
+    monkeypatch.setattr(harness, "_run_crash_contracts", run_crash_contracts)
+
+    harness.main(
+        (
+            "--crash-report",
+            str(report),
+            "--crash-methodology",
+            str(methodology),
+            "--implementation-id",
+            "build-a",
+        )
+    )
+
+    assert observed == [("postgresql://container/isolated", report, methodology, "build-a")]
+
+
+def test_crash_report_and_implementation_id_must_be_supplied_together() -> None:
+    with pytest.raises(SystemExit):
+        harness.main(("--crash-report", "report.json"))
+
+
+def test_relative_evidence_paths_bind_to_the_operator_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cases run with cwd set to the repository, so paths must bind before that."""
+    monkeypatch.chdir(tmp_path)
+
+    arguments = harness._arguments(
+        ["--crash-report", "evidence/crash.json", "--implementation-id", "build-a"]
+    )
+
+    assert arguments.crash_report == (tmp_path / "evidence" / "crash.json").resolve()
+    assert arguments.crash_report.is_absolute()
+    assert arguments.crash_methodology.is_absolute()

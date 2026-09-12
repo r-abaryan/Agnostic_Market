@@ -749,7 +749,7 @@ async def test_turn_evidence_excludes_cleanup_but_retains_cleanup_failure(
             return 0.5
 
         async def aclose(self) -> None:
-            with observe_duration(self.observer, DurabilityOperation.REGISTRY_CLOSE):
+            with observe_duration(self.observer, DurabilityOperation.REGISTRY_FINALIZE_CLOSE):
                 if fail_cleanup and self.sample_id.startswith("sample-"):
                     raise RuntimeError("synthetic cleanup failure")
 
@@ -1014,3 +1014,17 @@ def test_failed_samples_remain_evidence_without_inventing_latency_values() -> No
     assert report.startup.statistics.count == 0
     assert report.startup.statistics.p95_seconds is None
     assert all(result.statistics.count == 0 for result in report.journeys)
+
+
+def test_abort_evidence_records_a_private_exception_class_name() -> None:
+    """A failure an envelope exists to record must not be rejected by its own field type."""
+    abort = LatencyCertificationAbort(
+        stage=LatencyAbortStage.WARMUP_RUN,
+        sample_id="sample-warmup-0001",
+        journey_id="simple-cart-read",
+        error_type="_InternalProviderError",
+        cleanup_error_type="_InternalCleanupError",
+    )
+
+    assert abort.error_type == "_InternalProviderError"
+    assert abort.cleanup_error_type == "_InternalCleanupError"

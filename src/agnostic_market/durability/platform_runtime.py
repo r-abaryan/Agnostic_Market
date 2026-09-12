@@ -97,6 +97,10 @@ async def _finish_pool_close(
                 deferred_cancellation = cancellation
             if close_task.done():
                 break
+        except BaseException:
+            # The pool close itself failed. Report it through close_task.result() below so
+            # a deferred cancellation is preserved and chained instead of being dropped.
+            break
     try:
         close_task.result()
     except BaseException as cleanup_failure:
@@ -233,6 +237,7 @@ class DurablePlatformResources:
         )
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._close_failure: BaseException | None = None
 
     @classmethod
     async def open(
@@ -438,10 +443,24 @@ class DurablePlatformResources:
         async with self._close_lock:
             if self._closed:
                 return
+            if self._close_failure is not None:
+                raise RuntimeError(
+                    "durable platform pool close already failed and cannot be completed"
+                ) from self._close_failure
             close_task = asyncio.create_task(
                 self.pool.close(timeout=self.config.database.operation_timeout_seconds)
             )
-            deferred_cancellation = await _finish_pool_close(close_task)
+            try:
+                deferred_cancellation = await _finish_pool_close(close_task)
+            except BaseException as failure:
+                # The vendor pool marks itself closed before draining connections, so once
+                # it reports closed a later call returns immediately and cannot finish the
+                # interrupted drain. Retain the failure instead of letting that retry
+                # report a clean shutdown. A pool that has not yet marked itself closed is
+                # still genuinely retryable.
+                if self.pool.closed:
+                    self._close_failure = failure
+                raise
             self._closed = True
             if deferred_cancellation is not None:
                 raise deferred_cancellation

@@ -534,6 +534,7 @@ async def test_platform_resource_close_resists_repeated_cancellation_until_pool_
         pool=pool,
         _close_lock=asyncio.Lock(),
         _closed=False,
+        _close_failure=None,
     )
 
     closing = asyncio.create_task(DurablePlatformResources.aclose(resources))
@@ -552,3 +553,80 @@ async def test_platform_resource_close_resists_repeated_cancellation_until_pool_
     assert pool.closed
     connection.close.assert_awaited_once_with()
     waiter.fail.assert_awaited_once()
+
+
+class _FailingBlockingClosePool:
+    """Fails its drain without ever marking itself closed, so a retry is meaningful."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.close_started = asyncio.Event()
+        self.allow_close = asyncio.Event()
+
+    async def close(self, **options: float) -> None:
+        assert options["timeout"] > 0
+        self.close_started.set()
+        await self.allow_close.wait()
+        raise RuntimeError("pool close failed after cancellation")
+
+
+class _VendorShapedFailingClosePool:
+    """Marks itself closed before draining, exactly as psycopg_pool does."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.close_calls = 0
+
+    async def close(self, **options: float) -> None:
+        assert options["timeout"] > 0
+        self.close_calls += 1
+        if self.closed:
+            return
+        self.closed = True
+        raise RuntimeError("socket error draining the pool")
+
+
+async def test_close_failure_after_the_vendor_marks_closed_is_not_retryable() -> None:
+    pool = _VendorShapedFailingClosePool()
+    resources = SimpleNamespace(
+        config=PlatformRuntimeConfig.model_validate(_valid_config()),
+        pool=pool,
+        _close_lock=asyncio.Lock(),
+        _closed=False,
+        _close_failure=None,
+    )
+
+    with pytest.raises(RuntimeError, match="socket error draining the pool"):
+        await DurablePlatformResources.aclose(resources)
+    with pytest.raises(RuntimeError, match="already failed and cannot be completed") as retry:
+        await DurablePlatformResources.aclose(resources)
+
+    assert isinstance(retry.value.__cause__, RuntimeError)
+    assert str(retry.value.__cause__) == "socket error draining the pool"
+    assert pool.close_calls == 1
+    assert resources._closed is False
+
+
+async def test_pool_cleanup_failure_preserves_a_deferred_cancellation() -> None:
+    pool = _FailingBlockingClosePool()
+    resources = SimpleNamespace(
+        config=PlatformRuntimeConfig.model_validate(_valid_config()),
+        pool=pool,
+        _close_lock=asyncio.Lock(),
+        _closed=False,
+        _close_failure=None,
+    )
+
+    closing = asyncio.create_task(DurablePlatformResources.aclose(resources))
+    await pool.close_started.wait()
+    closing.cancel("shutdown cancelled")
+    await asyncio.sleep(0)
+    assert not closing.done()
+    pool.allow_close.set()
+
+    with pytest.raises(asyncio.CancelledError, match="shutdown cancelled") as failure:
+        await closing
+
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert str(failure.value.__cause__) == "pool close failed after cancellation"
+    assert resources._closed is False

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import secrets
 import shutil
@@ -11,7 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ _USER = "postgres"
 _ROOT = Path(__file__).resolve().parents[1]
 _START_TIMEOUT_SECONDS = 60
 _STOP_TIMEOUT_SECONDS = 15
+_DEFAULT_CRASH_METHODOLOGY = _ROOT / "config" / "eval" / "durable_crash_matrix.yaml"
 
 
 @dataclass(frozen=True)
@@ -329,8 +331,62 @@ def _run_contracts(dsn: str) -> None:
     )
 
 
-def main() -> None:
+def _run_crash_contracts(
+    dsn: str,
+    *,
+    report: Path,
+    methodology: Path,
+    implementation_id: str,
+) -> None:
+    environment = {**os.environ, POSTGRES_DSN_ENV: dsn}
+    subprocess.run(  # noqa: S603 - command is built from fixed local entrypoints
+        (
+            sys.executable,
+            "scripts/durable_crash_certification.py",
+            "--methodology",
+            methodology,
+            "--report",
+            report,
+            "--implementation-id",
+            implementation_id,
+        ),
+        cwd=_ROOT,
+        env=environment,
+        check=True,
+    )
+
+
+def _arguments(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--crash-report",
+        type=Path,
+        help="run the controlled crash matrix and write this immutable report",
+    )
+    parser.add_argument(
+        "--crash-methodology",
+        type=Path,
+        default=_DEFAULT_CRASH_METHODOLOGY,
+        help="pre-registered crash methodology used with --crash-report",
+    )
+    parser.add_argument(
+        "--implementation-id",
+        help="commit or immutable build identifier required with --crash-report",
+    )
+    arguments = parser.parse_args(argv)
+    if (arguments.crash_report is None) != (arguments.implementation_id is None):
+        parser.error("--crash-report and --implementation-id must be supplied together")
+    # The matrix runs in a child process rooted at the repository, so resolve operator
+    # paths here, against the directory the command was actually typed in.
+    arguments.crash_methodology = arguments.crash_methodology.resolve()
+    if arguments.crash_report is not None:
+        arguments.crash_report = arguments.crash_report.resolve()
+    return arguments
+
+
+def main(argv: Sequence[str] = ()) -> None:
     load_dotenv(_ROOT / ".env")
+    arguments = _arguments(argv)
     supplied_dsn = os.environ.get(POSTGRES_DSN_ENV, "").strip()
     binary_directory = os.environ.get(POSTGRES_BIN_ENV, "").strip()
     if supplied_dsn and binary_directory:
@@ -344,8 +400,17 @@ def main() -> None:
         provisioner = _container_postgres()
 
     with provisioner as dsn:
-        _run_contracts(dsn)
+        if arguments.crash_report is None:
+            _run_contracts(dsn)
+        else:
+            assert arguments.implementation_id is not None
+            _run_crash_contracts(
+                dsn,
+                report=arguments.crash_report,
+                methodology=arguments.crash_methodology,
+                implementation_id=arguments.implementation_id,
+            )
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

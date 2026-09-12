@@ -154,6 +154,29 @@ uv run --no-sync python scripts/postgres_checkpoint_harness.py
 The harness exercises two independent pools, setup, read, list, checkpoint and pending-write
 persistence, deletion, pool exhaustion, deadline, cancellation, and post-cancellation recovery.
 
+Run the frozen controlled crash/concurrency matrix against the same isolated backend and record a
+redacted, immutable result labelled with an operator-declared implementation identifier:
+
+```bash
+uv run --no-sync python scripts/postgres_checkpoint_harness.py \
+  --crash-report config/telemetry/durable-crash-<run-id>.json \
+  --implementation-id <commit-or-build-id>
+```
+
+The matrix runs exact existing architecture contracts; it does not duplicate them. Each case
+declares its execution surface, so the pinned PostgreSQL version covers only backend cases, and each
+result records the observed pytest collection counts, so a skipped or expected-failure case cannot
+be recorded as a pass. After writing, the run is reloaded and verified against the registered
+methodology; schema 1 artifacts predate these fields and are refused by identity rather than
+silently compared.
+
+The artifact carries the run envelope, the embedded methodology it was run against, and one result
+per case holding only case identity, boundary, execution surface, outcome, observed counts, and
+duration. It never contains a DSN, checkpoint payload, transcript, or caller data. The
+implementation identifier is operator-declared metadata, not build attestation; trusted build
+identity belongs to release assembly. A passing controlled report explicitly does not certify live
+transport or authorize activation.
+
 For a Docker-free local run, set exactly one alternative before invoking the same command:
 
 - `PHASE4C_POSTGRES_DSN` uses a PostgreSQL 18.6 service. The harness creates a uniquely named

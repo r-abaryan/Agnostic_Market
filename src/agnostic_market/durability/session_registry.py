@@ -1429,7 +1429,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryError("session close claim returned no authoritative row")
         return _record_from_row(row)
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE)
+    @observe_async_operation(DurabilityOperation.REGISTRY_BEGIN_CLOSE)
     async def begin_close(
         self,
         authority: SessionLeaseAuthority,
@@ -1483,7 +1483,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close transition failed") from exc
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE)
+    @observe_async_operation(DurabilityOperation.REGISTRY_CLAIM_EXPIRED)
     async def claim_expired(
         self,
         candidate: ExpiredSessionCandidate,
@@ -1524,7 +1524,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("expired session claim failed") from exc
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE)
+    @observe_async_operation(DurabilityOperation.REGISTRY_REFRESH_CLOSE)
     async def refresh_close(
         self,
         authority: SessionCloseAuthority,
@@ -1600,7 +1600,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close renewal failed") from exc
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE)
+    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE_GENERATIONS)
     async def close_checkpoint_generations(
         self,
         authority: SessionCloseAuthority,
@@ -1621,7 +1621,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close inventory failed") from exc
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE)
+    @observe_async_operation(DurabilityOperation.REGISTRY_RECORD_CLOSE_DELETION)
     async def record_close_checkpoint_deletion(
         self,
         authority: SessionCloseAuthority,
@@ -1668,7 +1668,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close checkpoint update failed") from exc
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE)
+    @observe_async_operation(DurabilityOperation.REGISTRY_FINALIZE_CLOSE)
     async def finalize_close(
         self,
         authority: SessionCloseAuthority,
