@@ -65,7 +65,10 @@ from agnostic_market.durability.migrations import (
 )
 from agnostic_market.durability.platform_runtime import DurablePlatformResources
 from agnostic_market.durability.postgres_checkpoints import FencedPostgresCheckpointSaver
-from agnostic_market.durability.session_lifecycle import DurableSessionLifecycleCoordinator
+from agnostic_market.durability.session_lifecycle import (
+    DurableSessionLifecycleCoordinator,
+    OperationalSessionReaper,
+)
 from agnostic_market.durability.session_payload import (
     SESSION_OPERATION_RESULT_SCHEMA_VERSION,
     SESSION_PAYLOAD_SCHEMA_VERSION,
@@ -99,6 +102,10 @@ from agnostic_market.durability.session_registry import (
 from agnostic_market.durability.session_state import (
     BoundPostgresSessionStatePersistence,
     SessionStateCoordinator,
+)
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    InMemoryDurabilityTimingObserver,
 )
 from agnostic_market.tenancy.context import build_tenant_context
 
@@ -1508,6 +1515,20 @@ async def test_reaper_claims_only_expired_sessions_through_the_close_coordinator
         assert foreign_record is not None
         assert foreign_record.lifecycle is SessionLifecycle.OPENING
 
+        operational_reaper = OperationalSessionReaper(
+            coordinator,
+            tenant_ids=(foreign.tenant_id, expired.tenant_id),
+            interval_seconds=60.0,
+            batch_size=100,
+        )
+        assert await operational_reaper.run_once() == 1
+        foreign_record = await registry.get(
+            foreign.tenant_id,
+            foreign.authority.logical_session_id,
+        )
+        assert foreign_record is not None
+        assert foreign_record.lifecycle is SessionLifecycle.CLOSED
+
 
 @pytest.mark.postgres
 async def test_expired_close_reclaim_keeps_operation_identity_and_advances_owner_fence() -> None:
@@ -1516,29 +1537,47 @@ async def test_expired_close_reclaim_keeps_operation_identity_and_advances_owner
         await apply_platform_migrations(connection)
     registration = _registration("close_reclaim_store", f"AD_reclaim_{uuid.uuid4().hex}")
     async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
         registry = PostgresSessionRegistry(
-            await _open_pool(stack, dsn),
+            pool,
             cipher=_cipher(),
             operation_timeout_seconds=2.0,
         )
+
+        async def expire_current_lease() -> None:
+            async with pool.connection() as connection, connection.transaction():
+                await connection.execute(
+                    "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+                    (registration.tenant_id,),
+                )
+                await connection.execute(
+                    """
+                    UPDATE platform_sessions
+                    SET created_at = created_at - interval '1 hour',
+                        lease_expires_at = clock_timestamp() - interval '1 second'
+                    WHERE tenant_id = %s AND logical_session_id = %s
+                    """,
+                    (registration.tenant_id, registration.authority.logical_session_id),
+                )
+
         await registry.register_and_acquire(
             registration,
-            _lease("expired-live-owner", duration_seconds=0.01),
+            _lease("expired-live-owner", duration_seconds=30.0),
             payload=_empty_payload(),
         )
-        await asyncio.sleep(0.02)
+        await expire_current_lease()
         candidate = (await registry.expired_sessions(registration.tenant_id, limit=10))[0]
         first = await registry.claim_expired(
             candidate,
             SessionCloseRequest(
                 operation_id="stable-reap-operation",
                 lease_owner_id="reaper-owner-a",
-                duration_seconds=0.01,
+                duration_seconds=30.0,
             ),
         )
 
         assert await registry.expired_sessions(registration.tenant_id, limit=10) == ()
-        await asyncio.sleep(0.02)
+        await expire_current_lease()
         abandoned = (await registry.expired_sessions(registration.tenant_id, limit=10))[0]
         assert abandoned.close_operation_id == "stable-reap-operation"
         second = await registry.claim_expired(
@@ -1695,10 +1734,15 @@ async def test_concurrent_close_claims_have_one_fence_owner() -> None:
     authority = _lease_authority(registration, "race-live-owner")
     async with AsyncExitStack() as stack:
         pool = await _open_pool(stack, dsn)
-        registries = [
-            PostgresSessionRegistry(pool, cipher=_cipher(), operation_timeout_seconds=2.0)
-            for _ in range(2)
-        ]
+        competing_pool = await _open_pool(stack, dsn)
+        registries = (
+            PostgresSessionRegistry(pool, cipher=_cipher(), operation_timeout_seconds=2.0),
+            PostgresSessionRegistry(
+                competing_pool,
+                cipher=_cipher(),
+                operation_timeout_seconds=2.0,
+            ),
+        )
         await registries[0].register_and_acquire(
             registration,
             _lease("race-live-owner"),
@@ -2186,7 +2230,7 @@ async def test_checkpoint_revision_reconciliation_distinguishes_seed_and_missing
 
 
 @pytest.mark.postgres
-async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts() -> None:
+async def test_session_ahead_reconciliation_requires_one_contiguous_typed_receipt() -> None:
     dsn = _dsn()
     async with await AsyncConnection.connect(dsn, autocommit=True) as migration_connection:
         await apply_platform_migrations(migration_connection)
@@ -2212,6 +2256,12 @@ async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts()
                 operation_result=EmptySessionOperationResult(),
             )
         )
+        reconciled = await registry.reconcile_checkpoint_revision(authority, 0)
+        assert reconciled.disposition is CheckpointRevisionDisposition.SESSION_AHEAD
+        assert reconciled.payload.guest_order_refs == ("ORD-9001",)
+        assert [item.operation_id for item in reconciled.operations] == ["revision-operation-1"]
+        assert [item.committed_revision for item in reconciled.operations] == [1]
+
         await registry.publish(
             SessionStatePublication(
                 **authority.model_dump(),
@@ -2223,14 +2273,15 @@ async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts()
             )
         )
 
-        reconciled = await registry.reconcile_checkpoint_revision(authority, 0)
+        with pytest.raises(SessionRestoreError) as multi_revision:
+            await registry.reconcile_checkpoint_revision(authority, 0)
+        assert multi_revision.value.reason is SessionRestoreReason.REVISION_GAP_UNEXPLAINED
+
+        reconciled = await registry.reconcile_checkpoint_revision(authority, 1)
         assert reconciled.disposition is CheckpointRevisionDisposition.SESSION_AHEAD
         assert reconciled.payload.guest_order_refs == ("ORD-9001", "ORD-9002")
-        assert [item.operation_id for item in reconciled.operations] == [
-            "revision-operation-1",
-            "revision-operation-2",
-        ]
-        assert [item.committed_revision for item in reconciled.operations] == [1, 2]
+        assert [item.operation_id for item in reconciled.operations] == ["revision-operation-2"]
+        assert [item.committed_revision for item in reconciled.operations] == [2]
         assert all(
             item.committed_checkpoint_namespace == reconciled.record.checkpoint_namespace
             for item in reconciled.operations
@@ -2264,7 +2315,7 @@ async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts()
                 (registration.tenant_id, registration.authority.logical_session_id),
             )
         with pytest.raises(SessionRestoreError) as corrupted:
-            await registry.reconcile_checkpoint_revision(authority, 0)
+            await registry.reconcile_checkpoint_revision(authority, 1)
         assert corrupted.value.reason is SessionRestoreReason.DECRYPTION_FAILED
         async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
             await connection.execute(
@@ -2311,7 +2362,7 @@ async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts()
                 ),
             )
         with pytest.raises(SessionRestoreError) as malformed_payload:
-            await registry.reconcile_checkpoint_revision(authority, 0)
+            await registry.reconcile_checkpoint_revision(authority, 1)
         assert malformed_payload.value.reason is SessionRestoreReason.PAYLOAD_SCHEMA_INVALID
 
         mismatched_receipt = SessionOperationReceiptPayload(
@@ -2340,7 +2391,7 @@ async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts()
                 ),
             )
         with pytest.raises(SessionRestoreError) as mismatched_authority:
-            await registry.reconcile_checkpoint_revision(authority, 0)
+            await registry.reconcile_checkpoint_revision(authority, 1)
         assert mismatched_authority.value.reason is SessionRestoreReason.RECONSTRUCTION_FAILED
 
         async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
@@ -2366,12 +2417,12 @@ async def test_session_ahead_reconciliation_requires_contiguous_typed_receipts()
                 """
                 DELETE FROM platform_session_operations
                 WHERE tenant_id = %s AND logical_session_id = %s
-                  AND operation_id = 'revision-operation-1'
+                  AND operation_id = 'revision-operation-2'
                 """,
                 (registration.tenant_id, registration.authority.logical_session_id),
             )
         with pytest.raises(SessionRestoreError) as unexplained:
-            await registry.reconcile_checkpoint_revision(authority, 0)
+            await registry.reconcile_checkpoint_revision(authority, 1)
 
     assert unexplained.value.reason is SessionRestoreReason.REVISION_GAP_UNEXPLAINED
 
@@ -3358,7 +3409,7 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
 
     config = PlatformRuntimeConfig.model_validate(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "graph_contract": graph_contract,
             "database": {
                 "application_dsn_ref": {
@@ -3380,6 +3431,9 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
                 "lease_renewal_interval_seconds": 10.0,
                 "session_retention_seconds": 3600,
                 "closed_tombstone_retention_seconds": 7200,
+                "reaper_interval_seconds": 60.0,
+                "reaper_batch_size": 100,
+                "transport_retirement_timeout_seconds": 5.0,
             },
             "encryption": {
                 "envelope_format": "aes_256_gcm_v1",
@@ -3393,9 +3447,20 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         }
     )
 
+    timing = InMemoryDurabilityTimingObserver()
     resources: DurablePlatformResources | None = None
+    competing_resources: DurablePlatformResources | None = None
     try:
-        resources = await DurablePlatformResources.open(config, RuntimeSecrets())
+        resources = await DurablePlatformResources.open(
+            config,
+            RuntimeSecrets(),
+            durability_timing=timing,
+        )
+        competing_resources = await DurablePlatformResources.open(
+            config,
+            RuntimeSecrets(),
+            durability_timing=timing,
+        )
         async with resources.pool.connection() as connection:
             cursor = await connection.execute(
                 """
@@ -3422,6 +3487,14 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
             deployment_id="deployment-a",
             config_version=tenant.config_version,
         )
+        with pytest.raises(LeaseAdmissionError) as competing_worker:
+            await competing_resources.acquire_fresh_session(
+                tenant_id=tenant.tenant_id,
+                admitted_authority=admitted_authority,
+                deployment_id="deployment-a",
+                config_version=tenant.config_version,
+            )
+        assert competing_worker.value.reason is LeaseAdmissionReason.SESSION_EXISTS
         with pytest.raises(ValueError, match="registry-fenced checkpoints"):
             replace(
                 durable_session,
@@ -3450,7 +3523,9 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         assert restored.record.lifecycle is SessionLifecycle.ACTIVE
         assert restored.record.session_revision == 0
 
-        restored_session = await resources.restore_owned_session(durable_session.authority)
+        restored_session = await competing_resources.restore_owned_session(
+            durable_session.authority
+        )
         reconstructed_services = build_fixture_tenant_services(
             config_root,
             tenant,
@@ -3552,7 +3627,9 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         assert paused.pending_placement is not None
         assert len([event for event in readback if isinstance(event, InterruptEvent)]) == 1
 
-        confirmation_restore = await resources.restore_owned_session(durable_session.authority)
+        confirmation_restore = await competing_resources.restore_owned_session(
+            durable_session.authority
+        )
         confirmation_services = build_fixture_tenant_services(
             config_root,
             tenant,
@@ -3617,6 +3694,22 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
             ).kind
             == "committed"
         )
+        observed_operations = {sample.operation for sample in timing.samples}
+        assert {
+            DurabilityOperation.POOL_OPEN,
+            DurabilityOperation.STARTUP_GATES,
+            DurabilityOperation.REGISTRY_REGISTER,
+            DurabilityOperation.REGISTRY_RESTORE,
+            DurabilityOperation.REGISTRY_RECONCILE,
+            DurabilityOperation.REGISTRY_PUBLISH,
+            DurabilityOperation.CHECKPOINT_READ,
+            DurabilityOperation.CHECKPOINT_WRITE,
+            DurabilityOperation.SESSION_STORE_PUBLISH,
+            DurabilityOperation.CHECKPOINT_BIND,
+            DurabilityOperation.ENVELOPE_ENCRYPT,
+            DurabilityOperation.ENVELOPE_DECRYPT,
+        } <= observed_operations
+        assert all(sample.elapsed_seconds >= 0 for sample in timing.samples)
 
         await confirmation_application.state.caller_context.aclose_session()
         closed = await resources.registry.get(
@@ -3637,6 +3730,8 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
             == "committed"
         )
     finally:
+        if competing_resources is not None:
+            await competing_resources.aclose()
         if resources is not None:
             await resources.aclose()
             await resources.aclose()

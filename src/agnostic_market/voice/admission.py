@@ -197,7 +197,7 @@ class VoiceJobAdmission:
                 raise TenantResolutionError(
                     "production voice admission requires an inbound SIP dispatch rule"
                 )
-            inbound_number = participant.attributes.get(_SIP_TRUNK_NUMBER_ATTRIBUTE, "")
+            inbound_number = participant.attributes.get(_SIP_TRUNK_NUMBER_ATTRIBUTE, "").strip()
             if not inbound_number:
                 raise TenantResolutionError(
                     "production voice admission has no inbound trunk number"

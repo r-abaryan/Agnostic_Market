@@ -50,8 +50,8 @@ from agnostic_market.agents.frontline import (
     FRONTLINE_SPEAKABLE_NODES,
     MODEL_SPEECH_NODES,
     NON_SPEAKING_MODEL_NODES,
+    build_frontline_capability_registry,
 )
-from agnostic_market.agents.frontline.graph import _build_frontline_capability_registry
 from agnostic_market.agents.frontline.read_flow import (
     ANSWER_CLARIFY_NODE,
     ANSWER_RESPONSE_NODE,
@@ -2068,7 +2068,7 @@ def _validate_semantic_route_structural_supplement(
     corpus: SemanticRouteEvalCorpus,
     supplement: SemanticRouteStructuralSupplement,
 ) -> None:
-    registry = _build_frontline_capability_registry()
+    registry = build_frontline_capability_registry()
     expected_contract = {
         "frozen_corpus_fingerprint": _corpus_fingerprint(corpus),
         "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
@@ -2164,7 +2164,7 @@ def _run_semantic_route_structural_coverage(report_path: Path) -> int:
 
 
 def _routing_data_contract() -> dict[str, object]:
-    registry = _build_frontline_capability_registry()
+    registry = build_frontline_capability_registry()
     return {
         "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
         "registry_fingerprint": registry_fingerprint(registry),

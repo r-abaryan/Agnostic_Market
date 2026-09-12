@@ -20,6 +20,7 @@ from agnostic_market.agents.routing import (
     SemanticRouter,
     registry_fingerprint,
 )
+from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.dtos.config import ProviderModel, ReasoningEffort
 from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutputMethod
 from agnostic_market.llm.gateway import LLMGateway
@@ -93,6 +94,29 @@ def _load_qualification(path: Path) -> SemanticRoutingQualification:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfiguredSemanticRouterFactory:
+    """Construct the selected recognizer without making an activation claim."""
+
+    selection: ProviderModel
+    credentials: ProviderCredentialsConfig
+    secrets: SecretResolver
+    structured_output_method: StructuredOutputMethod
+    timeout_seconds: float
+    input_max_chars: int
+
+    def __call__(self, registry: CapabilityRegistry) -> RoutingRecognizer:
+        gateway = LLMGateway(self.credentials, self.secrets)
+        return SemanticRouter(
+            gateway.chat_model(self.selection),
+            selection=self.selection,
+            structured_output_method=self.structured_output_method,
+            timeout_seconds=self.timeout_seconds,
+            input_max_chars=self.input_max_chars,
+            registry=registry,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class QualifiedSemanticRouterFactory:
     """Build the existing provider recognizer only after its exact contract qualifies."""
 
@@ -154,12 +178,42 @@ class QualifiedSemanticRouterFactory:
             raise RoutingActivationError(
                 "semantic routing activation refused: " + " | ".join(failures)
             )
-        gateway = LLMGateway(self.credentials, self.secrets)
-        return SemanticRouter(
-            gateway.chat_model(self.selection),
+        return ConfiguredSemanticRouterFactory(
             selection=self.selection,
+            credentials=self.credentials,
+            secrets=self.secrets,
             structured_output_method=self.structured_output_method,
             timeout_seconds=self.timeout_seconds,
             input_max_chars=self.input_max_chars,
-            registry=registry,
-        )
+        )(registry)
+
+
+def build_qualified_semantic_router_factory(
+    config_root: Path,
+    *,
+    selection: ProviderModel,
+    credentials: ProviderCredentialsConfig,
+    secrets: SecretResolver,
+    structured_output_method: StructuredOutputMethod,
+    timeout_seconds: float,
+    input_max_chars: int,
+    max_report_age_days: int,
+) -> QualifiedSemanticRouterFactory:
+    """Bind the recognizer to the repository's frozen routing-evaluation corpus."""
+    routing_contract = load_yaml_layer(
+        config_root / "eval" / "frontline_semantic_route_structural.yaml"
+    )
+    expected_corpus_fingerprint = routing_contract.get("frozen_corpus_fingerprint")
+    if not isinstance(expected_corpus_fingerprint, str) or not expected_corpus_fingerprint.strip():
+        raise RoutingActivationError("semantic routing corpus contract has no frozen fingerprint")
+    return QualifiedSemanticRouterFactory(
+        qualification_path=config_root / "telemetry" / "semantic_routing_report.json",
+        selection=selection,
+        credentials=credentials,
+        secrets=secrets,
+        structured_output_method=structured_output_method,
+        timeout_seconds=timeout_seconds,
+        input_max_chars=input_max_chars,
+        max_report_age_days=max_report_age_days,
+        expected_corpus_fingerprint=expected_corpus_fingerprint,
+    )

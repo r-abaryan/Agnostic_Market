@@ -41,6 +41,11 @@ from agnostic_market.durability.session_payload import (
     SessionOperationReceiptPayload,
     SessionOperationResult,
 )
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingObserver,
+    observe_async_operation,
+)
 
 _STRICT = ConfigDict(extra="forbid", frozen=True, strict=True)
 _AUTHORITY_IDENTIFIER = TypeAdapter(AuthorityIdentifier)
@@ -482,6 +487,8 @@ class CheckpointRevisionReconciliation(BaseModel):
             if self.checkpoint_revision != self.record.session_revision or self.operations:
                 raise ValueError("current checkpoint evidence is inconsistent")
             return self
+        if self.record.session_revision != self.checkpoint_revision + 1:
+            raise ValueError("session-ahead recovery requires exactly one revision")
         expected = tuple(range(self.checkpoint_revision + 1, self.record.session_revision + 1))
         if tuple(item.committed_revision for item in self.operations) != expected or any(
             item.committed_checkpoint_namespace != self.record.checkpoint_namespace
@@ -1127,13 +1134,16 @@ class PostgresSessionRegistry(SessionRegistryPort):
         *,
         cipher: AesGcmSessionCipher,
         operation_timeout_seconds: float,
+        durability_timing: DurabilityTimingObserver | None = None,
     ) -> None:
         if not math.isfinite(operation_timeout_seconds) or operation_timeout_seconds <= 0:
             raise ValueError("registry operation timeout must be positive")
         self._pool = pool
         self._cipher = cipher
         self._operation_timeout_seconds = operation_timeout_seconds
+        self._durability_timing = durability_timing
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_REGISTER)
     async def register_and_acquire(
         self,
         registration: SessionRegistration,
@@ -1419,6 +1429,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryError("session close claim returned no authoritative row")
         return _record_from_row(row)
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_BEGIN_CLOSE)
     async def begin_close(
         self,
         authority: SessionLeaseAuthority,
@@ -1472,6 +1483,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close transition failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_CLAIM_EXPIRED)
     async def claim_expired(
         self,
         candidate: ExpiredSessionCandidate,
@@ -1512,6 +1524,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("expired session claim failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_REFRESH_CLOSE)
     async def refresh_close(
         self,
         authority: SessionCloseAuthority,
@@ -1587,6 +1600,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close renewal failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_CLOSE_GENERATIONS)
     async def close_checkpoint_generations(
         self,
         authority: SessionCloseAuthority,
@@ -1607,6 +1621,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close inventory failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_RECORD_CLOSE_DELETION)
     async def record_close_checkpoint_deletion(
         self,
         authority: SessionCloseAuthority,
@@ -1653,6 +1668,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("session close checkpoint update failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_FINALIZE_CLOSE)
     async def finalize_close(
         self,
         authority: SessionCloseAuthority,
@@ -1759,6 +1775,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryError("session close finalization returned no row")
         return _record_from_row(row)
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_REAP)
     async def expired_sessions(
         self,
         tenant_id: str,
@@ -1805,6 +1822,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("expired session lookup failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_REAP)
     async def purge_closed_tombstones(self, tenant_id: str, *, limit: int) -> int:
         tenant_id = _AUTHORITY_IDENTIFIER.validate_python(tenant_id)
         if type(limit) is not int or limit < 1:
@@ -1840,6 +1858,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("closed session tombstone purge failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_GET)
     async def checkpoint_generations(
         self, authority: SessionLeaseAuthority
     ) -> tuple[CheckpointGeneration, ...]:
@@ -1915,6 +1934,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryDataError("checkpoint rotation inventory is inconsistent")
         return sources[0], destination
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_ROTATE)
     async def begin_checkpoint_rotation(
         self,
         authority: SessionLeaseAuthority,
@@ -2029,6 +2049,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("checkpoint rotation allocation failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_ROTATE)
     async def switch_checkpoint_generation(
         self,
         authority: SessionLeaseAuthority,
@@ -2180,6 +2201,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("checkpoint rotation switch failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_ROTATE)
     async def record_checkpoint_deletion(
         self,
         authority: SessionLeaseAuthority,
@@ -2221,6 +2243,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("checkpoint deletion record failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_ACTIVATE)
     async def activate(self, authority: SessionLeaseAuthority) -> SessionRegistryRecord:
         row = None
         try:
@@ -2280,6 +2303,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryError("session activation returned no authoritative row")
         return _record_from_row(row)
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_RENEW)
     async def renew(self, renewal: SessionLeaseRenewal) -> SessionRegistryRecord:
         row = None
         try:
@@ -2357,6 +2381,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except (TypeError, ValueError) as exc:
             raise SessionRestoreError(SessionRestoreReason.PAYLOAD_SCHEMA_INVALID) from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_RECONCILE)
     async def reconcile_checkpoint_revision(
         self,
         authority: SessionLeaseAuthority,
@@ -2395,6 +2420,8 @@ class PostgresSessionRegistry(SessionRegistryPort):
                             checkpoint_revision=checkpoint_revision,
                             disposition=disposition,
                         )
+                    if record.session_revision != checkpoint_revision + 1:
+                        raise SessionRestoreError(SessionRestoreReason.REVISION_GAP_UNEXPLAINED)
                     async with connection.cursor(row_factory=dict_row) as cursor:
                         await cursor.execute(
                             """
@@ -2448,6 +2475,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("checkpoint revision reconciliation failed") from exc
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_RESTORE)
     async def restore(self, authority: SessionLeaseAuthority) -> RestoredSessionState:
         try:
             async with asyncio.timeout(self._operation_timeout_seconds):
@@ -2465,6 +2493,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             raise SessionRegistryError("session state restore failed") from exc
         return RestoredSessionState(record=record, payload=payload)
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_PUBLISH)
     async def publish(self, publication: SessionStatePublication) -> RestoredSessionState:
         row = None
         try:
@@ -2656,6 +2685,7 @@ class PostgresSessionRegistry(SessionRegistryPort):
             payload=publication.payload,
         )
 
+    @observe_async_operation(DurabilityOperation.REGISTRY_GET)
     async def get(
         self,
         tenant_id: str,

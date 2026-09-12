@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -39,6 +40,12 @@ from agnostic_market.durability.session_registry import (
     SessionCloseAuthority,
     SessionLeaseAuthority,
     SessionLifecycle,
+)
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingObserver,
+    observe_async_operation,
+    observe_duration,
 )
 
 
@@ -110,12 +117,15 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
         authority: CheckpointAuthority,
         cipher: AesGcmSessionCipher,
         serde: SerializerProtocol,
+        durability_timing: DurabilityTimingObserver | None = None,
     ) -> None:
         super().__init__(serde=serde)
         self._pool = pool
         self._authority = authority
         self._cipher = cipher
+        self._durability_timing = durability_timing
         self._versioning = AsyncPostgresSaver(pool, serde=serde)
+        self._operation_lock = asyncio.Lock()
 
     @property
     def config_specs(self) -> list:
@@ -268,7 +278,11 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
         *,
         operation: CheckpointOperation,
     ) -> AsyncIterator[tuple[AsyncConnection, AsyncPostgresSaver, CheckpointGeneration]]:
-        async with self._pool.connection() as connection, connection.transaction():
+        async with (
+            self._operation_lock,
+            self._pool.connection() as connection,
+            connection.transaction(),
+        ):
             generation = await self._authorized_generation(
                 connection,
                 thread_id,
@@ -508,6 +522,7 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
         if existing is None or existing["checkpoint_exists"] or existing["pending_writes_exist"]:
             raise CheckpointDataPlaneError(CheckpointDataPlaneReason.MANIFEST_MISSING)
 
+    @observe_async_operation(DurabilityOperation.CHECKPOINT_READ)
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         thread_id = _config_value(config, "thread_id")
         async with self._operation(thread_id, operation="read") as (
@@ -537,30 +552,39 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
     ) -> AsyncIterator[CheckpointTuple]:
         if config is None:
             raise CheckpointSchemaError("unscoped checkpoint listing is forbidden")
-        thread_id = _config_value(config, "thread_id")
-        saved_items: list[CheckpointTuple] = []
-        async with self._operation(thread_id, operation="read") as (
-            connection,
-            delegate,
-            generation,
+        with observe_duration(
+            self._durability_timing,
+            DurabilityOperation.CHECKPOINT_LIST,
         ):
-            async for saved in delegate.alist(
-                config,
-                filter=filter,
-                before=before,
-                limit=limit,
+            thread_id = _config_value(config, "thread_id")
+            saved_items: list[CheckpointTuple] = []
+            async with self._operation(thread_id, operation="read") as (
+                connection,
+                delegate,
+                generation,
             ):
-                await self._verify_manifest(
-                    connection,
-                    generation,
-                    thread_id=thread_id,
-                    checkpoint_ns=_config_value(saved.config, "checkpoint_ns", default=""),
-                    checkpoint_id=_config_value(saved.config, "checkpoint_id"),
-                )
-                saved_items.append(saved)
+                async for saved in delegate.alist(
+                    config,
+                    filter=filter,
+                    before=before,
+                    limit=limit,
+                ):
+                    await self._verify_manifest(
+                        connection,
+                        generation,
+                        thread_id=thread_id,
+                        checkpoint_ns=_config_value(
+                            saved.config,
+                            "checkpoint_ns",
+                            default="",
+                        ),
+                        checkpoint_id=_config_value(saved.config, "checkpoint_id"),
+                    )
+                    saved_items.append(saved)
         for saved in saved_items:
             yield saved
 
+    @observe_async_operation(DurabilityOperation.CHECKPOINT_WRITE)
     async def aput(
         self,
         config: RunnableConfig,
@@ -595,6 +619,7 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
             )
             return next_config
 
+    @observe_async_operation(DurabilityOperation.CHECKPOINT_PENDING_WRITE)
     async def aput_writes(
         self,
         config: RunnableConfig,
@@ -626,6 +651,7 @@ class FencedPostgresCheckpointSaver(BaseCheckpointSaver):
                 checkpoint_id=checkpoint_id,
             )
 
+    @observe_async_operation(DurabilityOperation.CHECKPOINT_DELETE)
     async def adelete_thread(self, thread_id: str) -> None:
         async with self._operation(thread_id, operation="delete") as (
             connection,

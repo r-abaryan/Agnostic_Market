@@ -51,6 +51,9 @@ class DurableSessionConfig(BaseModel):
     lease_renewal_interval_seconds: float = Field(gt=0)
     session_retention_seconds: int = Field(gt=0)
     closed_tombstone_retention_seconds: int = Field(gt=0)
+    reaper_interval_seconds: float = Field(gt=0)
+    reaper_batch_size: int = Field(ge=1)
+    transport_retirement_timeout_seconds: float = Field(gt=0)
 
     @model_validator(mode="after")
     def _validate_lifecycle_windows(self) -> Self:
@@ -75,7 +78,7 @@ class PlatformRuntimeConfig(BaseModel):
 
     model_config = _STRICT
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     graph_contract: str = Field(pattern=r"^[0-9a-f]{64}$")
     database: PlatformDatabaseConfig
     sessions: DurableSessionConfig

@@ -1,0 +1,38 @@
+schema_version: "1"
+merchant_id: acme_store
+journeys:
+  - journey_id: simple-cart-read
+    setup_turns: []
+    utterance: what is in my cart?
+    initial_cart: []
+    expected_cart: []
+    expected_event_kind: spoken_message
+    expected_event_node: cart_view_render
+    expected_event_text_contains:
+      - empty
+
+  - journey_id: commerce-cart-confirmation
+    setup_turns: []
+    utterance: add one trail running shoes to my cart
+    initial_cart: []
+    expected_cart: []
+    expected_event_kind: interrupt
+    expected_event_node: null
+    expected_event_text_contains:
+      - trail running shoes
+
+  - journey_id: checkout-placement-readback
+    setup_turns:
+      - add one waterproof rain jacket to my cart
+      - "yes"
+    utterance: place my order
+    initial_cart:
+      - sku: SKU-BLU-07
+        quantity: 1
+    expected_cart:
+      - sku: SKU-BLU-07
+        quantity: 1
+    expected_event_kind: interrupt
+    expected_event_node: null
+    expected_event_text_contains:
+      - $129.00

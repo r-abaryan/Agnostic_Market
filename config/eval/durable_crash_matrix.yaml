@@ -1,0 +1,128 @@
+schema_version: "2"
+environment: controlled
+postgres_version: "18.6"
+per_case_timeout_seconds: 120.0
+cases:
+  - case_id: pinned-postgres-release
+    boundary: backend_baseline
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_harness_runs_the_pinned_postgresql_release
+    expected_test_count: 1
+
+  - case_id: startup-gates-before-connect
+    boundary: admission
+    execution_surface: process_local
+    nodeid: tests/test_voice_admission.py::test_worker_completes_startup_gates_before_connecting
+    expected_test_count: 1
+  - case_id: startup-failure-closes-durable-session
+    boundary: admission
+    execution_surface: process_local
+    nodeid: tests/test_voice_admission.py::test_network_worker_closes_durable_session_when_composition_fails
+    expected_test_count: 1
+
+  - case_id: one-registration-winner
+    boundary: lease_authority
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_initial_registration_and_lease_have_one_concurrent_winner
+    expected_test_count: 1
+  - case_id: waiting-writer-rejected-after-close-fence
+    boundary: lease_authority
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_closing_fence_rejects_a_writer_already_waiting_on_registry_authority
+    expected_test_count: 1
+
+  - case_id: publication-replay-safe
+    boundary: session_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_fenced_session_state_publication_is_visible_and_replay_safe
+    expected_test_count: 1
+  - case_id: cross-worker-projection-restore
+    boundary: session_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_session_state_coordinator_restores_a_committed_cross_worker_projection
+    expected_test_count: 1
+  - case_id: one-receipt-session-ahead-boundary
+    boundary: session_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_session_ahead_reconciliation_requires_one_contiguous_typed_receipt
+    expected_test_count: 1
+
+  - case_id: same-session-checkpoint-serialization
+    boundary: checkpoint_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_same_session_checkpoint_waiters_do_not_exhaust_the_pool
+    expected_test_count: 1
+  - case_id: queued-checkpoint-cancellation
+    boundary: checkpoint_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_cancelled_checkpoint_waiter_does_not_block_the_session_queue
+    expected_test_count: 1
+  - case_id: active-checkpoint-cancellation
+    boundary: checkpoint_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_cancelled_active_checkpoint_operation_releases_pool_and_queue
+    expected_test_count: 1
+  - case_id: pending-write-before-checkpoint
+    boundary: checkpoint_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_fenced_checkpoint_accepts_langgraph_write_before_checkpoint_ordering
+    expected_test_count: 1
+  - case_id: pending-write-tamper-rejected
+    boundary: checkpoint_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_fenced_checkpoint_rejects_pending_write_collection_tampering
+    expected_test_count: 4
+  - case_id: stale-generation-write-rejected
+    boundary: checkpoint_publication
+    execution_surface: postgres
+    nodeid: tests/test_postgres_checkpoints.py::test_registry_generation_switch_retires_source_checkpoint_write_authority
+    expected_test_count: 1
+
+  - case_id: restored-confirmation-requires-fresh-consent
+    boundary: pending_confirmation
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_durable_platform_resources_open_with_the_pinned_application_role
+    expected_test_count: 1
+
+  - case_id: unresolved-principal-retirement-rejected
+    boundary: principal_retirement
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_checkpoint_reconciliation_rejects_a_principal_retirement_marker
+    expected_test_count: 1
+  - case_id: lost-principal-retirement-acknowledgement
+    boundary: principal_retirement
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_lost_retirement_acknowledgement_reconciles_the_committed_marker
+    expected_test_count: 1
+
+  - case_id: close-fences-and-verifies-deletion
+    boundary: close_and_reap
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_durable_close_fences_writers_deletes_state_and_replays_safely
+    expected_test_count: 1
+  - case_id: one-concurrent-close-owner
+    boundary: close_and_reap
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_concurrent_close_claims_have_one_fence_owner
+    expected_test_count: 1
+  - case_id: lost-close-begin-acknowledgement
+    boundary: close_and_reap
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_lost_begin_acknowledgement_recognizes_reaper_completed_close
+    expected_test_count: 1
+  - case_id: expired-session-reaper-claim
+    boundary: close_and_reap
+    execution_surface: postgres
+    nodeid: tests/test_postgres_session_registry.py::test_reaper_claims_only_expired_sessions_through_the_close_coordinator
+    expected_test_count: 1
+
+  - case_id: authority-loss-retires-output-before-disconnect
+    boundary: local_transport_retirement
+    execution_surface: process_local
+    nodeid: tests/test_voice_pipeline.py::test_lease_loss_stops_turns_and_output_before_transport_disconnect
+    expected_test_count: 1
+  - case_id: transport-retirement-timeout-closes-local-state
+    boundary: local_transport_retirement
+    execution_surface: process_local
+    nodeid: tests/test_voice_pipeline.py::test_transport_retirement_timeout_still_closes_local_caller_state
+    expected_test_count: 1

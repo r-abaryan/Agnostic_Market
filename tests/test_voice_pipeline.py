@@ -23,8 +23,13 @@ from turn_helpers import engine_events
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.recovery import NodeExecutionTracker
+from agnostic_market.agents.routing_activation import RoutingRecognizerFactory
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink
-from agnostic_market.application import build_fixture_tenant_services
+from agnostic_market.application import (
+    PreparedApplicationRouting,
+    build_fixture_tenant_services,
+    prepare_application_routing,
+)
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentEntry,
     PaymentInstrumentsFixture,
@@ -41,13 +46,19 @@ from agnostic_market.tenancy.context import build_tenant_context
 from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.pipeline import (
     DisclosureFirstAgent,
+    TurnLatencyMeasurement,
     VoiceLoop,
+    _attach_turn_metrics_logger,
     build_voice_loop,
     retire_voice_transport,
 )
 
 
-async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
+async def _loop(
+    config_root: Path,
+    resolver: RecordingResolver,
+    routing: RoutingRecognizerFactory | PreparedApplicationRouting | None = None,
+) -> VoiceLoop:
     registry = ConfigRegistry(config_root).load()
     resolved = registry.get("acme_store")
     tenant = build_tenant_context(registry, "acme_store")
@@ -63,7 +74,9 @@ async def _loop(config_root: Path, resolver: RecordingResolver) -> VoiceLoop:
             tenant,
             telemetry=make_tenant_telemetry("acme_store"),
         ),
-        routing_recognizer_factory=lambda _registry: ArchitectureRoutingRecognizer(),
+        routing_recognizer_factory=(
+            routing if routing is not None else lambda _registry: ArchitectureRoutingRecognizer()
+        ),
     )
 
 
@@ -103,6 +116,73 @@ async def test_session_wiring_is_config_driven(config_root: Path) -> None:
     # low-confidence turns without cutting natural multi-clause speech; min stays 0.3s.
     assert loop.session.options.endpointing["max_delay"] == 1.5
     assert loop.session.options.endpointing["min_delay"] == 0.3  # streaming default kept
+
+
+def test_latency_observer_separates_endpointing_from_assistant_processing() -> None:
+    callbacks = {}
+    observed: list[TurnLatencyMeasurement] = []
+
+    class Session:
+        def on(self, event_name: str):
+            def register(callback):
+                callbacks[event_name] = callback
+                return callback
+
+            return register
+
+    _attach_turn_metrics_logger(Session(), observed.append)
+    callback = callbacks["conversation_item_added"]
+
+    callback(
+        SimpleNamespace(
+            item=SimpleNamespace(
+                role="user",
+                metrics={"end_of_turn_delay": 0.25, "transcription_delay": 0.05},
+            )
+        )
+    )
+    callback(
+        SimpleNamespace(
+            item=SimpleNamespace(
+                role="assistant",
+                metrics={"e2e_latency": 0.625, "llm_node_ttft": 0.2},
+            )
+        )
+    )
+    assert observed == [
+        TurnLatencyMeasurement(
+            end_to_end_seconds=0.625,
+            endpointing_seconds=0.25,
+            processing_seconds=0.375,
+        )
+    ]
+
+
+def test_latency_observer_rejects_uncorrelated_or_contradictory_metrics() -> None:
+    callbacks = {}
+    observed: list[TurnLatencyMeasurement] = []
+
+    class Session:
+        def on(self, event_name: str):
+            def register(callback):
+                callbacks[event_name] = callback
+                return callback
+
+            return register
+
+    _attach_turn_metrics_logger(Session(), observed.append)
+    callback = callbacks["conversation_item_added"]
+
+    callback(SimpleNamespace(item=SimpleNamespace(role="assistant", metrics={"e2e_latency": 1.0})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="user", metrics={})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="assistant", metrics={"e2e_latency": 1.0})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="user", metrics={"end_of_turn_delay": 0.7})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="user", metrics={"end_of_turn_delay": 0.2})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="assistant", metrics={"e2e_latency": 1.0})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="user", metrics={"end_of_turn_delay": 1.1})))
+    callback(SimpleNamespace(item=SimpleNamespace(role="assistant", metrics={"e2e_latency": 1.0})))
+
+    assert observed == []
 
 
 async def test_voice_graph_uses_only_response_and_reasoning_model_roles(
@@ -205,11 +285,13 @@ async def test_engine_seam_wiring(config_root: Path) -> None:
 
 
 async def test_voice_runtime_shares_the_graph_capability_registry(config_root: Path) -> None:
-    loop = await _loop(config_root, RecordingResolver())
+    prepared = prepare_application_routing(lambda _registry: ArchitectureRoutingRecognizer())
+    loop = await _loop(config_root, RecordingResolver(), prepared)
     # The dispatcher closes over the registry the compiled graph carries. The runtime must
     # expose THAT instance; a second availability list built alongside it would drift the
     # day a capability is registered, and the ids guard against sharing an empty one.
     assert loop.capability_registry is loop.engine._graph.capability_registry
+    assert loop.capability_registry is prepared.capability_registry
     assert loop.application.assembly.graph is loop.engine._graph
     assert loop.capability_registry.capability_ids
 
@@ -863,6 +945,11 @@ async def test_lease_loss_stops_turns_and_output_before_transport_disconnect() -
     assert context.engine.deletes == 0
     assert context.cart_store.clears == 1  # type: ignore[attr-defined]
     assert context.verification_store.clears == 1  # type: ignore[attr-defined]
+    sink = context.telemetry.sink
+    assert isinstance(sink, InMemoryTelemetrySink)
+    assert [(record.event, record.attributes.get("reason")) for record in sink.records] == [
+        ("caller_context_closed", "authority_lost")
+    ]
 
 
 async def test_transport_retirement_timeout_still_closes_local_caller_state() -> None:

@@ -7,7 +7,8 @@ import hashlib
 import json
 import os
 import uuid
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TypedDict
 
 import pytest
@@ -175,6 +176,8 @@ async def _open_fenced_boundary(
     dsn: str,
     *,
     logical_session_id: str,
+    max_pool_size: int = 3,
+    pool_timeout_seconds: float = _CHECKPOINT_IO_TIMEOUT_SECONDS,
 ) -> tuple[
     AsyncConnectionPool,
     AsyncPostgresSaver,
@@ -185,8 +188,8 @@ async def _open_fenced_boundary(
     pool = AsyncConnectionPool(
         dsn,
         min_size=1,
-        max_size=3,
-        timeout=_CHECKPOINT_IO_TIMEOUT_SECONDS,
+        max_size=max_pool_size,
+        timeout=pool_timeout_seconds,
         kwargs={"autocommit": True, "prepare_threshold": 0},
         open=False,
     )
@@ -249,6 +252,182 @@ async def _open_fenced_boundary(
         authority,
         registry,
     )
+
+
+def _bound_fenced_write_saver(
+    pool: AsyncConnectionPool,
+    authority: SessionLeaseAuthority,
+    logical_session_id: str,
+) -> tuple[
+    SchemaValidatedCheckpointSaver,
+    CheckpointBinding,
+    RunnableConfig,
+]:
+    backend = FencedPostgresCheckpointSaver(
+        pool,
+        authority=authority,
+        cipher=_checkpoint_cipher(),
+        serde=build_checkpoint_serializer(),
+    )
+    saver = build_checkpointer(
+        backend,
+        synchronous_operations=False,
+        cipher=_checkpoint_cipher(),
+    )
+    binding = CheckpointBinding(
+        tenant_id=authority.tenant_id,
+        logical_session_id=logical_session_id,
+        deployment_id=authority.deployment_id,
+        graph_contract=authority.graph_contract,
+        thread_id=f"{logical_session_id}::fence::1",
+    )
+    saver.bind_checkpoint_contract(
+        {"value"},
+        binding=binding,
+        io_timeout_seconds=1.0,
+        required_state_keys=_SensitiveState.__annotations__,
+    )
+    write_config: RunnableConfig = {
+        "configurable": {
+            **binding.config["configurable"],
+            "checkpoint_id": str(uuid.uuid4()),
+        }
+    }
+    return saver, binding, write_config
+
+
+@asynccontextmanager
+async def _hold_session_row(
+    pool: AsyncConnectionPool,
+    authority: SessionLeaseAuthority,
+) -> AsyncIterator[None]:
+    async with pool.connection() as connection, connection.transaction():
+        await connection.execute(
+            "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+            (authority.tenant_id,),
+        )
+        await connection.execute(
+            """
+            SELECT 1 FROM platform_sessions
+            WHERE tenant_id = %s AND logical_session_id = %s
+            FOR UPDATE
+            """,
+            (authority.tenant_id, authority.authority.logical_session_id),
+        )
+        yield
+
+
+async def _open_fenced_queue_boundary(
+    stack: AsyncExitStack,
+    prefix: str,
+) -> tuple[
+    AsyncConnectionPool,
+    SchemaValidatedCheckpointSaver,
+    SessionLeaseAuthority,
+    RunnableConfig,
+]:
+    logical_session_id = f"{prefix}-{uuid.uuid4().hex}"
+    pool, _raw_backend, _saver, authority, _registry = await _open_fenced_boundary(
+        stack,
+        _dsn(),
+        logical_session_id=logical_session_id,
+        max_pool_size=2,
+        pool_timeout_seconds=0.1,
+    )
+    saver, _binding, write_config = _bound_fenced_write_saver(
+        pool,
+        authority,
+        logical_session_id,
+    )
+    return pool, saver, authority, write_config
+
+
+def _pending_write_task(
+    saver: SchemaValidatedCheckpointSaver,
+    config: RunnableConfig,
+    task_id: str,
+) -> asyncio.Task[None]:
+    return asyncio.create_task(
+        saver.aput_writes(
+            config,
+            (("value", task_id),),
+            task_id,
+            f"pull/{task_id}",
+        )
+    )
+
+
+@pytest.mark.postgres
+async def test_same_session_checkpoint_waiters_do_not_exhaust_the_pool() -> None:
+    async with AsyncExitStack() as stack:
+        pool, saver, authority, write_config = await _open_fenced_queue_boundary(
+            stack,
+            "checkpoint-queue",
+        )
+
+        async with _hold_session_row(pool, authority):
+            first = _pending_write_task(saver, write_config, "queued-task-first")
+            second = _pending_write_task(saver, write_config, "queued-task-second")
+            await asyncio.sleep(0.2)
+            assert not first.done()
+            assert not second.done()
+
+        await asyncio.gather(first, second)
+
+
+@pytest.mark.postgres
+async def test_cancelled_checkpoint_waiter_does_not_block_the_session_queue() -> None:
+    async with AsyncExitStack() as stack:
+        pool, saver, authority, write_config = await _open_fenced_queue_boundary(
+            stack,
+            "checkpoint-queued-cancel",
+        )
+
+        async with _hold_session_row(pool, authority):
+            active = _pending_write_task(saver, write_config, "active-task")
+            queued = _pending_write_task(saver, write_config, "queued-task")
+            await asyncio.sleep(0.05)
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            assert not active.done()
+
+        await active
+        await saver.aput_writes(
+            write_config,
+            (("value", "after-cancel"),),
+            "after-cancel-task",
+            "pull/after-cancel-task",
+        )
+
+
+@pytest.mark.postgres
+async def test_cancelled_active_checkpoint_operation_releases_pool_and_queue() -> None:
+    async with AsyncExitStack() as stack:
+        pool, saver, authority, write_config = await _open_fenced_queue_boundary(
+            stack,
+            "checkpoint-active-cancel",
+        )
+
+        async with _hold_session_row(pool, authority):
+            active = _pending_write_task(
+                saver,
+                write_config,
+                "cancelled-active-task",
+            )
+            await asyncio.sleep(0.05)
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+            replacement = _pending_write_task(
+                saver,
+                write_config,
+                "replacement-task",
+            )
+            await asyncio.sleep(0.2)
+            assert not replacement.done()
+
+        await replacement
 
 
 @pytest.mark.postgres

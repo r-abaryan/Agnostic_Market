@@ -14,7 +14,10 @@ from agnostic_market.durability.migrations import (
     PLATFORM_MIGRATIONS,
     PLATFORM_SESSION_SCHEMA_VERSION,
 )
-from agnostic_market.durability.session_lifecycle import DurableSessionLifecycleCoordinator
+from agnostic_market.durability.session_lifecycle import (
+    DurableSessionLifecycleCoordinator,
+    OperationalSessionReaper,
+)
 from agnostic_market.durability.session_payload import (
     SESSION_PAYLOAD_SCHEMA_VERSION,
     DurableSessionPayload,
@@ -67,6 +70,18 @@ class _ReaperRegistry:
         assert limit == 100
         self.purge_calls += 1
         return 0
+
+
+class _ScheduledReaperCoordinator:
+    def __init__(self, *, failing_tenants: frozenset[str] = frozenset()) -> None:
+        self.failing_tenants = failing_tenants
+        self.calls: list[tuple[str, int]] = []
+
+    async def reap_expired(self, tenant_id: str, *, limit: int = 100) -> int:
+        self.calls.append((tenant_id, limit))
+        if tenant_id in self.failing_tenants:
+            raise RuntimeError(f"failed {tenant_id}")
+        return 2
 
 
 def _authority() -> AdmittedSessionAuthority:
@@ -189,6 +204,60 @@ async def test_reaper_treats_ownership_loss_during_finalization_as_a_benign_race
     assert await coordinator.reap_expired("acme_store") == 1
     assert finalized == ["AD_poisoned", "AD_healthy"]
     assert registry.purge_calls == 1
+
+
+async def test_operational_reaper_sweeps_every_tenant_with_the_configured_batch() -> None:
+    coordinator = _ScheduledReaperCoordinator()
+    reaper = OperationalSessionReaper(
+        coordinator,
+        tenant_ids=("demo_shop", "acme_store"),
+        interval_seconds=30.0,
+        batch_size=25,
+    )
+
+    assert await reaper.run_once() == 4
+    assert coordinator.calls == [("acme_store", 25), ("demo_shop", 25)]
+
+
+async def test_operational_reaper_isolates_tenant_failures() -> None:
+    coordinator = _ScheduledReaperCoordinator(failing_tenants=frozenset({"acme_store"}))
+    reaper = OperationalSessionReaper(
+        coordinator,
+        tenant_ids=("acme_store", "demo_shop"),
+        interval_seconds=30.0,
+        batch_size=25,
+    )
+
+    with pytest.raises(ExceptionGroup, match="tenant cleanup operations failed") as failed:
+        await reaper.run_once()
+
+    assert coordinator.calls == [("acme_store", 25), ("demo_shop", 25)]
+    assert len(failed.value.exceptions) == 1
+    assert failed.value.exceptions[0].__notes__ == ["failed reaper tenant acme_store"]
+
+
+@pytest.mark.parametrize(
+    ("tenant_ids", "interval_seconds", "batch_size"),
+    (
+        ((), 30.0, 25),
+        (("acme_store", "acme_store"), 30.0, 25),
+        (("acme store",), 30.0, 25),
+        (("acme_store",), 0.0, 25),
+        (("acme_store",), 30.0, 0),
+    ),
+)
+def test_operational_reaper_rejects_ambiguous_or_unbounded_schedules(
+    tenant_ids: tuple[str, ...],
+    interval_seconds: float,
+    batch_size: int,
+) -> None:
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        OperationalSessionReaper(
+            _ScheduledReaperCoordinator(),
+            tenant_ids=tenant_ids,
+            interval_seconds=interval_seconds,
+            batch_size=batch_size,
+        )
 
 
 async def test_in_memory_checkpoint_authority_models_one_registry_owned_rotation() -> None:

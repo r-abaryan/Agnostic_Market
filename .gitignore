@@ -26,6 +26,7 @@ docs/
 config/telemetry/
 config/conformance/reports.json
 config/fixtures/
+config/platform/*.local.yaml
 .claude/
 
 assets/audio/generate_thinking_beep.py

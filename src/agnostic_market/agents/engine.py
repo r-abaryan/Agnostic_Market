@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Literal
@@ -231,6 +231,16 @@ class _TurnSpeech:
         self._buffers.clear()
 
 
+@dataclass(frozen=True, slots=True)
+class GraphTurnLatencyMeasurement:
+    """The existing graph-span measurement exposed to certification consumers."""
+
+    total_seconds: float
+    time_to_first_model_seconds: float | None
+    tool_count: int
+    tool_to_next_model_seconds: float | None
+
+
 class _GraphSpans:
     """Graph-internal latency timeline for one turn. The voice plane's `llm_node_ttft`/
     `e2e_latency` metrics treat the whole graph as one opaque "LLM", so they cannot say
@@ -274,12 +284,24 @@ class _GraphSpans:
         if self._last_tool_at is not None and self._tool_to_next_model is None:
             self._tool_to_next_model = now - self._last_tool_at
 
-    def log(self) -> None:
-        parts = [f"total={time.perf_counter() - self._start:.3f}s", f"tools={self._tool_count}"]
-        if self._ttf_model is not None:
-            parts.append(f"ttf_model={self._ttf_model:.3f}s")
-        if self._tool_to_next_model is not None:
-            parts.append(f"tool_to_next_model={self._tool_to_next_model:.3f}s")
+    def finish(self) -> GraphTurnLatencyMeasurement:
+        return GraphTurnLatencyMeasurement(
+            total_seconds=time.perf_counter() - self._start,
+            time_to_first_model_seconds=self._ttf_model,
+            tool_count=self._tool_count,
+            tool_to_next_model_seconds=self._tool_to_next_model,
+        )
+
+    @staticmethod
+    def log(measurement: GraphTurnLatencyMeasurement) -> None:
+        parts = [
+            f"total={measurement.total_seconds:.3f}s",
+            f"tools={measurement.tool_count}",
+        ]
+        if measurement.time_to_first_model_seconds is not None:
+            parts.append(f"ttf_model={measurement.time_to_first_model_seconds:.3f}s")
+        if measurement.tool_to_next_model_seconds is not None:
+            parts.append(f"tool_to_next_model={measurement.tool_to_next_model_seconds:.3f}s")
         logger.debug("graph spans: %s", ", ".join(parts))
 
 
@@ -327,14 +349,16 @@ def _session_ahead_evidence_matches(
     action: ExceptionAction,
     operations: tuple[SessionOperationEvidence, ...],
 ) -> bool:
-    latest = operations[-1]
-    result = latest.result
+    if len(operations) != 1:
+        return False
+    operation = operations[0]
+    result = operation.result
     if action is ExceptionAction.CART_REVIEW:
         pending = state.pending_cart_mutation
         return bool(
             isinstance(pending, PendingCartMutation)
             and isinstance(result, CartMutationSessionOperationResult)
-            and latest.operation_id == pending.idempotency_key
+            and operation.operation_id == pending.idempotency_key
             and result.record.operation == pending.operation
             and result.record.sku == pending.sku
             and result.record.name == pending.name
@@ -346,18 +370,19 @@ def _session_ahead_evidence_matches(
         return False
     if action is ExceptionAction.RECONCILE_PLACEMENT:
         pending = state.pending_placement
-        return bool(pending is not None and latest.operation_id == pending.idempotency_key)
+        return bool(pending is not None and operation.operation_id == pending.idempotency_key)
     if action is ExceptionAction.RECONCILE_REFUND:
         pending = state.pending_refund
         return bool(
             pending is not None
-            and latest.operation_id == recent_orders_operation_id("refund", pending.idempotency_key)
+            and operation.operation_id
+            == recent_orders_operation_id("refund", pending.idempotency_key)
         )
     if action is ExceptionAction.RECONCILE_CANCEL:
         pending = state.pending_cancel
         if pending is None or len(pending.outcomes) >= len(pending.targets):
             return False
-        return latest.operation_id == recent_orders_operation_id(
+        return operation.operation_id == recent_orders_operation_id(
             "cancel",
             pending.targets[len(pending.outcomes)].idempotency_key,
         )
@@ -365,13 +390,14 @@ def _session_ahead_evidence_matches(
         pending = state.pending_return
         return bool(
             pending is not None
-            and latest.operation_id == recent_orders_operation_id("return", pending.idempotency_key)
+            and operation.operation_id
+            == recent_orders_operation_id("return", pending.idempotency_key)
         )
     if action is ExceptionAction.SAFE_ABORT:
         invocation = state.active_invocation
         return bool(
             invocation is not None
-            and latest.operation_id
+            and operation.operation_id
             in {
                 recent_orders_operation_id("read", invocation.invocation_id),
                 recent_orders_operation_id("list", invocation.invocation_id),
@@ -450,6 +476,7 @@ class ReasoningEngine:
         routing: RoutingSession,
         telemetry: TelemetryRecorder,
         lifecycle: PrincipalTransitionLifecycle | None = None,
+        turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
     ) -> None:
         if graph.checkpointer is None:
             raise ValueError(
@@ -493,6 +520,7 @@ class ReasoningEngine:
             raise ValueError("ReasoningEngine requires an active RoutingSession")
         self._routing = routing
         self._telemetry = telemetry
+        self._turn_latency_observer = turn_latency_observer
         if cancellation_quiescence_timeout_seconds <= 0:
             raise ValueError("cancellation quiescence timeout must be positive")
         self._cancellation_quiescence_timeout_seconds = cancellation_quiescence_timeout_seconds
@@ -1602,7 +1630,13 @@ class ReasoningEngine:
                         raise deferred_cancellation
             for flushed in speech.flush():
                 yield flushed
-            spans.log()
+            measurement = spans.finish()
+            spans.log(measurement)
+            if self._turn_latency_observer is not None:
+                try:
+                    self._turn_latency_observer(measurement)
+                except Exception:
+                    logger.exception("graph turn latency observer failed")
 
     async def adelete_thread(self) -> None:
         """Asynchronously remove this session's tenant-scoped reasoning thread."""

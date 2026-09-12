@@ -35,6 +35,11 @@ from agnostic_market.durability.session_registry import (
 from agnostic_market.durability.session_registry import (
     classify_checkpoint_revision as classify_checkpoint_revision,
 )
+from agnostic_market.durability.timing import (
+    DurabilityOperation,
+    DurabilityTimingObserver,
+    observe_async_operation,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +66,9 @@ class SessionStatePersistencePort(Protocol):
 class BoundPostgresSessionStatePersistence(SessionStatePersistencePort):
     registry: PostgresSessionRegistry
     authority: SessionLeaseAuthority
+    _durability_timing: DurabilityTimingObserver | None = None
 
+    @observe_async_operation(DurabilityOperation.SESSION_STORE_PUBLISH)
     async def publish(
         self,
         *,
