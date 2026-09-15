@@ -1,0 +1,7 @@
+schema_version: 1
+environment: synthetic
+production_agent_name: agnostic-market
+certification_agent_name: agnostic-market-certification
+room_name: agnostic-market-certification-01
+controller_participant_identity: certification-controller
+merchant_id: acme_store

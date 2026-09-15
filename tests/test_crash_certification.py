@@ -45,11 +45,14 @@ def _result(
     outcome: CrashCaseOutcome = CrashCaseOutcome.PASSED,
 ) -> CrashCaseResult:
     case = methodology.cases[index]
-    execution = (
-        CrashCaseExecution(tests=case.expected_test_count, skipped=0, failures=0, errors=0)
-        if outcome is CrashCaseOutcome.PASSED
-        else None
-    )
+    execution = None
+    if outcome in {CrashCaseOutcome.PASSED, CrashCaseOutcome.FAILED}:
+        execution = CrashCaseExecution(
+            tests=case.expected_test_count,
+            skipped=0,
+            failures=int(outcome is CrashCaseOutcome.FAILED),
+            errors=0,
+        )
     return CrashCaseResult(
         case_id=case.case_id,
         boundary=case.boundary,
@@ -234,6 +237,99 @@ def test_a_passing_case_cannot_claim_an_unexecuted_test(
         )
 
 
+@pytest.mark.parametrize(
+    ("outcome", "execution", "message"),
+    [
+        (CrashCaseOutcome.PASSED, None, "must record its observed execution"),
+        (CrashCaseOutcome.FAILED, None, "must record its observed execution"),
+        (
+            CrashCaseOutcome.TIMED_OUT,
+            {"tests": 1, "skipped": 0, "failures": 0, "errors": 0},
+            "must not record execution",
+        ),
+        (
+            CrashCaseOutcome.INFRASTRUCTURE_ERROR,
+            {"tests": 1, "skipped": 0, "failures": 0, "errors": 0},
+            "must not record execution",
+        ),
+    ],
+)
+def test_case_result_rejects_outcome_execution_states_the_runner_cannot_emit(
+    outcome: CrashCaseOutcome,
+    execution: dict[str, int] | None,
+    message: str,
+) -> None:
+    case = load_crash_methodology(_METHODOLOGY_PATH).cases[0]
+
+    with pytest.raises(ValidationError, match=message):
+        CrashCaseResult(
+            case_id=case.case_id,
+            boundary=case.boundary,
+            execution_surface=case.execution_surface,
+            nodeid=case.nodeid,
+            outcome=outcome,
+            elapsed_seconds=0.1,
+            execution=execution,
+        )
+
+
+def test_case_result_requires_a_positive_observed_duration() -> None:
+    methodology = load_crash_methodology(_METHODOLOGY_PATH)
+    payload = _result(methodology, 0).model_dump() | {"elapsed_seconds": 0}
+
+    with pytest.raises(ValidationError, match="greater than 0"):
+        CrashCaseResult.model_validate(payload)
+
+
+def test_failed_case_may_retain_clean_xml_when_the_process_exit_was_nonzero() -> None:
+    case = load_crash_methodology(_METHODOLOGY_PATH).cases[0]
+
+    result = CrashCaseResult(
+        case_id=case.case_id,
+        boundary=case.boundary,
+        execution_surface=case.execution_surface,
+        nodeid=case.nodeid,
+        outcome=CrashCaseOutcome.FAILED,
+        elapsed_seconds=0.1,
+        execution=CrashCaseExecution(
+            tests=case.expected_test_count,
+            skipped=0,
+            failures=0,
+            errors=0,
+        ),
+    )
+
+    assert result.outcome is CrashCaseOutcome.FAILED
+
+
+def test_report_revalidates_outcome_execution_for_unvalidated_model_copies() -> None:
+    methodology = load_crash_methodology(_METHODOLOGY_PATH)
+    observed = CrashCaseExecution(
+        tests=methodology.cases[0].expected_test_count,
+        skipped=0,
+        failures=0,
+        errors=0,
+    )
+    invalid_results = (
+        _result(methodology, 0, CrashCaseOutcome.FAILED).model_copy(update={"execution": None}),
+        _result(methodology, 0, CrashCaseOutcome.TIMED_OUT).model_copy(
+            update={"execution": observed}
+        ),
+    )
+
+    for first in invalid_results:
+        with pytest.raises(ValidationError, match="execution"):
+            build_crash_certification_report(
+                methodology,
+                (
+                    first,
+                    *(_result(methodology, index) for index in range(1, len(methodology.cases))),
+                ),
+                run_at=_RUN_AT,
+                implementation_id="build-a",
+            )
+
+
 def test_runner_retains_a_failed_case_without_stopping_the_matrix() -> None:
     methodology = load_crash_methodology(_METHODOLOGY_PATH)
     visited: list[str] = []
@@ -347,6 +443,40 @@ def test_abort_completed_prefix_enforces_passing_case_execution_evidence() -> No
                 "completed_results": (first_result,),
             },
         )
+
+
+def test_abort_prefix_revalidates_nonpassing_outcome_execution_binding() -> None:
+    methodology = load_crash_methodology(_METHODOLOGY_PATH)
+    observed = CrashCaseExecution(
+        tests=methodology.cases[0].expected_test_count,
+        skipped=0,
+        failures=0,
+        errors=0,
+    )
+    invalid_results = (
+        _result(methodology, 0, CrashCaseOutcome.FAILED).model_copy(update={"execution": None}),
+        _result(methodology, 0, CrashCaseOutcome.TIMED_OUT).model_copy(
+            update={"execution": observed}
+        ),
+    )
+    next_case = methodology.cases[1]
+
+    for first_result in invalid_results:
+        with pytest.raises(ValidationError, match="execution"):
+            DurableCrashCertificationRun(
+                run_at=_RUN_AT,
+                implementation_id="build-a",
+                methodology_fingerprint=crash_methodology_fingerprint(methodology),
+                methodology=methodology,
+                outcome=CrashCertificationOutcome.ABORTED,
+                abort={
+                    "case_id": next_case.case_id,
+                    "boundary": next_case.boundary,
+                    "nodeid": next_case.nodeid,
+                    "error_type": "OSError",
+                    "completed_results": (first_result,),
+                },
+            )
 
 
 def test_abort_cannot_follow_a_fully_completed_matrix() -> None:

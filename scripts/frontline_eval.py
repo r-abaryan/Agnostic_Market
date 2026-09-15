@@ -2000,7 +2000,15 @@ def _semantic_model_report(
                 "expected": _route_signature(result.expected),
                 "actual": _route_signature(result.attempt.resolution),
                 "latency_ms": result.attempt.elapsed_ms,
+                "observed_at": (
+                    None
+                    if result.attempt.observed_at is None
+                    else result.attempt.observed_at.isoformat()
+                ),
                 "provider_call_outcome": result.attempt.provider_call_outcome,
+                "provider_error_category": result.attempt.provider_error_category,
+                "provider_request_id": result.attempt.provider_request_id,
+                "provider_retry_count": result.attempt.provider_retry_count,
                 "input_tokens": result.attempt.input_tokens,
                 "cache_read_tokens": result.attempt.cache_read_tokens,
                 "output_tokens": result.attempt.output_tokens,

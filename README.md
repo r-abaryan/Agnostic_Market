@@ -242,13 +242,22 @@ in the repository workflow. Each provisioner removes only the database resources
 Run one bounded expiry and tombstone-cleanup cycle with a deployment-owned platform configuration:
 
 ```bash
-uv run --no-sync python scripts/session_reaper.py --platform-config <path> --once
+uv run --no-sync python scripts/session_reaper.py \
+  --platform-config <runtime-path> \
+  --tenant-inventory <inventory-path> \
+  --deployment-id <immutable-deployment-id> \
+  --once
 ```
 
 Omit `--once` only in the dedicated reaper process. Platform configuration schema version 2
-requires explicit reaper cadence and batch-size values. The command enumerates trusted tenant IDs
-from the merchant registry and reuses the fenced close coordinator; it does not run inside a voice
-job.
+requires explicit reaper cadence and batch-size values. The strict lifecycle inventory is a
+separate deployment artifact: its active entries must exactly match the merchant registry, while
+retiring entries remain sweepable after admission config is removed. The command has no fallback
+that derives retirement authority from the current merchant files. Add
+`--drain-evidence-dir <directory>` to a clean `--once` sweep to record immutable zero-state evidence
+for retiring tenants. Each result binds the deployment ID and the existing non-secret runtime
+fingerprint as well as the exact inventory revision. The reaper reuses the fenced close coordinator
+and does not run inside a voice job.
 
 Milestone 3 now has native async application construction, registry and encryption contracts,
 lease supervision, and revisioned session-state adapters. The same harness also exercises registry
@@ -271,15 +280,18 @@ proves dispatch continuity, old-transport retirement, and one replacement speake
 Copy `.env.example` to `.env` and provide the required provider and LiveKit credentials.
 `VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact. Console mode also
 requires an explicit `VOICE_AGENT_MERCHANT_ID`; there is no default merchant.
-`VOICE_AGENT_NAME` is required for network worker commands and must match the named LiveKit
-dispatch target. Network workers also require `VOICE_AGENT_PLATFORM_CONFIG` to be an absolute
+`VOICE_AGENT_CERTIFICATION_CONFIG` is the single deployment-owned authority for the distinct
+production and certification LiveKit dispatch names. Network workers also require
+`VOICE_AGENT_PLATFORM_CONFIG` to be an absolute
 path to the deployment-owned schema-2 platform runtime YAML. Console and model-file download
 commands do not require either network setting. The YAML resolves `PLATFORM_POSTGRES_DSN` as the
 restricted application-role connection and `PLATFORM_SESSION_KEY` as a base64-encoded 32-byte
 AES-256 key. Do not reuse the migration or Phase 4C harness administrator connection as the
-application DSN. Worker activation additionally requires a schema-3 latency methodology and report
-whose measurement surface is `voice_processing`; the repository's current graph-only certification
-runner deliberately cannot produce that activation artifact.
+application DSN. Network workers also require `VOICE_AGENT_BUILD_ARTIFACT_DIGEST` to contain the
+immutable OCI image digest. Worker activation requires a schema-5 voice-processing methodology and
+report whose application contract exactly matches the durable runtime, build digest, tenant
+configuration, semantic router, and certification target. Schema-4 voice evidence and the
+repository's graph-only certification results are retained evidence, but cannot authorize startup.
 
 On Windows, network-worker prewarm selects the psycopg-compatible selector loop inside each
 LiveKit job process; the running supervisor loop is unchanged. Console mode uses LiveKit's thread
@@ -293,6 +305,54 @@ SDK loop selection before the upgrade. The reaper owns its loop directly and alr
 uv run --no-sync python scripts/voice_agent.py console
 uv run --no-sync python scripts/voice_agent.py dev
 ```
+
+The pre-manifest voice-certification worker is a separate launch target. Set
+`VOICE_AGENT_CERTIFICATION_CONFIG` to an absolute deployment-owned target file and reserve its
+exact room for the standard controller participant. The normal worker derives
+`production_agent_name` from this file; the certification worker derives
+`certification_agent_name`, which must be the production name plus the reserved
+`-certification` suffix. Independently entered environment values cannot make them collide:
+
+```bash
+uv run --no-sync python scripts/durable_voice_certification_worker.py dev
+```
+
+This worker reuses normal admission, provider construction, durable composition, lease supervision,
+and cleanup. Its request boundary accepts only a room-scoped explicit dispatch for the configured
+agent and room with an authenticated sample directive. LiveKit room jobs do not carry a job
+participant; normal admission binds the exact standard controller identity after connection. The
+worker bypasses only the completed voice-latency evidence that this path exists to produce.
+
+After generating and freezing the methodology's PCM WAV files, launch the controller separately:
+
+```bash
+uv run --no-sync python scripts/durable_voice_certification.py \
+  --smoke-journey simple-cart-read
+```
+
+Smoke mode runs exactly one named journey through the same dispatch, audio, worker RPC, semantic
+postcondition, and cleanup path. It writes no report and cannot authorize activation. Use it only
+to prove the deployment mechanics before spending the complete frozen sample schedule.
+
+Then launch the full controller with a new immutable report path:
+
+```bash
+uv run --no-sync python scripts/durable_voice_certification.py \
+  --platform-config <absolute-platform-yaml> \
+  --methodology <absolute-schema-5-methodology-yaml> \
+  --target <absolute-certification-target-yaml> \
+  --audio-root <absolute-frozen-audio-root> \
+  --report <new-result-json> \
+  --deployment-id <immutable-deployment-id> \
+  --build-artifact-digest sha256:<immutable-image-digest>
+```
+
+The exact-room controller currently requires methodology concurrency `1`. It authenticates every
+audio asset before connecting, creates one non-restarting server dispatch per sample, waits for the
+worker's authenticated readiness and setup progress, publishes the frozen PCM through a microphone
+track, and deletes the dispatch before the next sample. Completed or aborted evidence is immutable;
+a passing result is reloaded and re-derived before the command succeeds. This producer is locally
+implemented and tested, but no deployment voice result is claimed until the credentialed run occurs.
 
 Every network job uses named explicit dispatch. A strict metadata preflight resolves the tenant,
 then model certification, platform secret resolution, PostgreSQL pool creation, and read-only
@@ -351,4 +411,4 @@ evaluations, not to weaken rubrics or claim real-caller population accuracy.
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-Copyright 2026 Rasoul Abaryan.
+Copyright 2026 R-Abaryan.

@@ -47,6 +47,7 @@ from agnostic_market.voice.graph import GraphVoiceAdapter
 from agnostic_market.voice.pipeline import (
     DisclosureFirstAgent,
     TurnLatencyMeasurement,
+    TurnMetricObservationError,
     VoiceLoop,
     _attach_turn_metrics_logger,
     build_voice_loop,
@@ -145,6 +146,7 @@ def test_latency_observer_separates_endpointing_from_assistant_processing() -> N
         SimpleNamespace(
             item=SimpleNamespace(
                 role="assistant",
+                interrupted=False,
                 metrics={"e2e_latency": 0.625, "llm_node_ttft": 0.2},
             )
         )
@@ -154,8 +156,72 @@ def test_latency_observer_separates_endpointing_from_assistant_processing() -> N
             end_to_end_seconds=0.625,
             endpointing_seconds=0.25,
             processing_seconds=0.375,
+            interrupted=False,
         )
     ]
+
+
+def test_latency_observer_failure_is_retained_without_escaping_the_event_callback() -> None:
+    callbacks = {}
+    failures: list[Exception] = []
+
+    class Session:
+        def on(self, event_name: str):
+            def register(callback):
+                callbacks[event_name] = callback
+                return callback
+
+            return register
+
+    def fail_observation(_measurement: TurnLatencyMeasurement) -> None:
+        raise RuntimeError("diagnostic observer failed")
+
+    _attach_turn_metrics_logger(Session(), fail_observation, failures.append)
+    callback = callbacks["conversation_item_added"]
+
+    callback(
+        SimpleNamespace(item=SimpleNamespace(role="user", metrics={"end_of_turn_delay": 0.25}))
+    )
+    callback(
+        SimpleNamespace(
+            item=SimpleNamespace(
+                role="assistant",
+                interrupted=False,
+                metrics={"e2e_latency": 0.625},
+            )
+        )
+    )
+
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+
+
+def test_latency_observer_requires_boolean_interruption_evidence() -> None:
+    callbacks = {}
+    observed: list[TurnLatencyMeasurement] = []
+    failures: list[Exception] = []
+
+    class Session:
+        def on(self, event_name: str):
+            def register(callback):
+                callbacks[event_name] = callback
+                return callback
+
+            return register
+
+    _attach_turn_metrics_logger(Session(), observed.append, failures.append)
+    callback = callbacks["conversation_item_added"]
+
+    callback(
+        SimpleNamespace(item=SimpleNamespace(role="user", metrics={"end_of_turn_delay": 0.25}))
+    )
+    callback(
+        SimpleNamespace(item=SimpleNamespace(role="assistant", metrics={"e2e_latency": 0.625}))
+    )
+
+    assert observed == []
+    assert len(failures) == 1
+    assert isinstance(failures[0], TurnMetricObservationError)
 
 
 def test_latency_observer_rejects_uncorrelated_or_contradictory_metrics() -> None:

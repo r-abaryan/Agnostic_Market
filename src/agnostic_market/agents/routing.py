@@ -12,6 +12,7 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Literal, Protocol
 
@@ -236,11 +237,13 @@ confirmation. Use direct request_person only for an explicit request to leave au
 a person. For every other reply use clarify ambiguous_intent. Never select another capability or
 continue from this scope. Consent itself remains code-owned and is not a routing decision.
 
-Classify the caller's desired outcome, not the presence of words for people. RequestPerson owns a
+Classify the caller's desired outcome, not the presence of words for people. A quoted command is
+not the caller's request. A declarative report with no requested action must not start the action it
+mentions; use answer_question general only for a safe tool-incapable response. RequestPerson owns a
 request only when the caller wants to leave automated assistance and converse with, transfer to,
 or hand control to a person. When a person is merely the requested actor, source, approver, or
-subject of another task, route the underlying task in ordinary scope. In confirmation_escape,
-that same mention is not an escape and must remain clarify ambiguous_intent.
+subject of an explicit task, route that task in ordinary scope. In confirmation_escape, that same
+mention is not an escape and must remain clarify ambiguous_intent.
 
 Decision order:
 1. Use continue, with no payload, when an active capability exists and the utterance can
@@ -259,24 +262,26 @@ Capability definitions:
 {capability_definitions}
 
 Never direct an unavailable capability; clarify with unsupported_capability. Requests to fabricate
-or merely claim live state or effects also use unsupported_capability. If the caller's meaning is
-ambiguous, use ambiguous_intent. Use missing_target for an unresolved deictic target only when no
-active or recent context identifies an owner. Use missing_value only when the absent value prevents
-choosing an owner; otherwise let the selected owner gather its slot.
+or merely claim live state or effects also use unsupported_capability. A question that requires
+unavailable live account membership or transfer state uses unsupported_capability, not an adjacent
+read owner. If the request is ambiguous among capability owners, use ambiguous_intent. Use
+missing_target only when one owner is identifiable but its deictic item or order target is
+unresolved. Use missing_value only when the absent value prevents choosing an owner; otherwise let
+the selected owner gather its slot.
 
 For verify_order_status, order_status_selector=explicit means the owner must extract or ask for
 explicit order references; focused means one live focused recent order; recent means the complete
-recent order set. Pronouns may use focused/recent only when the supplied recent context supports
-them.
+recent order set. With no recent order context, use explicit so the owner gathers the target.
+Pronouns may use focused/recent only when the supplied recent context supports them.
 
 Contrastive examples:
 - ordinary: "Stop the automated help and connect me with a staff member." ->
   {"decision":"direct","capability":"request_person"}
 - ordinary: "A shop employee needs to update my mobile number." ->
   {"decision":"direct","capability":"change_profile","profile_field":"phone"}
-- ordinary: "Please have the returns team start a return for this raincoat." ->
-  {"decision":"direct","capability":"return_order"}
-- ordinary: "Could a colleague check the delivery status for my purchase?" ->
+- ordinary: "My manager approved the refund." ->
+  {"decision":"direct","capability":"answer_question","answer_topic":"general"}
+- ordinary, no recent orders: "Why did my order stop moving?" ->
   {"decision":"direct","capability":"verify_order_status","order_status_selector":"explicit"}
 - ordinary: "A salesperson mentioned two weeks. What is your exchange policy?" ->
   {"decision":"direct","capability":"answer_question","answer_topic":"policy"}
@@ -286,8 +291,8 @@ Contrastive examples:
   {"decision":"direct","capability":"return_order"}
 - ordinary: "Do not remove anything. Tell me what is in my basket." ->
   {"decision":"direct","capability":"view_cart"}
-- ordinary: "The note says 'send it back.' What does that phrase mean?" ->
-  {"decision":"direct","capability":"answer_question","answer_topic":"general"}
+- ordinary: "The note says 'refund the purchase.' What does that phrase mean?" ->
+  {"decision":"clarify","clarification_reason":"ambiguous_intent"}
 - confirmation_escape: "I do not want automation. Let me speak with a person." ->
   {"decision":"direct","capability":"request_person"}
 - confirmation_escape: "My partner checked it, so yes." ->
@@ -378,6 +383,12 @@ def resolve_route(context: RoutingContext, decision: RouteDecision) -> RouteReso
             return RoutingFailure(reason="decision_rejected")
         if request.kind not in context.available_capabilities:
             return RouteDecision.clarify("unsupported_capability")
+        if (
+            isinstance(request, VerifyOrderStatus)
+            and isinstance(request.target, (FocusedOrderSet, RecentOrderSet))
+            and context.recent_order_count == 0
+        ):
+            return RouteDecision.direct(VerifyOrderStatus())
     return decision
 
 
@@ -434,6 +445,12 @@ class RoutingAttempt:
     provider_call_outcome: ProviderCallOutcome
     projector_version: str = CONTEXT_PROJECTOR_VERSION
     reasoning_effort: ReasoningEffort | None = None
+    # Diagnostics: exception class only, never a message. None means the provider
+    # boundary did not supply the value, never that it was inferred.
+    observed_at: datetime | None = None
+    provider_error_category: str | None = None
+    provider_request_id: str | None = None
+    provider_retry_count: int | None = None
 
 
 class RoutingRecognizer(Protocol):
@@ -628,10 +645,12 @@ class SemanticRouter:
 
     async def route(self, context: RoutingContext) -> RoutingAttempt:
         started = time.perf_counter()
+        observed_at = datetime.now(tz=UTC)
         if len(context.utterance) > self._input_max_chars:
             return self._attempt(
                 RoutingFailure(reason="context_invalid"),
                 started=started,
+                observed_at=observed_at,
                 provider_call_outcome="not_attempted",
             )
         deadline = asyncio.timeout(self._timeout_seconds)
@@ -647,25 +666,30 @@ class SemanticRouter:
                 )
         except asyncio.CancelledError:
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
             return self._attempt(
                 RoutingFailure(reason="routing_unavailable"),
                 started=started,
+                observed_at=observed_at,
                 provider_call_outcome=(
                     "deadline_exceeded" if deadline.expired() else "provider_error"
                 ),
+                provider_error_category=type(exc).__name__,
             )
-        except Exception:
+        except Exception as exc:
             return self._attempt(
                 RoutingFailure(reason="routing_unavailable"),
                 started=started,
+                observed_at=observed_at,
                 provider_call_outcome="provider_error",
+                provider_error_category=type(exc).__name__,
             )
 
         if not isinstance(envelope, dict):
             return self._attempt(
                 RoutingFailure(reason="invalid_output"),
                 started=started,
+                observed_at=observed_at,
                 provider_call_outcome="completed",
             )
         raw = envelope.get("raw")
@@ -678,6 +702,7 @@ class SemanticRouter:
         return self._attempt(
             resolution,
             started=started,
+            observed_at=observed_at,
             raw=raw,
             provider_call_outcome="completed",
         )
@@ -687,7 +712,9 @@ class SemanticRouter:
         resolution: RouteResolution,
         *,
         started: float,
+        observed_at: datetime,
         provider_call_outcome: ProviderCallOutcome,
+        provider_error_category: str | None = None,
         raw: object = None,
     ) -> RoutingAttempt:
         input_tokens: int | None = None
@@ -716,7 +743,21 @@ class SemanticRouter:
             timeout_seconds=self._timeout_seconds,
             provider_call_outcome=provider_call_outcome,
             reasoning_effort=self._reasoning_effort,
+            observed_at=observed_at,
+            provider_error_category=provider_error_category,
+            provider_request_id=_provider_request_id(raw),
         )
+
+
+def _provider_request_id(raw: object) -> str | None:
+    """Read the provider's own response identifier, only when it supplies one."""
+    if not isinstance(raw, AIMessage):
+        return None
+    metadata = raw.response_metadata
+    if not isinstance(metadata, Mapping):
+        return None
+    identifier = metadata.get("id")
+    return identifier if isinstance(identifier, str) and identifier else None
 
 
 def _nonnegative_int(value: object) -> int | None:

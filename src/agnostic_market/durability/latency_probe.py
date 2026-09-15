@@ -22,7 +22,7 @@ from agnostic_market.application import (
     prepare_application_routing,
 )
 from agnostic_market.config.registry import ConfigRegistry
-from agnostic_market.dtos.events import CommittedTurn, InterruptEvent, SpokenMessageEvent, TurnFacts
+from agnostic_market.dtos.events import CommittedTurn, TurnFacts
 from agnostic_market.dtos.platform import PlatformRuntimeConfig
 from agnostic_market.dtos.session import AdmittedSessionAuthority, TransportAuthority
 from agnostic_market.durability.latency import (
@@ -31,8 +31,10 @@ from agnostic_market.durability.latency import (
     LatencyJourney,
     LatencyJourneyContract,
     LatencyJourneyCorpus,
+    LatencyJourneyPostconditionError,
     LatencyMeasurementSurface,
     bind_latency_journey_contracts,
+    require_latency_journey_postconditions,
 )
 from agnostic_market.durability.platform_runtime import (
     DurablePlatformResources,
@@ -99,10 +101,16 @@ class _TurnProbeExecution:
             raise DeploymentLatencyProbeError(
                 "journey did not produce exactly one graph-span measurement"
             )
-        _require_expected_event(self.contract, events)
-        _require_expected_cart(self.contract, self.execution.loop)
-        if _placed_order_count(self.execution.services) != before_orders:
-            raise DeploymentLatencyProbeError("latency journey committed an order")
+        try:
+            require_latency_journey_postconditions(
+                self.contract,
+                events=events,
+                actual_cart=_cart_lines(self.execution.loop),
+                placed_orders_before=before_orders,
+                placed_orders_after=_placed_order_count(self.execution.services),
+            )
+        except LatencyJourneyPostconditionError as exc:
+            raise DeploymentLatencyProbeError(str(exc)) from exc
         return self.execution.measurements[0].total_seconds
 
     async def aclose(self) -> None:
@@ -287,25 +295,22 @@ async def _prepare_journey(
     execution.measurements.clear()
 
 
-def _require_expected_cart(
-    contract: LatencyJourneyContract,
-    loop: VoiceLoop,
-) -> None:
-    _require_cart_lines(contract.expected_cart, loop, phase="measured turn")
-
-
 def _require_cart_lines(
     expected: tuple[LatencyCartLine, ...],
     loop: VoiceLoop,
     *,
     phase: str,
 ) -> None:
-    actual = tuple(
+    actual = _cart_lines(loop)
+    if actual != expected:
+        raise DeploymentLatencyProbeError(f"journey cart state is invalid after {phase}")
+
+
+def _cart_lines(loop: VoiceLoop) -> tuple[LatencyCartLine, ...]:
+    return tuple(
         LatencyCartLine(sku=line.sku, quantity=line.quantity)
         for line in loop.application.state.cart_store.snapshot()
     )
-    if actual != expected:
-        raise DeploymentLatencyProbeError(f"journey cart state is invalid after {phase}")
 
 
 def _placed_order_count(services: TenantServices) -> int:
@@ -313,29 +318,6 @@ def _placed_order_count(services: TenantServices) -> int:
     if not isinstance(count, int):
         raise DeploymentLatencyProbeError("latency probe requires the fixture order adapter")
     return count
-
-
-def _require_expected_event(contract: LatencyJourneyContract, events: list[object]) -> None:
-    if contract.expected_event_kind == "interrupt":
-        expected = [event for event in events if isinstance(event, InterruptEvent)]
-        unexpected = [event for event in events if not isinstance(event, InterruptEvent)]
-        text = expected[0].prompt if len(expected) == 1 else ""
-    else:
-        expected = [event for event in events if isinstance(event, SpokenMessageEvent)]
-        unexpected = [event for event in events if not isinstance(event, SpokenMessageEvent)]
-        text = expected[0].text if len(expected) == 1 else ""
-        if len(expected) == 1 and expected[0].node != contract.expected_event_node:
-            raise DeploymentLatencyProbeError(
-                "journey produced spoken message from "
-                f"{expected[0].node!r}; expected {contract.expected_event_node!r}"
-            )
-    if len(expected) != 1 or unexpected:
-        raise DeploymentLatencyProbeError("journey produced the wrong caller-event shape")
-    normalized = text.casefold()
-    if any(
-        fragment.casefold() not in normalized for fragment in contract.expected_event_text_contains
-    ):
-        raise DeploymentLatencyProbeError("journey output did not satisfy its frozen contract")
 
 
 async def _close_after_failure(

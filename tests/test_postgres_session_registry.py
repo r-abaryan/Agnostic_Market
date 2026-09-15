@@ -103,6 +103,12 @@ from agnostic_market.durability.session_state import (
     BoundPostgresSessionStatePersistence,
     SessionStateCoordinator,
 )
+from agnostic_market.durability.tenant_lifecycle import (
+    TenantLifecycleEntry,
+    TenantLifecycleInventory,
+    TenantLifecycleState,
+    build_tenant_drain_result,
+)
 from agnostic_market.durability.timing import (
     DurabilityOperation,
     InMemoryDurabilityTimingObserver,
@@ -1497,7 +1503,9 @@ async def test_reaper_claims_only_expired_sessions_through_the_close_coordinator
             tombstone_retention_seconds=3600.0,
         )
 
-        assert await coordinator.reap_expired("reaper_store") == 1
+        tenant_result = await coordinator.reap_expired("reaper_store")
+        assert tenant_result.sessions_closed == 1
+        assert tenant_result.failure_count == 0
         expired_record = await registry.get(
             expired.tenant_id,
             expired.authority.logical_session_id,
@@ -1521,13 +1529,74 @@ async def test_reaper_claims_only_expired_sessions_through_the_close_coordinator
             interval_seconds=60.0,
             batch_size=100,
         )
-        assert await operational_reaper.run_once() == 1
+        reap_result = await operational_reaper.run_once()
+        assert reap_result.sessions_closed == 1
+        assert reap_result.tombstones_purged == 0
+        assert reap_result.failure_count == 0
         foreign_record = await registry.get(
             foreign.tenant_id,
             foreign.authority.logical_session_id,
         )
         assert foreign_record is not None
         assert foreign_record.lifecycle is SessionLifecycle.CLOSED
+
+
+@pytest.mark.postgres
+async def test_retiring_tenant_drain_uses_rls_scoped_authoritative_row_counts() -> None:
+    dsn = _dsn()
+    async with await AsyncConnection.connect(dsn, autocommit=True) as connection:
+        await apply_platform_migrations(connection)
+    tenant_id = f"retiring_{uuid.uuid4().hex}"
+    registration = _registration(tenant_id, f"AD_retiring_{uuid.uuid4().hex}")
+    inventory = TenantLifecycleInventory(
+        schema_version=1,
+        revision=1,
+        previous_revision=None,
+        previous_fingerprint=None,
+        entries=(TenantLifecycleEntry(tenant_id=tenant_id, state=TenantLifecycleState.RETIRING),),
+    )
+    async with AsyncExitStack() as stack:
+        pool = await _open_pool(stack, dsn)
+        registry = PostgresSessionRegistry(
+            pool,
+            cipher=_cipher(),
+            operation_timeout_seconds=2.0,
+        )
+        await registry.register_and_acquire(
+            registration,
+            _lease("retiring-owner", duration_seconds=0.01),
+            payload=_empty_payload(),
+        )
+
+        occupied = await registry.tenant_durable_row_counts(tenant_id)
+        assert occupied.platform_sessions == 1
+        assert occupied.platform_checkpoint_generations == 1
+
+        await asyncio.sleep(0.02)
+        coordinator = DurableSessionLifecycleCoordinator(
+            pool,
+            registry,
+            _cipher(),
+            checkpoint_io_timeout_seconds=2.0,
+            close_lease_duration_seconds=30.0,
+            tombstone_retention_seconds=0.01,
+        )
+        result = await coordinator.reap_expired(tenant_id)
+        assert result.sessions_closed == 1
+        await asyncio.sleep(0.02)
+        result = await coordinator.reap_expired(tenant_id)
+        assert result.tombstones_purged == 1
+
+        drained = await registry.tenant_durable_row_counts(tenant_id)
+        assert (
+            build_tenant_drain_result(
+                inventory,
+                drained,
+                deployment_id="deployment-a",
+                runtime_contract_fingerprint="b" * 64,
+            ).tenant_id
+            == tenant_id
+        )
 
 
 @pytest.mark.postgres
@@ -1640,7 +1709,9 @@ async def test_lost_begin_acknowledgement_recognizes_reaper_completed_close() ->
             close_lease_duration_seconds=30.0,
             tombstone_retention_seconds=3600.0,
         )
-        assert await reaper.reap_expired(registration.tenant_id) == 1
+        tenant_result = await reaper.reap_expired(registration.tenant_id)
+        assert tenant_result.sessions_closed == 1
+        assert tenant_result.failure_count == 0
 
         await closer.begin_close()
         await closer.finalize_close()
@@ -3515,6 +3586,10 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
             routing_factory=lambda _registry: ArchitectureRoutingRecognizer(),
             durable_session=durable_session,
         )
+        startup_operations = {sample.operation for sample in timing.samples}
+        assert DurabilityOperation.REGISTRY_CHECKPOINT_GENERATIONS in startup_operations
+        assert DurabilityOperation.CHECKPOINT_READ in startup_operations
+        assert DurabilityOperation.REGISTRY_GET not in startup_operations
         snapshot = await application.assembly.graph.aget_state(application.engine._config)
         restored = await resources.registry.restore(durable_session.authority)
 
@@ -3701,6 +3776,7 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
             DurabilityOperation.REGISTRY_REGISTER,
             DurabilityOperation.REGISTRY_RESTORE,
             DurabilityOperation.REGISTRY_RECONCILE,
+            DurabilityOperation.REGISTRY_CHECKPOINT_GENERATIONS,
             DurabilityOperation.REGISTRY_PUBLISH,
             DurabilityOperation.CHECKPOINT_READ,
             DurabilityOperation.CHECKPOINT_WRITE,

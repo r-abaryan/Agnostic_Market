@@ -22,6 +22,8 @@ from agnostic_market.agents.routing_activation import (
     ConfiguredSemanticRouterFactory,
     QualifiedSemanticRouterFactory,
     RoutingActivationError,
+    semantic_routing_runtime_contract,
+    semantic_routing_runtime_contract_fingerprint,
 )
 from agnostic_market.dtos.config import ProviderModel
 from agnostic_market.llm.gateway import load_provider_credentials
@@ -37,7 +39,7 @@ def _report(
     return {
         "schema_version": SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
         "run_at": (run_at or datetime.now(tz=UTC)).isoformat(),
-        "corpus_fingerprint": "reviewed-corpus",
+        "corpus_fingerprint": "a" * 64,
         "gate": {"mode": gate, "passed": passed, "failures": []},
         "projection": {"exact": True},
         "models": {
@@ -67,12 +69,38 @@ def _factory(config_root: Path, report_path: Path) -> QualifiedSemanticRouterFac
         timeout_seconds=2.0,
         input_max_chars=2048,
         max_report_age_days=30,
-        expected_corpus_fingerprint="reviewed-corpus",
+        expected_corpus_fingerprint="a" * 64,
     )
 
 
 def _write_report(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_runtime_contract_fingerprint_binds_every_semantic_router_input() -> None:
+    contract = semantic_routing_runtime_contract(
+        CapabilityRegistry(()),
+        selection=ProviderModel(
+            provider="fake",
+            model="qualified-router",
+            reasoning_effort=None,
+        ),
+        structured_output_method="function_calling",
+        timeout_seconds=2.0,
+        input_max_chars=2048,
+        corpus_fingerprint="a" * 64,
+    )
+    baseline = semantic_routing_runtime_contract_fingerprint(contract)
+
+    for field, value in {
+        "model": "changed-router",
+        "prompt_fingerprint": "changed-prompt",
+        "registry_fingerprint": "changed-registry",
+        "timeout_seconds": 3.0,
+        "corpus_fingerprint": "b" * 64,
+    }.items():
+        changed = contract.model_copy(update={field: value})
+        assert semantic_routing_runtime_contract_fingerprint(changed) != baseline
 
 
 def test_diagnostic_report_cannot_activate_routing(config_root: Path, tmp_path: Path) -> None:
@@ -168,7 +196,7 @@ def test_stale_corpus_cannot_activate_routing(config_root: Path, tmp_path: Path)
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
     payload = _report(registry)
-    payload["corpus_fingerprint"] = "stale-corpus"
+    payload["corpus_fingerprint"] = "b" * 64
     _write_report(path, payload)
 
     with pytest.raises(RoutingActivationError, match="corpus_fingerprint"):

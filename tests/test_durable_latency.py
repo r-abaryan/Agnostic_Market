@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from agnostic_market.agents.routing_activation import SemanticRoutingRuntimeContract
 from agnostic_market.durability.latency import (
     DurableLatencyActivationError,
     DurableLatencyCertificationRun,
@@ -28,6 +29,10 @@ from agnostic_market.durability.latency import (
     LatencyPhase,
     LatencyTier,
     ThermalState,
+    VoiceApplicationContract,
+    VoiceAudioTreatment,
+    VoiceLatencyMetrics,
+    VoiceTransportSurface,
     bind_latency_journey_contracts,
     build_latency_report,
     latency_journey_contract_fingerprint,
@@ -128,6 +133,98 @@ def _methodology() -> DurableLatencyMethodology:
                 tier=LatencyTier.CHECKOUT,
             ),
         ),
+    )
+
+
+def _application_contract() -> VoiceApplicationContract:
+    return VoiceApplicationContract(
+        durable_platform_fingerprint="a" * 64,
+        build_artifact_digest=f"sha256:{'b' * 64}",
+        tenant_config_version="c" * 64,
+        semantic_routing=SemanticRoutingRuntimeContract(
+            provider="fake",
+            model="router",
+            reasoning_effort=None,
+            structured_output_method="function_calling",
+            route_schema_fingerprint="route-schema",
+            prompt_fingerprint="prompt",
+            registry_fingerprint="registry",
+            projector_version="projector",
+            input_max_chars=4_000,
+            timeout_seconds=2.0,
+            corpus_fingerprint="d" * 64,
+        ),
+        certification_target_fingerprint="e" * 64,
+    )
+
+
+def _voice_methodology() -> DurableLatencyMethodology:
+    methodology = _methodology()
+    setup_treatments = {
+        "checkout-placement-readback": (
+            VoiceAudioTreatment(
+                asset_path="assets/audio/latency/checkout-setup-add.wav",
+                asset_sha256="a" * 64,
+                container="wav",
+                pcm_format="s16le",
+                channel_count=1,
+                sample_rate_hz=16_000,
+                playback_rate=1.0,
+                pre_speech_silence_seconds=0.25,
+                post_speech_silence_seconds=0.5,
+            ),
+            VoiceAudioTreatment(
+                asset_path="assets/audio/latency/checkout-setup-confirm.wav",
+                asset_sha256="b" * 64,
+                container="wav",
+                pcm_format="s16le",
+                channel_count=1,
+                sample_rate_hz=16_000,
+                playback_rate=1.0,
+                pre_speech_silence_seconds=0.25,
+                post_speech_silence_seconds=0.5,
+            ),
+        )
+    }
+    return DurableLatencyMethodology.model_validate(
+        methodology.model_dump()
+        | {
+            "schema_version": "5",
+            "environment": LatencyEnvironment.DEPLOYMENT,
+            "application_contract": _application_contract(),
+            "measurement_surface": LatencyMeasurementSurface.VOICE_PROCESSING,
+            "transport_surface": VoiceTransportSurface.STANDARD,
+            "result_rpc_timeout_seconds": 3.0,
+            "result_rpc_retries": 1,
+            "result_rpc_retry_backoff_seconds": 0.01,
+            "job_ready_timeout_seconds": 1.0,
+            "dispatch_cleanup_timeout_seconds": 1.0,
+            "required_startup_operations": (
+                DurabilityOperation.REGISTRY_CHECKPOINT_GENERATIONS,
+                DurabilityOperation.CHECKPOINT_READ,
+            ),
+            "journeys": tuple(
+                journey.model_dump()
+                | {
+                    "setup_audio_treatments": setup_treatments.get(
+                        journey.journey_id,
+                        (),
+                    ),
+                    "audio_treatment": VoiceAudioTreatment(
+                        asset_path=f"assets/audio/latency/{journey.journey_id}.wav",
+                        asset_sha256=str(index) * 64,
+                        container="wav",
+                        pcm_format="s16le",
+                        channel_count=1,
+                        sample_rate_hz=16_000,
+                        playback_rate=1.0,
+                        pre_speech_silence_seconds=0.25,
+                        post_speech_silence_seconds=0.5,
+                    ),
+                }
+                for index, journey in enumerate(methodology.journeys, start=1)
+            ),
+        }
     )
 
 
@@ -322,6 +419,187 @@ def _observations(
         for index in range(methodology.samples_per_journey)
     )
     return startup + turns
+
+
+def _voice_observations(
+    methodology: DurableLatencyMethodology,
+) -> tuple[LatencyObservation, ...]:
+    checkpoint_read = DurabilityTimingSample(
+        operation=DurabilityOperation.CHECKPOINT_READ,
+        elapsed_seconds=0.01,
+        outcome=DurabilityTimingOutcome.SUCCESS,
+    )
+    generation_lookup = DurabilityTimingSample(
+        operation=DurabilityOperation.REGISTRY_CHECKPOINT_GENERATIONS,
+        elapsed_seconds=0.01,
+        outcome=DurabilityTimingOutcome.SUCCESS,
+    )
+    startup = tuple(
+        LatencyObservation.from_timing(
+            schema_version="3",
+            sample_id=f"sample-startup-{index + 1:04d}",
+            phase=LatencyPhase.STARTUP,
+            thermal_state=ThermalState.COLD,
+            elapsed_seconds=0.5,
+            component_samples=(generation_lookup, checkpoint_read),
+        )
+        for index in range(methodology.startup_samples)
+    )
+    turns = tuple(
+        LatencyObservation.from_timing(
+            schema_version="3",
+            sample_id=f"sample-turn-{journey.journey_id}-{index + 1:04d}",
+            phase=LatencyPhase.TURN,
+            thermal_state=ThermalState.WARM,
+            journey_id=journey.journey_id,
+            tier=journey.tier,
+            elapsed_seconds=0.5,
+            voice_metrics=VoiceLatencyMetrics(
+                end_to_end_seconds=0.75,
+                endpointing_seconds=0.25,
+                processing_seconds=0.5,
+            ),
+            component_samples=(checkpoint_read,),
+        )
+        for journey in methodology.journeys
+        for index in range(methodology.samples_per_journey)
+    )
+    return startup + turns
+
+
+def test_latency_schema_five_binds_voice_transport_audio_and_application() -> None:
+    voice = _voice_methodology()
+
+    assert voice.schema_version == "5"
+    assert voice.transport_surface is VoiceTransportSurface.STANDARD
+    assert all(journey.audio_treatment is not None for journey in voice.journeys)
+    assert len(voice.journeys[2].setup_audio_treatments) == 2
+    assert methodology_fingerprint(voice) != methodology_fingerprint(_methodology())
+
+    missing_transport = voice.model_dump()
+    missing_transport["transport_surface"] = None
+    with pytest.raises(ValidationError, match="transport surface"):
+        DurableLatencyMethodology.model_validate(missing_transport)
+
+    missing_audio = voice.model_dump()
+    missing_audio["journeys"][0]["audio_treatment"] = None
+    with pytest.raises(ValidationError, match="audio treatment"):
+        DurableLatencyMethodology.model_validate(missing_audio)
+
+    duplicate_audio = voice.model_dump()
+    duplicate_audio["journeys"][1]["audio_treatment"] = duplicate_audio["journeys"][0][
+        "audio_treatment"
+    ]
+    with pytest.raises(ValidationError, match="audio assets must be unique"):
+        DurableLatencyMethodology.model_validate(duplicate_audio)
+
+    missing_setup_audio = voice.model_copy(
+        update={
+            "journeys": (
+                *voice.journeys[:2],
+                voice.journeys[2].model_copy(update={"setup_audio_treatments": ()}),
+            )
+        }
+    )
+    with pytest.raises(DurableLatencyActivationError, match="setup audio count"):
+        bind_latency_journey_contracts(missing_setup_audio, _corpus())
+
+    assert bind_latency_journey_contracts(voice, _corpus()).keys() == {
+        journey.journey_id for journey in voice.journeys
+    }
+
+    legacy_voice = _methodology().model_dump()
+    legacy_voice["measurement_surface"] = LatencyMeasurementSurface.VOICE_PROCESSING
+    with pytest.raises(ValidationError, match="schema-3"):
+        DurableLatencyMethodology.model_validate(legacy_voice)
+
+
+def test_voice_report_requires_schema_three_observations_and_raw_correlated_metrics() -> None:
+    methodology = _voice_methodology()
+    observations = _voice_observations(methodology)
+
+    report = build_latency_report(
+        methodology,
+        observations,
+        run_at=datetime(2026, 9, 12, tzinfo=UTC),
+        deployment_id="deployment-a",
+    )
+
+    assert report.schema_version == "3"
+    assert report.gate.passed
+    first_turn = next(item for item in report.observations if item.phase is LatencyPhase.TURN)
+    assert first_turn.voice_metrics is not None
+    assert first_turn.voice_metrics.processing_seconds == first_turn.elapsed_seconds
+
+    wrong_schema = (observations[0].model_copy(update={"schema_version": "1"}), *observations[1:])
+    with pytest.raises(ValueError, match="observation schema"):
+        build_latency_report(
+            methodology,
+            wrong_schema,
+            run_at=datetime(2026, 9, 12, tzinfo=UTC),
+            deployment_id="deployment-a",
+        )
+
+    with pytest.raises(ValidationError, match="correlated voice metrics"):
+        LatencyObservation.model_validate(first_turn.model_dump() | {"voice_metrics": None})
+
+
+def test_voice_activation_requires_the_admitted_transport_surface(tmp_path: Path) -> None:
+    methodology = _voice_methodology()
+    run_at = datetime(2026, 9, 12, tzinfo=UTC)
+    report = build_latency_report(
+        methodology,
+        _voice_observations(methodology),
+        run_at=run_at,
+        deployment_id="deployment-a",
+    )
+    run = DurableLatencyCertificationRun(
+        schema_version="3",
+        run_at=run_at,
+        deployment_id="deployment-a",
+        methodology_fingerprint=methodology_fingerprint(methodology),
+        methodology=methodology,
+        outcome=LatencyCertificationOutcome.COMPLETED,
+        report=report,
+    )
+    methodology_path = tmp_path / "voice-methodology.json"
+    report_path = tmp_path / "voice-report.json"
+    methodology_path.write_text(methodology.model_dump_json(), encoding="utf-8")
+    report_path.write_text(run.model_dump_json(), encoding="utf-8")
+
+    accepted = require_deployment_latency_evidence(
+        methodology_path,
+        report_path,
+        expected_deployment_id="deployment-a",
+        expected_journey_corpus=_corpus(),
+        expected_runtime_contract_fingerprint="a" * 64,
+        expected_application_contract=_application_contract(),
+        required_measurement_surface=LatencyMeasurementSurface.VOICE_PROCESSING,
+        required_transport_surface=VoiceTransportSurface.STANDARD,
+    )
+
+    assert accepted == report
+    with pytest.raises(DurableLatencyActivationError, match="expected application contract"):
+        require_deployment_latency_evidence(
+            methodology_path,
+            report_path,
+            expected_deployment_id="deployment-a",
+            expected_journey_corpus=_corpus(),
+            expected_runtime_contract_fingerprint="a" * 64,
+            required_measurement_surface=LatencyMeasurementSurface.VOICE_PROCESSING,
+            required_transport_surface=VoiceTransportSurface.STANDARD,
+        )
+    with pytest.raises(DurableLatencyActivationError, match="transport surface"):
+        require_deployment_latency_evidence(
+            methodology_path,
+            report_path,
+            expected_deployment_id="deployment-a",
+            expected_journey_corpus=_corpus(),
+            expected_runtime_contract_fingerprint="a" * 64,
+            expected_application_contract=_application_contract(),
+            required_measurement_surface=LatencyMeasurementSurface.VOICE_PROCESSING,
+            required_transport_surface=VoiceTransportSurface.SIP,
+        )
 
 
 def test_latency_report_requires_exact_frozen_coverage_and_passes_within_limits() -> None:
@@ -1028,3 +1306,48 @@ def test_abort_evidence_records_a_private_exception_class_name() -> None:
 
     assert abort.error_type == "_InternalProviderError"
     assert abort.cleanup_error_type == "_InternalCleanupError"
+
+
+def test_voice_abort_can_identify_controller_startup_without_a_journey() -> None:
+    abort = LatencyCertificationAbort(
+        stage=LatencyAbortStage.VOICE_PREPARE,
+        sample_id="voice-controller",
+        journey_id=None,
+        error_type="ConnectionError",
+    )
+
+    assert abort.journey_id is None
+
+
+def test_warmup_abort_still_requires_its_journey_identity() -> None:
+    with pytest.raises(ValidationError, match="warmup abort requires a journey"):
+        LatencyCertificationAbort(
+            stage=LatencyAbortStage.WARMUP_PREPARE,
+            sample_id="warmup-turn-simple-cart-read-0001",
+            journey_id=None,
+            error_type="ConnectionError",
+        )
+
+
+def test_controller_cleanup_abort_is_run_scoped_and_cannot_claim_a_sample() -> None:
+    abort = LatencyCertificationAbort(
+        stage=LatencyAbortStage.VOICE_CONTROLLER_CLEANUP,
+        error_type="RuntimeError",
+    )
+    assert abort.sample_id is None
+    assert abort.journey_id is None
+
+    with pytest.raises(ValidationError, match="cannot claim a sample"):
+        LatencyCertificationAbort(
+            stage=LatencyAbortStage.VOICE_CONTROLLER_CLEANUP,
+            sample_id="sample-startup-0001",
+            error_type="RuntimeError",
+        )
+
+
+def test_sample_scoped_voice_abort_requires_a_sample_identity() -> None:
+    with pytest.raises(ValidationError, match="requires a sample"):
+        LatencyCertificationAbort(
+            stage=LatencyAbortStage.VOICE_CLEANUP,
+            error_type="RuntimeError",
+        )

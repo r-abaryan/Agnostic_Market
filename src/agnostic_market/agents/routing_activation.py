@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION: SemanticRoutingQualificationSchem
 RoutingRecognizerFactory = Callable[[CapabilityRegistry], RoutingRecognizer]
 
 _STRICT = ConfigDict(extra="ignore", frozen=True)
+_CONTRACT_STRICT = ConfigDict(extra="forbid", frozen=True, strict=True)
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 
 class RoutingActivationError(RuntimeError):
@@ -66,6 +69,72 @@ class _QualifiedRecognizer(BaseModel):
     projector_version: str = Field(min_length=1)
 
 
+class SemanticRoutingRuntimeContract(BaseModel):
+    """Exact non-secret semantic recognizer identity used by a running worker."""
+
+    model_config = _CONTRACT_STRICT
+
+    schema_version: Literal[1] = 1
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    reasoning_effort: ReasoningEffort | None
+    structured_output_method: StructuredOutputMethod
+    route_schema_fingerprint: str = Field(min_length=1)
+    prompt_fingerprint: str = Field(min_length=1)
+    registry_fingerprint: str = Field(min_length=1)
+    projector_version: str = Field(min_length=1)
+    input_max_chars: int = Field(gt=0)
+    timeout_seconds: float = Field(gt=0)
+    corpus_fingerprint: str = Field(pattern=_SHA256_PATTERN)
+
+
+def semantic_routing_runtime_contract(
+    registry: CapabilityRegistry,
+    *,
+    selection: ProviderModel,
+    structured_output_method: StructuredOutputMethod,
+    timeout_seconds: float,
+    input_max_chars: int,
+    corpus_fingerprint: str,
+) -> SemanticRoutingRuntimeContract:
+    """Derive the recognizer contract from the same inputs used at activation."""
+    return SemanticRoutingRuntimeContract(
+        provider=selection.provider,
+        model=selection.model,
+        reasoning_effort=selection.reasoning_effort,
+        structured_output_method=structured_output_method,
+        route_schema_fingerprint=ROUTE_SCHEMA_FINGERPRINT,
+        prompt_fingerprint=ROUTER_PROMPT_FINGERPRINT,
+        registry_fingerprint=registry_fingerprint(registry),
+        projector_version=CONTEXT_PROJECTOR_VERSION,
+        input_max_chars=input_max_chars,
+        timeout_seconds=timeout_seconds,
+        corpus_fingerprint=corpus_fingerprint,
+    )
+
+
+def semantic_routing_runtime_contract_fingerprint(
+    contract: SemanticRoutingRuntimeContract,
+) -> str:
+    canonical = json.dumps(
+        contract.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def semantic_routing_corpus_fingerprint(config_root: Path) -> str:
+    """Load the repository-owned frozen corpus identity used by activation."""
+    routing_contract = load_yaml_layer(
+        config_root / "eval" / "frontline_semantic_route_structural.yaml"
+    )
+    fingerprint = routing_contract.get("frozen_corpus_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise RoutingActivationError("semantic routing corpus contract has no frozen fingerprint")
+    return fingerprint
+
+
 class _QualificationModels(BaseModel):
     model_config = _STRICT
 
@@ -77,7 +146,7 @@ class SemanticRoutingQualification(BaseModel):
 
     schema_version: SemanticRoutingQualificationSchemaVersion
     run_at: datetime
-    corpus_fingerprint: str = Field(min_length=1)
+    corpus_fingerprint: str = Field(pattern=_SHA256_PATTERN)
     gate: _QualificationGate
     projection: _QualificationProjection
     models: _QualificationModels
@@ -154,17 +223,16 @@ class QualifiedSemanticRouterFactory:
             failures.append("qualification timestamp has no timezone")
         elif run_at > now or now - run_at > timedelta(days=self.max_report_age_days):
             failures.append("qualification is not current")
+        runtime_contract = semantic_routing_runtime_contract(
+            registry,
+            selection=self.selection,
+            structured_output_method=self.structured_output_method,
+            timeout_seconds=self.timeout_seconds,
+            input_max_chars=self.input_max_chars,
+            corpus_fingerprint=self.expected_corpus_fingerprint,
+        )
         expected = {
-            "provider": self.selection.provider,
-            "model": self.selection.model,
-            "reasoning_effort": self.selection.reasoning_effort,
-            "structured_output_method": self.structured_output_method,
-            "route_schema_fingerprint": ROUTE_SCHEMA_FINGERPRINT,
-            "prompt_fingerprint": ROUTER_PROMPT_FINGERPRINT,
-            "registry_fingerprint": registry_fingerprint(registry),
-            "input_max_chars": self.input_max_chars,
-            "timeout_seconds": self.timeout_seconds,
-            "projector_version": CONTEXT_PROJECTOR_VERSION,
+            field: getattr(runtime_contract, field) for field in _QualifiedRecognizer.model_fields
         }
         actual = candidate.model_dump()
         mismatches = [
@@ -200,12 +268,7 @@ def build_qualified_semantic_router_factory(
     max_report_age_days: int,
 ) -> QualifiedSemanticRouterFactory:
     """Bind the recognizer to the repository's frozen routing-evaluation corpus."""
-    routing_contract = load_yaml_layer(
-        config_root / "eval" / "frontline_semantic_route_structural.yaml"
-    )
-    expected_corpus_fingerprint = routing_contract.get("frozen_corpus_fingerprint")
-    if not isinstance(expected_corpus_fingerprint, str) or not expected_corpus_fingerprint.strip():
-        raise RoutingActivationError("semantic routing corpus contract has no frozen fingerprint")
+    expected_corpus_fingerprint = semantic_routing_corpus_fingerprint(config_root)
     return QualifiedSemanticRouterFactory(
         qualification_path=config_root / "telemetry" / "semantic_routing_report.json",
         selection=selection,

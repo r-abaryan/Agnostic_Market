@@ -352,6 +352,21 @@ def test_route_resolver_preserves_executable_decisions() -> None:
 
 
 @pytest.mark.parametrize(
+    "target",
+    (FocusedOrderSet(), RecentOrderSet()),
+)
+def test_route_resolver_normalizes_recent_order_selector_without_recent_context(
+    target: FocusedOrderSet | RecentOrderSet,
+) -> None:
+    context = _context(CapabilityId.VERIFY_ORDER_STATUS)
+
+    assert resolve_route(
+        context,
+        RouteDecision.direct(VerifyOrderStatus(target=target)),
+    ) == RouteDecision.direct(VerifyOrderStatus())
+
+
+@pytest.mark.parametrize(
     "decision",
     (
         RouteDecision.direct(ViewCart()),
@@ -395,7 +410,9 @@ async def test_confirmation_escape_projects_its_scope_for_the_one_recognizer() -
 
 
 def test_route_materializer_covers_every_capability_from_one_coarse_contract() -> None:
-    context = _context(*CapabilityId)
+    context = _context(*CapabilityId).model_copy(
+        update={"recent_order_operation": "read", "recent_order_count": 2}
+    )
     cases = (
         (
             RouteProposal(
@@ -560,9 +577,19 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "84f013b151c9f2e0d080d7977f48f02fee0d0ef8c9bb2f3bd0c6e9862483d3de"
+        "c699c3490ac9776f98e23ef55f012043c5b8fd37983a9fcad5f1313f8fdadcf1"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
+
+
+def test_router_prompt_distinguishes_reported_speech_and_context_gaps() -> None:
+    prompt = " ".join(ROUTER_SYSTEM_PROMPT.split())
+
+    assert "A quoted command is not the caller's request" in prompt
+    assert "A declarative report with no requested action" in prompt
+    assert "ambiguous among capability owners" in prompt
+    assert "requires unavailable live account membership" in prompt
+    assert "no recent order context" in prompt
 
 
 async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt() -> None:
@@ -606,7 +633,15 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
         "provider_call_outcome",
         "projector_version",
         "reasoning_effort",
+        "observed_at",
+        "provider_error_category",
+        "provider_request_id",
+        "provider_retry_count",
     }
+    assert attempt.observed_at is not None
+    assert attempt.observed_at.tzinfo is not None
+    assert attempt.provider_error_category is None
+    assert attempt.provider_retry_count is None
 
 
 async def test_semantic_router_extracts_standardized_usage_only() -> None:
@@ -647,6 +682,7 @@ async def test_semantic_router_classifies_invalid_and_unavailable_without_fallba
     assert invalid.provider_call_outcome == "completed"
     assert unavailable.resolution == RoutingFailure(reason="routing_unavailable")
     assert unavailable.provider_call_outcome == "provider_error"
+    assert unavailable.provider_error_category == "ConnectionError"
     assert unavailable_model.invoke_count == 1
 
 
@@ -710,6 +746,7 @@ async def test_semantic_router_timeout_is_closed_but_external_cancellation_propa
     )
     assert provider_timed_out.resolution == RoutingFailure(reason="routing_unavailable")
     assert provider_timed_out.provider_call_outcome == "provider_error"
+    assert provider_timed_out.provider_error_category == "TimeoutError"
 
     timed_out = await _router(BlockingModel(), registry, timeout_seconds=0.01).route(
         _context(CapabilityId.CANCEL_ORDERS)
@@ -717,6 +754,7 @@ async def test_semantic_router_timeout_is_closed_but_external_cancellation_propa
     assert timed_out.resolution == RoutingFailure(reason="routing_unavailable")
     assert timed_out.timeout_seconds == 0.01
     assert timed_out.provider_call_outcome == "deadline_exceeded"
+    assert timed_out.provider_error_category == "TimeoutError"
 
     started.clear()
     task = asyncio.create_task(

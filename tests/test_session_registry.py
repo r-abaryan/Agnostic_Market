@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -17,6 +19,10 @@ from agnostic_market.durability.migrations import (
 from agnostic_market.durability.session_lifecycle import (
     DurableSessionLifecycleCoordinator,
     OperationalSessionReaper,
+    ReaperCycleFailure,
+    ReaperCycleResult,
+    TenantReapFailure,
+    TenantReapResult,
 )
 from agnostic_market.durability.session_payload import (
     SESSION_PAYLOAD_SCHEMA_VERSION,
@@ -69,7 +75,7 @@ class _ReaperRegistry:
         assert tenant_id == "acme_store"
         assert limit == 100
         self.purge_calls += 1
-        return 0
+        return 3
 
 
 class _ScheduledReaperCoordinator:
@@ -77,11 +83,16 @@ class _ScheduledReaperCoordinator:
         self.failing_tenants = failing_tenants
         self.calls: list[tuple[str, int]] = []
 
-    async def reap_expired(self, tenant_id: str, *, limit: int = 100) -> int:
+    async def reap_expired(self, tenant_id: str, *, limit: int = 100) -> TenantReapResult:
         self.calls.append((tenant_id, limit))
         if tenant_id in self.failing_tenants:
             raise RuntimeError(f"failed {tenant_id}")
-        return 2
+        return TenantReapResult(
+            tenant_id=tenant_id,
+            sessions_closed=2,
+            tombstones_purged=0,
+            failure_count=0,
+        )
 
 
 def _authority() -> AdmittedSessionAuthority:
@@ -148,6 +159,10 @@ async def test_reaper_isolates_candidate_failures_and_still_purges_tombstones(
     assert failed.value.exceptions[0].__notes__ == [
         "failed reaper candidate acme_store/AD_poisoned"
     ]
+    assert failed.value.result.tenant_id == "acme_store"
+    assert failed.value.result.sessions_closed == 1
+    assert failed.value.result.tombstones_purged == 3
+    assert failed.value.result.failure_count == 1
 
 
 async def test_reaper_treats_a_concurrent_close_claim_as_a_benign_race(
@@ -175,7 +190,11 @@ async def test_reaper_treats_a_concurrent_close_claim_as_a_benign_race(
     monkeypatch.setattr(registry, "claim_expired", claim_expired)
     monkeypatch.setattr(coordinator, "finalize", finalize)
 
-    assert await coordinator.reap_expired("acme_store") == 1
+    result = await coordinator.reap_expired("acme_store")
+
+    assert result.sessions_closed == 1
+    assert result.tombstones_purged == 3
+    assert result.failure_count == 0
     assert finalized == ["AD_healthy"]
     assert registry.purge_calls == 1
 
@@ -201,9 +220,48 @@ async def test_reaper_treats_ownership_loss_during_finalization_as_a_benign_race
 
     monkeypatch.setattr(coordinator, "finalize", finalize)
 
-    assert await coordinator.reap_expired("acme_store") == 1
+    result = await coordinator.reap_expired("acme_store")
+
+    assert result.sessions_closed == 1
+    assert result.tombstones_purged == 3
+    assert result.failure_count == 0
     assert finalized == ["AD_poisoned", "AD_healthy"]
     assert registry.purge_calls == 1
+
+
+async def test_reaper_retains_committed_closes_when_tombstone_purge_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _ReaperRegistry()
+    coordinator = DurableSessionLifecycleCoordinator(
+        None,  # type: ignore[arg-type]
+        registry,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        checkpoint_io_timeout_seconds=1.0,
+        close_lease_duration_seconds=1.0,
+        tombstone_retention_seconds=1.0,
+    )
+
+    async def finalize(_candidate: ExpiredSessionCandidate) -> None:
+        pass
+
+    async def fail_purge(_tenant_id: str, *, limit: int) -> int:
+        assert limit == 100
+        raise RuntimeError("purge unavailable")
+
+    monkeypatch.setattr(coordinator, "finalize", finalize)
+    monkeypatch.setattr(registry, "purge_closed_tombstones", fail_purge)
+
+    with pytest.raises(TenantReapFailure, match="cleanup operations failed") as failed:
+        await coordinator.reap_expired("acme_store")
+
+    assert failed.value.result.sessions_closed == 2
+    assert failed.value.result.tombstones_purged == 0
+    assert failed.value.result.failure_count == 1
+    assert len(failed.value.exceptions) == 1
+    assert failed.value.exceptions[0].__notes__ == [
+        "failed closed-session tombstone purge for tenant acme_store"
+    ]
 
 
 async def test_operational_reaper_sweeps_every_tenant_with_the_configured_batch() -> None:
@@ -215,7 +273,12 @@ async def test_operational_reaper_sweeps_every_tenant_with_the_configured_batch(
         batch_size=25,
     )
 
-    assert await reaper.run_once() == 4
+    result = await reaper.run_once()
+
+    assert result.sessions_closed == 4
+    assert result.tombstones_purged == 0
+    assert result.tenants_attempted == 2
+    assert result.failure_count == 0
     assert coordinator.calls == [("acme_store", 25), ("demo_shop", 25)]
 
 
@@ -228,18 +291,140 @@ async def test_operational_reaper_isolates_tenant_failures() -> None:
         batch_size=25,
     )
 
-    with pytest.raises(ExceptionGroup, match="tenant cleanup operations failed") as failed:
+    with pytest.raises(ReaperCycleFailure, match="tenant cleanup operations failed") as failed:
         await reaper.run_once()
 
     assert coordinator.calls == [("acme_store", 25), ("demo_shop", 25)]
     assert len(failed.value.exceptions) == 1
     assert failed.value.exceptions[0].__notes__ == ["failed reaper tenant acme_store"]
+    assert failed.value.result.sessions_closed == 2
+    assert failed.value.result.tenants_attempted == 2
+    assert failed.value.result.failed_tenant_ids == ("acme_store",)
+    assert failed.value.result.failure_count == 1
+
+
+async def test_operational_reaper_rejects_a_failure_result_for_another_tenant() -> None:
+    class MismatchedCoordinator:
+        async def reap_expired(
+            self,
+            _tenant_id: str,
+            *,
+            limit: int = 100,
+        ) -> TenantReapResult:
+            assert limit == 25
+            result = TenantReapResult(
+                tenant_id="other_store",
+                sessions_closed=9,
+                tombstones_purged=8,
+                failure_count=1,
+            )
+            raise TenantReapFailure("wrong tenant", (RuntimeError("failed"),), result)
+
+    reaper = OperationalSessionReaper(
+        MismatchedCoordinator(),
+        tenant_ids=("acme_store",),
+        interval_seconds=30.0,
+        batch_size=25,
+    )
+
+    with pytest.raises(ReaperCycleFailure) as failed:
+        await reaper.run_once()
+
+    assert failed.value.result.failed_tenant_ids == ("acme_store",)
+    assert failed.value.result.sessions_closed == 0
+    assert isinstance(failed.value.exceptions[0], ExceptionGroup)
+
+
+def test_tenant_reap_failure_can_be_split_without_corrupting_its_result() -> None:
+    result = TenantReapResult(
+        tenant_id="acme_store",
+        sessions_closed=1,
+        tombstones_purged=2,
+        failure_count=2,
+    )
+    failure = TenantReapFailure(
+        "tenant cleanup failed",
+        (ValueError("invalid row"), RuntimeError("database unavailable")),
+        result,
+    )
+
+    value_errors, remainder = failure.split(ValueError)
+
+    assert type(value_errors) is ExceptionGroup
+    assert type(remainder) is ExceptionGroup
+    assert isinstance(value_errors.exceptions[0], ValueError)
+    assert isinstance(remainder.exceptions[0], RuntimeError)
+    assert failure.result is result
+
+
+def test_reaper_cycle_failure_can_be_split_without_corrupting_its_result() -> None:
+    result = ReaperCycleResult(
+        tenants=(
+            TenantReapResult("acme_store", 1, 0, 1),
+            TenantReapResult("demo_shop", 2, 0, 1),
+        )
+    )
+    failure = ReaperCycleFailure(
+        "reaper cycle failed",
+        (ValueError("invalid tenant"), RuntimeError("database unavailable")),
+        result,
+    )
+
+    value_errors, remainder = failure.split(ValueError)
+
+    assert type(value_errors) is ExceptionGroup
+    assert type(remainder) is ExceptionGroup
+    assert isinstance(value_errors.exceptions[0], ValueError)
+    assert isinstance(remainder.exceptions[0], RuntimeError)
+    assert failure.result is result
+
+
+async def test_continuous_reaper_reports_a_failed_cycle_and_runs_the_next_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stop = asyncio.Event()
+
+    class Coordinator:
+        calls = 0
+
+        async def reap_expired(
+            self,
+            tenant_id: str,
+            *,
+            limit: int = 100,
+        ) -> TenantReapResult:
+            assert tenant_id == "acme_store"
+            assert limit == 25
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("database unavailable")
+            stop.set()
+            return TenantReapResult(
+                tenant_id=tenant_id,
+                sessions_closed=1,
+                tombstones_purged=2,
+                failure_count=0,
+            )
+
+    coordinator = Coordinator()
+    reaper = OperationalSessionReaper(
+        coordinator,
+        tenant_ids=("acme_store",),
+        interval_seconds=0.001,
+        batch_size=25,
+    )
+    caplog.set_level(logging.INFO, logger="agnostic_market.durability.session_lifecycle")
+
+    await reaper.serve(stop)
+
+    assert coordinator.calls == 2
+    assert "cycle failed after closing 0 sessions and purging 0 tombstones" in caplog.text
+    assert "closed 1 sessions and purged 2 tombstones" in caplog.text
 
 
 @pytest.mark.parametrize(
     ("tenant_ids", "interval_seconds", "batch_size"),
     (
-        ((), 30.0, 25),
         (("acme_store", "acme_store"), 30.0, 25),
         (("acme store",), 30.0, 25),
         (("acme_store",), 0.0, 25),
@@ -258,6 +443,22 @@ def test_operational_reaper_rejects_ambiguous_or_unbounded_schedules(
             interval_seconds=interval_seconds,
             batch_size=batch_size,
         )
+
+
+async def test_operational_reaper_accepts_an_empty_drained_deployment() -> None:
+    coordinator = _ScheduledReaperCoordinator()
+    reaper = OperationalSessionReaper(
+        coordinator,
+        tenant_ids=(),
+        interval_seconds=30.0,
+        batch_size=25,
+    )
+
+    result = await reaper.run_once()
+
+    assert result.tenants == ()
+    assert result.sessions_closed == 0
+    assert coordinator.calls == []
 
 
 async def test_in_memory_checkpoint_authority_models_one_registry_owned_rotation() -> None:

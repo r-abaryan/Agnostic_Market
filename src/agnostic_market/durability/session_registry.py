@@ -41,6 +41,7 @@ from agnostic_market.durability.session_payload import (
     SessionOperationReceiptPayload,
     SessionOperationResult,
 )
+from agnostic_market.durability.tenant_lifecycle import TenantDurableRowCounts
 from agnostic_market.durability.timing import (
     DurabilityOperation,
     DurabilityTimingObserver,
@@ -1858,7 +1859,58 @@ class PostgresSessionRegistry(SessionRegistryPort):
         except PsycopgError as exc:
             raise SessionRegistryError("closed session tombstone purge failed") from exc
 
-    @observe_async_operation(DurabilityOperation.REGISTRY_GET)
+    @observe_async_operation(DurabilityOperation.REGISTRY_TENANT_DRAIN_OBSERVE)
+    async def tenant_durable_row_counts(self, tenant_id: str) -> TenantDurableRowCounts:
+        """Observe retirement state through the same tenant RLS boundary as normal cleanup."""
+        tenant_id = _AUTHORITY_IDENTIFIER.validate_python(tenant_id)
+        row = None
+        try:
+            async with asyncio.timeout(self._operation_timeout_seconds):
+                async with self._pool.connection() as connection, connection.transaction():
+                    await connection.execute(
+                        "SELECT set_config('agnostic_market.tenant_id', %s, true)",
+                        (tenant_id,),
+                    )
+                    cursor = await connection.execute(
+                        """
+                        SELECT
+                            clock_timestamp(),
+                            (SELECT count(*) FROM platform_sessions WHERE tenant_id = %s),
+                            (
+                                SELECT count(*) FROM platform_session_operations
+                                WHERE tenant_id = %s
+                            ),
+                            (
+                                SELECT count(*) FROM platform_checkpoint_generations
+                                WHERE tenant_id = %s
+                            ),
+                            (
+                                SELECT count(*) FROM platform_checkpoint_write_manifests
+                                WHERE tenant_id = %s
+                            )
+                        """,
+                        (tenant_id, tenant_id, tenant_id, tenant_id),
+                    )
+                    row = await cursor.fetchone()
+        except TimeoutError:
+            raise
+        except PsycopgError as exc:
+            raise SessionRegistryError("tenant durable-state observation failed") from exc
+        if row is None:
+            raise SessionRegistryError("tenant durable-state observation returned no row")
+        try:
+            return TenantDurableRowCounts(
+                tenant_id=tenant_id,
+                observed_at=row[0],
+                platform_sessions=row[1],
+                platform_session_operations=row[2],
+                platform_checkpoint_generations=row[3],
+                platform_checkpoint_write_manifests=row[4],
+            )
+        except (TypeError, ValueError) as exc:
+            raise SessionRegistryDataError("tenant durable-state counts are invalid") from exc
+
+    @observe_async_operation(DurabilityOperation.REGISTRY_CHECKPOINT_GENERATIONS)
     async def checkpoint_generations(
         self, authority: SessionLeaseAuthority
     ) -> tuple[CheckpointGeneration, ...]:
