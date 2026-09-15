@@ -339,8 +339,6 @@ async def _run(arguments: argparse.Namespace) -> int:
         or methodology.transport_surface is not VoiceTransportSurface.STANDARD
     ):
         raise ValueError("voice certification requires deployment schema-5 standard methodology")
-    if methodology.concurrency != 1:
-        raise ValueError("the exact-room voice controller requires methodology concurrency 1")
 
     target = load_voice_certification_target(arguments.target)
     corpus = load_latency_journey_corpus(arguments.journeys)

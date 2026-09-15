@@ -155,7 +155,7 @@ def _methodology() -> DurableLatencyMethodology:
         job_ready_timeout_seconds=1.0,
         dispatch_cleanup_timeout_seconds=1.0,
         startup_treatment="fresh_job_resources",
-        concurrency=2,
+        concurrency=1,
         warmup_runs=1,
         startup_samples=20,
         startup_p95_limit_seconds=1.5,
@@ -1846,6 +1846,25 @@ async def test_controller_binds_the_ready_job_to_its_server_created_dispatch() -
     assert await controller.wait_for_ready(binding.sample_id) == assignment
 
 
+def test_readiness_is_refused_after_the_controller_records_a_sample_failure() -> None:
+    # A terminally failed sample must not be reopened by a late readiness RPC, which
+    # would consume a dispatch for work whose outcome is already recorded.
+    controller = _controller()
+    binding = _binding("sample-turn-checkout-placement-readback-0001")
+    controller.bind_job(binding)
+    assignment = VoiceCertificationSampleAssignment.from_directive(
+        controller.directive(binding.sample_id),
+        binding,
+    )
+    controller.record_failure(binding.sample_id, RuntimeError("provider failure"))
+
+    with pytest.raises(VoiceCertificationProtocolError, match="already failed"):
+        controller.submit_ready(
+            assignment.model_dump_json(),
+            caller_identity=binding.worker_participant_identity,
+        )
+
+
 async def test_setup_progress_is_ordered_authenticated_and_idempotent() -> None:
     controller = _controller()
     binding = _binding("sample-turn-checkout-placement-readback-0001")
@@ -1938,7 +1957,7 @@ async def test_job_rejects_a_wrong_result_acknowledgement_without_rewriting_evid
 
 
 async def test_single_room_controller_executes_the_exact_warmup_and_sample_schedule() -> None:
-    methodology = _methodology().model_copy(update={"concurrency": 1})
+    methodology = _methodology()
     controller = _controller(methodology)
     prepared = PreparedVoiceAudio(
         pcm_bytes=b"\x00\x00" * 160,
@@ -2086,7 +2105,7 @@ async def test_single_room_controller_executes_the_exact_warmup_and_sample_sched
 
 
 async def test_smoke_executes_one_real_journey_without_finalizing_evidence() -> None:
-    methodology = _methodology().model_copy(update={"concurrency": 1})
+    methodology = _methodology()
     controller = _controller(methodology)
     prepared = PreparedVoiceAudio(
         pcm_bytes=b"\x00\x00" * 160,
@@ -2178,7 +2197,7 @@ async def test_smoke_executes_one_real_journey_without_finalizing_evidence() -> 
 async def test_smoke_rejects_a_journey_outside_the_frozen_methodology() -> None:
     with pytest.raises(VoiceCertificationProtocolError, match="outside the frozen methodology"):
         await run_voice_certification_smoke(
-            _controller(_methodology().model_copy(update={"concurrency": 1})),
+            _controller(_methodology()),
             cast(VoiceCertificationControllerTransport, object()),
             {},
             journey_id="not-a-journey",
@@ -2186,20 +2205,25 @@ async def test_smoke_rejects_a_journey_outside_the_frozen_methodology() -> None:
         )
 
 
-async def test_single_room_controller_rejects_parallel_methodology() -> None:
-    controller = _controller()
+def test_controller_rejects_parallel_concurrency_smuggled_past_the_validator() -> None:
+    # model_copy does not run validators, so the model-level rule alone is bypassable.
+    # The controller constructor is the chokepoint every voice execution passes through.
+    smuggled = _methodology().model_copy(update={"concurrency": 4})
+    assert smuggled.concurrency == 4
 
     with pytest.raises(VoiceCertificationProtocolError, match="concurrency 1"):
-        await run_voice_certification_controller(
-            controller,
-            cast(VoiceCertificationControllerTransport, object()),
-            {},
-            run_at=datetime(2026, 9, 13, tzinfo=UTC),
-        )
+        _controller(smuggled)
+
+
+def test_voice_methodology_rejects_parallel_concurrency() -> None:
+    # The single-room voice path is strictly sequential, so the frozen contract is
+    # refused at validation rather than at run time after it has been fingerprinted.
+    with pytest.raises(ValidationError, match="concurrency 1"):
+        DurableLatencyMethodology.model_validate(_methodology().model_dump() | {"concurrency": 2})
 
 
 async def test_voice_controller_aborts_before_dispatch_when_audio_is_missing() -> None:
-    methodology = _methodology().model_copy(update={"concurrency": 1})
+    methodology = _methodology()
     controller = _controller(methodology)
 
     class Transport:
@@ -2234,7 +2258,7 @@ async def test_voice_controller_aborts_before_dispatch_when_audio_is_missing() -
 
 
 async def test_voice_controller_reconciles_an_unknown_dispatch_before_aborting() -> None:
-    methodology = _methodology().model_copy(update={"concurrency": 1})
+    methodology = _methodology()
     controller = _controller(methodology)
     prepared = PreparedVoiceAudio(
         pcm_bytes=b"\x00\x00" * 160,
@@ -2287,7 +2311,7 @@ async def test_voice_controller_reconciles_an_unknown_dispatch_before_aborting()
 
 
 async def test_voice_controller_finishes_dispatch_cleanup_before_propagating_cancellation() -> None:
-    methodology = _methodology().model_copy(update={"concurrency": 1})
+    methodology = _methodology()
     controller = _controller(methodology)
     prepared = PreparedVoiceAudio(
         pcm_bytes=b"\x00\x00" * 160,
@@ -2439,9 +2463,7 @@ async def test_readiness_deadline_aborts_without_consuming_the_sample_budget() -
     A worker that never reports ready must fail on the readiness budget rather than the
     far larger result budget, which also keeps the worker's own timeout evidence viable.
     """
-    methodology = _methodology().model_copy(
-        update={"concurrency": 1, "job_ready_timeout_seconds": 0.05}
-    )
+    methodology = _methodology().model_copy(update={"job_ready_timeout_seconds": 0.05})
     controller = _controller(methodology)
     prepared = PreparedVoiceAudio(
         pcm_bytes=b"\x00\x00" * 160,

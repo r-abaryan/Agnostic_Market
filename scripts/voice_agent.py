@@ -523,6 +523,7 @@ async def entrypoint(
             observation = certification_measurements.mark_ready(certification_assignment)
             await announce_voice_certification_ready(ctx.agent, certification_assignment)
             if observation is None:
+
                 async def report_setup_progress(completed_setup_turns: int) -> None:
                     await announce_voice_certification_progress(
                         ctx.agent,

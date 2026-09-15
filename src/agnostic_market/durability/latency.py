@@ -352,6 +352,10 @@ class DurableLatencyMethodology(BaseModel):
             }
         ) != len(setup_audio_treatments) + len(audio_treatments):
             raise ValueError("voice methodology audio assets must be unique by digest")
+        if self.schema_version in {"4", "5"} and self.concurrency != 1:
+            # Voice measurement is single-room and strictly sequential, so a frozen
+            # contract must not claim a parallelism no runner can honor.
+            raise ValueError("voice methodology requires concurrency 1")
         if self.schema_version == "4" and (
             self.application_contract is not None
             or self.result_rpc_retry_backoff_seconds is not None
@@ -723,8 +727,18 @@ type TurnLatencyProbe = Callable[
 
 
 def methodology_fingerprint(methodology: DurableLatencyMethodology) -> str:
+    # Top-level fields a schema does not define are absent, not null, so adding a new
+    # top-level optional field cannot move an already frozen fingerprint. Nested None
+    # values deliberately stay in the hash, because there a None is a real setting,
+    # such as sending no reasoning effort.
+    #
+    # The protection is therefore partial, and knowing where it stops matters. Adding a
+    # field to a nested model such as LatencyJourney, or making an existing optional
+    # field required, still moves every existing fingerprint. Only an absolute pin
+    # catches those; see the frozen-methodology test in tests/test_durable_latency.py.
+    values = methodology.model_dump(mode="json")
     canonical = json.dumps(
-        methodology.model_dump(mode="json"),
+        {key: value for key, value in values.items() if value is not None},
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")

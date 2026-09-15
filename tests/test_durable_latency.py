@@ -191,6 +191,7 @@ def _voice_methodology() -> DurableLatencyMethodology:
         | {
             "schema_version": "5",
             "environment": LatencyEnvironment.DEPLOYMENT,
+            "concurrency": 1,
             "application_contract": _application_contract(),
             "measurement_surface": LatencyMeasurementSurface.VOICE_PROCESSING,
             "transport_surface": VoiceTransportSurface.STANDARD,
@@ -258,6 +259,18 @@ def test_journey_corpus_is_exactly_bound_to_the_preregistered_methodology() -> N
             methodology,
             corpus.model_copy(update={"journeys": (changed, *contracts[1:])}),
         )
+
+
+def test_frozen_deployment_methodology_has_its_published_fingerprint() -> None:
+    # The operator froze this value before any measured run. It must survive every later
+    # model change, because a moved fingerprint silently invalidates the frozen contract.
+    methodology = load_latency_methodology(
+        Path(__file__).parents[1] / "config" / "platform" / "latency.local.yaml"
+    )
+
+    assert methodology_fingerprint(methodology) == (
+        "10be6f32f0a73061e388bf98d8728240eae031c227375beb723d5fec02da961d"
+    )
 
 
 def test_repository_journey_corpus_has_the_published_contract_fingerprints() -> None:

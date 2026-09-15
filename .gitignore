@@ -27,6 +27,8 @@ config/telemetry/
 config/conformance/reports.json
 config/fixtures/
 config/platform/*.local.yaml
+# The frozen, operator-approved latency methodology is evidence, not machine-local
+!config/platform/latency.local.yaml
 .claude/
 
 assets/audio/generate_thinking_beep.py

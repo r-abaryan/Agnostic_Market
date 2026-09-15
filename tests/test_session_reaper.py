@@ -190,6 +190,10 @@ def _drain_artifact_contents(path: Path) -> tuple[str, ...]:
     )
 
 
+def _drain_artifact_names(path: Path, pattern: str) -> tuple[str, ...]:
+    return tuple(artifact.name for artifact in path.glob(pattern))
+
+
 def _install_runtime_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     platform = SimpleNamespace(
         database=SimpleNamespace(
@@ -359,10 +363,15 @@ async def test_drain_observation_retains_later_success_and_reports_aggregate_fai
     assert calls == ["blocked_shop", "drained_shop"]
     assert len(caught.value.exceptions) == 1
     assert isinstance(caught.value.exceptions[0], TenantLifecycleInventoryError)
-    assert not tuple(tmp_path.glob("tenant-drain-blocked_shop-*.json"))
-    artifacts = tuple(tmp_path.glob("tenant-drain-drained_shop-*.json"))
+    blocked = await asyncio.to_thread(
+        _drain_artifact_names, tmp_path, "tenant-drain-blocked_shop-*.json"
+    )
+    assert not blocked
+    artifacts = await asyncio.to_thread(
+        _drain_artifact_names, tmp_path, "tenant-drain-drained_shop-*.json"
+    )
     assert len(artifacts) == 1
-    assert "20260914T100000000000Z" in artifacts[0].name
+    assert "20260914T100000000000Z" in artifacts[0]
 
 
 async def test_continuous_reaper_refuses_a_drain_evidence_directory() -> None:

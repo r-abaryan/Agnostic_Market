@@ -1074,6 +1074,13 @@ class VoiceCertificationController:
             raise VoiceCertificationProtocolError(
                 "voice certification controller requires schema-5 application identity"
             )
+        if methodology.concurrency != 1:
+            # Re-checked here, not only in the model validator: model_copy bypasses
+            # validators, and this constructor is the one chokepoint every voice
+            # execution and every build_run call passes through.
+            raise VoiceCertificationProtocolError(
+                "single-room voice certification requires concurrency 1"
+            )
         try:
             run = _VoiceCertificationRunBinding(
                 run_id=run_id,
@@ -1357,8 +1364,11 @@ class VoiceCertificationController:
         if sample_id not in self._samples:
             raise VoiceCertificationProtocolError("readiness is outside the frozen schedule")
         resolution = self._resolutions.get(sample_id)
-        if resolution is not None and resolution.kind == "timeout":
-            raise VoiceCertificationProtocolError("sample already timed out")
+        if resolution is not None:
+            if resolution.kind == "timeout":
+                raise VoiceCertificationProtocolError("sample already timed out")
+            if resolution.kind == "failure":
+                raise VoiceCertificationProtocolError("sample already failed")
         binding = self._bindings.get(sample_id)
         if binding is None:
             expected_dispatch = self._dispatch_ids.get(sample_id)
@@ -1697,12 +1707,6 @@ async def run_voice_certification_controller(
     run_at: datetime,
 ) -> DurableLatencyCertificationRun:
     """Run the frozen single-room schedule and return completed or aborted evidence."""
-    methodology = controller.methodology
-    if methodology.concurrency != 1:
-        raise VoiceCertificationProtocolError(
-            "single-room voice certification requires concurrency 1"
-        )
-
     ordered_samples = (*controller.warmup_schedule, *controller.schedule)
     warmup_ids = {sample.sample_id for sample in controller.warmup_schedule}
     aborted = await _execute_voice_samples(
@@ -1727,11 +1731,6 @@ async def run_voice_certification_smoke(
     run_at: datetime,
 ) -> LatencyObservation:
     """Run one journey through the real protocol without producing activation evidence."""
-    methodology = controller.methodology
-    if methodology.concurrency != 1:
-        raise VoiceCertificationProtocolError(
-            "single-room voice certification requires concurrency 1"
-        )
     sample = next(
         (
             candidate
@@ -1775,7 +1774,6 @@ async def _execute_voice_samples(
     run_at: datetime,
 ) -> DurableLatencyCertificationRun | None:
     """Execute a selected schedule through the one dispatch and cleanup implementation."""
-    methodology = controller.methodology
     for sample in ordered_samples:
         required_assets = (*sample.setup_audio_treatments, sample.audio_treatment)
         if any(
