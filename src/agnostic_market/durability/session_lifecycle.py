@@ -130,6 +130,15 @@ class TenantReapFailure(ExceptionGroup):
     ) -> None:
         pass
 
+    def __reduce__(self) -> tuple[object, ...]:
+        # ExceptionGroup rebuilds from its message and exceptions alone, but this
+        # subclass also requires its retained result, so without this copy and
+        # pickle both raise TypeError instead of reporting the failure.
+        return (
+            self.__class__,
+            (self.message, cast(Sequence[Exception], self.exceptions), self.result),
+        )
+
     def derive(self, exceptions: Sequence[BaseException]) -> ExceptionGroup:
         if not all(isinstance(exception, Exception) for exception in exceptions):
             raise TypeError("tenant reaper failures can contain only Exception instances")
@@ -161,6 +170,15 @@ class ReaperCycleFailure(ExceptionGroup):
         _result: ReaperCycleResult,
     ) -> None:
         pass
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # ExceptionGroup rebuilds from its message and exceptions alone, but this
+        # subclass also requires its retained result, so without this copy and
+        # pickle both raise TypeError instead of reporting the failure.
+        return (
+            self.__class__,
+            (self.message, cast(Sequence[Exception], self.exceptions), self.result),
+        )
 
     def derive(self, exceptions: Sequence[BaseException]) -> ExceptionGroup:
         if not all(isinstance(exception, Exception) for exception in exceptions):

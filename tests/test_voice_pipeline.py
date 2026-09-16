@@ -224,6 +224,42 @@ def test_latency_observer_requires_boolean_interruption_evidence() -> None:
     assert isinstance(failures[0], TurnMetricObservationError)
 
 
+def test_latency_observer_ignores_the_disclosure_turn_without_reporting_a_failure() -> None:
+    """The opening disclosure is an assistant turn with no user turn to correlate.
+
+    DisclosureFirstAgent.on_enter says it before any user turn can exist, so it has
+    no endpointing metric and is not measurable. It is also not a fault, and counting
+    it as one would record a metric failure on every single call.
+    """
+    callbacks = {}
+    observed: list[TurnLatencyMeasurement] = []
+    failures: list[Exception] = []
+
+    class Session:
+        def on(self, event_name: str):
+            def register(callback):
+                callbacks[event_name] = callback
+                return callback
+
+            return register
+
+    _attach_turn_metrics_logger(Session(), observed.append, failures.append)
+    callback = callbacks["conversation_item_added"]
+
+    callback(
+        SimpleNamespace(
+            item=SimpleNamespace(
+                role="assistant",
+                interrupted=False,
+                metrics={"e2e_latency": 0.625},
+            )
+        )
+    )
+
+    assert observed == []
+    assert failures == []
+
+
 def test_latency_observer_rejects_uncorrelated_or_contradictory_metrics() -> None:
     callbacks = {}
     observed: list[TurnLatencyMeasurement] = []

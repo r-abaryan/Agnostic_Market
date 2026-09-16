@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import pickle
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -377,6 +379,51 @@ def test_reaper_cycle_failure_can_be_split_without_corrupting_its_result() -> No
     assert isinstance(value_errors.exceptions[0], ValueError)
     assert isinstance(remainder.exceptions[0], RuntimeError)
     assert failure.result is result
+
+
+def test_tenant_reap_failure_survives_a_round_trip_with_its_result() -> None:
+    """A retained result must survive copy and pickle, not only the raising frame.
+
+    ExceptionGroup rebuilds from its message and exceptions alone, so a subclass
+    that requires a third construction argument cannot be reconstructed unless it
+    says so. Without that, moving this failure across a process boundary or through
+    any library that copies exceptions raises TypeError instead of reporting it.
+    """
+    result = TenantReapResult(
+        tenant_id="acme_store",
+        sessions_closed=1,
+        tombstones_purged=2,
+        failure_count=1,
+    )
+    failure = TenantReapFailure(
+        "tenant cleanup failed",
+        (RuntimeError("database unavailable"),),
+        result,
+    )
+
+    restored = pickle.loads(pickle.dumps(failure))  # noqa: S301 - its own value
+
+    assert type(restored) is TenantReapFailure
+    assert restored.result == result
+    assert isinstance(restored.exceptions[0], RuntimeError)
+    assert copy.copy(failure).result == result
+
+
+def test_reaper_cycle_failure_survives_a_round_trip_with_its_result() -> None:
+    """The cycle result must survive the same round trip; see the tenant case above."""
+    result = ReaperCycleResult(tenants=(TenantReapResult("acme_store", 1, 0, 1),))
+    failure = ReaperCycleFailure(
+        "reaper cycle failed",
+        (RuntimeError("database unavailable"),),
+        result,
+    )
+
+    restored = pickle.loads(pickle.dumps(failure))  # noqa: S301 - its own value
+
+    assert type(restored) is ReaperCycleFailure
+    assert restored.result == result
+    assert isinstance(restored.exceptions[0], RuntimeError)
+    assert copy.copy(failure).result == result
 
 
 async def test_continuous_reaper_reports_a_failed_cycle_and_runs_the_next_one(
