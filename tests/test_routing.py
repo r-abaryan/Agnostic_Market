@@ -592,6 +592,33 @@ def test_router_prompt_distinguishes_reported_speech_and_context_gaps() -> None:
     assert "no recent order context" in prompt
 
 
+async def test_attempt_records_when_the_resolver_rewrote_the_models_decision() -> None:
+    """The resolver may rewrite a decision for runtime safety; evidence must say so.
+
+    Without this the report records the rewritten route as the model's own proposal,
+    so a wrong selector is indistinguishable from a right one.
+    """
+    model = FakeChatModel(
+        structured_args={
+            "RouteProposal": (
+                {
+                    "decision": "direct",
+                    "capability": "verify_order_status",
+                    "order_status_selector": "focused",
+                },
+            )
+        }
+    )
+    registry = _registry(VerifyOrderStatus)
+    router = _router(model, registry)
+
+    # recent_order_count is 0, so a focused selector cannot be executed as proposed.
+    attempt = await router.route(_context(CapabilityId.VERIFY_ORDER_STATUS))
+
+    assert attempt.resolution == RouteDecision.direct(VerifyOrderStatus())
+    assert attempt.resolution_adjusted is True
+
+
 async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt() -> None:
     model = FakeChatModel(record_prompts=True)
     registry = _registry(SearchCatalog)
@@ -613,6 +640,7 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
     assert attempt.input_max_chars == 2048
     assert attempt.timeout_seconds == 1.0
     assert attempt.provider_call_outcome == "completed"
+    assert attempt.resolution_adjusted is False
     assert attempt.projector_version == CONTEXT_PROJECTOR_VERSION
     assert model.structured_methods == (TEST_STRUCTURED_OUTPUT_METHOD,)
     assert "cancel all my orders" in model._seen_prompts[-1]
@@ -637,6 +665,7 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
         "provider_error_category",
         "provider_request_id",
         "provider_retry_count",
+        "resolution_adjusted",
     }
     assert attempt.observed_at is not None
     assert attempt.observed_at.tzinfo is not None

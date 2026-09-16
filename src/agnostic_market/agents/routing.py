@@ -392,8 +392,16 @@ def resolve_route(context: RoutingContext, decision: RouteDecision) -> RouteReso
     return decision
 
 
-def materialize_route(context: RoutingContext, proposal: RouteProposal) -> RouteResolution:
-    """Convert one coarse provider proposal into a validated internal route."""
+def proposed_route_decision(
+    context: RoutingContext,
+    proposal: RouteProposal,
+) -> RouteResolution:
+    """The model's own decision, before context resolution may adjust it.
+
+    Split out so a caller can observe what the provider actually proposed. The
+    resolver is allowed to rewrite a decision for runtime safety, and evidence
+    must not record that rewrite as though the model had proposed it.
+    """
 
     supplied = frozenset(
         field for field in _PROPOSAL_DISCRIMINATORS if getattr(proposal, field) is not None
@@ -422,6 +430,14 @@ def materialize_route(context: RoutingContext, proposal: RouteProposal) -> Route
         decision = RouteDecision.direct(definition.materialize(proposal))
     except (TypeError, ValueError, ValidationError):
         return RoutingFailure(reason="decision_rejected")
+    return decision
+
+
+def materialize_route(context: RoutingContext, proposal: RouteProposal) -> RouteResolution:
+    """Convert one coarse provider proposal into a validated internal route."""
+    decision = proposed_route_decision(context, proposal)
+    if isinstance(decision, RoutingFailure):
+        return decision
     return resolve_route(context, decision)
 
 
@@ -451,6 +467,9 @@ class RoutingAttempt:
     provider_error_category: str | None = None
     provider_request_id: str | None = None
     provider_retry_count: int | None = None
+    # True when the resolver rewrote the model's own decision for runtime safety.
+    # Without this the report records the rewritten route as the model's proposal.
+    resolution_adjusted: bool = False
 
 
 class RoutingRecognizer(Protocol):
@@ -695,16 +714,23 @@ class SemanticRouter:
         raw = envelope.get("raw")
         parsed = envelope.get("parsed")
         parsing_error = envelope.get("parsing_error")
+        adjusted = False
         if parsing_error is not None or not isinstance(parsed, RouteProposal):
             resolution: RouteResolution = RoutingFailure(reason="invalid_output")
         else:
-            resolution = materialize_route(context, parsed)
+            proposed = proposed_route_decision(context, parsed)
+            if isinstance(proposed, RoutingFailure):
+                resolution = proposed
+            else:
+                resolution = resolve_route(context, proposed)
+                adjusted = resolution != proposed
         return self._attempt(
             resolution,
             started=started,
             observed_at=observed_at,
             raw=raw,
             provider_call_outcome="completed",
+            resolution_adjusted=adjusted,
         )
 
     def _attempt(
@@ -716,6 +742,7 @@ class SemanticRouter:
         provider_call_outcome: ProviderCallOutcome,
         provider_error_category: str | None = None,
         raw: object = None,
+        resolution_adjusted: bool = False,
     ) -> RoutingAttempt:
         input_tokens: int | None = None
         cache_read_tokens: int | None = None
@@ -746,6 +773,7 @@ class SemanticRouter:
             observed_at=observed_at,
             provider_error_category=provider_error_category,
             provider_request_id=_provider_request_id(raw),
+            resolution_adjusted=resolution_adjusted,
         )
 
 
