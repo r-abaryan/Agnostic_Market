@@ -346,8 +346,10 @@ class SemanticRouteEvalCase(BaseModel):
 
     @model_validator(mode="after")
     def expected_route_is_executable_in_context(self) -> SemanticRouteEvalCase:
-        if isinstance(resolve_route(self.context, self.expected), RoutingFailure):
-            raise ValueError("semantic route ground truth must be executable in its context")
+        if resolve_route(self.context, self.expected) != self.expected:
+            # Not merely executable: an expectation the resolver rewrites can never be
+            # scored against, because the harness only ever sees the rewritten route.
+            raise ValueError("semantic route ground truth must survive its own context")
         return self
 
 
@@ -369,8 +371,8 @@ class ProjectedSemanticRouteEvalCase(BaseModel):
             raise ValueError("projected semantic-route case requires a committed-turn id")
         if self.turn.text != self.expected_context.utterance:
             raise ValueError("projected turn text must equal its expected context utterance")
-        if isinstance(resolve_route(self.expected_context, self.expected), RoutingFailure):
-            raise ValueError("projected route ground truth must be executable")
+        if resolve_route(self.expected_context, self.expected) != self.expected:
+            raise ValueError("projected route ground truth must survive its own context")
         return self
 
 
@@ -677,8 +679,8 @@ class RoutingDataCase(BaseModel):
                 )
         elif self.adjudicator_id is not None or self.adjudication_reference is not None:
             raise ValueError("approved routing data must not carry adjudication fields")
-        if isinstance(resolve_route(self.context, self.expected), RoutingFailure):
-            raise ValueError("routing-data ground truth must be executable in its context")
+        if resolve_route(self.context, self.expected) != self.expected:
+            raise ValueError("routing-data ground truth must survive its own context")
         return self
 
 
@@ -905,8 +907,8 @@ class RoutingDataCoverageCell(BaseModel):
             cart_state=self.cart_state,
             available_capabilities=self.available_capabilities,
         )
-        if isinstance(resolve_route(context, self.expected), RoutingFailure):
-            raise ValueError("coverage-cell expected route must be executable in its context")
+        if resolve_route(context, self.expected) != self.expected:
+            raise ValueError("coverage-cell expected route must survive its own context")
         if self.availability_origin == "rejection_counterfactual" and (
             self.partition != "ood"
             or self.context_origin != "authored_counterfactual"
@@ -2000,7 +2002,18 @@ def _semantic_model_report(
                 "expected": _route_signature(result.expected),
                 "actual": _route_signature(result.attempt.resolution),
                 "latency_ms": result.attempt.elapsed_ms,
+                "observed_at": (
+                    None
+                    if result.attempt.observed_at is None
+                    else result.attempt.observed_at.isoformat()
+                ),
                 "provider_call_outcome": result.attempt.provider_call_outcome,
+                "provider_error_category": result.attempt.provider_error_category,
+                "provider_request_id": result.attempt.provider_request_id,
+                "provider_retry_count": result.attempt.provider_retry_count,
+                # True when the resolver rewrote the model's decision. Without it the
+                # "actual" signature above reads as the model's own proposal.
+                "resolution_adjusted": result.attempt.resolution_adjusted,
                 "input_tokens": result.attempt.input_tokens,
                 "cache_read_tokens": result.attempt.cache_read_tokens,
                 "output_tokens": result.attempt.output_tokens,

@@ -10,14 +10,16 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, NoReturn, Protocol, Self
 
 from psycopg import ProgrammingError
 from psycopg.conninfo import conninfo_to_dict
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from agnostic_market.agents.routing_activation import SemanticRoutingRuntimeContract
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
+from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TurnEvent
 from agnostic_market.dtos.platform import ConfigIdentifier, PlatformRuntimeConfig
 from agnostic_market.durability.evidence import ExceptionTypeName, write_immutable_evidence
 from agnostic_market.durability.timing import (
@@ -30,6 +32,8 @@ from agnostic_market.durability.timing import (
 _STRICT = ConfigDict(extra="forbid", frozen=True, strict=True, allow_inf_nan=False)
 _REPORTED_STATISTICS = ("p50", "p95", "maximum")
 _MINIMUM_P95_SAMPLE_COUNT = 20
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_OCI_SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
 class LatencyTier(StrEnum):
@@ -46,6 +50,11 @@ class LatencyEnvironment(StrEnum):
 class LatencyMeasurementSurface(StrEnum):
     REASONING_GRAPH = "reasoning_graph"
     VOICE_PROCESSING = "voice_processing"
+
+
+class VoiceTransportSurface(StrEnum):
+    STANDARD = "standard"
+    SIP = "sip"
 
 
 _P95_LIMIT_SECONDS = {
@@ -70,6 +79,61 @@ class LatencyObservationOutcome(StrEnum):
     ERROR = "error"
 
 
+class VoiceAudioTreatment(BaseModel):
+    """Frozen synthetic audio asset and playback treatment for one voice journey."""
+
+    model_config = _STRICT
+
+    schema_version: Literal["1"] = "1"
+    asset_path: str = Field(min_length=1)
+    asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    container: Literal["wav"]
+    pcm_format: Literal["s16le"]
+    channel_count: int = Field(ge=1, le=2)
+    sample_rate_hz: int = Field(ge=8_000, le=48_000)
+    playback_rate: float = Field(gt=0)
+    pre_speech_silence_seconds: float = Field(ge=0, le=5)
+    post_speech_silence_seconds: float = Field(ge=0, le=5)
+
+    @field_validator("asset_path")
+    @classmethod
+    def validate_portable_asset_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or "\\" in value or path.as_posix() != value or ".." in path.parts:
+            raise ValueError("voice audio asset path must be a normalized relative POSIX path")
+        return value
+
+    @field_validator("playback_rate")
+    @classmethod
+    def validate_supported_playback_rate(cls, value: float) -> float:
+        if value != 1.0:
+            raise ValueError("voice certification currently requires playback_rate 1.0")
+        return value
+
+
+class VoiceLatencyMetrics(BaseModel):
+    """Correlated raw LiveKit metrics plus their processing-only derivation."""
+
+    model_config = _STRICT
+
+    schema_version: Literal["1"] = "1"
+    end_to_end_seconds: float = Field(ge=0)
+    endpointing_seconds: float = Field(ge=0)
+    processing_seconds: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_processing_derivation(self) -> Self:
+        expected = self.end_to_end_seconds - self.endpointing_seconds
+        if expected < 0 or not math.isclose(
+            self.processing_seconds,
+            expected,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("voice processing latency must equal end-to-end minus endpointing")
+        return self
+
+
 class LatencyJourney(BaseModel):
     model_config = _STRICT
 
@@ -77,6 +141,8 @@ class LatencyJourney(BaseModel):
     journey_contract_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     tier: LatencyTier
     required_operations: tuple[DurabilityOperation, ...] = Field(min_length=1)
+    setup_audio_treatments: tuple[VoiceAudioTreatment, ...] = ()
+    audio_treatment: VoiceAudioTreatment | None = None
 
     @field_validator("required_operations")
     @classmethod
@@ -130,6 +196,45 @@ class LatencyJourneyContract(BaseModel):
         return self
 
 
+class LatencyJourneyPostconditionError(RuntimeError):
+    """A measured journey did not satisfy its frozen semantic contract."""
+
+
+def require_latency_journey_postconditions(
+    contract: LatencyJourneyContract,
+    *,
+    events: Sequence[TurnEvent],
+    actual_cart: tuple[LatencyCartLine, ...],
+    placed_orders_before: int,
+    placed_orders_after: int,
+) -> None:
+    """Verify the shared graph and voice journey outcome without reclassifying it."""
+    if contract.expected_event_kind == "interrupt":
+        expected = [event for event in events if isinstance(event, InterruptEvent)]
+        unexpected = [event for event in events if not isinstance(event, InterruptEvent)]
+        text = expected[0].prompt if len(expected) == 1 else ""
+    else:
+        expected = [event for event in events if isinstance(event, SpokenMessageEvent)]
+        unexpected = [event for event in events if not isinstance(event, SpokenMessageEvent)]
+        text = expected[0].text if len(expected) == 1 else ""
+        if len(expected) == 1 and expected[0].node != contract.expected_event_node:
+            raise LatencyJourneyPostconditionError(
+                "journey produced spoken message from "
+                f"{expected[0].node!r}; expected {contract.expected_event_node!r}"
+            )
+    if len(expected) != 1 or unexpected:
+        raise LatencyJourneyPostconditionError("journey produced the wrong caller-event shape")
+    normalized = text.casefold()
+    if any(
+        fragment.casefold() not in normalized for fragment in contract.expected_event_text_contains
+    ):
+        raise LatencyJourneyPostconditionError("journey output did not satisfy its frozen contract")
+    if actual_cart != contract.expected_cart:
+        raise LatencyJourneyPostconditionError("journey cart state is invalid after measured turn")
+    if placed_orders_after != placed_orders_before:
+        raise LatencyJourneyPostconditionError("latency journey committed an order")
+
+
 class LatencyJourneyCorpus(BaseModel):
     model_config = _STRICT
 
@@ -144,17 +249,46 @@ class LatencyJourneyCorpus(BaseModel):
         return self
 
 
+class VoiceApplicationContract(BaseModel):
+    """Canonical release identity measured by deployment voice certification."""
+
+    model_config = _STRICT
+
+    schema_version: Literal[1] = 1
+    durable_platform_fingerprint: str = Field(pattern=_SHA256_PATTERN)
+    build_artifact_digest: str = Field(pattern=_OCI_SHA256_PATTERN)
+    tenant_config_version: str = Field(pattern=_SHA256_PATTERN)
+    semantic_routing: SemanticRoutingRuntimeContract
+    certification_target_fingerprint: str = Field(pattern=_SHA256_PATTERN)
+
+
+def voice_application_contract_fingerprint(contract: VoiceApplicationContract) -> str:
+    canonical = json.dumps(
+        contract.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 class DurableLatencyMethodology(BaseModel):
     """Frozen inputs selected before a deployment-shaped certification run."""
 
     model_config = _STRICT
 
-    schema_version: Literal["3"]
+    schema_version: Literal["3", "4", "5"]
     environment: LatencyEnvironment
     backend_location: ConfigIdentifier
     journey_corpus_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     runtime_contract_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    application_contract: VoiceApplicationContract | None = None
     measurement_surface: LatencyMeasurementSurface
+    transport_surface: VoiceTransportSurface | None = None
+    result_rpc_timeout_seconds: float | None = Field(default=None, gt=0)
+    result_rpc_retries: int | None = Field(default=None, ge=0, le=3)
+    result_rpc_retry_backoff_seconds: float | None = Field(default=None, gt=0)
+    job_ready_timeout_seconds: float | None = Field(default=None, gt=0)
+    dispatch_cleanup_timeout_seconds: float | None = Field(default=None, gt=0)
     startup_treatment: Literal["fresh_job_resources"]
     concurrency: int = Field(ge=1)
     warmup_runs: int = Field(ge=1)
@@ -183,6 +317,81 @@ class DurableLatencyMethodology(BaseModel):
         covered_tiers = {journey.tier for journey in self.journeys}
         if covered_tiers != set(LatencyTier):
             raise ValueError("latency methodology must cover every turn tier")
+        audio_treatments = tuple(journey.audio_treatment for journey in self.journeys)
+        setup_audio_treatments = tuple(
+            treatment for journey in self.journeys for treatment in journey.setup_audio_treatments
+        )
+        if self.schema_version == "3":
+            if (
+                self.measurement_surface is not LatencyMeasurementSurface.REASONING_GRAPH
+                or self.transport_surface is not None
+                or self.result_rpc_timeout_seconds is not None
+                or self.result_rpc_retries is not None
+                or self.result_rpc_retry_backoff_seconds is not None
+                or self.job_ready_timeout_seconds is not None
+                or self.dispatch_cleanup_timeout_seconds is not None
+                or any(treatment is not None for treatment in audio_treatments)
+                or setup_audio_treatments
+                or self.application_contract is not None
+            ):
+                raise ValueError("schema-3 latency methodology covers only the reasoning graph")
+        elif self.schema_version in {"4", "5"} and (
+            self.measurement_surface is not LatencyMeasurementSurface.VOICE_PROCESSING
+            or self.transport_surface is None
+            or self.result_rpc_timeout_seconds is None
+            or self.result_rpc_retries is None
+        ):
+            raise ValueError("voice methodology requires a voice-processing transport surface")
+        elif any(treatment is None for treatment in audio_treatments):
+            raise ValueError("voice methodology requires every audio treatment")
+        elif len(
+            {
+                treatment.asset_sha256
+                for treatment in (*setup_audio_treatments, *audio_treatments)
+                if treatment is not None
+            }
+        ) != len(setup_audio_treatments) + len(audio_treatments):
+            raise ValueError("voice methodology audio assets must be unique by digest")
+        if self.schema_version in {"4", "5"} and self.concurrency != 1:
+            # Voice measurement is single-room and strictly sequential, so a frozen
+            # contract must not claim a parallelism no runner can honor.
+            raise ValueError("voice methodology requires concurrency 1")
+        if self.schema_version == "4" and (
+            self.application_contract is not None
+            or self.result_rpc_retry_backoff_seconds is not None
+            or self.job_ready_timeout_seconds is not None
+            or self.dispatch_cleanup_timeout_seconds is not None
+        ):
+            raise ValueError("schema-4 voice methodology cannot claim schema-5 contracts")
+        if self.schema_version == "5":
+            if (
+                self.application_contract is None
+                or self.result_rpc_retry_backoff_seconds is None
+                or self.job_ready_timeout_seconds is None
+                or self.dispatch_cleanup_timeout_seconds is None
+            ):
+                raise ValueError(
+                    "schema-5 voice methodology requires application, readiness, cleanup, "
+                    "and RPC retry contracts"
+                )
+            if (
+                self.application_contract.durable_platform_fingerprint
+                != self.runtime_contract_fingerprint
+            ):
+                raise ValueError("voice application and durable runtime fingerprints must match")
+            required_startup = set(self.required_startup_operations)
+            if (
+                not {
+                    DurabilityOperation.REGISTRY_CHECKPOINT_GENERATIONS,
+                    DurabilityOperation.CHECKPOINT_READ,
+                }
+                <= required_startup
+                or DurabilityOperation.REGISTRY_GET in required_startup
+            ):
+                raise ValueError(
+                    "schema-5 startup must require generation lookup and checkpoint read, "
+                    "not registry get"
+                )
         return self
 
 
@@ -199,7 +408,7 @@ class LatencyObservation(BaseModel):
 
     model_config = _STRICT
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2", "3"] = "1"
     sample_id: ConfigIdentifier
     phase: LatencyPhase
     thermal_state: ThermalState
@@ -208,6 +417,7 @@ class LatencyObservation(BaseModel):
     error_type: ExceptionTypeName | None = None
     journey_id: ConfigIdentifier | None = None
     tier: LatencyTier | None = None
+    voice_metrics: VoiceLatencyMetrics | None = None
     components: tuple[DurabilityComponentObservation, ...]
 
     @model_validator(mode="after")
@@ -230,12 +440,34 @@ class LatencyObservation(BaseModel):
             or self.tier is None
         ):
             raise ValueError("turn latency observations require one warm typed journey")
+        if self.schema_version == "1" and self.voice_metrics is not None:
+            raise ValueError("schema-1 observations cannot contain voice metrics")
+        if self.schema_version in {"2", "3"}:
+            if self.phase is LatencyPhase.STARTUP and self.voice_metrics is not None:
+                raise ValueError("startup observations cannot contain voice turn metrics")
+            if (
+                self.phase is LatencyPhase.TURN
+                and self.outcome is LatencyObservationOutcome.SUCCESS
+                and self.voice_metrics is None
+            ):
+                raise ValueError("successful voice turns require correlated voice metrics")
+        if self.voice_metrics is not None and (
+            self.elapsed_seconds is None
+            or not math.isclose(
+                self.elapsed_seconds,
+                self.voice_metrics.processing_seconds,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("voice processing metric must equal observed latency")
         return self
 
     @classmethod
     def from_timing(
         cls,
         *,
+        schema_version: Literal["1", "2", "3"] = "1",
         sample_id: str,
         phase: LatencyPhase,
         thermal_state: ThermalState,
@@ -243,8 +475,10 @@ class LatencyObservation(BaseModel):
         component_samples: Sequence[DurabilityTimingSample],
         journey_id: str | None = None,
         tier: LatencyTier | None = None,
+        voice_metrics: VoiceLatencyMetrics | None = None,
     ) -> LatencyObservation:
         return cls(
+            schema_version=schema_version,
             sample_id=sample_id,
             phase=phase,
             thermal_state=thermal_state,
@@ -252,6 +486,7 @@ class LatencyObservation(BaseModel):
             outcome=LatencyObservationOutcome.SUCCESS,
             journey_id=journey_id,
             tier=tier,
+            voice_metrics=voice_metrics,
             components=tuple(
                 DurabilityComponentObservation(
                     operation=sample.operation,
@@ -314,12 +549,29 @@ class LatencyGate(BaseModel):
     failures: tuple[str, ...]
 
 
+def latency_evidence_schema_version(
+    methodology: DurableLatencyMethodology,
+) -> Literal["1", "2", "3"]:
+    return latency_evidence_schema_version_for_methodology(methodology.schema_version)
+
+
+def latency_evidence_schema_version_for_methodology(
+    methodology_schema_version: Literal["3", "4", "5"],
+) -> Literal["1", "2", "3"]:
+    """Map a methodology schema to the only evidence envelope it can produce."""
+    if methodology_schema_version == "3":
+        return "1"
+    if methodology_schema_version == "4":
+        return "2"
+    return "3"
+
+
 class DurableLatencyReport(BaseModel):
     """Complete evidence artifact for one frozen deployment-shaped run."""
 
     model_config = _STRICT
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2", "3"] = "1"
     run_at: datetime
     deployment_id: ConfigIdentifier
     methodology_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -335,6 +587,8 @@ class DurableLatencyReport(BaseModel):
             raise ValueError("latency report timestamp must be timezone-aware")
         if self.methodology_fingerprint != methodology_fingerprint(self.methodology):
             raise ValueError("latency report methodology fingerprint is invalid")
+        if self.schema_version != latency_evidence_schema_version(self.methodology):
+            raise ValueError("latency report schema does not match its methodology")
         if self.gate.passed != (not self.gate.failures):
             raise ValueError("latency report gate result is inconsistent")
         return self
@@ -349,18 +603,44 @@ class LatencyAbortStage(StrEnum):
     WARMUP_PREPARE = "warmup_prepare"
     WARMUP_RUN = "warmup_run"
     WARMUP_CLEANUP = "warmup_cleanup"
+    VOICE_PREPARE = "voice_prepare"
+    VOICE_RUN = "voice_run"
+    VOICE_CLEANUP = "voice_cleanup"
+    VOICE_CONTROLLER_CLEANUP = "voice_controller_cleanup"
 
 
 class LatencyCertificationAbort(BaseModel):
-    """Redacted evidence for a run that could not complete its frozen warmup."""
+    """Redacted evidence for a run that could not complete its frozen execution."""
 
     model_config = _STRICT
 
     stage: LatencyAbortStage
-    sample_id: ConfigIdentifier
-    journey_id: ConfigIdentifier
+    sample_id: ConfigIdentifier | None = None
+    journey_id: ConfigIdentifier | None = None
     error_type: ExceptionTypeName
     cleanup_error_type: ExceptionTypeName | None = None
+
+    @model_validator(mode="after")
+    def validate_stage_binding(self) -> Self:
+        warmup_stages = {
+            LatencyAbortStage.WARMUP_PREPARE,
+            LatencyAbortStage.WARMUP_RUN,
+            LatencyAbortStage.WARMUP_CLEANUP,
+        }
+        sample_stages = warmup_stages | {
+            LatencyAbortStage.VOICE_PREPARE,
+            LatencyAbortStage.VOICE_RUN,
+            LatencyAbortStage.VOICE_CLEANUP,
+        }
+        if self.stage in warmup_stages and self.journey_id is None:
+            raise ValueError("latency warmup abort requires a journey")
+        if self.stage in sample_stages and self.sample_id is None:
+            raise ValueError("sample-scoped latency abort requires a sample")
+        if self.stage is LatencyAbortStage.VOICE_CONTROLLER_CLEANUP and (
+            self.sample_id is not None or self.journey_id is not None
+        ):
+            raise ValueError("voice controller cleanup abort cannot claim a sample")
+        return self
 
 
 class DurableLatencyCertificationRun(BaseModel):
@@ -368,7 +648,7 @@ class DurableLatencyCertificationRun(BaseModel):
 
     model_config = _STRICT
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2", "3"] = "1"
     run_at: datetime
     deployment_id: ConfigIdentifier
     methodology_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -383,6 +663,8 @@ class DurableLatencyCertificationRun(BaseModel):
             raise ValueError("latency certification timestamp must be timezone-aware")
         if self.methodology_fingerprint != methodology_fingerprint(self.methodology):
             raise ValueError("latency certification methodology fingerprint is invalid")
+        if self.schema_version != latency_evidence_schema_version(self.methodology):
+            raise ValueError("latency certification schema does not match its methodology")
         if self.outcome is LatencyCertificationOutcome.COMPLETED:
             if self.report is None or self.abort is not None:
                 raise ValueError("completed latency certification requires only a report")
@@ -400,6 +682,17 @@ class DurableLatencyCertificationRun(BaseModel):
 
 class DurableLatencyActivationError(RuntimeError):
     """The supplied latency evidence cannot authorize durable activation."""
+
+
+def require_voice_application_contract(
+    methodology: DurableLatencyMethodology,
+    expected: VoiceApplicationContract,
+) -> None:
+    """Require schema-5 evidence to name the exact observed application identity."""
+    if methodology.schema_version != "5" or methodology.application_contract != expected:
+        raise DurableLatencyActivationError(
+            "voice latency evidence does not match the application contract"
+        )
 
 
 class InvalidLatencyMeasurementError(ValueError):
@@ -434,8 +727,18 @@ type TurnLatencyProbe = Callable[
 
 
 def methodology_fingerprint(methodology: DurableLatencyMethodology) -> str:
+    # Top-level fields a schema does not define are absent, not null, so adding a new
+    # top-level optional field cannot move an already frozen fingerprint. Nested None
+    # values deliberately stay in the hash, because there a None is a real setting,
+    # such as sending no reasoning effort.
+    #
+    # The protection is therefore partial, and knowing where it stops matters. Adding a
+    # field to a nested model such as LatencyJourney, or making an existing optional
+    # field required, still moves every existing fingerprint. Only an absolute pin
+    # catches those; see the frozen-methodology test in tests/test_durable_latency.py.
+    values = methodology.model_dump(mode="json")
     canonical = json.dumps(
-        methodology.model_dump(mode="json"),
+        {key: value for key, value in values.items() if value is not None},
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -527,6 +830,12 @@ def bind_latency_journey_contracts(
             raise DurableLatencyActivationError(
                 f"latency journey contract fingerprint mismatch: {journey_id}"
             )
+        if methodology.schema_version in {"4", "5"} and len(journey.setup_audio_treatments) != len(
+            contracts[journey_id].setup_turns
+        ):
+            raise DurableLatencyActivationError(
+                f"latency journey setup audio count mismatch: {journey_id}"
+            )
     return contracts
 
 
@@ -600,7 +909,9 @@ def require_deployment_latency_evidence(
     expected_deployment_id: str,
     expected_journey_corpus: LatencyJourneyCorpus,
     expected_runtime_contract_fingerprint: str,
+    expected_application_contract: VoiceApplicationContract | None = None,
     required_measurement_surface: LatencyMeasurementSurface,
+    required_transport_surface: VoiceTransportSurface | None = None,
 ) -> DurableLatencyReport:
     """Require one completed run matching the pre-registered deployment contract."""
     methodology = load_latency_methodology(methodology_path)
@@ -616,6 +927,23 @@ def require_deployment_latency_evidence(
     if methodology.measurement_surface is not required_measurement_surface:
         raise DurableLatencyActivationError(
             "durable latency evidence does not cover the required measurement surface"
+        )
+    if required_measurement_surface is LatencyMeasurementSurface.VOICE_PROCESSING:
+        if expected_application_contract is None:
+            raise DurableLatencyActivationError(
+                "voice activation requires an expected application contract"
+            )
+        require_voice_application_contract(methodology, expected_application_contract)
+        if (
+            required_transport_surface is None
+            or methodology.transport_surface is not required_transport_surface
+        ):
+            raise DurableLatencyActivationError(
+                "durable latency evidence does not cover the required transport surface"
+            )
+    elif required_transport_surface is not None:
+        raise DurableLatencyActivationError(
+            "reasoning-graph latency evidence cannot require a transport surface"
         )
     run = load_latency_certification_run(report_path)
     if (
@@ -723,6 +1051,9 @@ def build_latency_report(
 ) -> DurableLatencyReport:
     """Validate exact evidence coverage, retain misses, and evaluate the frozen gate."""
     evidence = tuple(observations)
+    expected_schema = latency_evidence_schema_version(methodology)
+    if any(observation.schema_version != expected_schema for observation in evidence):
+        raise ValueError("latency observation schema does not match its methodology")
     sample_ids = tuple(observation.sample_id for observation in evidence)
     if len(set(sample_ids)) != len(sample_ids):
         raise ValueError("latency sample ids must be unique")
@@ -835,6 +1166,7 @@ def build_latency_report(
         raise ValueError("latency evidence contains observations outside the frozen methodology")
 
     return DurableLatencyReport(
+        schema_version=expected_schema,
         run_at=run_at,
         deployment_id=deployment_id,
         methodology_fingerprint=methodology_fingerprint(methodology),
@@ -859,6 +1191,13 @@ async def run_latency_certification(
     run_at: datetime,
 ) -> DurableLatencyCertificationRun:
     """Execute the frozen warmup, sample count, and concurrency contract."""
+    if (
+        methodology.schema_version != "3"
+        or methodology.measurement_surface is not LatencyMeasurementSurface.REASONING_GRAPH
+    ):
+        raise DurableLatencyActivationError(
+            "the in-process latency runner supports only schema-3 reasoning-graph methodology"
+        )
     frozen_fingerprint = methodology_fingerprint(methodology)
 
     def aborted(
@@ -870,6 +1209,7 @@ async def run_latency_certification(
         cleanup_failure: Exception | None = None,
     ) -> DurableLatencyCertificationRun:
         return DurableLatencyCertificationRun(
+            schema_version=latency_evidence_schema_version(methodology),
             run_at=run_at,
             deployment_id=deployment_id,
             methodology_fingerprint=frozen_fingerprint,
@@ -1096,6 +1436,7 @@ async def run_latency_certification(
         deployment_id=deployment_id,
     )
     return DurableLatencyCertificationRun(
+        schema_version=latency_evidence_schema_version(methodology),
         run_at=run_at,
         deployment_id=deployment_id,
         methodology_fingerprint=frozen_fingerprint,

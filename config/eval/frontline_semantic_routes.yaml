@@ -785,7 +785,7 @@ cases:
     context:
       <<: *base_context
       utterance: "Is there anyone else listed on the account?"
-    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+    expected: { decision: clarify, clarification_reason: unsupported_capability }
 
   - case_id: human_mention_transfer_question
     scenario_class: adversarial

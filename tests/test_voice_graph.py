@@ -29,7 +29,7 @@ class ScriptedEngine:
 
 
 class _FakeHistoryItem:
-    def __init__(self, role: str, interrupted: bool) -> None:
+    def __init__(self, role: str, interrupted: object) -> None:
         self.type = "message"
         self.role = role
         self.interrupted = interrupted
@@ -38,7 +38,7 @@ class _FakeHistoryItem:
 class _FakeSession:
     """AgentSession double: just the history surface the adapter reads."""
 
-    def __init__(self, items: list[_FakeHistoryItem] | None = None) -> None:
+    def __init__(self, items: list[object] | None = None) -> None:
         class _History:
             pass
 
@@ -67,6 +67,44 @@ async def test_adapter_renders_all_event_kinds_as_text() -> None:
         "I'll pass it to support.",
         "2 x rain jacket, $258.00 total. Shall I place it?",
     ]
+
+
+async def test_adapter_reports_the_exact_events_it_renders() -> None:
+    events = [
+        SpokenMessageEvent(text="Your cart is empty.", node="cart_view_render"),
+    ]
+    observed: list[object] = []
+    adapter = GraphVoiceAdapter(ScriptedEngine(events), turn_event_observer=observed.append)
+
+    assert await _spoken(
+        adapter,
+        {"messages": [HumanMessage("what is in my cart?", id="turn-1")]},
+    ) == ["Your cart is empty."]
+    assert observed == events
+
+
+async def test_diagnostic_observer_failure_does_not_interrupt_caller_output() -> None:
+    event = SpokenMessageEvent(text="Your cart is empty.", node="cart_view_render")
+    started: list[bool] = []
+    failures: list[Exception] = []
+
+    def fail_observation(_event: object) -> None:
+        raise RuntimeError("diagnostic observer failed")
+
+    adapter = GraphVoiceAdapter(
+        ScriptedEngine([event]),
+        turn_started_observer=lambda: started.append(True),
+        turn_event_observer=fail_observation,
+        observer_failure_observer=failures.append,
+    )
+
+    assert await _spoken(
+        adapter,
+        {"messages": [HumanMessage("what is in my cart?", id="turn-1")]},
+    ) == ["Your cart is empty."]
+    assert started == [True]
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
 
 
 async def test_adapter_feeds_only_the_last_user_turn() -> None:
@@ -131,6 +169,21 @@ async def test_4a_fact_false_when_readback_played_out() -> None:
     adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=False)]))
     await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
     assert engine.calls[0][1].readback_interrupted is False
+
+
+async def test_missing_or_invalid_interruption_evidence_fails_closed() -> None:
+    class MissingInterruption:
+        type = "message"
+        role = "assistant"
+
+    for item in (MissingInterruption(), _FakeHistoryItem("assistant", "false")):
+        engine = ScriptedEngine([])
+        adapter = GraphVoiceAdapter(engine)
+        adapter.attach_session(_FakeSession([item]))
+
+        await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
+
+        assert engine.calls[0][1].readback_interrupted is True
 
 
 async def test_unconsumed_turn_never_reaches_the_engine() -> None:

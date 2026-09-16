@@ -101,6 +101,18 @@ class CrashCaseExecution(BaseModel):
     errors: int = Field(ge=0)
 
 
+def _validate_outcome_execution(
+    outcome: CrashCaseOutcome,
+    execution: CrashCaseExecution | None,
+) -> None:
+    if outcome in {CrashCaseOutcome.PASSED, CrashCaseOutcome.FAILED}:
+        if execution is None:
+            raise ValueError("a passed or failed crash case must record its observed execution")
+        return
+    if execution is not None:
+        raise ValueError("a timed-out or infrastructure-error crash case must not record execution")
+
+
 class CrashCaseResult(BaseModel):
     model_config = _STRICT
 
@@ -109,8 +121,13 @@ class CrashCaseResult(BaseModel):
     execution_surface: CrashExecutionSurface
     nodeid: str
     outcome: CrashCaseOutcome
-    elapsed_seconds: float = Field(ge=0)
+    elapsed_seconds: float = Field(gt=0)
     execution: CrashCaseExecution | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome_execution(self) -> Self:
+        _validate_outcome_execution(self.outcome, self.execution)
+        return self
 
 
 class DurableCrashCertificationReport(BaseModel):
@@ -230,10 +247,10 @@ type CrashCaseExecutor = Callable[[CrashMatrixCase, float], CrashCaseResult]
 
 
 def _validate_case_evidence(case: CrashMatrixCase, result: CrashCaseResult) -> None:
+    _validate_outcome_execution(result.outcome, result.execution)
     if result.outcome is not CrashCaseOutcome.PASSED:
         return
-    if result.execution is None:
-        raise ValueError("a passing crash case must record its observed execution")
+    assert result.execution is not None
     if result.execution.tests != case.expected_test_count:
         raise ValueError("a passing crash case must collect its expected test count")
     if result.execution.skipped or result.execution.failures or result.execution.errors:

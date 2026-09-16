@@ -32,6 +32,7 @@ from agnostic_market.application import (
     build_application_session,
 )
 from agnostic_market.config.registry import ResolvedConfig
+from agnostic_market.dtos.events import TurnEvent
 from agnostic_market.dtos.llm import ProviderCredentialsConfig
 from agnostic_market.durability.platform_runtime import DurableSessionResources
 from agnostic_market.durability.session_lease import LeaseLoss, SessionLeaseSupervisor
@@ -53,6 +54,11 @@ class TurnLatencyMeasurement:
     end_to_end_seconds: float
     endpointing_seconds: float
     processing_seconds: float
+    interrupted: bool
+
+
+class TurnMetricObservationError(RuntimeError):
+    """The transport did not expose one valid correlated turn measurement."""
 
 
 class DisclosureFirstAgent(Agent):
@@ -213,6 +219,9 @@ async def build_voice_loop(
     session_state_factory: SessionStateFactory | None = None,
     durable_session: DurableSessionResources | None = None,
     turn_latency_observer: Callable[[TurnLatencyMeasurement], None] | None = None,
+    turn_started_observer: Callable[[], None] | None = None,
+    turn_event_observer: Callable[[TurnEvent], None] | None = None,
+    turn_observer_failure_observer: Callable[[Exception], None] | None = None,
     graph_turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
 ) -> VoiceLoop:
     """Assemble the per-merchant session: engines, graph, tools, disclosure — all from config."""
@@ -237,7 +246,12 @@ async def build_voice_loop(
         durable_session=durable_session,
         graph_turn_latency_observer=graph_turn_latency_observer,
     )
-    adapter = GraphVoiceAdapter(application.engine)
+    adapter = GraphVoiceAdapter(
+        application.engine,
+        turn_started_observer=turn_started_observer,
+        turn_event_observer=turn_event_observer,
+        observer_failure_observer=turn_observer_failure_observer,
+    )
 
     session = AgentSession(
         stt=build_stt(config.voice.stt, credentials, secrets),
@@ -265,7 +279,11 @@ async def build_voice_loop(
         },
     )
     adapter.attach_session(session)  # §4a fact source (readback-interrupted flag)
-    _attach_turn_metrics_logger(session, turn_latency_observer)
+    _attach_turn_metrics_logger(
+        session,
+        turn_latency_observer,
+        turn_observer_failure_observer,
+    )
     _attach_thread_reaper(session, application.state.caller_context)
 
     agent = DisclosureFirstAgent(
@@ -327,6 +345,7 @@ def _attach_thread_reaper(session: AgentSession, caller_context: CallerContext) 
 def _attach_turn_metrics_logger(
     session: AgentSession,
     turn_latency_observer: Callable[[TurnLatencyMeasurement], None] | None = None,
+    observer_failure_observer: Callable[[Exception], None] | None = None,
 ) -> None:
     """Log per-turn latency (BUILD_PLAN Phase 2 'measure turn latency'; OTel backend = Phase 6).
 
@@ -336,6 +355,14 @@ def _attach_turn_metrics_logger(
     """
 
     pending_endpointing: list[float | None] = []
+
+    def record_observer_failure(failure: Exception) -> None:
+        if observer_failure_observer is None:
+            return
+        try:
+            observer_failure_observer(failure)
+        except Exception:
+            logger.exception("turn metric failure observer failed")
 
     def metric_value(value: object) -> float | None:
         if (
@@ -353,14 +380,29 @@ def _attach_turn_metrics_logger(
         role = ev.item.role
         if turn_latency_observer is not None and role == "user":
             pending_endpointing.append(metric_value(metrics.get("end_of_turn_delay")))
-        elif turn_latency_observer is not None and role == "assistant":
-            if (e2e_latency := metrics.get("e2e_latency")) is not None:
+        elif turn_latency_observer is not None and role == "assistant" and pending_endpointing:
+            if (e2e_latency := metrics.get("e2e_latency")) is None:
+                logger.warning("ignored assistant turn without end-to-end latency metric")
+                record_observer_failure(
+                    TurnMetricObservationError("assistant turn has no end-to-end latency metric")
+                )
+            else:
                 end_to_end_seconds = metric_value(e2e_latency)
                 if end_to_end_seconds is None:
                     logger.warning("ignored invalid assistant end-to-end latency metric")
+                    record_observer_failure(
+                        TurnMetricObservationError(
+                            "assistant turn has an invalid end-to-end latency metric"
+                        )
+                    )
                 elif len(pending_endpointing) != 1 or pending_endpointing[0] is None:
                     logger.warning(
                         "ignored assistant latency without one correlated endpointing metric"
+                    )
+                    record_observer_failure(
+                        TurnMetricObservationError(
+                            "assistant turn has ambiguous endpointing latency"
+                        )
                     )
                 else:
                     endpointing_seconds = pending_endpointing[0]
@@ -369,17 +411,35 @@ def _attach_turn_metrics_logger(
                         logger.warning(
                             "ignored contradictory assistant and endpointing latency metrics"
                         )
+                        record_observer_failure(
+                            TurnMetricObservationError(
+                                "assistant and endpointing latency metrics contradict"
+                            )
+                        )
                     else:
-                        try:
-                            turn_latency_observer(
-                                TurnLatencyMeasurement(
-                                    end_to_end_seconds=end_to_end_seconds,
-                                    endpointing_seconds=endpointing_seconds,
-                                    processing_seconds=processing_seconds,
+                        interrupted = getattr(ev.item, "interrupted", None)
+                        if not isinstance(interrupted, bool):
+                            logger.warning(
+                                "ignored assistant latency without a boolean interruption flag"
+                            )
+                            record_observer_failure(
+                                TurnMetricObservationError(
+                                    "assistant turn has no boolean interruption flag"
                                 )
                             )
-                        except Exception:
-                            logger.exception("turn latency observer failed")
+                        else:
+                            try:
+                                turn_latency_observer(
+                                    TurnLatencyMeasurement(
+                                        end_to_end_seconds=end_to_end_seconds,
+                                        endpointing_seconds=endpointing_seconds,
+                                        processing_seconds=processing_seconds,
+                                        interrupted=interrupted,
+                                    )
+                                )
+                            except Exception as exc:
+                                logger.exception("turn latency observer failed")
+                                record_observer_failure(exc)
             pending_endpointing.clear()
         if not metrics:
             return

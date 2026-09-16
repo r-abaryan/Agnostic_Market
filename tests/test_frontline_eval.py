@@ -816,6 +816,26 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
         case.risk_domain for case in (*corpus.cases, corpus.projected_case)
     }
     assert by_id["acceptance_cancel_negated_then_list"].risk_domain == "commerce_effect"
+    assert by_id["human_mention_account_question"].expected == RouteDecision.clarify(
+        "unsupported_capability"
+    )
+    assert by_id["ambiguous_without_owner"].expected == RouteDecision.clarify("ambiguous_intent")
+    assert all(
+        by_id[case_id].expected == RouteDecision.clarify("ambiguous_intent")
+        for case_id in ("quoted_cancel_is_not_an_action", "acceptance_cancel_quoted")
+    )
+    assert all(
+        by_id[case_id].expected == RouteDecision.direct(AnswerQuestion(topic="general"))
+        for case_id in (
+            "human_mention_supervisor_statement",
+            "human_mention_sales_rep_statement",
+            "human_mention_manager_statement",
+        )
+    )
+    assert all(
+        by_id[case_id].expected == RouteDecision.direct(VerifyOrderStatus())
+        for case_id in ("status_without_recent_context", "stop_word_order_status")
+    )
     request_person_cases = [
         case for case in corpus.cases if case.case_id.startswith("request_person_")
     ]
@@ -1719,6 +1739,7 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
                 input_max_chars=2048,
                 timeout_seconds=2.0,
                 provider_call_outcome="provider_error",
+                provider_error_category="ConnectionError",
             ),
         ),
     )
@@ -1834,6 +1855,13 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
     assert run_case["mismatch_kind"] == "exact"
     assert run_case["risk_domain"] == "commerce_read"
     assert "timeout_seconds" not in run_case
+    assert run_case["observed_at"] is None
+    assert run_case["provider_error_category"] is None
+    assert run_case["provider_request_id"] is None
+    assert run_case["provider_retry_count"] is None
+    outage_case = report["runs"][1]["models"]["candidate"]["cases"][1]
+    assert outage_case["provider_call_outcome"] == "provider_error"
+    assert outage_case["provider_error_category"] == "ConnectionError"
 
     diagnostic_verdict = frontline_eval._semantic_series_verdict(
         (results,),

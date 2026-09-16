@@ -15,6 +15,7 @@ from livekit import rtc
 
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.config.resolver import ConfigResolutionError
+from agnostic_market.durability.latency import VoiceApplicationContract
 from agnostic_market.tenancy.resolver import TenantResolutionError, TenantResolver
 from agnostic_market.voice.admission import (
     ConsoleVoiceTenantAdmission,
@@ -34,6 +35,7 @@ import os
 import runpy
 import socket
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from livekit import agents
 from livekit.agents.ipc.proc_client import _ProcClient
@@ -98,7 +100,9 @@ def run_app(options):
 
 agents.cli.run_app = run_app
 sys.argv = ["scripts/voice_agent.py", "dev"]
-os.environ["VOICE_AGENT_NAME"] = "agnostic-market"
+os.environ["VOICE_AGENT_CERTIFICATION_CONFIG"] = str(
+    (Path.cwd() / "config/platform/voice_certification.example.yaml").resolve()
+)
 sys.path.insert(0, "scripts")
 runpy.run_path("scripts/voice_agent.py", run_name="__main__")
 """
@@ -171,7 +175,9 @@ class _JobContext:
             room=SimpleNamespace(sid=room_id),
         )
         self.worker_id = worker_id
-        self.room = object()
+        self.room = SimpleNamespace(
+            local_participant=SimpleNamespace(identity="worker-participant")
+        )
         self.participants = (
             SimpleNamespace(
                 identity=participant_identity,
@@ -217,6 +223,10 @@ class _JobContext:
 
     def add_shutdown_callback(self, callback) -> None:
         self.shutdown_callbacks.append(callback)
+
+    @property
+    def agent(self):
+        return self.room.local_participant
 
 
 async def test_console_admission_requires_an_explicit_known_merchant(
@@ -716,21 +726,34 @@ def test_registry_rejects_a_noncanonical_inbound_did_for_any_merchant(
         ConfigRegistry(invalid_root).load()
 
 
-def test_worker_requires_an_explicit_dispatch_name(
+def test_worker_derives_its_dispatch_name_from_the_shared_target(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from agnostic_market.durability.voice_certification import VoiceCertificationTarget
     from scripts import voice_agent
 
-    monkeypatch.delenv("VOICE_AGENT_NAME", raising=False)
+    target = VoiceCertificationTarget(
+        schema_version=1,
+        environment="synthetic",
+        production_agent_name="agnostic-market",
+        certification_agent_name="agnostic-market-certification",
+        room_name="certification-room-01",
+        controller_participant_identity="certification-controller",
+        merchant_id="acme_store",
+    )
+    path = tmp_path / "voice-certification.json"
+    path.write_text(target.model_dump_json(), encoding="utf-8")
+    monkeypatch.delenv("VOICE_AGENT_CERTIFICATION_CONFIG", raising=False)
     assert voice_agent._agent_name(()) == ""
     assert voice_agent._agent_name(("--help",)) == ""
     assert voice_agent._agent_name(("dev", "--help")) == ""
     assert voice_agent._agent_name(("console",)) == ""
     assert voice_agent._agent_name(("download-files",)) == ""
-    with pytest.raises(RuntimeError, match="VOICE_AGENT_NAME"):
+    with pytest.raises(RuntimeError, match="VOICE_AGENT_CERTIFICATION_CONFIG"):
         voice_agent._agent_name(("dev",))
 
-    monkeypatch.setenv("VOICE_AGENT_NAME", "  agnostic-market  ")
+    monkeypatch.setenv("VOICE_AGENT_CERTIFICATION_CONFIG", str(path))
     assert voice_agent._agent_name(("dev",)) == "agnostic-market"
 
 
@@ -846,6 +869,45 @@ class _WorkerLoop:
             await release_job_resources()
 
 
+def _bind_certification_job(job: _JobContext, target: object) -> None:
+    from agnostic_market.durability.latency import LatencyMeasurementSurface, LatencyPhase
+    from agnostic_market.durability.timing import DurabilityOperation
+    from agnostic_market.durability.voice_certification import (
+        VOICE_CERTIFICATION_SAMPLE_ATTRIBUTE,
+        VoiceCertificationDispatchDirective,
+        VoiceCertificationSampleSpec,
+        VoiceCertificationTarget,
+    )
+
+    assert isinstance(target, VoiceCertificationTarget)
+    job.job.agent_name = target.certification_agent_name
+    job.job.room.name = target.room_name
+    # Certification uses explicit room dispatch. LiveKit binds the controller
+    # only after connection, not through Job.participant.
+    job.job.participant = None
+    directive = VoiceCertificationDispatchDirective(
+        methodology_schema_version="5",
+        run_id="voice-certification-run-01",
+        methodology_fingerprint="c" * 64,
+        journey_corpus_fingerprint="b" * 64,
+        runtime_contract_fingerprint="a" * 64,
+        application_contract_fingerprint="d" * 64,
+        deployment_id="deployment-test",
+        controller_identity=target.controller_participant_identity,
+        measurement_surface=LatencyMeasurementSurface.VOICE_PROCESSING,
+        result_rpc_timeout_seconds=3.0,
+        result_rpc_retries=1,
+        result_rpc_retry_backoff_seconds=0.01,
+        sample_timeout_seconds=10.0,
+        sample=VoiceCertificationSampleSpec(
+            sample_id="sample-startup-0001",
+            phase=LatencyPhase.STARTUP,
+            required_operations=(DurabilityOperation.POOL_OPEN,),
+        ),
+    )
+    job.job.attributes = {VOICE_CERTIFICATION_SAMPLE_ATTRIBUTE: directive.model_dump_json()}
+
+
 def _patch_durable_worker_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     config_root: Path,
@@ -856,9 +918,20 @@ def _patch_durable_worker_dependencies(
     composition_failure: BaseException | None = None,
     session_start_failure: BaseException | None = None,
 ) -> None:
+    from agnostic_market.agents.routing_activation import SemanticRoutingRuntimeContract
+    from agnostic_market.durability.voice_certification import VoiceCertificationTarget
     from scripts import voice_agent
 
-    prepared_routing = object()
+    prepared_routing = SimpleNamespace(capability_registry=object())
+    certification_target = VoiceCertificationTarget(
+        schema_version=1,
+        environment="synthetic",
+        production_agent_name="agnostic-market",
+        certification_agent_name="agnostic-market-certification",
+        room_name="certification-room-01",
+        controller_participant_identity="caller-primary",
+        merchant_id="demo_shop",
+    )
     monkeypatch.setattr(voice_agent, "_CONFIG_ROOT", config_root)
     monkeypatch.setattr(voice_agent, "load_close_certification_request", lambda _root: None)
     monkeypatch.setattr(voice_agent, "require_llm_certification", lambda *_args: None)
@@ -866,6 +939,28 @@ def _patch_durable_worker_dependencies(
         voice_agent,
         "prepare_application_routing",
         lambda _factory: events.append("routing_prepared") or prepared_routing,
+    )
+    monkeypatch.setattr(
+        voice_agent,
+        "semantic_routing_runtime_contract",
+        lambda *_args, **_kwargs: SemanticRoutingRuntimeContract(
+            provider="fake",
+            model="router",
+            reasoning_effort=None,
+            structured_output_method="function_calling",
+            route_schema_fingerprint="route-schema",
+            prompt_fingerprint="prompt",
+            registry_fingerprint="registry",
+            projector_version="projector",
+            input_max_chars=4_000,
+            timeout_seconds=2.0,
+            corpus_fingerprint="c" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        voice_agent,
+        "load_voice_certification_target",
+        lambda _path: certification_target,
     )
     journey_corpus = object()
 
@@ -876,16 +971,30 @@ def _patch_durable_worker_dependencies(
         expected_deployment_id: str,
         expected_journey_corpus: object,
         expected_runtime_contract_fingerprint: str,
+        expected_application_contract: VoiceApplicationContract,
         required_measurement_surface: voice_agent.LatencyMeasurementSurface,
+        required_transport_surface: voice_agent.VoiceTransportSurface,
     ) -> None:
         assert methodology_path == platform_config_path.with_name("latency-methodology.yaml")
         assert report_path == platform_config_path.with_name("latency-report.json")
         assert expected_deployment_id == "deployment-test"
         assert expected_journey_corpus is journey_corpus
         assert expected_runtime_contract_fingerprint == "a" * 64
+        assert expected_application_contract.durable_platform_fingerprint == "a" * 64
+        assert expected_application_contract.build_artifact_digest == f"sha256:{'b' * 64}"
+        assert expected_application_contract.tenant_config_version
+        assert expected_application_contract.semantic_routing.provider == "fake"
+        assert (
+            expected_application_contract.certification_target_fingerprint
+            == voice_agent.voice_certification_target_fingerprint(certification_target)
+        )
         assert (
             required_measurement_surface is voice_agent.LatencyMeasurementSurface.VOICE_PROCESSING
         )
+        assert required_transport_surface in {
+            voice_agent.VoiceTransportSurface.STANDARD,
+            voice_agent.VoiceTransportSurface.SIP,
+        }
         events.append("latency_authorized")
 
     monkeypatch.setattr(
@@ -914,10 +1023,35 @@ def _patch_durable_worker_dependencies(
         "deployment_runtime_contract_fingerprint",
         lambda *_args, **_kwargs: "a" * 64,
     )
+    monkeypatch.setattr(
+        voice_agent,
+        "latency_journey_corpus_fingerprint",
+        lambda _corpus: "b" * 64,
+    )
 
-    async def open_resources(config, _secrets, *, application_dsn: str):
+    async def open_resources(
+        config,
+        _secrets,
+        *,
+        durability_timing=None,
+        application_dsn: str,
+    ):
         assert config is platform_config
         assert application_dsn == "postgresql://runtime.invalid/platform"
+        if durability_timing is not None:
+            from agnostic_market.durability.timing import (
+                DurabilityOperation,
+                DurabilityTimingOutcome,
+                DurabilityTimingSample,
+            )
+
+            durability_timing.observe(
+                DurabilityTimingSample(
+                    operation=DurabilityOperation.POOL_OPEN,
+                    elapsed_seconds=0.01,
+                    outcome=DurabilityTimingOutcome.SUCCESS,
+                )
+            )
         events.append("platform_opened")
         return resources
 
@@ -925,6 +1059,50 @@ def _patch_durable_worker_dependencies(
         voice_agent.DurablePlatformResources,
         "open",
         staticmethod(open_resources),
+    )
+
+    def load_certification_assignment(*_args, **kwargs):
+        from agnostic_market.durability.latency import LatencyPhase
+
+        assert kwargs["expected_deployment_id"] == "deployment-test"
+        assert kwargs["expected_journey_corpus_fingerprint"] == "b" * 64
+        assert kwargs["expected_runtime_contract_fingerprint"] == "a" * 64
+        assert isinstance(kwargs["expected_application_contract"], VoiceApplicationContract)
+        assert kwargs["worker_id"] == "AW_test_worker"
+        assert kwargs["worker_participant_identity"] == "worker-participant"
+        events.append("certification_assignment_loaded")
+        return SimpleNamespace(
+            sample=SimpleNamespace(
+                sample_id="sample-startup-0001",
+                phase=LatencyPhase.STARTUP,
+            )
+        )
+
+    monkeypatch.setattr(
+        voice_agent,
+        "load_voice_sample_assignment",
+        load_certification_assignment,
+    )
+
+    async def announce_certification_ready(_participant, assignment):
+        assert assignment.sample.sample_id == "sample-startup-0001"
+        events.append("certification_ready_announced")
+
+    monkeypatch.setattr(
+        voice_agent,
+        "announce_voice_certification_ready",
+        announce_certification_ready,
+    )
+
+    async def submit_certification_result(_participant, assignment, observation):
+        assert assignment.sample.sample_id == "sample-startup-0001"
+        assert observation.sample_id == "sample-startup-0001"
+        events.append("certification_result_submitted")
+
+    monkeypatch.setattr(
+        voice_agent,
+        "submit_voice_certification_sample",
+        submit_certification_result,
     )
 
     def build_services(_root, tenant, *, telemetry, checkpointer):
@@ -946,6 +1124,7 @@ def _patch_durable_worker_dependencies(
 
     monkeypatch.setattr(voice_agent, "build_voice_loop", build_loop)
     monkeypatch.setenv("VOICE_AGENT_DEPLOYMENT_ID", "deployment-test")
+    monkeypatch.setenv("VOICE_AGENT_BUILD_ARTIFACT_DIGEST", f"sha256:{'b' * 64}")
     monkeypatch.setenv("PLATFORM_POSTGRES_DSN", "postgresql://runtime.invalid/platform")
     monkeypatch.setenv("VOICE_AGENT_PLATFORM_CONFIG", str(platform_config_path))
     monkeypatch.setenv(
@@ -956,6 +1135,7 @@ def _patch_durable_worker_dependencies(
         "VOICE_AGENT_LATENCY_REPORT",
         str(platform_config_path.with_name("latency-report.json")),
     )
+    monkeypatch.setenv("VOICE_AGENT_CERTIFICATION_CONFIG", str(platform_config_path))
 
 
 def test_network_worker_requires_an_absolute_platform_config_path(tmp_path: Path) -> None:
@@ -991,6 +1171,38 @@ def test_network_worker_requires_an_absolute_platform_config_path(tmp_path: Path
             "VOICE_AGENT_LATENCY_REPORT": str(report_path),
         }
     ) == (methodology_path, report_path)
+
+
+async def test_network_worker_requires_immutable_build_identity_before_connecting(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    resources = _WorkerPlatformResources(events)
+    _patch_durable_worker_dependencies(
+        monkeypatch,
+        config_root,
+        tmp_path / "platform.yaml",
+        events,
+        resources,
+    )
+    monkeypatch.delenv("VOICE_AGENT_BUILD_ARTIFACT_DIGEST")
+    job = _JobContext(
+        fake=False,
+        metadata=(
+            '{"schema_version":1,"merchant_id":"demo_shop",'
+            '"participant_kind":"standard","participant_identity":"caller-primary"}'
+        ),
+    )
+
+    from scripts import voice_agent
+
+    with pytest.raises(RuntimeError, match="VOICE_AGENT_BUILD_ARTIFACT_DIGEST"):
+        await voice_agent.entrypoint(job)  # type: ignore[arg-type]
+
+    assert "platform_opened" not in events
+    assert job.connect_count == 0
 
 
 async def test_network_worker_acquires_durable_authority_before_runtime_composition(
@@ -1042,6 +1254,103 @@ async def test_network_worker_acquires_durable_authority_before_runtime_composit
     assert len(job.shutdown_callbacks) == 1
     await job.shutdown_callbacks[0]()
     assert events[-3:] == ["loop_closed", "background_audio_closed", "platform_closed"]
+
+
+async def test_certification_worker_reuses_normal_composition_without_prior_latency_evidence(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agnostic_market.durability.voice_certification import VoiceCertificationTarget
+    from scripts import voice_agent
+
+    events: list[str] = []
+    resources = _WorkerPlatformResources(events)
+    _patch_durable_worker_dependencies(
+        monkeypatch,
+        config_root,
+        tmp_path / "platform.yaml",
+        events,
+        resources,
+    )
+    target = VoiceCertificationTarget(
+        schema_version=1,
+        environment="synthetic",
+        production_agent_name="agnostic-market",
+        certification_agent_name="agnostic-market-certification",
+        room_name="certification-room-01",
+        controller_participant_identity="caller-primary",
+        merchant_id="demo_shop",
+    )
+    job = _JobContext(
+        fake=False,
+        metadata=(
+            '{"schema_version":1,"merchant_id":"demo_shop",'
+            '"participant_kind":"standard","participant_identity":"caller-primary"}'
+        ),
+    )
+    _bind_certification_job(job, target)
+
+    await voice_agent.entrypoint(  # type: ignore[call-arg]
+        job,  # type: ignore[arg-type]
+        certification_target=target,
+    )
+
+    assert "latency_authorized" not in events
+    assert job.connect_count == 1
+    assert events == [
+        "routing_prepared",
+        "platform_config_loaded",
+        "platform_opened",
+        "certification_assignment_loaded",
+        "lease_acquired",
+        "tenant_services_built",
+        "voice_loop_build_started",
+        "shutdown_registered",
+        "lease_supervision_started",
+        "session_started",
+        "background_audio_started",
+        "certification_ready_announced",
+        "certification_result_submitted",
+    ]
+
+
+async def test_certification_worker_rejects_admission_outside_its_target_before_connecting(
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agnostic_market.durability.voice_certification import (
+        VoiceCertificationTarget,
+        VoiceCertificationTargetError,
+    )
+    from scripts import voice_agent
+
+    monkeypatch.setattr(voice_agent, "_CONFIG_ROOT", config_root)
+    target = VoiceCertificationTarget(
+        schema_version=1,
+        environment="synthetic",
+        production_agent_name="agnostic-market",
+        certification_agent_name="agnostic-market-certification",
+        room_name="certification-room-01",
+        controller_participant_identity="caller-primary",
+        merchant_id="demo_shop",
+    )
+    job = _JobContext(
+        fake=False,
+        metadata=(
+            '{"schema_version":1,"merchant_id":"acme_store",'
+            '"participant_kind":"standard","participant_identity":"caller-primary"}'
+        ),
+    )
+    _bind_certification_job(job, target)
+
+    with pytest.raises(VoiceCertificationTargetError, match="wrong merchant"):
+        await voice_agent.entrypoint(  # type: ignore[call-arg]
+            job,  # type: ignore[arg-type]
+            certification_target=target,
+        )
+
+    assert job.connect_count == 0
 
 
 async def test_network_worker_closes_durable_session_when_composition_fails(

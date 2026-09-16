@@ -1,0 +1,112 @@
+# Frozen deployment-owned standard-transport voice latency contract.
+# Operator-approved 2026-09-13; fingerprint: 10be6f32f0a73061e388bf98d8728240eae031c227375beb723d5fec02da961d
+schema_version: "4"
+environment: deployment
+backend_location: aiven-primary
+journey_corpus_fingerprint: 1d7d9e9f5126c9547f4986cc42778255b9f5701cb630b4f1c09b9edd0b8c86ad
+runtime_contract_fingerprint: c6ba5d205ed36f6df834734fb45eb31333b663dc18bdd600f990faacaf3622cf
+measurement_surface: voice_processing
+transport_surface: standard
+result_rpc_timeout_seconds: 3.0
+result_rpc_retries: 1
+startup_treatment: fresh_job_resources
+concurrency: 1
+warmup_runs: 2
+startup_samples: 20
+startup_p95_limit_seconds: 2.0
+required_startup_operations:
+  - pool.open
+  - platform.startup_gates
+  - registry.register_and_acquire
+  - registry.restore
+  - registry.reconcile_checkpoint_revision
+  - registry.activate
+  - registry.get
+  - checkpoint.write
+  - checkpoint.bind
+  - envelope.encrypt
+  - envelope.decrypt
+samples_per_journey: 20
+sample_timeout_seconds: 15.0
+reported_statistics:
+  - p50
+  - p95
+  - maximum
+journeys:
+  - journey_id: simple-cart-read
+    journey_contract_fingerprint: a9304596004c7bd0515380f0cbab5ef5caf62bbf8b6ef607328304a1556bbe67
+    tier: simple
+    required_operations:
+      - checkpoint.read
+      - checkpoint.write
+      - envelope.encrypt
+      - envelope.decrypt
+    audio_treatment:
+      asset_path: simple-cart-read.wav
+      asset_sha256: 3e7a5cb596992856774e1d10ea08a991969f466e2160dce132f1ecae9a252ad9
+      container: wav
+      pcm_format: s16le
+      channel_count: 1
+      sample_rate_hz: 16000
+      playback_rate: 1.0
+      pre_speech_silence_seconds: 0.25
+      post_speech_silence_seconds: 0.5
+
+  - journey_id: commerce-cart-confirmation
+    journey_contract_fingerprint: d2da9a766025b7e196688531453fc0babe455cbe39d0227eb26b0b786af97083
+    tier: non_checkout_commerce
+    required_operations:
+      - checkpoint.read
+      - checkpoint.write
+      - checkpoint.pending_write
+      - envelope.encrypt
+      - envelope.decrypt
+    audio_treatment:
+      asset_path: commerce-cart-confirmation.wav
+      asset_sha256: 876c0fc18df56bd41db61bf52b444aa63ba74b6ef719d9a20ae610590c839fa6
+      container: wav
+      pcm_format: s16le
+      channel_count: 1
+      sample_rate_hz: 16000
+      playback_rate: 1.0
+      pre_speech_silence_seconds: 0.25
+      post_speech_silence_seconds: 0.5
+
+  - journey_id: checkout-placement-readback
+    journey_contract_fingerprint: 0c57f13de9e35722c199b81e204a8aee2f518a2acec3c9e181f3cf1e5bb458d3
+    tier: checkout
+    required_operations:
+      - checkpoint.read
+      - checkpoint.write
+      - checkpoint.pending_write
+      - envelope.encrypt
+      - envelope.decrypt
+    setup_audio_treatments:
+      - asset_path: checkout-setup-add.wav
+        asset_sha256: c58df99d5a079bea19a5d0581a98383ea3a1db4096cc28662d49a72bc85ee63d
+        container: wav
+        pcm_format: s16le
+        channel_count: 1
+        sample_rate_hz: 16000
+        playback_rate: 1.0
+        pre_speech_silence_seconds: 0.25
+        post_speech_silence_seconds: 0.5
+      - asset_path: checkout-setup-confirm.wav
+        asset_sha256: ce03e26923e6f6aca98c1373715003e8b2aec9b3acf225488ceed56d6eb6dd77
+        container: wav
+        pcm_format: s16le
+        channel_count: 1
+        sample_rate_hz: 16000
+        playback_rate: 1.0
+        pre_speech_silence_seconds: 0.25
+        post_speech_silence_seconds: 0.5
+    audio_treatment:
+      asset_path: checkout-placement-readback.wav
+      asset_sha256: cad6956dc38b9ba46206b0fbd76129d3003b3cd65d88b6d6ba577773f5e96ee7
+      container: wav
+      pcm_format: s16le
+      channel_count: 1
+      sample_rate_hz: 16000
+      playback_rate: 1.0
+      pre_speech_silence_seconds: 0.25
+      post_speech_silence_seconds: 0.5

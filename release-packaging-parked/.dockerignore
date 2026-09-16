@@ -1,0 +1,32 @@
+# Keep deployment-owned secrets and machine-local state out of the build context.
+.env
+.env.*
+!.env.example
+.venv/
+.git/
+.github/
+.test-tmp/
+.claude/
+**/__pycache__/
+**/*.pyc
+
+# Deployment-owned and generated config. The platform YAML is mounted at deploy time;
+# only the frozen latency methodology is part of the immutable artifact.
+config/platform/*.local.yaml
+!config/platform/latency.local.yaml
+config/fixtures/
+# config/telemetry/semantic_routing_report.json and config/conformance/reports.json are
+# read at startup, so they must reach the build context. Everything else is generated.
+config/telemetry/*
+!config/telemetry/semantic_routing_report.json
+
+
+# Local-only working material. Kept out of the repo deliberately: design notes and live-call
+# findings are unreviewed internal drafts, the telemetry sink is a per-call dataset, and the
+# fixture data stands in for a system of record that does not ship with the code.
+docs/
+tests/
+config/telemetry/
+config/conformance/reports.json
+config/fixtures/
+config/platform/*.local.yaml

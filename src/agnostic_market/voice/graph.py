@@ -20,13 +20,13 @@ built around this adapter.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from langchain_core.messages import HumanMessage
 
 from agnostic_market.agents.engine import ReasoningEngine
-from agnostic_market.dtos.events import CommittedTurn, TurnFacts
+from agnostic_market.dtos.events import CommittedTurn, TurnEvent, TurnFacts
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,19 @@ logger = logging.getLogger(__name__)
 class GraphVoiceAdapter:
     """`astream`-compatible facade over a ReasoningEngine, for LiveKit's LLMAdapter."""
 
-    def __init__(self, engine: ReasoningEngine) -> None:
+    def __init__(
+        self,
+        engine: ReasoningEngine,
+        *,
+        turn_started_observer: Callable[[], None] | None = None,
+        turn_event_observer: Callable[[TurnEvent], None] | None = None,
+        observer_failure_observer: Callable[[Exception], None] | None = None,
+    ) -> None:
         self._engine = engine
         self._session: Any = None
+        self._turn_started_observer = turn_started_observer
+        self._turn_event_observer = turn_event_observer
+        self._observer_failure_observer = observer_failure_observer
 
     def attach_session(self, session: Any) -> None:
         """Bind the live AgentSession (post-construction; the session wraps this adapter)."""
@@ -70,8 +80,23 @@ class GraphVoiceAdapter:
         for item in reversed(items):
             is_message = getattr(item, "type", None) == "message"
             if is_message and getattr(item, "role", "") == "assistant":
-                return bool(getattr(item, "interrupted", False))
+                interrupted = getattr(item, "interrupted", None)
+                return interrupted if isinstance(interrupted, bool) else True
         return False
+
+    def _observe(self, observer: Callable[..., None] | None, *values: object) -> None:
+        if observer is None:
+            return
+        try:
+            observer(*values)
+        except Exception as exc:
+            logger.exception("voice diagnostic observer failed")
+            if self._observer_failure_observer is None:
+                return
+            try:
+                self._observer_failure_observer(exc)
+            except Exception:
+                logger.exception("voice diagnostic failure observer failed")
 
     def astream(self, state: dict[str, Any], *args: Any, **kwargs: Any) -> AsyncIterator[str]:
         """The LLMAdapter entry point. `state` is the chat_ctx-derived message dict; the
@@ -82,8 +107,10 @@ class GraphVoiceAdapter:
             if turn is None:
                 logger.warning("voice adapter: no user message in transport input; empty turn")
                 return
+            self._observe(self._turn_started_observer)
             facts = TurnFacts(readback_interrupted=self._readback_interrupted())
             async for event in self._engine.stream_turn(turn, facts):
+                self._observe(self._turn_event_observer, event)
                 # Token / spoken-message / interrupt prompt — all graph-authored text.
                 yield event.text if event.kind != "interrupt" else event.prompt
 
