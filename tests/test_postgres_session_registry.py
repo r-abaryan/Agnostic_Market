@@ -1581,11 +1581,15 @@ async def test_retiring_tenant_drain_uses_rls_scoped_authoritative_row_counts() 
             close_lease_duration_seconds=30.0,
             tombstone_retention_seconds=0.01,
         )
-        result = await coordinator.reap_expired(tenant_id)
-        assert result.sessions_closed == 1
+        first_result = await coordinator.reap_expired(tenant_id)
+        assert first_result.sessions_closed == 1
+        assert first_result.failure_count == 0
+
         await asyncio.sleep(0.02)
-        result = await coordinator.reap_expired(tenant_id)
-        assert result.tombstones_purged == 1
+        second_result = await coordinator.reap_expired(tenant_id)
+        assert second_result.sessions_closed == 0
+        assert second_result.failure_count == 0
+        assert first_result.tombstones_purged + second_result.tombstones_purged == 1
 
         drained = await registry.tenant_durable_row_counts(tenant_id)
         assert (

@@ -33,3 +33,4 @@ config/platform/*.local.yaml
 
 assets/audio/generate_thinking_beep.py
 .vscode/settings.json
+CLAUDE.md
