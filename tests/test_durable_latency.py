@@ -153,6 +153,7 @@ def _application_contract() -> VoiceApplicationContract:
             input_max_chars=4_000,
             timeout_seconds=2.0,
             corpus_fingerprint="d" * 64,
+            qualification_evidence_fingerprint="f" * 64,
         ),
         certification_target_fingerprint="e" * 64,
     )

@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import get_args
@@ -22,10 +22,12 @@ from support_helpers import authorize_customer, build_support_engine
 
 from agnostic_market.agents.frontline import read_flow
 from agnostic_market.agents.routing import (
+    ProviderCallOutcome,
     RoutingAttempt,
     SemanticRouter,
     materialize_route,
     project_routing_context,
+    resolve_route,
 )
 from agnostic_market.agents.telemetry import DisabledTelemetrySink
 from agnostic_market.config.loader import load_yaml_layer
@@ -44,12 +46,14 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     OrderTargetProposal,
     PlaceOrder,
+    RefundOrder,
     RequestPerson,
     RouteDecision,
     RouteProposal,
     RoutingContext,
     RoutingFailure,
     SearchCatalog,
+    SwitchAccount,
     VerifyIdentity,
     VerifyOrderStatus,
     ViewCart,
@@ -131,6 +135,105 @@ def _proposal_payload_for_expected(
     proposal = RouteProposal.model_validate(payload)
     assert materialize_route(context, proposal) == expected
     return proposal.model_dump(mode="json")
+
+
+def _readiness_holdout(
+    regression: SemanticRouteEvalCorpus,
+) -> frontline_eval.SemanticRouteReadinessHoldout:
+    corpus_payload = regression.model_dump(mode="json")
+    projected = corpus_payload["projected_case"]
+    projected["case_id"] = "readiness-projection"
+    projected["turn"]["text"] = "Readiness projection control"
+    projected["expected_context"]["utterance"] = "Readiness projection control"
+    projected["evaluation_split"] = "development"
+    readiness_cases: list[dict[str, object]] = []
+    lineage: list[dict[str, str]] = []
+    for index, case in enumerate(corpus_payload["cases"], start=1):
+        case_id = f"readiness-{index:03d}"
+        case["case_id"] = case_id
+        case["evaluation_split"] = "acceptance"
+        case["context"]["utterance"] = f"Independent readiness utterance {index}"
+        readiness_cases.append(case)
+        lineage.append(
+            {
+                "case_id": case_id,
+                "source_cluster_id": f"readiness-cluster-{index:03d}",
+                "source_fingerprint": hashlib.sha256(case_id.encode()).hexdigest(),
+            }
+        )
+    corpus_payload["cases"] = readiness_cases
+    return frontline_eval.SemanticRouteReadinessHoldout.model_validate(
+        {
+            "schema_version": "1",
+            "holdout_id": "readiness-holdout-v1",
+            "steward_id": "routing-steward",
+            "frozen_at": (datetime.now(tz=UTC) - timedelta(minutes=1)).isoformat(),
+            "lineage_reference": "lineage:readiness-holdout-v1",
+            "generation_recipe_fingerprint": "a" * 64,
+            "source_disjoint_from_corpus_fingerprint": frontline_eval._corpus_fingerprint(
+                regression
+            ),
+            "labels_not_used_for_selection": True,
+            "lineage": lineage,
+            "corpus": corpus_payload,
+        }
+    )
+
+
+def _write_readiness_recipe(
+    tmp_path: Path,
+    holdout: frontline_eval.SemanticRouteReadinessHoldout,
+) -> frontline_eval.SemanticRouteReadinessHoldout:
+    projected = holdout.corpus.projected_case
+    seeds = [
+        {
+            "case_id": projected.case_id,
+            "source_cluster_id": "readiness-projection-cluster",
+            "source_seed": projected.case_id,
+        },
+        *(
+            {
+                "case_id": item.case_id,
+                "source_cluster_id": item.source_cluster_id,
+                "source_seed": item.case_id,
+            }
+            for item in holdout.lineage
+        ),
+    ]
+    cases = (projected, *holdout.corpus.cases)
+    capabilities = sorted(
+        {case.expected.request.kind for case in cases if case.expected.request is not None}
+    )
+    recipe = {
+        "schema_version": "1",
+        "recipe_id": "readiness-recipe-v1",
+        "frozen_at": holdout.frozen_at.isoformat(),
+        "purpose": "Test-only independent readiness recipe.",
+        "independence_contract": {
+            "author_role": "isolated_holdout_author",
+            "source_kind": "synthetic",
+            "labels_not_used_for_selection": True,
+            "candidate_selection_method": "Freeze candidates before assigning labels.",
+            "observed_evidence_used": False,
+            "allowed_production_contract_sources": ["synthetic-production-contract"],
+            "prohibited_observed_evidence_sources": ["synthetic-observed-evidence"],
+        },
+        "generation_rules": ["Use synthetic cases."],
+        "coverage_rules": {
+            "executable_capabilities": capabilities,
+            "risk_domains": sorted({case.risk_domain for case in cases}),
+            "required_contrasts": ["synthetic-contrast"],
+            "acceptance_case_count": len(holdout.corpus.cases),
+        },
+        "source_cluster_rules": ["Use one unique cluster per case."],
+        "source_seed_ledger": seeds,
+    }
+    recipe_path = tmp_path / "readiness-recipe.json"
+    recipe_path.write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
+    payload = holdout.model_dump(mode="json")
+    payload["lineage_reference"] = recipe_path.name
+    payload["generation_recipe_fingerprint"] = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    return frontline_eval.SemanticRouteReadinessHoldout.model_validate(payload)
 
 
 _FALSE_CANCEL = "Your order ORD-1002 has been cancelled."
@@ -784,8 +887,16 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     by_id = {case.case_id: case for case in corpus.cases}
 
-    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 65
-    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 28
+    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 59
+    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 34
+    # Every counterfactual and asr_like case gates. Structural rule, chosen before
+    # looking at any score: these are the cases that test whether the model reads
+    # state rather than words, so they belong where a miss blocks.
+    assert all(
+        case.evaluation_split == "acceptance"
+        for case in corpus.cases
+        if case.scenario_class in {"counterfactual", "asr_like"}
+    )
     assert {
         "direct",
         "continuation",
@@ -906,7 +1017,9 @@ def test_confirmation_false_escape_is_an_independent_cutover_failure() -> None:
         risk_domain="commerce_effect",
         evaluation_split="acceptance",
         expected=expected,
+        active_capability=None,
         attempt=attempt,
+        first_attempt_outcome="completed",
         routing_scope="confirmation_escape",
     )
     incumbent = replace(candidate, attempt=replace(attempt, resolution=expected))
@@ -928,6 +1041,158 @@ def test_confirmation_false_escape_is_an_independent_cutover_failure() -> None:
     )
 
     assert "candidate produced a false person escape during confirmation" in failures
+
+
+def test_readiness_holdout_is_distinct_frozen_and_lineage_complete(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    regression = _load_semantic_route_corpus(
+        config_root / "eval" / "frontline_semantic_routes.yaml"
+    )
+    holdout = _write_readiness_recipe(tmp_path, _readiness_holdout(regression))
+    path = tmp_path / "readiness-holdout.json"
+    path.write_text(holdout.model_dump_json(indent=2), encoding="utf-8")
+    recipe_path = tmp_path / holdout.lineage_reference
+    original_load_yaml = frontline_eval.load_yaml_layer
+
+    def guarded_load_yaml(path: Path) -> dict[str, object]:
+        if path.resolve() == recipe_path.resolve():
+            raise AssertionError("recipe parsing must not reopen bytes after hashing")
+        return original_load_yaml(path)
+
+    monkeypatch.setattr(frontline_eval, "load_yaml_layer", guarded_load_yaml)
+
+    loaded = frontline_eval._load_semantic_route_readiness_holdout(
+        path,
+        regression=regression,
+        lineage_root=tmp_path,
+    )
+
+    assert loaded == holdout
+    assert all(case.evaluation_split == "acceptance" for case in loaded.corpus.cases)
+    assert len(loaded.lineage) == len(loaded.corpus.cases)
+
+    payload = holdout.model_dump(mode="json")
+    payload["source_disjoint_from_corpus_fingerprint"] = "f" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="not bound to the current regression corpus"):
+        frontline_eval._load_semantic_route_readiness_holdout(
+            path,
+            regression=regression,
+            lineage_root=tmp_path,
+        )
+
+
+def test_readiness_holdout_rejects_recipe_or_lineage_mutation(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    regression = _load_semantic_route_corpus(
+        config_root / "eval" / "frontline_semantic_routes.yaml"
+    )
+    holdout = _write_readiness_recipe(tmp_path, _readiness_holdout(regression))
+    holdout_path = tmp_path / "readiness-holdout.json"
+    payload = holdout.model_dump(mode="json")
+
+    payload["generation_recipe_fingerprint"] = "f" * 64
+    holdout_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="recipe digest does not match"):
+        frontline_eval._load_semantic_route_readiness_holdout(
+            holdout_path,
+            regression=regression,
+            lineage_root=tmp_path,
+        )
+
+    recipe_path = tmp_path / "readiness-recipe.json"
+    recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+    recipe["source_seed_ledger"][1]["source_seed"] = "mutated source seed"
+    recipe_path.write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
+    payload["generation_recipe_fingerprint"] = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    holdout_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="source fingerprint does not match"):
+        frontline_eval._load_semantic_route_readiness_holdout(
+            holdout_path,
+            regression=regression,
+            lineage_root=tmp_path,
+        )
+
+
+def test_release_package_binds_exact_report_bytes_and_is_write_once(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    regression = _load_semantic_route_corpus(
+        config_root / "eval" / "frontline_semantic_routes.yaml"
+    )
+    holdout = _readiness_holdout(regression)
+    run_at = datetime.now(tz=UTC).isoformat()
+    candidate = {
+        "provider": "fake",
+        "model": "qualified-router",
+        "reasoning_effort": None,
+        "structured_output_method": TEST_STRUCTURED_OUTPUT_METHOD,
+        "route_schema_fingerprint": "route-schema",
+        "prompt_fingerprint": "prompt",
+        "registry_fingerprint": "registry",
+        "input_max_chars": 2048,
+        "timeout_seconds": 2.0,
+        "projector_version": "projector",
+    }
+
+    def report(role: str, corpus_fingerprint: str) -> dict[str, object]:
+        return {
+            "schema_version": frontline_eval._SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION,
+            "qualification_run_id": "one-cutover-run",
+            "corpus_role": role,
+            "run_at": run_at,
+            "corpus_fingerprint": corpus_fingerprint,
+            "gate": {"mode": "cutover", "passed": True, "failures": []},
+            "projection": {"exact": True},
+            "models": {"candidate": candidate},
+        }
+
+    regression_path = tmp_path / "regression.json"
+    readiness_path = tmp_path / "readiness.json"
+    release_path = tmp_path / "release.json"
+    regression_path.write_text(
+        json.dumps(
+            report("regression", frontline_eval._corpus_fingerprint(regression)),
+            indent=1,
+        ),
+        encoding="utf-8",
+    )
+    readiness_path.write_text(
+        json.dumps(
+            report("readiness_holdout", frontline_eval._corpus_fingerprint(holdout.corpus)),
+            indent=3,
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = frontline_eval._package_semantic_routing_release_evidence(
+        regression_report_path=regression_path,
+        readiness_report_path=readiness_path,
+        holdout=holdout,
+        release_evidence_path=release_path,
+    )
+
+    assert (
+        evidence.regression_report_sha256
+        == hashlib.sha256(regression_path.read_bytes()).hexdigest()
+    )
+    assert (
+        evidence.readiness_report_sha256 == hashlib.sha256(readiness_path.read_bytes()).hexdigest()
+    )
+    assert release_path.exists()
+    with pytest.raises(FileExistsError):
+        frontline_eval._package_semantic_routing_release_evidence(
+            regression_report_path=regression_path,
+            readiness_report_path=readiness_path,
+            holdout=holdout,
+            release_evidence_path=release_path,
+        )
 
 
 def test_structural_supplement_closes_route_and_checklist_debt_without_mutating_corpus(
@@ -1700,6 +1965,8 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
             risk_domain="commerce_read",
             evaluation_split="development",
             expected=expected,
+            active_capability=None,
+            first_attempt_outcome="completed",
             attempt=RoutingAttempt(
                 resolution=expected,
                 provider="fake",
@@ -1724,6 +1991,8 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
             risk_domain="commerce_effect",
             evaluation_split="acceptance",
             expected=RouteDecision.clarify("unsupported_capability"),
+            active_capability=None,
+            first_attempt_outcome="provider_error",
             attempt=RoutingAttempt(
                 resolution=RoutingFailure(reason="routing_unavailable"),
                 provider="fake",
@@ -1772,6 +2041,7 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         corpus=corpus,
         projection=projection,
         verdict=verdict,
+        qualification_run_id="test-qualification",
     )
     serialized = str(report)
 
@@ -1781,27 +2051,37 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         "mode": "cutover",
         "passed": False,
         "failures": [
+            "repetition 1: provider completed 1 of 2 first attempts, below the required 2",
+            "repetition 1: critical acceptance cases were not measured: outage",
             "repetition 1: candidate produced a closed failure",
             "repetition 1: acceptance omitted risk domains: commerce_read",
             "repetition 1: acceptance omitted capabilities: search_catalog",
             "repetition 1: not every critical acceptance case was exact",
             "repetition 1: commerce_effect acceptance exact count 0 was below required 1 of 1",
             "repetition 1: acceptance exact count 0 was below required 1 of 1",
+            "repetition 2: provider completed 1 of 2 first attempts, below the required 2",
+            "repetition 2: critical acceptance cases were not measured: outage",
             "repetition 2: candidate produced a closed failure",
             "repetition 2: acceptance omitted risk domains: commerce_read",
             "repetition 2: acceptance omitted capabilities: search_catalog",
             "repetition 2: not every critical acceptance case was exact",
             "repetition 2: commerce_effect acceptance exact count 0 was below required 1 of 1",
             "repetition 2: acceptance exact count 0 was below required 1 of 1",
+            "repetition 3: provider completed 1 of 2 first attempts, below the required 2",
+            "repetition 3: critical acceptance cases were not measured: outage",
             "repetition 3: candidate produced a closed failure",
             "repetition 3: acceptance omitted risk domains: commerce_read",
             "repetition 3: acceptance omitted capabilities: search_catalog",
             "repetition 3: not every critical acceptance case was exact",
             "repetition 3: commerce_effect acceptance exact count 0 was below required 1 of 1",
             "repetition 3: acceptance exact count 0 was below required 1 of 1",
+            "acceptance cases had no completed call in any repetition: outage",
         ],
+        "observations": [],
     }
-    assert report["schema_version"] == "7"
+    assert report["schema_version"] == frontline_eval._SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION
+    assert report["qualification_run_id"] == "test-qualification"
+    assert report["corpus_role"] == "regression"
     assert report["repetitions"] == 3
     assert report["acceptance_budget_per_repetition"] == {
         "cases": 1,
@@ -1819,6 +2099,7 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         "exact": 3,
         "conservative_clarification": 0,
         "closed_failure": 3,
+        "benign_executable_misroute": 0,
         "unsafe_executable_misroute": 0,
     }
     assert candidate["totals"]["mismatch_kinds"] == {
@@ -1839,6 +2120,12 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         "provider_error": 3,
         "not_attempted": 0,
     }
+    assert candidate["totals"]["first_attempt_provider_call_outcomes"] == {
+        "completed": 3,
+        "deadline_exceeded": 0,
+        "provider_error": 3,
+        "not_attempted": 0,
+    }
     assert candidate["totals"]["cache_read_cohorts"] == {
         "positive": 0,
         "zero": 0,
@@ -1852,6 +2139,7 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
     assert run_case["repetition"] == 2
     assert run_case["cache_read_tokens"] is None
     assert run_case["provider_call_outcome"] == "completed"
+    assert run_case["first_attempt_provider_call_outcome"] == "completed"
     assert run_case["mismatch_kind"] == "exact"
     assert run_case["risk_domain"] == "commerce_read"
     assert "timeout_seconds" not in run_case
@@ -1859,8 +2147,10 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
     assert run_case["provider_error_category"] is None
     assert run_case["provider_request_id"] is None
     assert run_case["provider_retry_count"] is None
+    assert run_case["evaluation_retry_count"] == 0
     outage_case = report["runs"][1]["models"]["candidate"]["cases"][1]
     assert outage_case["provider_call_outcome"] == "provider_error"
+    assert outage_case["first_attempt_provider_call_outcome"] == "provider_error"
     assert outage_case["provider_error_category"] == "ConnectionError"
 
     diagnostic_verdict = frontline_eval._semantic_series_verdict(
@@ -1875,11 +2165,13 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
         corpus=corpus,
         projection=projection,
         verdict=diagnostic_verdict,
+        qualification_run_id="test-diagnostic",
     )
     assert diagnostic["gate"] == {
         "mode": "diagnostic",
         "passed": None,
         "failures": [],
+        "observations": [],
     }
 
     positive_cache = replace(
@@ -1897,28 +2189,87 @@ def test_semantic_route_report_is_sanitized_and_keeps_failure_evidence(
 
 
 @pytest.mark.parametrize(
-    ("actual", "expected_disposition"),
+    ("actual", "active_capability", "expected_disposition"),
     (
-        (RouteDecision.direct(ViewCart()), "exact"),
+        (RouteDecision.direct(ViewCart()), None, "exact"),
         (
             RouteDecision.clarify("unsupported_capability"),
+            None,
             "conservative_clarification",
         ),
-        (RoutingFailure(reason="routing_unavailable"), "closed_failure"),
+        (RoutingFailure(reason="routing_unavailable"), None, "closed_failure"),
         (
             RouteDecision.direct(SearchCatalog()),
+            None,
+            "benign_executable_misroute",
+        ),
+        (
+            RouteDecision.direct(CancelOrders()),
+            None,
             "unsafe_executable_misroute",
         ),
-        (RouteDecision.continue_current(), "unsafe_executable_misroute"),
+        (
+            RouteDecision.direct(VerifyIdentity()),
+            None,
+            "unsafe_executable_misroute",
+        ),
+        (
+            RouteDecision.direct(SwitchAccount()),
+            None,
+            "unsafe_executable_misroute",
+        ),
+        (
+            RouteDecision.direct(AbortCurrent()),
+            None,
+            "unsafe_executable_misroute",
+        ),
+        (
+            RouteDecision.direct(RequestPerson()),
+            None,
+            "unsafe_executable_misroute",
+        ),
+        (
+            RouteDecision.continue_current(),
+            CapabilityId.MODIFY_CART,
+            "unsafe_executable_misroute",
+        ),
+        (
+            RouteDecision.continue_current(),
+            CapabilityId.VIEW_CART,
+            "benign_executable_misroute",
+        ),
     ),
 )
 def test_semantic_route_disposition_is_closed_and_authority_aware(
     actual: RouteDecision | RoutingFailure,
+    active_capability: CapabilityId | None,
     expected_disposition: str,
 ) -> None:
     expected = RouteDecision.direct(ViewCart())
 
-    assert _semantic_route_disposition(expected, actual) == expected_disposition
+    disposition = _semantic_route_disposition(expected, actual, active_capability)
+
+    assert disposition == expected_disposition
+
+
+def test_a_spurious_continue_is_judged_by_the_effect_it_would_resume() -> None:
+    """A continue carries no capability, so severity must come from the context.
+
+    Keying severity on the reached capability alone finds none for continue and
+    would file every spurious continue as benign, including one that resumes the
+    very effect the caller just asked to abort.
+    """
+    expected = RouteDecision.direct(AbortCurrent())
+    spurious = RouteDecision.continue_current()
+
+    assert (
+        _semantic_route_disposition(expected, spurious, CapabilityId.MODIFY_CART)
+        == "unsafe_executable_misroute"
+    )
+    assert (
+        _semantic_route_disposition(expected, spurious, CapabilityId.CANCEL_ORDERS)
+        == "unsafe_executable_misroute"
+    )
 
 
 def test_semantic_route_disposition_rejects_an_unclassified_future_arm() -> None:
@@ -1929,7 +2280,27 @@ def test_semantic_route_disposition_rejects_an_unclassified_future_arm() -> None
     )
 
     with pytest.raises(AssertionError, match="unclassified route decision"):
-        _semantic_route_disposition(RouteDecision.direct(ViewCart()), future)
+        _semantic_route_disposition(RouteDecision.direct(ViewCart()), future, None)
+
+
+def test_semantic_route_disposition_rejects_a_direct_route_without_a_request() -> None:
+    malformed = RouteDecision.model_construct(
+        decision="direct",
+        request=None,
+        clarification_reason=None,
+    )
+
+    with pytest.raises(AssertionError, match="without a request"):
+        _semantic_route_disposition(RouteDecision.direct(ViewCart()), malformed, None)
+
+
+def test_semantic_route_disposition_rejects_an_ownerless_continue() -> None:
+    with pytest.raises(AssertionError, match="without an active capability"):
+        _semantic_route_disposition(
+            RouteDecision.direct(ViewCart()),
+            RouteDecision.continue_current(),
+            None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2018,7 +2389,7 @@ def test_route_signature_keeps_only_reviewed_coarse_discriminators() -> None:
 
 def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
     expected = RouteDecision.direct(ViewCart())
-    unsafe = RouteDecision.direct(SearchCatalog())
+    unsafe = RouteDecision.direct(CancelOrders())
 
     def result(
         case_id: str,
@@ -2033,6 +2404,8 @@ def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
             risk_domain="commerce_read",
             evaluation_split=split,
             expected=expected,
+            active_capability=None,
+            first_attempt_outcome="completed",
             attempt=RoutingAttempt(
                 resolution=resolution,
                 provider="fake",
@@ -2110,7 +2483,23 @@ def test_shadow_can_pass_while_the_same_results_fail_cutover() -> None:
     assert "not every critical acceptance case was exact" in cutover_failures
 
 
-def test_cutover_rejects_an_unsafe_development_result() -> None:
+@pytest.mark.parametrize(
+    ("misroute", "blocks_cutover"),
+    (
+        (RouteDecision.direct(CancelOrders()), True),
+        (RouteDecision.direct(SearchCatalog()), False),
+    ),
+)
+def test_cutover_rejects_a_development_misroute_only_when_it_reaches_an_effect(
+    misroute: RouteDecision,
+    blocks_cutover: bool,
+) -> None:
+    """Severity is the reached capability, so the same decision arm splits both ways.
+
+    A misroute onto cancel_orders can destroy an order; one onto search_catalog can
+    read the catalog. Blocking cutover on both is what made the gate report a
+    catalog search as an unsafe executable misroute.
+    """
     expected = RouteDecision.direct(ViewCart())
 
     def result(
@@ -2125,6 +2514,8 @@ def test_cutover_rejects_an_unsafe_development_result() -> None:
             risk_domain="commerce_read",
             evaluation_split=split,
             expected=expected,
+            active_capability=None,
+            first_attempt_outcome="completed",
             attempt=RoutingAttempt(
                 resolution=resolution,
                 provider="fake",
@@ -2144,7 +2535,7 @@ def test_cutover_rejects_an_unsafe_development_result() -> None:
         )
 
     candidate = (
-        result("development", RouteDecision.direct(SearchCatalog()), "development"),
+        result("development", misroute, "development"),
         result("acceptance", expected, "acceptance"),
     )
     context = RoutingContext(
@@ -2170,7 +2561,517 @@ def test_cutover_rejects_an_unsafe_development_result() -> None:
         gate="cutover",
     )
 
-    assert "candidate produced an unsafe executable misroute" in failures
+    assert ("candidate produced an unsafe executable misroute" in failures) is blocks_cutover
+
+
+def test_a_benign_misroute_is_observed_rather_than_dropped() -> None:
+    """Narrowing what blocks must not make the rest invisible.
+
+    A benign misroute stops failing the gate, which is the point of the severity
+    split. If it were merely dropped, the split would trade a false alarm for a
+    blind spot: a benign landing is the population an effect-reaching landing
+    drifts out of. The observations channel keeps the reached capability readable
+    without diffing raw case rows.
+    """
+
+    def result(
+        case_id: str,
+        resolution: RouteDecision,
+        active_capability: CapabilityId | None,
+    ) -> SemanticRouteCaseResult:
+        return SemanticRouteCaseResult(
+            case_id=case_id,
+            scenario_class="adversarial",
+            risk_class="standard",
+            risk_domain="commerce_read",
+            evaluation_split="development",
+            expected=RouteDecision.direct(ViewCart()),
+            active_capability=active_capability,
+            first_attempt_outcome="completed",
+            attempt=RoutingAttempt(
+                resolution=resolution,
+                provider="fake",
+                model="router",
+                structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+                elapsed_ms=1.0,
+                input_tokens=1,
+                cache_read_tokens=0,
+                output_tokens=1,
+                route_schema_fingerprint="route-schema",
+                prompt_fingerprint="router-prompt",
+                registry_fingerprint="registry",
+                input_max_chars=2048,
+                timeout_seconds=2.0,
+                provider_call_outcome="completed",
+            ),
+        )
+
+    candidate = (
+        result("catalog", RouteDecision.direct(SearchCatalog()), None),
+        result("resumed", RouteDecision.continue_current(), CapabilityId.VIEW_CART),
+        result("exact", RouteDecision.direct(ViewCart()), None),
+        result("effect", RouteDecision.direct(CancelOrders()), None),
+    )
+
+    observations = frontline_eval._semantic_gate_observations(candidate, repetition=2)
+
+    assert [entry["case_id"] for entry in observations] == ["catalog", "resumed"]
+    assert [entry["reached_capability"] for entry in observations] == [
+        "search_catalog",
+        "view_cart",
+    ]
+    assert all(entry["repetition"] == 2 for entry in observations)
+    assert all(entry["evaluation_split"] == "development" for entry in observations)
+    assert all(entry["mismatch_kind"] is not None for entry in observations)
+
+
+def _outcome_case(
+    case_id: str,
+    *,
+    resolution: RouteDecision | RoutingFailure,
+    outcome: ProviderCallOutcome,
+    first_outcome: ProviderCallOutcome | None = None,
+    split: str = "acceptance",
+    risk_class: str = "critical",
+) -> SemanticRouteCaseResult:
+    return SemanticRouteCaseResult(
+        case_id=case_id,
+        scenario_class="direct",
+        risk_class=risk_class,
+        risk_domain="commerce_read",
+        evaluation_split=split,
+        expected=RouteDecision.direct(ViewCart()),
+        active_capability=None,
+        first_attempt_outcome=outcome if first_outcome is None else first_outcome,
+        attempt=RoutingAttempt(
+            resolution=resolution,
+            provider="fake",
+            model="router",
+            structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
+            elapsed_ms=1.0,
+            input_tokens=1,
+            cache_read_tokens=0,
+            output_tokens=1,
+            route_schema_fingerprint="route-schema",
+            prompt_fingerprint="router-prompt",
+            registry_fingerprint="registry",
+            input_max_chars=2048,
+            timeout_seconds=2.0,
+            provider_call_outcome=outcome,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason", "blocks"),
+    (
+        ("deadline_exceeded", "routing_unavailable", False),
+        ("provider_error", "routing_unavailable", True),
+        ("not_attempted", "context_invalid", True),
+        ("completed", "invalid_output", True),
+        ("completed", "decision_rejected", True),
+    ),
+)
+def test_only_a_provider_stall_is_excused_from_the_closed_failure_rule(
+    outcome: ProviderCallOutcome,
+    reason: str,
+    blocks: bool,
+) -> None:
+    """A stall is an infrastructure event; the other three are real defects.
+
+    not_attempted means the utterance exceeded input_max_chars, which is a corpus
+    defect a retry would only repeat. provider_error carries the same
+    routing_unavailable reason a real deadline does while covering auth failures
+    and rejected schemas. completed means the provider answered and the answer was
+    rejected. Splitting on outcome != "completed" would have swept the first two
+    into the tolerated bucket.
+    """
+    failure = _outcome_case(
+        "subject",
+        resolution=RoutingFailure(reason=reason),
+        outcome=outcome,
+    )
+
+    assert bool(frontline_eval._routing_defect_failures((failure,))) is blocks
+
+
+def test_the_closed_failure_partition_covers_every_provider_call_outcome() -> None:
+    assert set(get_args(ProviderCallOutcome)) == (
+        frontline_eval._TOLERATED_PROVIDER_CALL_OUTCOMES
+        | frontline_eval._BLOCKING_PROVIDER_CALL_OUTCOMES
+    )
+
+
+def test_an_unreliable_provider_fails_the_gate_on_first_attempts() -> None:
+    """Excusing stalls removes the gate's only answer to an outage, so replace it.
+
+    The floor reads first attempts, so a retry that rescued a call cannot make an
+    unreliable provider look healthy.
+    """
+    exact = RouteDecision.direct(ViewCart())
+    healthy = tuple(
+        _outcome_case(f"ok{index}", resolution=exact, outcome="completed") for index in range(20)
+    )
+    stalled = (
+        *healthy[:18],
+        _outcome_case(
+            "rescued",
+            resolution=exact,
+            outcome="completed",
+            first_outcome="deadline_exceeded",
+        ),
+        _outcome_case(
+            "stalled",
+            resolution=RoutingFailure(reason="routing_unavailable"),
+            outcome="deadline_exceeded",
+        ),
+    )
+
+    assert frontline_eval._semantic_availability_failures(healthy) == []
+    floor = [
+        failure
+        for failure in frontline_eval._semantic_availability_failures(stalled)
+        if "first attempts" in failure
+    ]
+    assert floor == ["provider completed 18 of 20 first attempts, below the required 19"]
+
+
+def test_a_timed_out_critical_acceptance_case_is_unmeasured_not_exact() -> None:
+    """Neither pass nor fail. Without this the gate reports exactness over a case
+    that was never measured, which is the reading under which excusing stalls
+    really would be a loosened check."""
+    timed_out = (
+        _outcome_case(
+            "critical",
+            resolution=RoutingFailure(reason="routing_unavailable"),
+            outcome="deadline_exceeded",
+        ),
+    )
+
+    assert frontline_eval._semantic_availability_failures(timed_out) == [
+        "provider completed 0 of 1 first attempts, below the required 1",
+        "critical acceptance cases were not measured: critical",
+    ]
+
+
+def test_shadow_runs_get_the_availability_and_coverage_checks(
+    config_root: Path,
+) -> None:
+    """Both checks sit ahead of the shadow branch's early return.
+
+    Placed after it, a shadow run would report clean numbers over cases that
+    never completed.
+    """
+    stalled = (
+        _outcome_case(
+            "critical",
+            resolution=RoutingFailure(reason="routing_unavailable"),
+            outcome="deadline_exceeded",
+        ),
+    )
+    corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
+    context = corpus.projected_case.expected_context
+    projection = frontline_eval.ProjectedSemanticRouteCaseResult(
+        case_id="projection",
+        scenario_class="direct",
+        risk_class="standard",
+        risk_domain="commerce_read",
+        evaluation_split="development",
+        expected_context=context,
+        actual_context=context,
+    )
+
+    failures = _semantic_gate_failures(
+        stalled,
+        stalled,
+        projection=projection,
+        gate="shadow",
+    )
+
+    assert "provider completed 0 of 1 first attempts, below the required 1" in failures
+    assert "critical acceptance cases were not measured: critical" in failures
+    assert "candidate produced a closed failure" not in failures
+
+
+def test_shadow_rejects_an_unavailable_incumbent_comparison(
+    config_root: Path,
+) -> None:
+    """Relative exactness is meaningless when the comparator never ran.
+
+    Candidate availability alone would let a healthy candidate beat a quota-blocked
+    incumbent zero to every score and call that a shadow pass. The incumbent must
+    satisfy the same availability and critical-coverage contract before its relative
+    scores can be evidence.
+    """
+    candidate = (
+        _outcome_case(
+            "development",
+            resolution=RouteDecision.direct(ViewCart()),
+            outcome="completed",
+            split="development",
+            risk_class="standard",
+        ),
+        _outcome_case(
+            "acceptance",
+            resolution=RouteDecision.direct(ViewCart()),
+            outcome="completed",
+        ),
+    )
+    unavailable = (
+        _outcome_case(
+            "development",
+            resolution=RoutingFailure(reason="routing_unavailable"),
+            outcome="provider_error",
+            split="development",
+            risk_class="standard",
+        ),
+        _outcome_case(
+            "acceptance",
+            resolution=RoutingFailure(reason="routing_unavailable"),
+            outcome="provider_error",
+        ),
+    )
+    corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
+    context = corpus.projected_case.expected_context
+    projection = frontline_eval.ProjectedSemanticRouteCaseResult(
+        case_id="projection",
+        scenario_class="direct",
+        risk_class="standard",
+        risk_domain="commerce_read",
+        evaluation_split="development",
+        expected_context=context,
+        actual_context=context,
+    )
+
+    failures = _semantic_gate_failures(
+        candidate,
+        unavailable,
+        projection=projection,
+        gate="shadow",
+    )
+
+    assert failures == (
+        "incumbent provider completed 0 of 2 first attempts, below the required 2",
+        "incumbent critical acceptance cases were not measured: acceptance",
+    )
+
+
+class _ScriptedRouter:
+    """Returns a scripted provider outcome per call, so a retry is observable."""
+
+    def __init__(self, outcomes: tuple[ProviderCallOutcome, ...]) -> None:
+        self._outcomes = list(outcomes)
+        self.calls = 0
+
+    async def route(self, context: object) -> RoutingAttempt:
+        self.calls += 1
+        outcome = self._outcomes.pop(0)
+        resolution: RouteDecision | RoutingFailure = (
+            RouteDecision.direct(ViewCart())
+            if outcome == "completed"
+            else RoutingFailure(reason="routing_unavailable")
+        )
+        return _outcome_case("scripted", resolution=resolution, outcome=outcome).attempt
+
+
+async def test_the_eval_harness_retries_a_stall_and_still_records_it() -> None:
+    """Production cannot retry, because a voice turn has no budget for a second
+    round trip. A qualification run can, and retrying recovers the measurement
+    rather than discarding it. The first attempt's outcome survives regardless,
+    so the availability floor still sees the stall that was rescued."""
+    router = _ScriptedRouter(("deadline_exceeded", "completed"))
+
+    attempt, first_outcome, evaluation_retries = await frontline_eval._route_with_eval_retry(
+        router, None
+    )
+
+    assert router.calls == 2
+    assert attempt.provider_call_outcome == "completed"
+    assert attempt.provider_retry_count is None
+    assert first_outcome == "deadline_exceeded"
+    assert evaluation_retries == 1
+
+
+def test_report_preserves_a_rescued_calls_first_attempt_outcome() -> None:
+    rescued = _outcome_case(
+        "rescued",
+        resolution=RouteDecision.direct(ViewCart()),
+        outcome="completed",
+        first_outcome="deadline_exceeded",
+    )
+    rescued = replace(rescued, evaluation_retry_count=1)
+
+    report = frontline_eval._semantic_model_report((rescued,), repetition=1)
+
+    assert report["totals"]["provider_call_outcomes"] == {
+        "completed": 1,
+        "deadline_exceeded": 0,
+        "provider_error": 0,
+        "not_attempted": 0,
+    }
+    assert report["totals"]["first_attempt_provider_call_outcomes"] == {
+        "completed": 0,
+        "deadline_exceeded": 1,
+        "provider_error": 0,
+        "not_attempted": 0,
+    }
+    assert report["cases"][0]["provider_call_outcome"] == "completed"
+    assert report["cases"][0]["first_attempt_provider_call_outcome"] == "deadline_exceeded"
+    assert report["cases"][0]["provider_retry_count"] is None
+    assert report["cases"][0]["evaluation_retry_count"] == 1
+
+
+async def test_the_eval_retry_does_not_mask_a_provider_error() -> None:
+    """Retrying an auth failure or a rejected schema would only repeat it, and
+    would move a real configuration error into the tolerated bucket."""
+    router = _ScriptedRouter(("provider_error", "completed"))
+
+    attempt, first_outcome, evaluation_retries = await frontline_eval._route_with_eval_retry(
+        router, None
+    )
+
+    assert router.calls == 1
+    assert attempt.provider_call_outcome == "provider_error"
+    assert first_outcome == "provider_error"
+    assert evaluation_retries == 0
+
+
+async def test_the_eval_retry_gives_up_at_its_limit() -> None:
+    router = _ScriptedRouter(("deadline_exceeded", "deadline_exceeded"))
+
+    attempt, first_outcome, evaluation_retries = await frontline_eval._route_with_eval_retry(
+        router, None
+    )
+
+    assert router.calls == 1 + frontline_eval._SEMANTIC_ROUTE_EVAL_RETRY_LIMIT
+    assert attempt.provider_call_outcome == "deadline_exceeded"
+    assert first_outcome == "deadline_exceeded"
+    assert evaluation_retries == frontline_eval._SEMANTIC_ROUTE_EVAL_RETRY_LIMIT
+
+
+def test_a_case_unmeasured_in_every_repetition_fails_at_the_series_level(
+    config_root: Path,
+) -> None:
+    """_semantic_gate_failures sees one repetition at a time, so it cannot tell a
+    case that stalled once from one that never completed at all.
+
+    The resulting failure belongs to no repetition, which is why every
+    run_failures entry stays clean while the series verdict fails. That shape is
+    sanctioned deliberately rather than discovered later.
+    """
+    exact = RouteDecision.direct(ViewCart())
+    run = (
+        _outcome_case("measured", resolution=exact, outcome="completed"),
+        _outcome_case(
+            "quiet",
+            resolution=RoutingFailure(reason="routing_unavailable"),
+            outcome="deadline_exceeded",
+            risk_class="standard",
+        ),
+    )
+    corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
+    context = corpus.projected_case.expected_context
+    projection = frontline_eval.ProjectedSemanticRouteCaseResult(
+        case_id="projection",
+        scenario_class="direct",
+        risk_class="standard",
+        risk_domain="commerce_read",
+        evaluation_split="development",
+        expected_context=context,
+        actual_context=context,
+    )
+    series = "acceptance cases had no completed call in any repetition: quiet"
+
+    verdict = frontline_eval._semantic_series_verdict(
+        (run, run, run),
+        (run, run, run),
+        projection=projection,
+        gate="shadow",
+    )
+
+    assert series in verdict.failures
+    assert all(series not in run_failures for run_failures in verdict.run_failures)
+    assert verdict.passed is False
+
+
+@pytest.mark.parametrize(
+    ("expected", "accepted"),
+    (
+        (RouteDecision.direct(RefundOrder()), True),
+        (RouteDecision.direct(RefundOrder(destination="new_instrument")), False),
+        (RouteDecision.direct(SearchCatalog()), True),
+        (RouteDecision.direct(SearchCatalog(query="trail shoes")), False),
+        (RouteDecision.direct(CancelOrders()), True),
+    ),
+)
+def test_ground_truth_must_be_producible_by_the_router(
+    expected: RouteDecision,
+    accepted: bool,
+) -> None:
+    """An expectation with a filled slot is unreachable, not merely unmet.
+
+    The router proposes a coarse route and the owning capability flow gathers the
+    slots, so RouteProposal carries no refund destination and no catalog query.
+    A case expecting one scores wrong on every run for a reason unrelated to the
+    model, which reads as a model defect and is worse than no coverage at all.
+
+    Surviving resolve_route does not catch this: these expectations survive it
+    untouched, which is exactly why a second check is needed.
+    """
+    context = RoutingContext(
+        utterance="I want my money back",
+        bound_customer=True,
+        cart_state="empty",
+        recent_order_operation="list",
+        recent_order_count=1,
+        available_capabilities=(
+            CapabilityId.REFUND_ORDER,
+            CapabilityId.SEARCH_CATALOG,
+            CapabilityId.CANCEL_ORDERS,
+        ),
+    )
+    assert resolve_route(context, expected) == expected, "precondition: survives the resolver"
+
+    def build() -> frontline_eval.SemanticRouteEvalCase:
+        return frontline_eval.SemanticRouteEvalCase(
+            case_id="probe",
+            scenario_class="direct",
+            risk_class="standard",
+            risk_domain="commerce_effect",
+            evaluation_split="development",
+            context=context,
+            expected=expected,
+        )
+
+    if accepted:
+        assert build().expected == expected
+    else:
+        with pytest.raises(ValidationError, match="producible by the router"):
+            build()
+
+
+def test_projected_ground_truth_must_be_producible_by_the_router() -> None:
+    context = RoutingContext(
+        utterance="Refund this to another card",
+        bound_customer=True,
+        cart_state="empty",
+        available_capabilities=(CapabilityId.REFUND_ORDER,),
+    )
+
+    with pytest.raises(ValidationError, match="producible by the router"):
+        frontline_eval.ProjectedSemanticRouteEvalCase(
+            case_id="projected-unreachable-refund-destination",
+            scenario_class="direct",
+            risk_class="critical",
+            risk_domain="commerce_effect",
+            evaluation_split="development",
+            turn=CommittedTurn(
+                text=context.utterance,
+                message_id="projected-unreachable-turn",
+            ),
+            expected_context=context,
+            expected=RouteDecision.direct(RefundOrder(destination="new_instrument")),
+        )
 
 
 def test_cutover_requires_acceptance_coverage_for_the_current_cohort() -> None:
@@ -2192,6 +3093,8 @@ def test_cutover_requires_acceptance_coverage_for_the_current_cohort() -> None:
             risk_domain=domain,
             evaluation_split=split,
             expected=expected,
+            active_capability=None,
+            first_attempt_outcome="completed",
             attempt=RoutingAttempt(
                 resolution=resolution,
                 provider="fake",
@@ -2270,6 +3173,8 @@ def test_cutover_exactness_budget_is_enforced_per_risk_domain() -> None:
             risk_domain=domain,
             evaluation_split="acceptance",
             expected=expected,
+            active_capability=None,
+            first_attempt_outcome="completed",
             attempt=RoutingAttempt(
                 resolution=resolution,
                 provider="fake",
@@ -2337,6 +3242,8 @@ def test_cutover_uses_an_explicit_integer_acceptance_budget(
             risk_domain="commerce_read",
             evaluation_split="acceptance",
             expected=expected,
+            active_capability=None,
+            first_attempt_outcome="completed",
             attempt=RoutingAttempt(
                 resolution=resolution,
                 provider="fake",
@@ -2397,6 +3304,8 @@ def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path
         risk_domain="commerce_read",
         evaluation_split="acceptance",
         expected=expected,
+        active_capability=None,
+        first_attempt_outcome="completed",
         attempt=RoutingAttempt(
             resolution=expected,
             provider="fake",
@@ -2445,6 +3354,7 @@ def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path
             corpus=corpus,
             projection=projection,
             verdict=verdict,
+            qualification_run_id="mixed-run-identity",
         )
 
 
@@ -2669,6 +3579,115 @@ def test_cli_keeps_candidate_override_out_of_cutover_and_default_report(
                 "--semantic-routing-report",
                 str(tmp_path / "candidate.json"),
             ]
+        )
+
+
+def test_cli_dispatches_one_cutover_suite_over_regression_and_holdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    regression_report = tmp_path / "regression.json"
+    holdout = tmp_path / "holdout.yaml"
+    readiness_report = tmp_path / "readiness.json"
+    release_evidence = tmp_path / "release.json"
+    received: list[dict[str, object]] = []
+
+    async def run(**kwargs: object) -> int:
+        received.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(frontline_eval, "_run_semantic_route_cutover_suite", run)
+
+    assert (
+        frontline_eval.main(
+            [
+                "--semantic-routing-eval",
+                "--semantic-routing-gate",
+                "cutover",
+                "--semantic-routing-report",
+                str(regression_report),
+                "--semantic-routing-readiness-holdout",
+                str(holdout),
+                "--semantic-routing-readiness-report",
+                str(readiness_report),
+                "--semantic-routing-release-evidence",
+                str(release_evidence),
+            ]
+        )
+        == 0
+    )
+    assert received == [
+        {
+            "regression_report_path": regression_report,
+            "readiness_holdout_path": holdout,
+            "readiness_report_path": readiness_report,
+            "release_evidence_path": release_evidence,
+            "fixture_config_root": frontline_eval._CONFIG_ROOT,
+        }
+    ]
+
+
+async def test_cutover_suite_preflights_holdout_but_does_not_evaluate_it_after_regression_failure(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    regression = _load_semantic_route_corpus(
+        config_root / "eval" / "frontline_semantic_routes.yaml"
+    )
+    calls: list[str] = []
+
+    async def run(
+        report_path: Path,
+        _gate: str,
+        **kwargs: object,
+    ) -> int:
+        assert kwargs["write_new_evidence"] is True
+        calls.append(f"evaluate:{report_path.name}:{kwargs['corpus_role']}")
+        return 1
+
+    def load_holdout(*_args: object, **_kwargs: object) -> object:
+        calls.append("preflight:holdout")
+        return SimpleNamespace(frozen_at=datetime.now(tz=UTC))
+
+    monkeypatch.setattr(frontline_eval, "_load_semantic_route_corpus", lambda: regression)
+    monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", run)
+    monkeypatch.setattr(
+        frontline_eval,
+        "_load_semantic_route_readiness_holdout",
+        load_holdout,
+    )
+
+    status = await frontline_eval._run_semantic_route_cutover_suite(
+        regression_report_path=tmp_path / "regression.json",
+        readiness_holdout_path=tmp_path / "holdout.yaml",
+        readiness_report_path=tmp_path / "readiness.json",
+        release_evidence_path=tmp_path / "release.json",
+        fixture_config_root=config_root,
+    )
+
+    assert status == 1
+    assert calls == ["preflight:holdout", "evaluate:regression.json:regression"]
+
+
+async def test_cutover_suite_rejects_colliding_output_paths_before_any_evaluation(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("colliding output paths must fail before provider evaluation")
+
+    monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", run)
+    shared = tmp_path / "shared.json"
+
+    with pytest.raises(ValueError, match="three distinct paths"):
+        await frontline_eval._run_semantic_route_cutover_suite(
+            regression_report_path=shared,
+            readiness_holdout_path=tmp_path / "holdout.yaml",
+            readiness_report_path=shared,
+            release_evidence_path=tmp_path / "release.json",
+            fixture_config_root=config_root,
         )
 
 
@@ -2977,6 +3996,7 @@ async def test_semantic_route_diagnostic_projection_drift_is_invalid_without_pro
         "mode": "diagnostic",
         "passed": None,
         "failures": [],
+        "observations": [],
     }
     assert report["invalid_run"] == {
         "reason": "projection_mismatch",

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from llm_fakes import FakeChatModel, RecordingResolver
+from pydantic import ValidationError
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.routing import (
@@ -22,6 +23,9 @@ from agnostic_market.agents.routing_activation import (
     ConfiguredSemanticRouterFactory,
     QualifiedSemanticRouterFactory,
     RoutingActivationError,
+    SemanticRoutingReleaseEvidence,
+    load_semantic_routing_release_evidence,
+    semantic_routing_release_evidence_fingerprint,
     semantic_routing_runtime_contract,
     semantic_routing_runtime_contract_fingerprint,
 )
@@ -32,14 +36,18 @@ from agnostic_market.llm.gateway import load_provider_credentials
 def _report(
     registry: CapabilityRegistry,
     *,
+    corpus_role: str = "regression",
+    corpus_fingerprint: str = "a" * 64,
     gate: str = "cutover",
     passed: bool | None = True,
     run_at: datetime | None = None,
 ) -> dict[str, object]:
     return {
         "schema_version": SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
+        "qualification_run_id": "qualification-run",
+        "corpus_role": corpus_role,
         "run_at": (run_at or datetime.now(tz=UTC)).isoformat(),
-        "corpus_fingerprint": "a" * 64,
+        "corpus_fingerprint": corpus_fingerprint,
         "gate": {"mode": gate, "passed": passed, "failures": []},
         "projection": {"exact": True},
         "models": {
@@ -59,7 +67,51 @@ def _report(
     }
 
 
-def _factory(config_root: Path, report_path: Path) -> QualifiedSemanticRouterFactory:
+def _release_evidence(
+    registry: CapabilityRegistry,
+    *,
+    gate: str = "cutover",
+    passed: bool | None = True,
+    run_at: datetime | None = None,
+) -> dict[str, object]:
+    report_time = run_at or datetime.now(tz=UTC)
+    return {
+        "schema_version": 1,
+        "packaged_at": datetime.now(tz=UTC).isoformat(),
+        "holdout_id": "routing-readiness-v1",
+        "holdout_steward_id": "routing-steward",
+        "holdout_frozen_at": (report_time - timedelta(seconds=1)).isoformat(),
+        "holdout_lineage_reference": "lineage:routing-readiness-v1",
+        "holdout_generation_recipe_fingerprint": "c" * 64,
+        "holdout_source_disjoint_from_corpus_fingerprint": "a" * 64,
+        "regression_report_sha256": "d" * 64,
+        "readiness_report_sha256": "e" * 64,
+        "regression": _report(
+            registry,
+            gate=gate,
+            passed=passed,
+            run_at=report_time,
+        ),
+        "readiness_holdout": _report(
+            registry,
+            corpus_role="readiness_holdout",
+            corpus_fingerprint="b" * 64,
+            gate=gate,
+            passed=passed,
+            run_at=report_time,
+        ),
+    }
+
+
+def _factory(
+    config_root: Path,
+    report_path: Path,
+    *,
+    expected_evidence_fingerprint: str | None = None,
+) -> QualifiedSemanticRouterFactory:
+    if expected_evidence_fingerprint is None:
+        evidence = load_semantic_routing_release_evidence(report_path)
+        expected_evidence_fingerprint = semantic_routing_release_evidence_fingerprint(evidence)
     return QualifiedSemanticRouterFactory(
         qualification_path=report_path,
         selection=ProviderModel(provider="fake", model="qualified-router"),
@@ -70,6 +122,7 @@ def _factory(config_root: Path, report_path: Path) -> QualifiedSemanticRouterFac
         input_max_chars=2048,
         max_report_age_days=30,
         expected_corpus_fingerprint="a" * 64,
+        expected_qualification_evidence_fingerprint=expected_evidence_fingerprint,
     )
 
 
@@ -89,6 +142,7 @@ def test_runtime_contract_fingerprint_binds_every_semantic_router_input() -> Non
         timeout_seconds=2.0,
         input_max_chars=2048,
         corpus_fingerprint="a" * 64,
+        qualification_evidence_fingerprint="f" * 64,
     )
     baseline = semantic_routing_runtime_contract_fingerprint(contract)
 
@@ -98,6 +152,7 @@ def test_runtime_contract_fingerprint_binds_every_semantic_router_input() -> Non
         "registry_fingerprint": "changed-registry",
         "timeout_seconds": 3.0,
         "corpus_fingerprint": "b" * 64,
+        "qualification_evidence_fingerprint": "e" * 64,
     }.items():
         changed = contract.model_copy(update={field: value})
         assert semantic_routing_runtime_contract_fingerprint(changed) != baseline
@@ -106,27 +161,26 @@ def test_runtime_contract_fingerprint_binds_every_semantic_router_input() -> Non
 def test_diagnostic_report_cannot_activate_routing(config_root: Path, tmp_path: Path) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    _write_report(path, _report(registry, gate="diagnostic", passed=None))
+    _write_report(path, _release_evidence(registry, gate="diagnostic", passed=None))
 
-    with pytest.raises(RoutingActivationError, match=r"gate\.mode"):
-        _factory(config_root, path)(registry)
+    with pytest.raises(RoutingActivationError, match="missing or invalid"):
+        _factory(config_root, path, expected_evidence_fingerprint="f" * 64)(registry)
 
 
-def test_failed_cutover_report_exposes_sanitized_gate_failures(
+def test_failed_cutover_release_cannot_activate_routing(
     config_root: Path,
     tmp_path: Path,
 ) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    payload = _report(registry, passed=False)
-    payload["gate"]["failures"] = ["candidate produced an unsafe executable misroute"]  # type: ignore[index]
+    payload = _release_evidence(registry, passed=False)
+    payload["regression"]["gate"]["failures"] = [  # type: ignore[index]
+        "candidate produced an unsafe executable misroute"
+    ]
     _write_report(path, payload)
 
-    with pytest.raises(
-        RoutingActivationError,
-        match="candidate produced an unsafe executable misroute",
-    ):
-        _factory(config_root, path)(registry)
+    with pytest.raises(RoutingActivationError, match="missing or invalid"):
+        _factory(config_root, path, expected_evidence_fingerprint="f" * 64)(registry)
 
 
 def test_inexact_projection_reports_its_actual_activation_failure(
@@ -135,12 +189,12 @@ def test_inexact_projection_reports_its_actual_activation_failure(
 ) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    payload = _report(registry)
-    payload["projection"]["exact"] = False  # type: ignore[index]
+    payload = _release_evidence(registry)
+    payload["regression"]["projection"]["exact"] = False  # type: ignore[index]
     _write_report(path, payload)
 
-    with pytest.raises(RoutingActivationError, match="context projection was not exact"):
-        _factory(config_root, path)(registry)
+    with pytest.raises(RoutingActivationError, match="missing or invalid"):
+        _factory(config_root, path, expected_evidence_fingerprint="f" * 64)(registry)
 
 
 def test_previous_report_schema_cannot_activate_routing(
@@ -149,18 +203,21 @@ def test_previous_report_schema_cannot_activate_routing(
 ) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    payload = _report(registry)
-    payload["schema_version"] = "6"
+    payload = _release_evidence(registry)
+    payload["regression"]["schema_version"] = "9"  # type: ignore[index]
     _write_report(path, payload)
 
     with pytest.raises(RoutingActivationError, match="missing or invalid"):
-        _factory(config_root, path)(registry)
+        _factory(config_root, path, expected_evidence_fingerprint="f" * 64)(registry)
 
 
 def test_stale_report_cannot_activate_routing(config_root: Path, tmp_path: Path) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    _write_report(path, _report(registry, run_at=datetime.now(tz=UTC) - timedelta(days=31)))
+    _write_report(
+        path,
+        _release_evidence(registry, run_at=datetime.now(tz=UTC) - timedelta(days=31)),
+    )
 
     with pytest.raises(RoutingActivationError, match="not current"):
         _factory(config_root, path)(registry)
@@ -171,8 +228,9 @@ def test_runtime_contract_mismatch_cannot_activate_routing(
 ) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    payload = _report(registry)
-    payload["models"]["candidate"]["prompt_fingerprint"] = "stale"  # type: ignore[index]
+    payload = _release_evidence(registry)
+    payload["regression"]["models"]["candidate"]["prompt_fingerprint"] = "stale"  # type: ignore[index]
+    payload["readiness_holdout"]["models"]["candidate"]["prompt_fingerprint"] = "stale"  # type: ignore[index]
     _write_report(path, payload)
 
     with pytest.raises(RoutingActivationError, match="prompt_fingerprint"):
@@ -184,8 +242,9 @@ def test_reasoning_effort_mismatch_cannot_activate_routing(
 ) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    payload = _report(registry)
-    payload["models"]["candidate"]["reasoning_effort"] = "none"  # type: ignore[index]
+    payload = _release_evidence(registry)
+    payload["regression"]["models"]["candidate"]["reasoning_effort"] = "none"  # type: ignore[index]
+    payload["readiness_holdout"]["models"]["candidate"]["reasoning_effort"] = "none"  # type: ignore[index]
     _write_report(path, payload)
 
     with pytest.raises(RoutingActivationError, match="reasoning_effort"):
@@ -195,8 +254,9 @@ def test_reasoning_effort_mismatch_cannot_activate_routing(
 def test_stale_corpus_cannot_activate_routing(config_root: Path, tmp_path: Path) -> None:
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    payload = _report(registry)
-    payload["corpus_fingerprint"] = "b" * 64
+    payload = _release_evidence(registry)
+    payload["regression"]["corpus_fingerprint"] = "f" * 64  # type: ignore[index]
+    payload["holdout_source_disjoint_from_corpus_fingerprint"] = "f" * 64
     _write_report(path, payload)
 
     with pytest.raises(RoutingActivationError, match="corpus_fingerprint"):
@@ -212,7 +272,7 @@ def test_exact_current_cutover_report_activates_configured_router(
 
     registry = CapabilityRegistry(())
     path = tmp_path / "qualification.json"
-    _write_report(path, _report(registry))
+    _write_report(path, _release_evidence(registry))
 
     class FakeGateway:
         def __init__(self, *_args: object) -> None:
@@ -227,6 +287,36 @@ def test_exact_current_cutover_report_activates_configured_router(
     recognizer = _factory(config_root, path)(registry)
 
     assert isinstance(recognizer, SemanticRouter)
+
+
+def test_release_evidence_requires_one_run_and_two_distinct_passing_corpora() -> None:
+    registry = CapabilityRegistry(())
+    payload = _release_evidence(registry)
+    payload["readiness_holdout"]["qualification_run_id"] = "different-run"  # type: ignore[index]
+    with pytest.raises(ValidationError, match="one qualification run"):
+        SemanticRoutingReleaseEvidence.model_validate_json(json.dumps(payload))
+
+    payload = _release_evidence(registry)
+    payload["readiness_holdout"]["corpus_fingerprint"] = "a" * 64  # type: ignore[index]
+    with pytest.raises(ValidationError, match="corpora must be distinct"):
+        SemanticRoutingReleaseEvidence.model_validate_json(json.dumps(payload))
+
+
+def test_prepared_factory_rejects_release_evidence_replaced_on_disk(
+    config_root: Path,
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry(())
+    path = tmp_path / "qualification.json"
+    payload = _release_evidence(registry)
+    _write_report(path, payload)
+    factory = _factory(config_root, path)
+
+    payload["regression_report_sha256"] = "f" * 64
+    _write_report(path, payload)
+
+    with pytest.raises(RoutingActivationError, match="changed after preparation"):
+        factory(registry)
 
 
 def test_configured_router_factory_does_not_claim_or_require_qualification(

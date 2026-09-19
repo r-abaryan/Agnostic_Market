@@ -8,7 +8,12 @@ Models live in dtos/config.py (single source of truth) — this package holds be
 never model definitions (there is deliberately no config/schemas.py).
 """
 
-from agnostic_market.config.loader import ConfigError, config_version, load_yaml_layer
+from agnostic_market.config.loader import (
+    ConfigError,
+    config_version,
+    load_yaml_bytes,
+    load_yaml_layer,
+)
 from agnostic_market.config.registry import (
     ConfigRegistry,
     ResolvedConfig,
@@ -28,6 +33,7 @@ __all__ = [
     "SafetyLockViolationError",
     "UnknownMerchantError",
     "config_version",
+    "load_yaml_bytes",
     "load_yaml_layer",
     "resolve_merchant_config",
 ]

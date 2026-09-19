@@ -923,6 +923,10 @@ def _patch_durable_worker_dependencies(
     from scripts import voice_agent
 
     prepared_routing = SimpleNamespace(capability_registry=object())
+    routing_factory = SimpleNamespace(
+        expected_corpus_fingerprint="c" * 64,
+        expected_qualification_evidence_fingerprint="d" * 64,
+    )
     certification_target = VoiceCertificationTarget(
         schema_version=1,
         environment="synthetic",
@@ -935,6 +939,11 @@ def _patch_durable_worker_dependencies(
     monkeypatch.setattr(voice_agent, "_CONFIG_ROOT", config_root)
     monkeypatch.setattr(voice_agent, "load_close_certification_request", lambda _root: None)
     monkeypatch.setattr(voice_agent, "require_llm_certification", lambda *_args: None)
+    monkeypatch.setattr(
+        voice_agent,
+        "build_qualified_semantic_router_factory",
+        lambda *_args, **_kwargs: routing_factory,
+    )
     monkeypatch.setattr(
         voice_agent,
         "prepare_application_routing",
@@ -955,6 +964,7 @@ def _patch_durable_worker_dependencies(
             input_max_chars=4_000,
             timeout_seconds=2.0,
             corpus_fingerprint="c" * 64,
+            qualification_evidence_fingerprint="d" * 64,
         ),
     )
     monkeypatch.setattr(
@@ -1457,10 +1467,19 @@ async def test_worker_rejects_routing_qualification_before_platform_or_connect(
     monkeypatch.setattr(voice_agent, "load_close_certification_request", lambda _root: None)
     monkeypatch.setattr(voice_agent, "require_llm_certification", lambda *_args: None)
 
-    def reject_routing(_factory):
+    def reject_routing(*_args: object, **_kwargs: object):
         raise RoutingActivationError("routing qualification rejected")
 
-    monkeypatch.setattr(voice_agent, "prepare_application_routing", reject_routing)
+    monkeypatch.setattr(
+        voice_agent,
+        "build_qualified_semantic_router_factory",
+        reject_routing,
+    )
+    monkeypatch.setattr(
+        voice_agent,
+        "prepare_application_routing",
+        lambda _factory: pytest.fail("routing preparation preceded release-evidence validation"),
+    )
     monkeypatch.setattr(
         voice_agent,
         "load_platform_runtime_config",

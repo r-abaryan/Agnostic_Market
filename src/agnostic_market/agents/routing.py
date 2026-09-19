@@ -72,6 +72,14 @@ ProviderCallOutcome = Literal[
 class _CapabilityDefinition:
     meaning: str
     discriminators: frozenset[str]
+    # True when this capability's flow owns a commerce-effect commit point, that is one of the
+    # CommerceEffectFinishers boundaries in agents/recovery.py. Identity capabilities commit to
+    # session state instead, a different subsystem, so they are not commerce effects even though
+    # they do mutate. Required and undefaulted so the import-time check below stays exhaustive.
+    commerce_effect: bool
+    # True when a wrong route can change durable/session authority, discard pending work, or
+    # terminate automation. This is deliberately broader than commerce_effect.
+    unsafe_misroute: bool
     materialize: Callable[[RouteProposal], IntentRequest]
 
 
@@ -117,86 +125,120 @@ _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingP
                 "account, identity, order, inventory, cart, transfer, or effect state."
             ),
             discriminators=frozenset({"answer_topic"}),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=_materialize_answer,
         ),
         CapabilityId.SEARCH_CATALOG: _CapabilityDefinition(
             meaning="find or describe products from the catalog; not live inventory state.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=lambda _proposal: SearchCatalog(),
         ),
         CapabilityId.VERIFY_ORDER_STATUS: _CapabilityDefinition(
             meaning="read status for explicit, focused, or recent orders.",
             discriminators=frozenset({"order_status_selector"}),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=_materialize_order_status,
         ),
         CapabilityId.LIST_ORDERS: _CapabilityDefinition(
             meaning="list session-visible or verified-account orders.",
             discriminators=frozenset({"list_scope"}),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=_materialize_list_orders,
         ),
         CapabilityId.VIEW_CART: _CapabilityDefinition(
             meaning="read the current cart.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=lambda _proposal: ViewCart(),
         ),
         CapabilityId.MODIFY_CART: _CapabilityDefinition(
             meaning="add, remove, or set the quantity of a cart item.",
             discriminators=frozenset({"cart_operation"}),
+            commerce_effect=True,
+            unsafe_misroute=True,
             materialize=_materialize_modify_cart,
         ),
         CapabilityId.PLACE_ORDER: _CapabilityDefinition(
             meaning="start checkout for the current cart.",
             discriminators=frozenset(),
+            commerce_effect=True,
+            unsafe_misroute=True,
             materialize=lambda _proposal: PlaceOrder(),
         ),
         CapabilityId.CANCEL_ORDERS: _CapabilityDefinition(
             meaning="cancel one or more existing orders before fulfillment.",
             discriminators=frozenset(),
+            commerce_effect=True,
+            unsafe_misroute=True,
             materialize=lambda _proposal: CancelOrders(),
         ),
         CapabilityId.REFUND_ORDER: _CapabilityDefinition(
             meaning="request money back for an existing order.",
             discriminators=frozenset(),
+            commerce_effect=True,
+            unsafe_misroute=True,
             materialize=lambda _proposal: RefundOrder(),
         ),
         CapabilityId.RETURN_ORDER: _CapabilityDefinition(
             meaning="return an existing order or item from it.",
             discriminators=frozenset(),
+            commerce_effect=True,
+            unsafe_misroute=True,
             materialize=lambda _proposal: ReturnOrder(),
         ),
         CapabilityId.CHANGE_PROFILE: _CapabilityDefinition(
             meaning="change the caller's address or contact value.",
             discriminators=frozenset({"profile_field"}),
+            commerce_effect=True,
+            unsafe_misroute=True,
             materialize=_materialize_change_profile,
         ),
         CapabilityId.VERIFY_IDENTITY: _CapabilityDefinition(
             meaning="verify the caller against an account.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=True,
             materialize=lambda _proposal: VerifyIdentity(),
         ),
         CapabilityId.SWITCH_ACCOUNT: _CapabilityDefinition(
             meaning="stop using the current account and verify a different account.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=True,
             materialize=lambda _proposal: SwitchAccount(),
         ),
         CapabilityId.VIEW_IDENTITY_STATUS: _CapabilityDefinition(
             meaning="state whether this session is currently bound to an account.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=lambda _proposal: ViewIdentityStatus(),
         ),
         CapabilityId.ABORT_CURRENT: _CapabilityDefinition(
             meaning="stop and clear the current request without performing its pending effect.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=True,
             materialize=lambda _proposal: AbortCurrent(),
         ),
         CapabilityId.DISCLOSE_AI_IDENTITY: _CapabilityDefinition(
             meaning="answer whether the caller is speaking with an AI assistant.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=False,
             materialize=lambda _proposal: DiscloseAiIdentity(),
         ),
         CapabilityId.REQUEST_PERSON: _CapabilityDefinition(
             meaning="end automation and request the human-onramp path.",
             discriminators=frozenset(),
+            commerce_effect=False,
+            unsafe_misroute=True,
             materialize=lambda _proposal: RequestPerson(),
         ),
     }
@@ -206,7 +248,12 @@ _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingP
 def _render_capability_definitions() -> str:
     keys = tuple(_CAPABILITY_DEFINITIONS)
     if any(not isinstance(key, CapabilityId) for key in keys) or set(keys) != set(CapabilityId):
-        raise RuntimeError("router capability definitions must cover CapabilityId exactly")
+        missing = sorted(member.value for member in set(CapabilityId) - set(keys))
+        unexpected = sorted(str(key) for key in set(keys) - set(CapabilityId))
+        raise RuntimeError(
+            "router capability definitions must cover CapabilityId exactly: "
+            f"missing {missing or 'none'}, unexpected {unexpected or 'none'}"
+        )
     if any(not definition.meaning.strip() for definition in _CAPABILITY_DEFINITIONS.values()):
         raise RuntimeError("router capability meanings must be non-empty")
     return "\n".join(
@@ -217,6 +264,18 @@ def _render_capability_definitions() -> str:
 
 
 _CAPABILITY_DEFINITION_LINES = _render_capability_definitions()
+COMMERCE_EFFECT_CAPABILITIES: frozenset[CapabilityId] = frozenset(
+    capability_id
+    for capability_id, definition in _CAPABILITY_DEFINITIONS.items()
+    if definition.commerce_effect
+)
+UNSAFE_MISROUTE_CAPABILITIES: frozenset[CapabilityId] = frozenset(
+    capability_id
+    for capability_id, definition in _CAPABILITY_DEFINITIONS.items()
+    if definition.unsafe_misroute
+)
+if not COMMERCE_EFFECT_CAPABILITIES <= UNSAFE_MISROUTE_CAPABILITIES:
+    raise RuntimeError("every commerce-effect capability must be an unsafe misroute target")
 _PROPOSAL_DISCRIMINATORS = frozenset(RouteProposal.model_fields) - {
     "decision",
     "capability",

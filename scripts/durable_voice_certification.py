@@ -16,7 +16,9 @@ from livekit import api, rtc
 
 from agnostic_market.agents.frontline.graph import build_frontline_capability_registry
 from agnostic_market.agents.routing_activation import (
+    load_semantic_routing_release_evidence,
     semantic_routing_corpus_fingerprint,
+    semantic_routing_release_evidence_fingerprint,
     semantic_routing_runtime_contract,
 )
 from agnostic_market.config.registry import ConfigRegistry
@@ -359,6 +361,9 @@ async def _run(arguments: argparse.Namespace) -> int:
     routing_method = LLMGateway(credentials, secrets).structured_output_method(
         resolved.config.llm.routing
     )
+    routing_release_evidence = load_semantic_routing_release_evidence(
+        _CONFIG_ROOT / "qualification" / "semantic_routing_release.json"
+    )
     application_contract = VoiceApplicationContract(
         durable_platform_fingerprint=runtime_fingerprint,
         build_artifact_digest=arguments.build_artifact_digest,
@@ -370,6 +375,9 @@ async def _run(arguments: argparse.Namespace) -> int:
             timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
             input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
             corpus_fingerprint=semantic_routing_corpus_fingerprint(_CONFIG_ROOT),
+            qualification_evidence_fingerprint=(
+                semantic_routing_release_evidence_fingerprint(routing_release_evidence)
+            ),
         ),
         certification_target_fingerprint=voice_certification_target_fingerprint(target),
     )

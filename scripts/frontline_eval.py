@@ -64,6 +64,7 @@ from agnostic_market.agents.recovery import RECOVERY_NODE_NAME, TURN_FALLBACK_LI
 from agnostic_market.agents.routing import (
     CONTEXT_PROJECTOR_VERSION,
     ROUTE_SCHEMA_FINGERPRINT,
+    UNSAFE_MISROUTE_CAPABILITIES,
     ProviderCallOutcome,
     RoutingAttempt,
     RoutingRecognizer,
@@ -75,6 +76,9 @@ from agnostic_market.agents.routing import (
 )
 from agnostic_market.agents.routing_activation import (
     SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION,
+    SEMANTIC_ROUTING_RELEASE_EVIDENCE_SCHEMA_VERSION,
+    SemanticRoutingQualification,
+    SemanticRoutingReleaseEvidence,
 )
 from agnostic_market.agents.telemetry import (
     DisabledTelemetrySink,
@@ -97,7 +101,12 @@ from agnostic_market.commerce.orders import OrderStore, RecentOrderContext
 from agnostic_market.commerce.profile import ProfileStore
 from agnostic_market.commerce.spoken import caller_stated_order_ids
 from agnostic_market.commerce.verification import OtpProvider, VerificationStore
-from agnostic_market.config.loader import ConfigError, config_version, load_yaml_layer
+from agnostic_market.config.loader import (
+    ConfigError,
+    config_version,
+    load_yaml_bytes,
+    load_yaml_layer,
+)
 from agnostic_market.config.registry import ConfigRegistry
 from agnostic_market.dtos.config import MerchantConfig, ProviderModel
 from agnostic_market.dtos.events import (
@@ -187,6 +196,14 @@ _ROUTING_DATA_REPORT_SCHEMA_VERSION = "2"
 _ROUTING_DATA_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_data_readiness.json"
 _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS = 3
 _SEMANTIC_ROUTE_MIN_ACCEPTANCE_EXACT_RATE = 0.95
+# Eval-only. Production cannot retry: a voice turn has no budget for a second round
+# trip. A qualification run does, and a provider stall is an infrastructure event
+# rather than a routing defect.
+_SEMANTIC_ROUTE_EVAL_RETRY_LIMIT = 1
+# First attempts only, so a retry cannot hide an unreliable provider. Measured
+# completed-call rates on the retained report are 91, 69 and 99 percent, so this
+# floor deliberately keeps that run red rather than tuning around the outage.
+_SEMANTIC_ROUTE_MIN_COMPLETED_RATE = 0.95
 _SEMANTIC_ROUTE_P50_QUANTILE = 0.50
 _SEMANTIC_ROUTE_P95_QUANTILE = 0.95
 _MERCHANT_ID = "acme_store"
@@ -317,6 +334,7 @@ SemanticRouteDisposition = Literal[
     "exact",
     "conservative_clarification",
     "closed_failure",
+    "benign_executable_misroute",
     "unsafe_executable_misroute",
 ]
 SemanticRouteMismatchKind = Literal[
@@ -352,6 +370,25 @@ class SemanticRouteEvalCase(BaseModel):
             raise ValueError("semantic route ground truth must survive its own context")
         return self
 
+    @model_validator(mode="after")
+    def expected_route_is_producible_by_the_router(self) -> SemanticRouteEvalCase:
+        """Reject an expectation no RouteProposal can ever yield.
+
+        Surviving resolve_route is not enough. The router proposes a coarse route and
+        the owning capability flow gathers the slots, so RouteProposal carries no
+        refund destination, order target, cart item or catalog query. An expectation
+        that fills one of those is unreachable: every model output materializes with
+        the slot empty, so the case scores wrong on every run for a reason that has
+        nothing to do with the model. That is worse than no coverage, because it looks
+        like a model defect.
+
+        Checked by round trip. The expectation's own coarse signature is the only
+        proposal that could produce it, so if materializing that proposal does not
+        return the expectation, nothing will.
+        """
+        _require_producible_ground_truth(self.context, self.expected)
+        return self
+
 
 class ProjectedSemanticRouteEvalCase(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -373,6 +410,7 @@ class ProjectedSemanticRouteEvalCase(BaseModel):
             raise ValueError("projected turn text must equal its expected context utterance")
         if resolve_route(self.expected_context, self.expected) != self.expected:
             raise ValueError("projected route ground truth must survive its own context")
+        _require_producible_ground_truth(self.expected_context, self.expected)
         return self
 
 
@@ -418,6 +456,120 @@ class SemanticRouteEvalCorpus(BaseModel):
                 if value
             )
             raise ValueError(f"semantic-route eval must cover every risk domain ({detail})")
+        return self
+
+
+class SemanticRouteReadinessLineage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: str = Field(min_length=1)
+    source_cluster_id: str = Field(min_length=1)
+    source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def lineage_identifiers_are_normalized(self) -> SemanticRouteReadinessLineage:
+        if any(value != value.strip() for value in (self.case_id, self.source_cluster_id)):
+            raise ValueError("readiness lineage identifiers must be normalized")
+        return self
+
+
+class SemanticRouteReadinessIndependenceContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    author_role: Literal["isolated_holdout_author"]
+    source_kind: Literal["synthetic"]
+    labels_not_used_for_selection: Literal[True]
+    candidate_selection_method: str = Field(min_length=1)
+    observed_evidence_used: Literal[False]
+    allowed_production_contract_sources: tuple[str, ...] = Field(min_length=1)
+    prohibited_observed_evidence_sources: tuple[str, ...] = Field(min_length=1)
+
+
+class SemanticRouteReadinessCoverageRules(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    executable_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
+    risk_domains: tuple[SemanticRouteRiskDomain, ...] = Field(min_length=1)
+    required_contrasts: tuple[str, ...] = Field(min_length=1)
+    acceptance_case_count: int = Field(ge=1)
+
+
+class SemanticRouteReadinessRecipeSeed(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: str = Field(min_length=1)
+    source_cluster_id: str = Field(min_length=1)
+    source_seed: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def seed_identifiers_are_normalized(self) -> SemanticRouteReadinessRecipeSeed:
+        if any(value != value.strip() for value in (self.case_id, self.source_cluster_id)):
+            raise ValueError("readiness recipe identifiers must be normalized")
+        return self
+
+
+class SemanticRouteReadinessRecipe(BaseModel):
+    """Frozen independent-authoring contract bound to one readiness holdout."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1"]
+    recipe_id: str = Field(min_length=1)
+    frozen_at: datetime
+    purpose: str = Field(min_length=1)
+    independence_contract: SemanticRouteReadinessIndependenceContract
+    generation_rules: tuple[str, ...] = Field(min_length=1)
+    coverage_rules: SemanticRouteReadinessCoverageRules
+    source_cluster_rules: tuple[str, ...] = Field(min_length=1)
+    source_seed_ledger: tuple[SemanticRouteReadinessRecipeSeed, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def recipe_is_frozen_and_unique(self) -> SemanticRouteReadinessRecipe:
+        if self.frozen_at.tzinfo is None:
+            raise ValueError("readiness recipe freeze time must be timezone-aware")
+        if self.recipe_id != self.recipe_id.strip():
+            raise ValueError("readiness recipe id must be normalized")
+        case_ids = [seed.case_id for seed in self.source_seed_ledger]
+        clusters = [seed.source_cluster_id for seed in self.source_seed_ledger]
+        if len(case_ids) != len(set(case_ids)):
+            raise ValueError("readiness recipe case ids must be unique")
+        if len(clusters) != len(set(clusters)):
+            raise ValueError("readiness recipe source clusters must be unique")
+        return self
+
+
+class SemanticRouteReadinessHoldout(BaseModel):
+    """Externally stewarded source-disjoint corpus used only for final cutover."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1"]
+    holdout_id: str = Field(min_length=1)
+    steward_id: str = Field(min_length=1)
+    frozen_at: datetime
+    lineage_reference: str = Field(min_length=1)
+    generation_recipe_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_disjoint_from_corpus_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    labels_not_used_for_selection: Literal[True]
+    lineage: tuple[SemanticRouteReadinessLineage, ...]
+    corpus: SemanticRouteEvalCorpus
+
+    @model_validator(mode="after")
+    def holdout_is_frozen_and_traceable(self) -> SemanticRouteReadinessHoldout:
+        if self.frozen_at.tzinfo is None:
+            raise ValueError("readiness holdout freeze time must be timezone-aware")
+        text = (self.holdout_id, self.steward_id, self.lineage_reference)
+        if any(not value.strip() or value != value.strip() for value in text):
+            raise ValueError("readiness holdout identifiers must be normalized and non-empty")
+        if any(case.evaluation_split != "acceptance" for case in self.corpus.cases):
+            raise ValueError("readiness holdout cases must all be acceptance evidence")
+        case_ids = {case.case_id for case in self.corpus.cases}
+        lineage_ids = [item.case_id for item in self.lineage]
+        if set(lineage_ids) != case_ids or len(lineage_ids) != len(set(lineage_ids)):
+            raise ValueError("readiness lineage must exactly cover the holdout cases")
+        clusters = [item.source_cluster_id for item in self.lineage]
+        if len(clusters) != len(set(clusters)):
+            raise ValueError("readiness holdout cases must use independent source clusters")
         return self
 
 
@@ -1240,11 +1392,19 @@ class SemanticRouteCaseResult:
     evaluation_split: SemanticRouteEvaluationSplit
     expected: RouteDecision
     attempt: RoutingAttempt
+    active_capability: CapabilityId | None
+    # The outcome of the FIRST provider call, before any eval-only retry. The
+    # availability floor must measure the provider, and attempt holds whichever
+    # call succeeded.
+    first_attempt_outcome: ProviderCallOutcome
+    evaluation_retry_count: int = 0
     routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary"
 
     @property
     def disposition(self) -> SemanticRouteDisposition:
-        return _semantic_route_disposition(self.expected, self.attempt.resolution)
+        return _semantic_route_disposition(
+            self.expected, self.attempt.resolution, self.active_capability
+        )
 
     @property
     def mismatch_kind(self) -> SemanticRouteMismatchKind:
@@ -1576,6 +1736,111 @@ def _load_semantic_route_corpus(
     return SemanticRouteEvalCorpus.model_validate(load_yaml_layer(path))
 
 
+def _bind_semantic_route_readiness_recipe(
+    holdout: SemanticRouteReadinessHoldout,
+    *,
+    lineage_root: Path,
+) -> None:
+    reference = Path(holdout.lineage_reference)
+    if reference.is_absolute():
+        raise ValueError("readiness lineage reference must be repository-relative")
+    resolved_root = lineage_root.resolve()
+    recipe_path = (resolved_root / reference).resolve()
+    if not recipe_path.is_relative_to(resolved_root):
+        raise ValueError("readiness lineage reference escapes its trusted root")
+    try:
+        recipe_bytes = recipe_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("readiness lineage recipe is unavailable") from exc
+    try:
+        recipe = SemanticRouteReadinessRecipe.model_validate(
+            load_yaml_bytes(recipe_bytes, source=recipe_path)
+        )
+    except (ConfigError, ValidationError) as exc:
+        raise ValueError("readiness lineage recipe is invalid") from exc
+    if hashlib.sha256(recipe_bytes).hexdigest() != holdout.generation_recipe_fingerprint:
+        raise ValueError("readiness lineage recipe digest does not match the holdout")
+    if recipe.frozen_at != holdout.frozen_at:
+        raise ValueError("readiness recipe and holdout freeze times differ")
+    if (
+        recipe.independence_contract.labels_not_used_for_selection
+        != holdout.labels_not_used_for_selection
+    ):
+        raise ValueError("readiness recipe and holdout label-access contracts differ")
+    if recipe.coverage_rules.acceptance_case_count != len(holdout.corpus.cases):
+        raise ValueError("readiness recipe acceptance count does not match the holdout")
+
+    corpus_case_ids = {
+        holdout.corpus.projected_case.case_id,
+        *(case.case_id for case in holdout.corpus.cases),
+    }
+    seeds = {seed.case_id: seed for seed in recipe.source_seed_ledger}
+    if set(seeds) != corpus_case_ids:
+        raise ValueError("readiness recipe seeds must exactly cover the holdout corpus")
+
+    observed_capabilities = {
+        case.expected.request.kind
+        for case in (holdout.corpus.projected_case, *holdout.corpus.cases)
+        if case.expected.request is not None
+    }
+    if set(recipe.coverage_rules.executable_capabilities) != observed_capabilities:
+        raise ValueError("readiness recipe capability coverage does not match the holdout")
+    observed_domains = {
+        holdout.corpus.projected_case.risk_domain,
+        *(case.risk_domain for case in holdout.corpus.cases),
+    }
+    if set(recipe.coverage_rules.risk_domains) != observed_domains:
+        raise ValueError("readiness recipe risk-domain coverage does not match the holdout")
+
+    lineage = {item.case_id: item for item in holdout.lineage}
+    for case_id, item in lineage.items():
+        seed = seeds[case_id]
+        if item.source_cluster_id != seed.source_cluster_id:
+            raise ValueError("readiness lineage source cluster does not match the recipe")
+        expected_fingerprint = hashlib.sha256(seed.source_seed.encode("utf-8")).hexdigest()
+        if item.source_fingerprint != expected_fingerprint:
+            raise ValueError("readiness lineage source fingerprint does not match the recipe")
+
+
+def _load_semantic_route_readiness_holdout(
+    path: Path,
+    *,
+    regression: SemanticRouteEvalCorpus,
+    lineage_root: Path | None = None,
+) -> SemanticRouteReadinessHoldout:
+    holdout = SemanticRouteReadinessHoldout.model_validate(load_yaml_layer(path))
+    regression_fingerprint = _corpus_fingerprint(regression)
+    if holdout.source_disjoint_from_corpus_fingerprint != regression_fingerprint:
+        raise ValueError("readiness holdout is not bound to the current regression corpus")
+    if _corpus_fingerprint(holdout.corpus) == regression_fingerprint:
+        raise ValueError("readiness holdout cannot reuse the regression corpus")
+    regression_ids = {
+        regression.projected_case.case_id,
+        *(case.case_id for case in regression.cases),
+    }
+    holdout_ids = {
+        holdout.corpus.projected_case.case_id,
+        *(case.case_id for case in holdout.corpus.cases),
+    }
+    if regression_ids & holdout_ids:
+        raise ValueError("readiness holdout cannot reuse regression case ids")
+    regression_utterances = {
+        regression.projected_case.turn.text.casefold().strip(),
+        *(case.context.utterance.casefold().strip() for case in regression.cases),
+    }
+    holdout_utterances = {
+        holdout.corpus.projected_case.turn.text.casefold().strip(),
+        *(case.context.utterance.casefold().strip() for case in holdout.corpus.cases),
+    }
+    if regression_utterances & holdout_utterances:
+        raise ValueError("readiness holdout cannot reuse regression utterances")
+    _bind_semantic_route_readiness_recipe(
+        holdout,
+        lineage_root=lineage_root or _CONFIG_ROOT.parent,
+    )
+    return holdout
+
+
 def _load_semantic_route_structural_supplement(
     path: Path = _SEMANTIC_ROUTE_STRUCTURAL_SUPPLEMENT_PATH,
 ) -> SemanticRouteStructuralSupplement:
@@ -1701,12 +1966,41 @@ async def _run_order_target_eval() -> int:
     return 0
 
 
+async def _route_with_eval_retry(
+    router: SemanticRouter,
+    context: RoutingContext,
+) -> tuple[RoutingAttempt, ProviderCallOutcome, int]:
+    """Retry a stalled provider call. Evaluation harness only, never SemanticRouter.
+
+    Scoring a provider stall as a model failure is the inaccuracy this removes: it
+    discards the measurement instead of recovering it. Only deadline_exceeded is
+    retried. A provider_error covers auth failures and rejected schemas and stays
+    blocking, and not_attempted is a corpus defect that a retry would repeat.
+
+    Returns the first attempt's outcome alongside the surviving attempt, because the
+    availability floor must measure the provider rather than the retry.
+    """
+    attempt = await router.route(context)
+    first_outcome = attempt.provider_call_outcome
+    retries = 0
+    while (
+        attempt.provider_call_outcome == "deadline_exceeded"
+        and retries < _SEMANTIC_ROUTE_EVAL_RETRY_LIMIT
+    ):
+        retries += 1
+        attempt = await router.route(context)
+    return attempt, first_outcome, retries
+
+
 async def _run_semantic_route_cases(
     router: SemanticRouter,
     corpus: SemanticRouteEvalCorpus,
 ) -> tuple[SemanticRouteCaseResult, ...]:
     results: list[SemanticRouteCaseResult] = []
     for case in corpus.cases:
+        attempt, first_outcome, evaluation_retries = await _route_with_eval_retry(
+            router, case.context
+        )
         results.append(
             SemanticRouteCaseResult(
                 case_id=case.case_id,
@@ -1715,7 +2009,10 @@ async def _run_semantic_route_cases(
                 risk_domain=case.risk_domain,
                 evaluation_split=case.evaluation_split,
                 expected=case.expected,
-                attempt=await router.route(case.context),
+                attempt=attempt,
+                active_capability=case.context.active_capability,
+                first_attempt_outcome=first_outcome,
+                evaluation_retry_count=evaluation_retries,
                 routing_scope=case.context.routing_scope,
             )
         )
@@ -1751,16 +2048,50 @@ if _ACTUAL_ROUTE_PROPOSAL_DISCRIMINATORS != _ROUTE_SIGNATURE_DISCRIMINATORS:
 def _semantic_route_disposition(
     expected: RouteDecision,
     actual: RouteDecision | RoutingFailure,
+    active_capability: CapabilityId | None,
 ) -> SemanticRouteDisposition:
+    """Classify a mismatch by what the wrong route can actually do.
+
+    Severity is the reached capability, not the decision arm. A direct route onto
+    search_catalog cannot move money or goods; one onto refund_order can.
+
+    A continue carries no request and so no capability of its own. It resumes
+    whatever the caller had active, so it is judged by that: resolve_route rejects
+    continue when active_capability is None, so every surviving continue has one.
+    Judging continue by the reached capability instead would find none and call
+    every spurious continue benign, which is the hole this argument closes.
+    """
     if actual == expected:
         return "exact"
     if isinstance(actual, RoutingFailure):
         return "closed_failure"
     if actual.decision == "clarify":
         return "conservative_clarification"
-    if actual.decision in {"direct", "continue"}:
+    reached = _route_reached_capability(actual, active_capability)
+    if reached is None:
+        raise AssertionError("an executable route must reach a capability")
+    if reached in UNSAFE_MISROUTE_CAPABILITIES:
         return "unsafe_executable_misroute"
-    raise AssertionError(f"unclassified route decision {actual.decision!r}")
+    return "benign_executable_misroute"
+
+
+def _route_reached_capability(
+    resolution: RouteDecision | RoutingFailure,
+    active_capability: CapabilityId | None,
+) -> CapabilityId | None:
+    if isinstance(resolution, RoutingFailure) or resolution.decision == "clarify":
+        return None
+    if resolution.decision == "direct":
+        if resolution.request is None:
+            raise AssertionError("a direct route without a request cannot be classified")
+        return resolution.request.kind
+    if resolution.decision == "continue":
+        if active_capability is None:
+            raise AssertionError(
+                "a continue route without an active capability cannot be classified"
+            )
+        return active_capability
+    raise AssertionError(f"unclassified route decision {resolution.decision!r}")
 
 
 def _semantic_route_mismatch_kind(
@@ -1834,6 +2165,27 @@ def _route_signature(
     return signature
 
 
+def _require_producible_ground_truth(
+    context: RoutingContext,
+    expected: RouteDecision,
+) -> None:
+    """Reject a direct expectation no provider proposal can materialize."""
+    if expected.decision != "direct":
+        return
+    signature = _route_signature(expected)
+    proposal = RouteProposal(
+        decision="direct",
+        capability=signature["capability"],
+        answer_topic=signature["answer_topic"],
+        list_scope=signature["list_scope"],
+        cart_operation=signature["cart_operation"],
+        profile_field=signature["profile_field"],
+        order_status_selector=signature["order_status_selector"],
+    )
+    if materialize_route(context, proposal) != expected:
+        raise ValueError("semantic route ground truth must be producible by the router")
+
+
 def _optional_sum(values: Sequence[int | None]) -> int | None:
     present = [value for value in values if value is not None]
     return sum(present) if present else None
@@ -1861,6 +2213,10 @@ def _semantic_route_group(
         "mismatch_kinds": mismatch_kinds,
         "provider_call_outcomes": {
             outcome: sum(result.attempt.provider_call_outcome == outcome for result in results)
+            for outcome in get_args(ProviderCallOutcome)
+        },
+        "first_attempt_provider_call_outcomes": {
+            outcome: sum(result.first_attempt_outcome == outcome for result in results)
             for outcome in get_args(ProviderCallOutcome)
         },
         "cache_read_cohorts": {
@@ -2008,9 +2364,11 @@ def _semantic_model_report(
                     else result.attempt.observed_at.isoformat()
                 ),
                 "provider_call_outcome": result.attempt.provider_call_outcome,
+                "first_attempt_provider_call_outcome": result.first_attempt_outcome,
                 "provider_error_category": result.attempt.provider_error_category,
                 "provider_request_id": result.attempt.provider_request_id,
                 "provider_retry_count": result.attempt.provider_retry_count,
+                "evaluation_retry_count": result.evaluation_retry_count,
                 # True when the resolver rewrote the model's decision. Without it the
                 # "actual" signature above reads as the model's own proposal.
                 "resolution_adjusted": result.attempt.resolution_adjusted,
@@ -2654,6 +3012,84 @@ def _assert_semantic_results_are_comparable(
         raise ValueError("candidate and incumbent results must cover the same ordered cases")
 
 
+_TOLERATED_PROVIDER_CALL_OUTCOMES = frozenset({"deadline_exceeded"})
+_BLOCKING_PROVIDER_CALL_OUTCOMES = frozenset({"completed", "provider_error", "not_attempted"})
+if set(get_args(ProviderCallOutcome)) != (
+    _TOLERATED_PROVIDER_CALL_OUTCOMES | _BLOCKING_PROVIDER_CALL_OUTCOMES
+):
+    raise RuntimeError("closed-failure partition must classify every provider call outcome")
+
+
+def _is_routing_defect_failure(result: SemanticRouteCaseResult) -> bool:
+    """True when a closed failure is the router's fault rather than the provider's.
+
+    deadline_exceeded is the only tolerated outcome, and only because a stall is an
+    infrastructure event that the eval harness now retries.
+
+    The other three stay blocking on purpose. not_attempted comes from an utterance
+    longer than input_max_chars, which is a corpus defect a retry would only repeat.
+    provider_error carries the same routing_unavailable reason as a real deadline
+    while covering auth failures, rejected schemas and wrong model names, and the
+    retained report has zero of them, so tolerating it would create a bucket with no
+    observations behind it. completed means the provider answered and the answer was
+    rejected, which is the model defect this gate exists to catch.
+    """
+    outcome = result.attempt.provider_call_outcome
+    if outcome in _TOLERATED_PROVIDER_CALL_OUTCOMES:
+        return False
+    if outcome in _BLOCKING_PROVIDER_CALL_OUTCOMES:
+        return True
+    raise AssertionError(f"unclassified provider call outcome {outcome!r}")
+
+
+def _routing_defect_failures(
+    candidate: Sequence[SemanticRouteCaseResult],
+) -> tuple[SemanticRouteCaseResult, ...]:
+    return tuple(
+        result
+        for result in candidate
+        if result.disposition == "closed_failure" and _is_routing_defect_failure(result)
+    )
+
+
+def _semantic_availability_failures(
+    candidate: Sequence[SemanticRouteCaseResult],
+) -> list[str]:
+    """Block on an unreliable provider, and on acceptance cases left unmeasured.
+
+    Tolerating deadline_exceeded removes the gate's only response to a provider
+    outage, so it has to be replaced rather than simply dropped. Nothing else in
+    _semantic_gate_failures gates on latency or availability.
+
+    The coverage half matters just as much: a timed-out case is neither pass nor
+    fail, it is unmeasured. Without it a run where a critical acceptance case timed
+    out in every repetition would report that every critical acceptance case was
+    exact, over a case that was never measured. That is the reading under which this
+    whole item would be a loosened check rather than a sharper one.
+
+    Both run for shadow as well as cutover, so they sit ahead of the shadow branch's
+    early return.
+    """
+    failures: list[str] = []
+    completed = sum(1 for result in candidate if result.first_attempt_outcome == "completed")
+    required = math.ceil(len(candidate) * _SEMANTIC_ROUTE_MIN_COMPLETED_RATE)
+    if completed < required:
+        failures.append(
+            f"provider completed {completed} of {len(candidate)} first attempts, "
+            f"below the required {required}"
+        )
+    unmeasured = sorted(
+        result.case_id
+        for result in candidate
+        if result.evaluation_split == "acceptance"
+        and result.risk_class == "critical"
+        and result.attempt.provider_call_outcome != "completed"
+    )
+    if unmeasured:
+        failures.append("critical acceptance cases were not measured: " + ", ".join(unmeasured))
+    return failures
+
+
 def _semantic_gate_failures(
     candidate: Sequence[SemanticRouteCaseResult],
     incumbent: Sequence[SemanticRouteCaseResult],
@@ -2668,8 +3104,12 @@ def _semantic_gate_failures(
     confirmation = _confirmation_escape_metrics(candidate)
     if confirmation["false_escapes"]:
         failures.append("candidate produced a false person escape during confirmation")
+    failures.extend(_semantic_availability_failures(candidate))
     if gate == "shadow":
-        if _count_disposition(candidate, "closed_failure"):
+        failures.extend(
+            f"incumbent {failure}" for failure in _semantic_availability_failures(incumbent)
+        )
+        if _routing_defect_failures(candidate):
             failures.append("candidate produced a closed failure")
         candidate_development = _count_disposition(
             candidate, "exact", evaluation_split="development"
@@ -2699,7 +3139,7 @@ def _semantic_gate_failures(
             failures.append("candidate is inferior to incumbent on critical acceptance")
         return tuple(failures)
 
-    if _count_disposition(candidate, "closed_failure"):
+    if _routing_defect_failures(candidate):
         failures.append("candidate produced a closed failure")
     if _count_disposition(candidate, "unsafe_executable_misroute"):
         failures.append("candidate produced an unsafe executable misroute")
@@ -2761,6 +3201,37 @@ def _semantic_gate_failures(
     return tuple(failures)
 
 
+def _reached_capability(result: SemanticRouteCaseResult) -> str | None:
+    reached = _route_reached_capability(result.attempt.resolution, result.active_capability)
+    return reached.value if reached is not None else None
+
+
+def _semantic_gate_observations(
+    candidate: Sequence[SemanticRouteCaseResult],
+    *,
+    repetition: int,
+) -> list[dict[str, object]]:
+    """Misroutes that do not block the gate, recorded so a severity drift stays visible.
+
+    A benign misroute reaches a read-only capability, so it cannot move money or goods,
+    change session authority, discard pending work, or terminate automation. It is still the
+    population an unsafe misroute would emerge from, so the reached
+    capability is written out rather than left to a diff of raw case rows.
+    """
+    return [
+        {
+            "repetition": repetition,
+            "case_id": result.case_id,
+            "evaluation_split": result.evaluation_split,
+            "risk_class": result.risk_class,
+            "mismatch_kind": result.mismatch_kind,
+            "reached_capability": _reached_capability(result),
+        }
+        for result in candidate
+        if result.disposition == "benign_executable_misroute"
+    ]
+
+
 def _semantic_acceptance_budget(
     results: Sequence[SemanticRouteCaseResult],
 ) -> dict[str, int]:
@@ -2807,6 +3278,22 @@ def _semantic_series_verdict(
         run_failures.append(current)
         for failure in current:
             failures.append(f"repetition {repetition}: {failure}")
+    # A series-scoped failure belongs to no single repetition, so it is appended to
+    # failures with no matching run_failures entry. That yields runs[i].gate.passed
+    # true for every i while the top-level passed is false. Sanctioned deliberately:
+    # an acceptance case that never completed in ANY repetition is unmeasured, and
+    # _semantic_gate_failures sees one repetition at a time so it cannot detect it.
+    series = [result for run in candidate_runs for result in run]
+    measured = {
+        result.case_id for result in series if result.attempt.provider_call_outcome == "completed"
+    }
+    never_measured = sorted(
+        {result.case_id for result in series if result.evaluation_split == "acceptance"} - measured
+    )
+    if never_measured:
+        failures.append(
+            "acceptance cases had no completed call in any repetition: " + ", ".join(never_measured)
+        )
     return _SemanticSeriesVerdict(
         gate=gate,
         run_failures=tuple(run_failures),
@@ -2821,6 +3308,8 @@ def _semantic_route_report(
     corpus: SemanticRouteEvalCorpus,
     projection: ProjectedSemanticRouteCaseResult,
     verdict: _SemanticSeriesVerdict,
+    qualification_run_id: str,
+    corpus_role: Literal["regression", "readiness_holdout"] = "regression",
 ) -> dict[str, object]:
     gate = verdict.gate
     if not candidate_runs or len(candidate_runs) != len(incumbent_runs):
@@ -2844,11 +3333,14 @@ def _semantic_route_report(
         raise ValueError("semantic-route verdict must align with repetitions")
     acceptance = [result for result in first_candidate if result.evaluation_split == "acceptance"]
     run_reports: list[dict[str, object]] = []
+    series_observations: list[dict[str, object]] = []
     for repetition, (candidate, incumbent) in enumerate(
         zip(candidate_runs, incumbent_runs, strict=True),
         start=1,
     ):
         run_failures = verdict.run_failures[repetition - 1]
+        run_observations = _semantic_gate_observations(candidate, repetition=repetition)
+        series_observations.extend(run_observations)
         run_reports.append(
             {
                 "repetition": repetition,
@@ -2856,6 +3348,7 @@ def _semantic_route_report(
                     "mode": gate,
                     "passed": None if gate == "diagnostic" else not run_failures,
                     "failures": list(run_failures),
+                    "observations": run_observations,
                 },
                 "models": {
                     "candidate": _semantic_model_report(
@@ -2871,6 +3364,8 @@ def _semantic_route_report(
         )
     return {
         "schema_version": _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION,
+        "qualification_run_id": qualification_run_id,
+        "corpus_role": corpus_role,
         "corpus_schema_version": corpus.schema_version,
         "run_at": datetime.now(tz=UTC).isoformat(),
         "corpus_fingerprint": _corpus_fingerprint(corpus),
@@ -2896,6 +3391,7 @@ def _semantic_route_report(
             "mode": gate,
             "passed": verdict.passed,
             "failures": list(verdict.failures),
+            "observations": series_observations,
         },
         "models": {
             "candidate": _semantic_model_report(
@@ -2917,10 +3413,14 @@ def _semantic_invalid_projection_report(
     *,
     gate: SemanticRouteGate,
     expected_repetitions: int,
+    qualification_run_id: str,
+    corpus_role: Literal["regression", "readiness_holdout"] = "regression",
 ) -> dict[str, object]:
     acceptance = [case for case in corpus.cases if case.evaluation_split == "acceptance"]
     return {
         "schema_version": _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION,
+        "qualification_run_id": qualification_run_id,
+        "corpus_role": corpus_role,
         "corpus_schema_version": corpus.schema_version,
         "run_at": datetime.now(tz=UTC).isoformat(),
         "corpus_fingerprint": _corpus_fingerprint(corpus),
@@ -2953,6 +3453,7 @@ def _semantic_invalid_projection_report(
             "mode": gate,
             "passed": None,
             "failures": [],
+            "observations": [],
         },
         "models": {},
         "runs": [],
@@ -2967,6 +3468,46 @@ def _write_json_report(path: Path, report: dict[str, object]) -> None:
     )
 
 
+def _write_new_json_evidence(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8", newline="\n") as destination:
+        destination.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
+
+def _package_semantic_routing_release_evidence(
+    *,
+    regression_report_path: Path,
+    readiness_report_path: Path,
+    holdout: SemanticRouteReadinessHoldout,
+    release_evidence_path: Path,
+) -> SemanticRoutingReleaseEvidence:
+    regression_bytes = regression_report_path.read_bytes()
+    readiness_bytes = readiness_report_path.read_bytes()
+    regression = SemanticRoutingQualification.model_validate_json(regression_bytes)
+    readiness = SemanticRoutingQualification.model_validate_json(readiness_bytes)
+    evidence = SemanticRoutingReleaseEvidence(
+        schema_version=SEMANTIC_ROUTING_RELEASE_EVIDENCE_SCHEMA_VERSION,
+        packaged_at=datetime.now(tz=UTC),
+        holdout_id=holdout.holdout_id,
+        holdout_steward_id=holdout.steward_id,
+        holdout_frozen_at=holdout.frozen_at,
+        holdout_lineage_reference=holdout.lineage_reference,
+        holdout_generation_recipe_fingerprint=holdout.generation_recipe_fingerprint,
+        holdout_source_disjoint_from_corpus_fingerprint=(
+            holdout.source_disjoint_from_corpus_fingerprint
+        ),
+        regression_report_sha256=hashlib.sha256(regression_bytes).hexdigest(),
+        readiness_report_sha256=hashlib.sha256(readiness_bytes).hexdigest(),
+        regression=regression,
+        readiness_holdout=readiness,
+    )
+    _write_new_json_evidence(
+        release_evidence_path,
+        evidence.model_dump(mode="json"),
+    )
+    return evidence
+
+
 async def _run_semantic_route_eval(
     report_path: Path,
     gate: SemanticRouteGate = "cutover",
@@ -2974,6 +3515,10 @@ async def _run_semantic_route_eval(
     fixture_config_root: Path,
     diagnostic_timeout_seconds: float | None = None,
     candidate_selection: ProviderModel | None = None,
+    corpus: SemanticRouteEvalCorpus | None = None,
+    qualification_run_id: str | None = None,
+    corpus_role: Literal["regression", "readiness_holdout"] = "regression",
+    write_new_evidence: bool = False,
 ) -> int:
     selection = _load_routing_eval_selection()
     config = selection.config
@@ -3012,7 +3557,8 @@ async def _run_semantic_route_eval(
         routing_evidence_sink=DisabledTelemetrySink(),
     )
     try:
-        corpus = _load_semantic_route_corpus()
+        corpus = corpus or _load_semantic_route_corpus()
+        qualification_run_id = qualification_run_id or uuid.uuid4().hex
         state = ReasoningState.from_checkpoint(
             (await runtime.graph.aget_state(runtime.engine._config)).values
         )
@@ -3039,8 +3585,11 @@ async def _run_semantic_route_eval(
                 projection,
                 gate=gate,
                 expected_repetitions=repetitions,
+                qualification_run_id=qualification_run_id,
+                corpus_role=corpus_role,
             )
-            await asyncio.to_thread(_write_json_report, report_path, report)
+            report_writer = _write_new_json_evidence if write_new_evidence else _write_json_report
+            await asyncio.to_thread(report_writer, report_path, report)
             print("[semantic_routes] projector: 0/1")
             print(f"    {projection.case_id}: production context projection did not match fixture")
             print(f"    sanitized report: {report_path}")
@@ -3067,6 +3616,9 @@ async def _run_semantic_route_eval(
         candidate_runs: list[tuple[SemanticRouteCaseResult, ...]] = []
         incumbent_runs: list[tuple[SemanticRouteCaseResult, ...]] = []
         for _ in range(repetitions):
+            candidate_projected, candidate_first, candidate_retries = await _route_with_eval_retry(
+                candidate_router, projected
+            )
             candidate_results = [
                 SemanticRouteCaseResult(
                     case_id=corpus.projected_case.case_id,
@@ -3075,10 +3627,16 @@ async def _run_semantic_route_eval(
                     risk_domain=corpus.projected_case.risk_domain,
                     evaluation_split=corpus.projected_case.evaluation_split,
                     expected=corpus.projected_case.expected,
-                    attempt=await candidate_router.route(projected),
+                    attempt=candidate_projected,
+                    active_capability=projected.active_capability,
+                    first_attempt_outcome=candidate_first,
+                    evaluation_retry_count=candidate_retries,
                 ),
                 *await _run_semantic_route_cases(candidate_router, corpus),
             ]
+            incumbent_projected, incumbent_first, incumbent_retries = await _route_with_eval_retry(
+                incumbent_router, projected
+            )
             incumbent_results = [
                 SemanticRouteCaseResult(
                     case_id=corpus.projected_case.case_id,
@@ -3087,7 +3645,10 @@ async def _run_semantic_route_eval(
                     risk_domain=corpus.projected_case.risk_domain,
                     evaluation_split=corpus.projected_case.evaluation_split,
                     expected=corpus.projected_case.expected,
-                    attempt=await incumbent_router.route(projected),
+                    attempt=incumbent_projected,
+                    active_capability=projected.active_capability,
+                    first_attempt_outcome=incumbent_first,
+                    evaluation_retry_count=incumbent_retries,
                 ),
                 *await _run_semantic_route_cases(incumbent_router, corpus),
             ]
@@ -3105,8 +3666,11 @@ async def _run_semantic_route_eval(
             corpus=corpus,
             projection=projection,
             verdict=verdict,
+            qualification_run_id=qualification_run_id,
+            corpus_role=corpus_role,
         )
-        await asyncio.to_thread(_write_json_report, report_path, report)
+        report_writer = _write_new_json_evidence if write_new_evidence else _write_json_report
+        await asyncio.to_thread(report_writer, report_path, report)
         for repetition, (candidate_results, incumbent_results) in enumerate(
             zip(candidate_runs, incumbent_runs, strict=True),
             start=1,
@@ -3150,6 +3714,78 @@ async def _run_semantic_route_eval(
         return 0
     finally:
         await runtime.caller_context.aclose_session()
+
+
+async def _run_semantic_route_cutover_suite(
+    *,
+    regression_report_path: Path,
+    readiness_holdout_path: Path,
+    readiness_report_path: Path,
+    release_evidence_path: Path,
+    fixture_config_root: Path,
+) -> int:
+    outputs = (
+        regression_report_path,
+        readiness_report_path,
+        release_evidence_path,
+    )
+    resolved_outputs = tuple(path.resolve() for path in outputs)
+    if len(set(resolved_outputs)) != len(resolved_outputs):
+        raise ValueError("routing cutover outputs must use three distinct paths")
+    existing = [str(path) for path in outputs if path.exists()]
+    if existing:
+        raise ValueError(
+            "routing cutover suite refuses to replace existing evidence: " + ", ".join(existing)
+        )
+    regression = _load_semantic_route_corpus()
+    holdout = _load_semantic_route_readiness_holdout(
+        readiness_holdout_path,
+        regression=regression,
+    )
+    if holdout.frozen_at > datetime.now(tz=UTC):
+        raise ValueError("readiness holdout freeze time cannot be in the future")
+    qualification_run_id = uuid.uuid4().hex
+    regression_status = await _run_semantic_route_eval(
+        regression_report_path,
+        "cutover",
+        fixture_config_root=fixture_config_root,
+        corpus=regression,
+        qualification_run_id=qualification_run_id,
+        corpus_role="regression",
+        write_new_evidence=True,
+    )
+    if regression_status:
+        print(
+            "\nSEMANTIC ROUTING RELEASE EVIDENCE NOT CREATED: "
+            "the regression corpus did not pass; the protected holdout was not evaluated. [FAIL]"
+        )
+        return 1
+    readiness_status = await _run_semantic_route_eval(
+        readiness_report_path,
+        "cutover",
+        fixture_config_root=fixture_config_root,
+        corpus=holdout.corpus,
+        qualification_run_id=qualification_run_id,
+        corpus_role="readiness_holdout",
+        write_new_evidence=True,
+    )
+    if readiness_status:
+        print(
+            "\nSEMANTIC ROUTING RELEASE EVIDENCE NOT CREATED: "
+            "the protected holdout did not pass. [FAIL]"
+        )
+        return 1
+    evidence = _package_semantic_routing_release_evidence(
+        regression_report_path=regression_report_path,
+        readiness_report_path=readiness_report_path,
+        holdout=holdout,
+        release_evidence_path=release_evidence_path,
+    )
+    print(f"    immutable routing release evidence: {release_evidence_path}")
+    print(f"    regression report sha256: {evidence.regression_report_sha256}")
+    print(f"    readiness report sha256: {evidence.readiness_report_sha256}")
+    print("\nSEMANTIC ROUTING CUTOVER SUITE PASSED. [RELEASE EVIDENCE CREATED]")
+    return 0
 
 
 def _score_read_owner_output(
@@ -3793,6 +4429,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="sanitized semantic-router report destination",
     )
     parser.add_argument(
+        "--semantic-routing-readiness-holdout",
+        type=Path,
+        help="externally stewarded source-disjoint holdout for final cutover",
+    )
+    parser.add_argument(
+        "--semantic-routing-readiness-report",
+        type=Path,
+        help="sanitized source-disjoint readiness report destination",
+    )
+    parser.add_argument(
+        "--semantic-routing-release-evidence",
+        type=Path,
+        help="new immutable routing release-evidence package destination",
+    )
+    parser.add_argument(
         "--semantic-routing-structural-report",
         type=Path,
         help="development-only structural coverage report destination",
@@ -3869,6 +4520,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("transport options require --recovery-certification")
     if args.semantic_routing_report is not None and not args.semantic_routing_eval:
         parser.error("--semantic-routing-report requires --semantic-routing-eval")
+    routing_cutover_suite_options = (
+        args.semantic_routing_readiness_holdout,
+        args.semantic_routing_readiness_report,
+        args.semantic_routing_release_evidence,
+    )
+    if any(value is not None for value in routing_cutover_suite_options):
+        if not args.semantic_routing_eval:
+            parser.error("routing cutover-suite options require --semantic-routing-eval")
+        if args.semantic_routing_report is None or any(
+            value is None for value in routing_cutover_suite_options
+        ):
+            parser.error(
+                "routing cutover suite requires explicit regression, readiness, holdout, "
+                "and release-evidence paths"
+            )
     if (
         args.semantic_routing_structural_report is not None
         and not args.semantic_routing_structural_coverage
@@ -3919,6 +4585,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.semantic_routing_eval:
         semantic_gate = args.semantic_routing_gate or "cutover"
+        if any(value is not None for value in routing_cutover_suite_options):
+            if semantic_gate != "cutover":
+                parser.error("routing cutover suite requires the cutover gate")
+            if args.semantic_routing_candidate is not None:
+                parser.error("routing cutover suite uses the configured production candidate")
+            regression_report_path = args.semantic_routing_report
+            readiness_holdout_path = args.semantic_routing_readiness_holdout
+            readiness_report_path = args.semantic_routing_readiness_report
+            release_evidence_path = args.semantic_routing_release_evidence
+            assert isinstance(regression_report_path, Path)
+            assert isinstance(readiness_holdout_path, Path)
+            assert isinstance(readiness_report_path, Path)
+            assert isinstance(release_evidence_path, Path)
+            return asyncio.run(
+                _run_semantic_route_cutover_suite(
+                    regression_report_path=regression_report_path,
+                    readiness_holdout_path=readiness_holdout_path,
+                    readiness_report_path=readiness_report_path,
+                    release_evidence_path=release_evidence_path,
+                    fixture_config_root=_CONFIG_ROOT,
+                )
+            )
         if args.semantic_routing_candidate is not None and semantic_gate == "cutover":
             parser.error(
                 "--semantic-routing-candidate is evaluation-only; use diagnostic or shadow"
