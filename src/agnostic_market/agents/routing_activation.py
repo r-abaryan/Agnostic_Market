@@ -8,9 +8,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.routing import (
@@ -27,8 +27,9 @@ from agnostic_market.dtos.llm import ProviderCredentialsConfig, StructuredOutput
 from agnostic_market.llm.gateway import LLMGateway
 from agnostic_market.secrets.base import SecretResolver
 
-type SemanticRoutingQualificationSchemaVersion = Literal["7"]
-SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION: SemanticRoutingQualificationSchemaVersion = "7"
+type SemanticRoutingQualificationSchemaVersion = Literal["10"]
+SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION: SemanticRoutingQualificationSchemaVersion = "10"
+SEMANTIC_ROUTING_RELEASE_EVIDENCE_SCHEMA_VERSION = 1
 RoutingRecognizerFactory = Callable[[CapabilityRegistry], RoutingRecognizer]
 
 _STRICT = ConfigDict(extra="ignore", frozen=True)
@@ -86,6 +87,7 @@ class SemanticRoutingRuntimeContract(BaseModel):
     input_max_chars: int = Field(gt=0)
     timeout_seconds: float = Field(gt=0)
     corpus_fingerprint: str = Field(pattern=_SHA256_PATTERN)
+    qualification_evidence_fingerprint: str = Field(pattern=_SHA256_PATTERN)
 
 
 def semantic_routing_runtime_contract(
@@ -96,6 +98,7 @@ def semantic_routing_runtime_contract(
     timeout_seconds: float,
     input_max_chars: int,
     corpus_fingerprint: str,
+    qualification_evidence_fingerprint: str,
 ) -> SemanticRoutingRuntimeContract:
     """Derive the recognizer contract from the same inputs used at activation."""
     return SemanticRoutingRuntimeContract(
@@ -110,6 +113,7 @@ def semantic_routing_runtime_contract(
         input_max_chars=input_max_chars,
         timeout_seconds=timeout_seconds,
         corpus_fingerprint=corpus_fingerprint,
+        qualification_evidence_fingerprint=qualification_evidence_fingerprint,
     )
 
 
@@ -145,6 +149,8 @@ class SemanticRoutingQualification(BaseModel):
     model_config = _STRICT
 
     schema_version: SemanticRoutingQualificationSchemaVersion
+    qualification_run_id: str = Field(min_length=1)
+    corpus_role: Literal["regression", "readiness_holdout"]
     run_at: datetime
     corpus_fingerprint: str = Field(pattern=_SHA256_PATTERN)
     gate: _QualificationGate
@@ -152,13 +158,90 @@ class SemanticRoutingQualification(BaseModel):
     models: _QualificationModels
 
 
-def _load_qualification(path: Path) -> SemanticRoutingQualification:
+class SemanticRoutingReleaseEvidence(BaseModel):
+    """One packaged routing decision over regression and source-disjoint evidence."""
+
+    model_config = _CONTRACT_STRICT
+
+    schema_version: Literal[1]
+    packaged_at: datetime
+    holdout_id: str = Field(min_length=1)
+    holdout_steward_id: str = Field(min_length=1)
+    holdout_frozen_at: datetime
+    holdout_lineage_reference: str = Field(min_length=1)
+    holdout_generation_recipe_fingerprint: str = Field(pattern=_SHA256_PATTERN)
+    holdout_source_disjoint_from_corpus_fingerprint: str = Field(pattern=_SHA256_PATTERN)
+    regression_report_sha256: str = Field(pattern=_SHA256_PATTERN)
+    readiness_report_sha256: str = Field(pattern=_SHA256_PATTERN)
+    regression: SemanticRoutingQualification
+    readiness_holdout: SemanticRoutingQualification
+
+    @model_validator(mode="after")
+    def validate_release_evidence(self) -> Self:
+        if self.packaged_at.tzinfo is None or self.holdout_frozen_at.tzinfo is None:
+            raise ValueError("routing release timestamps must be timezone-aware")
+        if self.holdout_frozen_at > self.packaged_at:
+            raise ValueError("routing holdout cannot freeze after release packaging")
+        text = (
+            self.holdout_id,
+            self.holdout_steward_id,
+            self.holdout_lineage_reference,
+            self.regression.qualification_run_id,
+        )
+        if any(not value.strip() or value != value.strip() for value in text):
+            raise ValueError("routing release identifiers must be normalized and non-empty")
+        if self.regression.corpus_role != "regression":
+            raise ValueError("routing release regression evidence has the wrong corpus role")
+        if self.readiness_holdout.corpus_role != "readiness_holdout":
+            raise ValueError("routing release holdout evidence has the wrong corpus role")
+        if self.regression.qualification_run_id != self.readiness_holdout.qualification_run_id:
+            raise ValueError("routing release reports must come from one qualification run")
+        if self.regression.corpus_fingerprint == self.readiness_holdout.corpus_fingerprint:
+            raise ValueError("routing release corpora must be distinct")
+        if (
+            self.holdout_source_disjoint_from_corpus_fingerprint
+            != self.regression.corpus_fingerprint
+        ):
+            raise ValueError("routing holdout disjointness targets the wrong regression corpus")
+        if self.regression.run_at.tzinfo is None or self.readiness_holdout.run_at.tzinfo is None:
+            raise ValueError("routing qualification timestamps must be timezone-aware")
+        if self.holdout_frozen_at > self.readiness_holdout.run_at:
+            raise ValueError("routing holdout must freeze before qualification")
+        if max(self.regression.run_at, self.readiness_holdout.run_at) > self.packaged_at:
+            raise ValueError("routing reports cannot postdate release packaging")
+        for label, qualification in (
+            ("regression", self.regression),
+            ("readiness holdout", self.readiness_holdout),
+        ):
+            if (
+                qualification.gate.mode != "cutover"
+                or qualification.gate.passed is not True
+                or qualification.gate.failures
+                or not qualification.projection.exact
+            ):
+                raise ValueError(f"routing {label} evidence is not a passing cutover")
+        if self.regression.models.candidate != self.readiness_holdout.models.candidate:
+            raise ValueError("routing release reports use different recognizer contracts")
+        return self
+
+
+def semantic_routing_release_evidence_fingerprint(
+    evidence: SemanticRoutingReleaseEvidence,
+) -> str:
+    canonical = json.dumps(
+        evidence.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def load_semantic_routing_release_evidence(path: Path) -> SemanticRoutingReleaseEvidence:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return SemanticRoutingQualification.model_validate(payload)
-    except (OSError, json.JSONDecodeError, ValidationError) as exc:
+        return SemanticRoutingReleaseEvidence.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValidationError) as exc:
         raise RoutingActivationError(
-            f"semantic routing qualification is missing or invalid: {path}"
+            f"semantic routing release evidence is missing or invalid: {path}"
         ) from exc
 
 
@@ -198,31 +281,36 @@ class QualifiedSemanticRouterFactory:
     input_max_chars: int
     max_report_age_days: int
     expected_corpus_fingerprint: str
+    expected_qualification_evidence_fingerprint: str
 
     def __post_init__(self) -> None:
         if self.max_report_age_days <= 0:
             raise ValueError("semantic qualification maximum age must be positive")
         if not self.expected_corpus_fingerprint.strip():
             raise ValueError("semantic qualification corpus fingerprint must be non-empty")
+        if not self.expected_qualification_evidence_fingerprint.strip():
+            raise ValueError("semantic qualification evidence fingerprint must be non-empty")
 
     def __call__(self, registry: CapabilityRegistry) -> RoutingRecognizer:
-        qualification = _load_qualification(self.qualification_path)
+        release_evidence = load_semantic_routing_release_evidence(self.qualification_path)
+        evidence_fingerprint = semantic_routing_release_evidence_fingerprint(release_evidence)
+        if evidence_fingerprint != self.expected_qualification_evidence_fingerprint:
+            raise RoutingActivationError(
+                "semantic routing activation refused: release evidence changed after preparation"
+            )
+        qualification = release_evidence.regression
         candidate = qualification.models.candidate
         now = datetime.now(tz=UTC)
-        run_at = qualification.run_at
         failures: list[str] = []
-        if qualification.gate.mode != "cutover":
-            failures.append(f"gate.mode={qualification.gate.mode}")
-        if qualification.gate.passed is not True:
-            failures.append("qualification gate did not pass")
-        if qualification.gate.failures:
-            failures.append("gate failures: " + "; ".join(qualification.gate.failures))
-        if not qualification.projection.exact:
-            failures.append("production context projection was not exact")
-        if run_at.tzinfo is None:
-            failures.append("qualification timestamp has no timezone")
-        elif run_at > now or now - run_at > timedelta(days=self.max_report_age_days):
-            failures.append("qualification is not current")
+        for role, report in (
+            ("regression", release_evidence.regression),
+            ("readiness_holdout", release_evidence.readiness_holdout),
+        ):
+            run_at = report.run_at
+            if run_at.tzinfo is None:
+                failures.append(f"{role} qualification timestamp has no timezone")
+            elif run_at > now or now - run_at > timedelta(days=self.max_report_age_days):
+                failures.append(f"{role} qualification is not current")
         runtime_contract = semantic_routing_runtime_contract(
             registry,
             selection=self.selection,
@@ -230,6 +318,7 @@ class QualifiedSemanticRouterFactory:
             timeout_seconds=self.timeout_seconds,
             input_max_chars=self.input_max_chars,
             corpus_fingerprint=self.expected_corpus_fingerprint,
+            qualification_evidence_fingerprint=evidence_fingerprint,
         )
         expected = {
             field: getattr(runtime_contract, field) for field in _QualifiedRecognizer.model_fields
@@ -269,8 +358,10 @@ def build_qualified_semantic_router_factory(
 ) -> QualifiedSemanticRouterFactory:
     """Bind the recognizer to the repository's frozen routing-evaluation corpus."""
     expected_corpus_fingerprint = semantic_routing_corpus_fingerprint(config_root)
+    qualification_path = config_root / "qualification" / "semantic_routing_release.json"
+    release_evidence = load_semantic_routing_release_evidence(qualification_path)
     return QualifiedSemanticRouterFactory(
-        qualification_path=config_root / "telemetry" / "semantic_routing_report.json",
+        qualification_path=qualification_path,
         selection=selection,
         credentials=credentials,
         secrets=secrets,
@@ -279,4 +370,7 @@ def build_qualified_semantic_router_factory(
         input_max_chars=input_max_chars,
         max_report_age_days=max_report_age_days,
         expected_corpus_fingerprint=expected_corpus_fingerprint,
+        expected_qualification_evidence_fingerprint=(
+            semantic_routing_release_evidence_fingerprint(release_evidence)
+        ),
     )

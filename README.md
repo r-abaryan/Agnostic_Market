@@ -9,7 +9,8 @@ typed work. It never grants authority or commits an effect.
 > Status: the semantic-routing migration is merged and the Phase 4C durable multi-tenant runtime is
 > in progress. Not production-qualified and not authorized for real merchant traffic. Synthetic
 > evidence is the current development authority, used to deepen tests, not to weaken rubrics or to
-> claim real-caller accuracy.
+> claim real-caller accuracy. Routing promotion now awaits one source-disjoint cutover package;
+> schema-5 voice-processing certification follows after that package exists.
 
 ## Architecture
 
@@ -19,7 +20,7 @@ Three planes, each owning one responsibility:
 |---|---|---|
 | Voice | VAD, STT, TTS, turn admission, barge-in, disclosure | LiveKit Agents behind the voice adapter |
 | Reasoning | semantic recognition, typed dispatch, deterministic owners, HITL, recovery | LangGraph behind `ReasoningEngine` |
-| Data | tenant services, session authority, effects, receipts, checkpoints, telemetry | fixture-backed ports and in-memory session state; PostgreSQL composition lands in Phase 4C |
+| Data | tenant services, session authority, effects, receipts, checkpoints, telemetry | fixture-backed service ports; PostgreSQL session registry and lifecycle, completing in Phase 4C |
 
 One ordinary committed turn follows a single ownership path:
 
@@ -70,10 +71,11 @@ src/agnostic_market/
   secrets/           environment-backed secret resolution
   tenancy/           immutable tenant identity and resolution
   voice/             trusted tenant admission, LiveKit pipeline, disclosure, speech transport
-config/              base, merchant, policy, fixture, eval, and telemetry artifacts
+config/              base, merchant, template, fixtures, eval, platform, telemetry, qualification,
+                     and conformance artifacts
 scripts/             worker, evaluators, smoke checks, recovery tools, PostgreSQL harness
 tests/               synthetic unit, integration, adversarial, lifecycle, backend contracts
-assets/audio/        recorded utterances used by the latency measurement harness
+assets/audio/        the pipeline thinking beep and the latency harness utterances
 .github/workflows/   locked verification workflow
 ```
 
@@ -111,8 +113,11 @@ To run the voice worker, copy `.env.example` to `.env` and supply provider and L
 `VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact, and console mode also
 requires an explicit `VOICE_AGENT_MERCHANT_ID`. Network workers additionally require
 `VOICE_AGENT_PLATFORM_CONFIG`, `VOICE_AGENT_CERTIFICATION_CONFIG`, and
-`VOICE_AGENT_BUILD_ARTIFACT_DIGEST`, and activation requires schema-5 voice evidence matching the
-deployed runtime. See `.env.example` for the complete set.
+`VOICE_AGENT_BUILD_ARTIFACT_DIGEST`, and the absolute `VOICE_AGENT_LATENCY_METHODOLOGY` and
+`VOICE_AGENT_LATENCY_REPORT` paths carrying schema-5 voice evidence for the deployed runtime.
+Production composition also requires the issued
+`config/qualification/semantic_routing_release.json`; a standalone mutable routing report is not
+activation authority. See `.env.example` for the complete set.
 
 ## License
 

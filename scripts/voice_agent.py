@@ -13,8 +13,9 @@ server-side dispatch metadata and an absolute VOICE_AGENT_PLATFORM_CONFIG path; 
 cross-check admission against the inbound number.
 VOICE_AGENT_CERTIFICATION_CONFIG owns the production and certification dispatch names.
 
-Startup requires current LLM conformance and semantic-routing qualification reports. A qualified
-session opens with the configured disclosure and logs per-turn latency through the voice pipeline.
+Startup requires current LLM conformance, an immutable semantic-routing release package, and the
+voice evidence bound to that package. A qualified session opens with the configured disclosure and
+logs per-turn latency through the voice pipeline.
 """
 
 from __future__ import annotations
@@ -357,6 +358,9 @@ async def entrypoint(
                 timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
                 input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
                 corpus_fingerprint=routing_factory.expected_corpus_fingerprint,
+                qualification_evidence_fingerprint=(
+                    routing_factory.expected_qualification_evidence_fingerprint
+                ),
             ),
             certification_target_fingerprint=voice_certification_target_fingerprint(
                 application_identity_target

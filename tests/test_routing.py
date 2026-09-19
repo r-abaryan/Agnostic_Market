@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import fields
 from typing import Literal
 
 import pytest
@@ -14,11 +15,14 @@ from agnostic_market.agents.capabilities import (
     CapabilityRegistry,
     CapabilitySpec,
 )
+from agnostic_market.agents.recovery import CommerceEffectFinishers
 from agnostic_market.agents.routing import (
+    COMMERCE_EFFECT_CAPABILITIES,
     CONTEXT_PROJECTOR_VERSION,
     ROUTE_SCHEMA_FINGERPRINT,
     ROUTER_PROMPT_FINGERPRINT,
     ROUTER_SYSTEM_PROMPT,
+    UNSAFE_MISROUTE_CAPABILITIES,
     RoutingAttempt,
     RoutingRecognizer,
     RoutingSession,
@@ -580,6 +584,48 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
         "c699c3490ac9776f98e23ef55f012043c5b8fd37983a9fcad5f1313f8fdadcf1"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
+
+
+def test_commerce_effect_capabilities_match_the_post_commit_boundary() -> None:
+    """The effect set is declared on the capability table; this pins why those six.
+
+    A capability is a commerce effect when its flow owns one of the post-commit
+    projection boundaries in CommerceEffectFinishers. That dataclass is the
+    independent source: it is defined for recovery, not for routing, so it moves
+    only when the commit boundary itself moves.
+
+    Identity capabilities are deliberately absent. verify_identity and
+    switch_account do mutate, via identity_apply to transition_principal to
+    begin_principal_retirement, which clears cart, recent and guest state. That
+    commit is to session state, a different subsystem, and owns no finisher here.
+    """
+    boundary_to_capability = {
+        "cart_mutation": CapabilityId.MODIFY_CART,
+        "placement": CapabilityId.PLACE_ORDER,
+        "cancel": CapabilityId.CANCEL_ORDERS,
+        "refund": CapabilityId.REFUND_ORDER,
+        "return_": CapabilityId.RETURN_ORDER,
+        "profile_change": CapabilityId.CHANGE_PROFILE,
+    }
+    finisher_fields = {field.name for field in fields(CommerceEffectFinishers)}
+
+    assert set(boundary_to_capability) == finisher_fields
+    assert frozenset(boundary_to_capability.values()) == COMMERCE_EFFECT_CAPABILITIES
+    assert CapabilityId.VERIFY_IDENTITY not in COMMERCE_EFFECT_CAPABILITIES
+    assert CapabilityId.SWITCH_ACCOUNT not in COMMERCE_EFFECT_CAPABILITIES
+
+
+def test_unsafe_misroute_targets_cover_effects_and_session_control() -> None:
+    assert (
+        COMMERCE_EFFECT_CAPABILITIES
+        | {
+            CapabilityId.VERIFY_IDENTITY,
+            CapabilityId.SWITCH_ACCOUNT,
+            CapabilityId.ABORT_CURRENT,
+            CapabilityId.REQUEST_PERSON,
+        }
+        == UNSAFE_MISROUTE_CAPABILITIES
+    )
 
 
 def test_router_prompt_distinguishes_reported_speech_and_context_gaps() -> None:

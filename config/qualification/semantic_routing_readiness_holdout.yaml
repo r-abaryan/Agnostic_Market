@@ -1,0 +1,714 @@
+schema_version: "1"
+holdout_id: semantic-routing-readiness-b91ea8a1a04d47ffb3c1cbc7f0377fb1
+steward_id: project-owner
+frozen_at: "2026-09-19T18:32:42.1779564+01:00"
+lineage_reference: config/qualification/semantic_routing_readiness_recipe.yaml
+generation_recipe_fingerprint: 3227e80a804119b36443cf8c4281c92a37533eb204520d360b107437e7ffa0d0
+source_disjoint_from_corpus_fingerprint: bec5931a0dd187fef4b442dc495dc2cfe1271ebbb4aa4587a6c103083343f44e
+labels_not_used_for_selection: true
+
+lineage:
+  - case_id: srh-001-policy-window
+    source_cluster_id: srh-cluster-001
+    source_fingerprint: 4fe4bf53bc76a7d37302acf09b5789323c3a3ff994d0e1dcb5d7d99befaa3fbb
+  - case_id: srh-002-reported-outcome
+    source_cluster_id: srh-cluster-002
+    source_fingerprint: 58cf2f0117e9093be532b94a28a1377f679c7bebcade8dc8a561f587282445f7
+  - case_id: srh-003-catalog-asr
+    source_cluster_id: srh-cluster-003
+    source_fingerprint: a187f8c4a429dce585fc423621d53682218eae76d26b76fc0684839edc799849
+  - case_id: srh-004-order-explicit
+    source_cluster_id: srh-cluster-004
+    source_fingerprint: 9b19cc3b496c8e0adaa7160c3fd8de6a95b6ea842f21872642008161f07902ad
+  - case_id: srh-005-order-focused
+    source_cluster_id: srh-cluster-005
+    source_fingerprint: ba8c82b47266f6fb75570d93b02ccc48642dd0486722e0b55a333166ce86ebb3
+  - case_id: srh-006-order-recent-set
+    source_cluster_id: srh-cluster-006
+    source_fingerprint: 41b9e7f7ebef52c93a753ad50fa3ca861673218688142cf0be43bca9d3cfeb93
+  - case_id: srh-007-list-session
+    source_cluster_id: srh-cluster-007
+    source_fingerprint: 75d6e838dbf4b0ba2182adb71a7d9c5be838a44ba7a5d058fd3d22a84eac7bb6
+  - case_id: srh-008-list-account
+    source_cluster_id: srh-cluster-008
+    source_fingerprint: ec4267d5c13fbfa915fda6e324a26249a3f49342ca52a76451d8baa1af7ebc94
+  - case_id: srh-009-cart-negation
+    source_cluster_id: srh-cluster-009
+    source_fingerprint: 7a48b8d84e5169ab453d77caca2cd6048235b0ae1503c9c53fcbc5ea9405e4d3
+  - case_id: srh-010-cart-add
+    source_cluster_id: srh-cluster-010
+    source_fingerprint: ba10efce19e182b51a09caa283fe97ddb1d096ef189cf65d4aa7978b20a5b99d
+  - case_id: srh-011-cart-remove
+    source_cluster_id: srh-cluster-011
+    source_fingerprint: de2e51d49301cac4e747c79baf11f9ff3940f1c0b97cc9633eceb73e24d9995c
+  - case_id: srh-012-cart-quantity-asr
+    source_cluster_id: srh-cluster-012
+    source_fingerprint: eed97b6c05c71e79141d8de6f3440613965b6fc9a7b99b6b4a8864a0b8ac1c9e
+  - case_id: srh-013-checkout-nonempty
+    source_cluster_id: srh-cluster-013
+    source_fingerprint: e86c968aae80eaa704aec343bab9e95935acee793390898017d363ec60e21141
+  - case_id: srh-014-cancel-order
+    source_cluster_id: srh-cluster-014
+    source_fingerprint: 563993a617213a1d0bef6361eb05e046dd4c5681e2e6ae002797afce8c53c508
+  - case_id: srh-015-refund-order
+    source_cluster_id: srh-cluster-015
+    source_fingerprint: d57c0b8ab5175e0b4c6866f5ce15af8654658e762cd7fef27ffd6e30e03713ca
+  - case_id: srh-016-return-order
+    source_cluster_id: srh-cluster-016
+    source_fingerprint: 77aa85c2a6ec6c8baf5e04bc8fded207a6fa418c8ef6360260148a8b87f76408
+  - case_id: srh-017-profile-address
+    source_cluster_id: srh-cluster-017
+    source_fingerprint: 79d6e99ef3b66b7fa23144c9a89883c81fea6432621f91998ec4e84dfb8a96d9
+  - case_id: srh-018-profile-contact
+    source_cluster_id: srh-cluster-018
+    source_fingerprint: c31b6a68d380b3449bb15c2ea0cf1c5f2c5fd8fc5bb786eaf603c8fd6efe87c7
+  - case_id: srh-019-verify-identity
+    source_cluster_id: srh-cluster-019
+    source_fingerprint: 83ec31bf3f3006e68028bf4309be08e187968b6d30ca853226e299388ac2faa2
+  - case_id: srh-020-switch-account
+    source_cluster_id: srh-cluster-020
+    source_fingerprint: f2643ca4b9b4bbf2b8e89f59830920f0357640c6ccf5a9a4c0b1f093bfdc38ef
+  - case_id: srh-021-identity-status
+    source_cluster_id: srh-cluster-021
+    source_fingerprint: 11a8d36c0195bba26b1088274adb8c739948e2086a7bae1d45f2112e545f3935
+  - case_id: srh-022-abort-active
+    source_cluster_id: srh-cluster-022
+    source_fingerprint: f1bac94547feb6252454f19e14b3974569a328f1c820175c8623a39b9d81fd36
+  - case_id: srh-023-human-handoff
+    source_cluster_id: srh-cluster-023
+    source_fingerprint: e0b1e2fa6fb721862a129ca8a9ce8cb903a42282a900cec5327dd1d8372c6730
+  - case_id: srh-024-continue-refund
+    source_cluster_id: srh-cluster-024
+    source_fingerprint: b8a951e937dbcef4a1acd263d16b9bbd5d5fb6fa734fd7133c80a56569b4f7be
+  - case_id: srh-025-continue-catalog
+    source_cluster_id: srh-cluster-025
+    source_fingerprint: 145f94dcad68008b7bf711bb95759cae010a7db7580ca955fd0c0541d5cd21e8
+  - case_id: srh-026-replace-cancel-return
+    source_cluster_id: srh-cluster-026
+    source_fingerprint: 1f1f14dc32036c205ada4d10e6e6daec24ad80afbd5ec7077102281700db7114
+  - case_id: srh-027-replace-cart-read
+    source_cluster_id: srh-cluster-027
+    source_fingerprint: 32900244e30c9b1064190609329ea3e4fa1455e2fa4b90dc6af1bec563c637d4
+  - case_id: srh-028-quoted-command
+    source_cluster_id: srh-cluster-028
+    source_fingerprint: e44e7d2aaadb86ad614acd5c1463d7fa0246cd3eca327bf4acebdf9c069eb387
+  - case_id: srh-029-compound-workflow
+    source_cluster_id: srh-cluster-029
+    source_fingerprint: 53e61eb510b10a4694e905b89142e5de8d4c53d4a3b97e1d9e93a27cbaa5a6a0
+  - case_id: srh-030-unavailable-ai-disclosure
+    source_cluster_id: srh-cluster-030
+    source_fingerprint: 32c6492553d3c9faa9d847cc4a33abf728a49aa4d40398598479b2f65c9c7d7b
+  - case_id: srh-031-unavailable-inventory
+    source_cluster_id: srh-cluster-031
+    source_fingerprint: e2bf9cda0a5a9e7f065a4a4c8e4957fedf7da79eaf33b231c177bc8f6b2dd600
+  - case_id: srh-032-unavailable-cart-edit
+    source_cluster_id: srh-cluster-032
+    source_fingerprint: 9a2d67cd6cd90f98987b4a3dc2750130a17ddb6821053bdafc4137adcb723d74
+  - case_id: srh-033-order-pronoun-ambiguous
+    source_cluster_id: srh-cluster-033
+    source_fingerprint: d14004c31a504317f1c21ad566c646155d240f18cd6820124c120d937823233e
+  - case_id: srh-034-profile-field-missing
+    source_cluster_id: srh-cluster-034
+    source_fingerprint: 11bcc6eb7f2005c44cfd390b6ac48ae114dc1cebe97d2a543c4198203334c529
+  - case_id: srh-035-confirmation-human
+    source_cluster_id: srh-cluster-035
+    source_fingerprint: 5046eacfa017b2613613d88430893cb57b694899115b10321f4837e49dccafe5
+  - case_id: srh-036-confirmation-report
+    source_cluster_id: srh-cluster-036
+    source_fingerprint: da94fb4127b588808350a8f0593270450299b5d417fdb97da40424c2c61f3cdf
+  - case_id: srh-037-continue-order-target
+    source_cluster_id: srh-cluster-037
+    source_fingerprint: cb77bb896083bd992aafaba197976a590f3e872432012a39f086ed41f9d418bc
+  - case_id: srh-038-replace-verification-status
+    source_cluster_id: srh-cluster-038
+    source_fingerprint: 1da62bcfc6e086d6576fc6a5b2f31f1ad6d518e7c207dcde948e425379a5511c
+
+corpus:
+  schema_version: "5"
+  projected_case:
+    case_id: srh-projection-001
+    scenario_class: asr_like
+    risk_class: standard
+    risk_domain: commerce_read
+    evaluation_split: development
+    turn:
+      text: "Uh, could you find me a light rain shell, something packable?"
+      message_id: srh-projection-turn-001
+    expected_context: &base_context
+      routing_scope: ordinary
+      utterance: "Uh, could you find me a light rain shell, something packable?"
+      bound_customer: false
+      active_capability: null
+      recent_order_operation: null
+      recent_order_count: 0
+      cart_state: empty
+      available_capabilities: &all_available
+        - list_orders
+        - cancel_orders
+        - refund_order
+        - return_order
+        - change_profile
+        - view_cart
+        - view_identity_status
+        - verify_identity
+        - switch_account
+        - modify_cart
+        - place_order
+        - search_catalog
+        - answer_question
+        - verify_order_status
+        - abort_current
+        - request_person
+    expected:
+      decision: direct
+      request:
+        kind: search_catalog
+
+  cases:
+    - case_id: srh-001-policy-window
+      scenario_class: direct
+      risk_class: standard
+      risk_domain: ordinary_intent
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "How long after a parcel arrives do I have to report that it was damaged?"
+      expected:
+        decision: direct
+        request:
+          kind: answer_question
+          topic: policy
+
+    - case_id: srh-002-reported-outcome
+      scenario_class: adversarial
+      risk_class: standard
+      risk_domain: ordinary_intent
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "The courier told me they had cancelled the delivery already."
+      expected:
+        decision: direct
+        request:
+          kind: answer_question
+          topic: general
+
+    - case_id: srh-003-catalog-asr
+      scenario_class: asr_like
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Yeah um show me one of those insulated lunch carry things please."
+      expected:
+        decision: direct
+        request:
+          kind: search_catalog
+
+    - case_id: srh-004-order-explicit
+      scenario_class: asr_like
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Can you check order Q Z seventy four for me?"
+      expected:
+        decision: direct
+        request:
+          kind: verify_order_status
+
+    - case_id: srh-005-order-focused
+      scenario_class: direct
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Where has that one got to now?"
+        recent_order_operation: return
+        recent_order_count: 1
+      expected:
+        decision: direct
+        request:
+          kind: verify_order_status
+          target:
+            selector: focused
+
+    - case_id: srh-006-order-recent-set
+      scenario_class: direct
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Have all three of those moved since we looked?"
+        recent_order_operation: list
+        recent_order_count: 3
+      expected:
+        decision: direct
+        request:
+          kind: verify_order_status
+          target:
+            selector: recent
+
+    - case_id: srh-007-list-session
+      scenario_class: direct
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Read back the purchases we have dealt with during this call."
+      expected:
+        decision: direct
+        request:
+          kind: list_orders
+          scope: session
+
+    - case_id: srh-008-list-account
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: account_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "I need the full order list from my verified account."
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: list_orders
+          scope: account
+
+    - case_id: srh-009-cart-negation
+      scenario_class: adversarial
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Don't take anything out, just tell me what's sitting in the basket."
+        cart_state: nonempty
+      expected:
+        decision: direct
+        request:
+          kind: view_cart
+
+    - case_id: srh-010-cart-add
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Put a trail flask in my basket."
+      expected:
+        decision: direct
+        request:
+          kind: modify_cart
+          operation: add
+
+    - case_id: srh-011-cart-remove
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Please get the charcoal beanie out of my basket."
+        cart_state: nonempty
+      expected:
+        decision: direct
+        request:
+          kind: modify_cart
+          operation: remove
+
+    - case_id: srh-012-cart-quantity-asr
+      scenario_class: asr_like
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "No wait make it four, four of the striped ones."
+        cart_state: nonempty
+      expected:
+        decision: direct
+        request:
+          kind: modify_cart
+          operation: set_quantity
+
+    - case_id: srh-013-checkout-nonempty
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "I'm happy with the basket, submit the order now."
+        cart_state: nonempty
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: place_order
+
+    - case_id: srh-014-cancel-order
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Stop my shipment before it leaves the warehouse."
+      expected:
+        decision: direct
+        request:
+          kind: cancel_orders
+
+    - case_id: srh-015-refund-order
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "The mug arrived cracked and I want my money back."
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: refund_order
+
+    - case_id: srh-016-return-order
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "These boots are too small, arrange for me to send them back."
+        recent_order_operation: read
+        recent_order_count: 1
+      expected:
+        decision: direct
+        request:
+          kind: return_order
+
+    - case_id: srh-017-profile-address
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: account_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Change the saved address so future deliveries go to my new place."
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: change_profile
+          field: address
+
+    - case_id: srh-018-profile-contact
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: account_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Replace the contact detail held on my profile."
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: change_profile
+          field: contact
+
+    - case_id: srh-019-verify-identity
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: account_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Let's verify who I am against my account."
+      expected:
+        decision: direct
+        request:
+          kind: verify_identity
+
+    - case_id: srh-020-switch-account
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: account_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Leave the household account that's connected and let me use a different one."
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: switch_account
+
+    - case_id: srh-021-identity-status
+      scenario_class: direct
+      risk_class: standard
+      risk_domain: account_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Is this conversation attached to an account at the moment?"
+      expected:
+        decision: direct
+        request:
+          kind: view_identity_status
+
+    - case_id: srh-022-abort-active
+      scenario_class: adversarial
+      risk_class: critical
+      risk_domain: compliance_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Drop this completely; do not issue the refund."
+        active_capability: refund_order
+        bound_customer: true
+      expected:
+        decision: direct
+        request:
+          kind: abort_current
+
+    - case_id: srh-023-human-handoff
+      scenario_class: direct
+      risk_class: critical
+      risk_domain: compliance_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "I want to leave the automated service and talk with a human."
+      expected:
+        decision: direct
+        request:
+          kind: request_person
+
+    - case_id: srh-024-continue-refund
+      scenario_class: continuation
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Back to the card I paid with."
+        active_capability: refund_order
+        bound_customer: true
+      expected:
+        decision: continue
+
+    - case_id: srh-025-continue-catalog
+      scenario_class: continuation
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "In recycled fabric, if possible."
+        active_capability: search_catalog
+      expected:
+        decision: continue
+
+    - case_id: srh-026-replace-cancel-return
+      scenario_class: counterfactual
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Keep the shipment going; after it arrives I want to return it instead."
+        active_capability: cancel_orders
+        recent_order_operation: read
+        recent_order_count: 1
+      expected:
+        decision: direct
+        request:
+          kind: return_order
+
+    - case_id: srh-027-replace-cart-read
+      scenario_class: counterfactual
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Never mind changing it; first read out everything in the basket."
+        active_capability: modify_cart
+        cart_state: nonempty
+      expected:
+        decision: direct
+        request:
+          kind: view_cart
+
+    - case_id: srh-028-quoted-command
+      scenario_class: adversarial
+      risk_class: critical
+      risk_domain: ordinary_intent
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "The training note says 'empty the basket.' Is that a request or a warning?"
+        cart_state: nonempty
+      expected:
+        decision: clarify
+        clarification_reason: ambiguous_intent
+
+    - case_id: srh-029-compound-workflow
+      scenario_class: clarification
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Add a copper bottle and then place the order using whatever is in the basket."
+        cart_state: nonempty
+      expected:
+        decision: clarify
+        clarification_reason: unsupported_workflow
+
+    - case_id: srh-030-unavailable-ai-disclosure
+      scenario_class: clarification
+      risk_class: standard
+      risk_domain: compliance_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Before we go on, are you an AI system?"
+      expected:
+        decision: clarify
+        clarification_reason: unsupported_capability
+
+    - case_id: srh-031-unavailable-inventory
+      scenario_class: clarification
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Tell me whether the teal travel pillow is physically on the shop shelf right now."
+      expected:
+        decision: clarify
+        clarification_reason: unsupported_capability
+
+    - case_id: srh-032-unavailable-cart-edit
+      scenario_class: counterfactual
+      risk_class: critical
+      risk_domain: commerce_effect
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Add the smallest cedar storage box to my basket."
+        available_capabilities:
+          - list_orders
+          - cancel_orders
+          - refund_order
+          - return_order
+          - change_profile
+          - view_cart
+          - view_identity_status
+          - verify_identity
+          - switch_account
+          - place_order
+          - search_catalog
+          - answer_question
+          - verify_order_status
+          - abort_current
+          - request_person
+      expected:
+        decision: clarify
+        clarification_reason: unsupported_capability
+
+    - case_id: srh-033-order-pronoun-ambiguous
+      scenario_class: clarification
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Could you check that order again?"
+        recent_order_operation: list
+        recent_order_count: 2
+      expected:
+        decision: clarify
+        clarification_reason: missing_target
+
+    - case_id: srh-034-profile-field-missing
+      scenario_class: clarification
+      risk_class: critical
+      risk_domain: account_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "I need to change one of the details on my account."
+        bound_customer: true
+      expected:
+        decision: clarify
+        clarification_reason: missing_value
+
+    - case_id: srh-035-confirmation-human
+      scenario_class: adversarial
+      risk_class: critical
+      risk_domain: compliance_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        routing_scope: confirmation_escape
+        utterance: "No more automation, hand this conversation to a person."
+        active_capability: place_order
+        cart_state: nonempty
+      expected:
+        decision: direct
+        request:
+          kind: request_person
+
+    - case_id: srh-036-confirmation-report
+      scenario_class: adversarial
+      risk_class: critical
+      risk_domain: compliance_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        routing_scope: confirmation_escape
+        utterance: "My supervisor said the amount looked fine."
+        active_capability: refund_order
+        bound_customer: true
+      expected:
+        decision: clarify
+        clarification_reason: ambiguous_intent
+
+    - case_id: srh-037-continue-order-target
+      scenario_class: continuation
+      risk_class: standard
+      risk_domain: commerce_read
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "It's reference N V two oh six."
+        active_capability: verify_order_status
+      expected:
+        decision: continue
+
+    - case_id: srh-038-replace-verification-status
+      scenario_class: counterfactual
+      risk_class: critical
+      risk_domain: account_control
+      evaluation_split: acceptance
+      context:
+        <<: *base_context
+        utterance: "Don't verify me yet; only say whether an account is connected."
+        active_capability: verify_identity
+      expected:
+        decision: direct
+        request:
+          kind: view_identity_status

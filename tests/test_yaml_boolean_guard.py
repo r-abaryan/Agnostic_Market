@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agnostic_market.config.loader import load_yaml_layer
+import pytest
+
+from agnostic_market.config.loader import ConfigError, load_yaml_bytes, load_yaml_layer
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -43,3 +45,14 @@ def test_ints_and_null_still_resolve(tmp_path: Path) -> None:
     assert data["n"] == 42
     assert data["f"] == 3.5
     assert data["nothing"] is None
+
+
+def test_exact_yaml_bytes_use_the_same_guard() -> None:
+    data = load_yaml_bytes(b"country_code: NO\nenabled: true\n", source="memory.yaml")
+
+    assert data == {"country_code": "NO", "enabled": True}
+
+
+def test_exact_yaml_bytes_reject_invalid_utf8() -> None:
+    with pytest.raises(ConfigError, match=r"invalid YAML in memory\.yaml"):
+        load_yaml_bytes(b"value: \xff", source="memory.yaml")

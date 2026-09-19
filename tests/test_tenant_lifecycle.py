@@ -113,6 +113,20 @@ def test_example_inventory_exactly_matches_the_repository_merchants(
     validate_tenant_lifecycle_inventory(inventory, registry.merchant_ids)
 
 
+def test_example_inventory_has_its_published_fingerprint(config_root: Path) -> None:
+    # An absolute pin, not a comparison of the function against itself. A successor
+    # revision freezes this value into its previous_fingerprint, and the transition check
+    # recomputes it from the prior inventory, so any model change that moves it breaks the
+    # chain. Adding a field to TenantLifecycleEntry moves it and nothing else would notice.
+    inventory = load_tenant_lifecycle_inventory(
+        config_root / "platform" / "tenant_lifecycle.example.yaml"
+    )
+
+    assert tenant_lifecycle_inventory_fingerprint(inventory) == (
+        "8a68c7609663e9982c4599c7176e818c03f838d8495bb702448599598dbe61c7"
+    )
+
+
 @pytest.mark.parametrize(
     "update",
     (
