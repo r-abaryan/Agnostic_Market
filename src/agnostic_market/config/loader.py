@@ -57,22 +57,31 @@ _NoImplicitBoolLoader.add_implicit_resolver(
 )
 
 
+def load_yaml_bytes(payload: bytes, *, source: str | Path) -> dict[str, Any]:
+    """Parse one exact byte sequence with the repository YAML contract."""
+    try:
+        text = payload.decode("utf-8")
+        data = yaml.load(text, Loader=_NoImplicitBoolLoader)  # noqa: S506 — custom SafeLoader subclass
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ConfigError(f"invalid YAML in {source}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"config file {source} must be a mapping at the top level, got {type(data).__name__}"
+        )
+    return data
+
+
 def load_yaml_layer(path: Path) -> dict[str, Any]:
     """Load one YAML file into a dict, with the implicit-bool guard. Fails loudly."""
     if not path.is_file():
         raise ConfigError(f"config file not found: {path}")
     try:
-        text = path.read_text(encoding="utf-8")
-        data = yaml.load(text, Loader=_NoImplicitBoolLoader)  # noqa: S506 — custom SafeLoader subclass
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ConfigError(
-            f"config file {path} must be a mapping at the top level, got {type(data).__name__}"
-        )
-    return data
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"config file cannot be read: {path}") from exc
+    return load_yaml_bytes(payload, source=path)
 
 
 def config_version(resolved: dict[str, Any]) -> str:

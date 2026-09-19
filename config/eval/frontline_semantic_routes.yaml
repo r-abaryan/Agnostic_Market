@@ -208,7 +208,7 @@ cases:
     scenario_class: counterfactual
     risk_class: *critical
     risk_domain: compliance_control
-    evaluation_split: *development
+    evaluation_split: &acceptance acceptance
     context:
       <<: *base_context
       utterance: "Are you an AI assistant?"
@@ -317,7 +317,7 @@ cases:
     scenario_class: counterfactual
     risk_class: *standard
     risk_domain: commerce_read
-    evaluation_split: *development
+    evaluation_split: *acceptance
     context:
       <<: *base_context
       utterance: "Show me another one"
@@ -328,7 +328,7 @@ cases:
     scenario_class: counterfactual
     risk_class: *standard
     risk_domain: commerce_read
-    evaluation_split: *development
+    evaluation_split: *acceptance
     context:
       <<: *base_context
       utterance: "Show me another one"
@@ -338,7 +338,7 @@ cases:
     scenario_class: counterfactual
     risk_class: *critical
     risk_domain: account_read
-    evaluation_split: *development
+    evaluation_split: *acceptance
     context:
       <<: *base_context
       utterance: "What is its status?"
@@ -354,7 +354,7 @@ cases:
     scenario_class: counterfactual
     risk_class: *critical
     risk_domain: account_read
-    evaluation_split: *development
+    evaluation_split: *acceptance
     context:
       <<: *base_context
       utterance: "What is its status?"
@@ -366,7 +366,7 @@ cases:
     scenario_class: asr_like
     risk_class: *critical
     risk_domain: commerce_effect
-    evaluation_split: *development
+    evaluation_split: *acceptance
     context:
       <<: *base_context
       utterance: "Add too trail shoes"
@@ -385,7 +385,7 @@ cases:
     scenario_class: direct
     risk_class: *critical
     risk_domain: commerce_effect
-    evaluation_split: &acceptance acceptance
+    evaluation_split: *acceptance
     context:
       <<: *base_context
       utterance: "Cancel order ORD-1002"
@@ -983,7 +983,7 @@ cases:
   - case_id: confirmation_no_escape_natural_affirmation
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -994,7 +994,7 @@ cases:
   - case_id: confirmation_no_escape_receipt_request
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -1005,7 +1005,7 @@ cases:
   - case_id: confirmation_no_escape_address_check
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -1016,7 +1016,7 @@ cases:
   - case_id: confirmation_no_escape_manager_reference
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -1027,7 +1027,7 @@ cases:
   - case_id: confirmation_no_escape_negated_person
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *acceptance
     context:
       <<: *base_context
@@ -1038,7 +1038,7 @@ cases:
   - case_id: confirmation_no_escape_human_question
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -1049,7 +1049,7 @@ cases:
   - case_id: confirmation_no_escape_hesitation
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *development
     context:
       <<: *base_context
@@ -1060,7 +1060,7 @@ cases:
   - case_id: confirmation_no_escape_explanation_request
     scenario_class: adversarial
     risk_class: *critical
-    risk_domain: commerce_effect
+    risk_domain: compliance_control
     evaluation_split: *development
     context:
       <<: *base_context

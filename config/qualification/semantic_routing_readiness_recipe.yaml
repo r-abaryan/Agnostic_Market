@@ -1,0 +1,225 @@
+schema_version: "1"
+recipe_id: semantic-routing-readiness-independent-20260919
+frozen_at: "2026-09-19T18:32:42.1779564+01:00"
+purpose: >-
+  Define a frozen, independently authored synthetic holdout for the final semantic-routing
+  readiness decision. The holdout measures ownership selection only. It does not grant
+  authority, execute a capability, or evaluate owner behavior.
+
+independence_contract:
+  author_role: isolated_holdout_author
+  source_kind: synthetic
+  labels_not_used_for_selection: true
+  candidate_selection_method: >-
+    Freeze the coverage matrix first, then author exactly one candidate for every matrix row.
+    Do not generate alternates, score candidates, inspect predicted routes, or retain and reject
+    candidates based on an expected label. Assign the expected route only after the candidate
+    text and bounded context for the row are frozen.
+  observed_evidence_used: false
+  allowed_production_contract_sources:
+    - src/agnostic_market/dtos/orchestration.py
+    - src/agnostic_market/dtos/events.py
+    - src/agnostic_market/dtos/confirmation.py
+    - src/agnostic_market/agents/capabilities.py
+    - src/agnostic_market/agents/routing.py
+    - src/agnostic_market/agents/frontline/__init__.py
+    - src/agnostic_market/agents/frontline/graph.py
+    - src/agnostic_market/agents/frontline/read_flow.py
+    - src/agnostic_market/agents/frontline/typed_prompt.py
+    - config/base/base.yaml
+    - config/base/providers.yaml
+    - config/merchants/acme_store.yaml
+    - config/merchants/demo_shop.yaml
+    - config/templates/fashion/template.yaml
+    - config/templates/grocery/template.yaml
+  prohibited_observed_evidence_sources:
+    - config/eval/frontline_semantic_route*
+    - config/telemetry/**
+    - tests/test_frontline_eval.py
+    - docs/EVALUATION.md
+    - docs/BUILD_PLAN.md
+    - docs/ROUTING_PLANNER_PLAN.md
+    - prior routing reports
+    - provider evaluation outputs
+    - model predictions for candidate utterances
+    - git history for any prohibited source
+
+generation_rules:
+  - Use invented caller wording and synthetic identifiers only.
+  - Do not copy, paraphrase, or adapt an utterance from any existing evaluation corpus.
+  - Keep each utterance self-contained within its bounded RoutingContext.
+  - Vary syntax, politeness, disfluency, negation, reported speech, and indirect phrasing without
+    adding noise that changes the intended ownership question.
+  - Use only coarse RouteProposal fields. Leave owner-gathered fine slots absent from direct
+    expectations.
+  - Require every expected route to be producible by RouteProposal and unchanged by resolve_route.
+  - Keep all ordinary acceptance cases synthetic and all corpus cases acceptance-only.
+  - Keep exactly one development projected_case, used only to verify production context projection.
+  - Do not run a provider or network evaluation while authoring or validating this holdout.
+
+coverage_rules:
+  executable_capabilities:
+    - answer_question
+    - search_catalog
+    - verify_order_status
+    - list_orders
+    - view_cart
+    - modify_cart
+    - place_order
+    - cancel_orders
+    - refund_order
+    - return_order
+    - change_profile
+    - verify_identity
+    - switch_account
+    - view_identity_status
+    - abort_current
+    - request_person
+  risk_domains:
+    - ordinary_intent
+    - commerce_read
+    - account_read
+    - account_control
+    - commerce_effect
+    - compliance_control
+  required_contrasts:
+    - direct_continue_clarify
+    - unavailable_capability_rejection
+    - active_owner_continuation_and_replacement
+    - order_context
+    - cart_state
+    - identity_state
+    - negation
+    - indirect_and_reporting_language
+    - asr_like_natural_speech
+    - ordinary_and_confirmation_escape_scopes
+  acceptance_case_count: 38
+
+source_cluster_rules:
+  - Give every acceptance case exactly one lineage record.
+  - Use a unique source_cluster_id for every acceptance case, with no shared conversational or
+    paraphrase family across clusters.
+  - Record one immutable source_seed for every projected or acceptance case in this recipe.
+  - Derive source_fingerprint as lowercase SHA-256 over the exact UTF-8 bytes of source_seed,
+    with no newline, prefix, normalization, or case folding.
+  - The projected development case has a recorded seed and cluster but is excluded from holdout
+    lineage because the readiness schema requires lineage to exactly cover corpus.cases.
+
+source_seed_ledger:
+  - case_id: srh-projection-001
+    source_cluster_id: srh-cluster-projection-001
+    source_seed: "projection|hesitant request to browse for a lightweight rain shell"
+  - case_id: srh-001-policy-window
+    source_cluster_id: srh-cluster-001
+    source_seed: "policy|deadline for reporting a damaged parcel after delivery"
+  - case_id: srh-002-reported-outcome
+    source_cluster_id: srh-cluster-002
+    source_seed: "general|reported cancellation statement without a requested action"
+  - case_id: srh-003-catalog-asr
+    source_cluster_id: srh-cluster-003
+    source_seed: "catalog|asr-like search for insulated lunch carrier"
+  - case_id: srh-004-order-explicit
+    source_cluster_id: srh-cluster-004
+    source_seed: "order-status|spoken explicit reference QZ seventy four"
+  - case_id: srh-005-order-focused
+    source_cluster_id: srh-cluster-005
+    source_seed: "order-status|singular follow-up to one recent return"
+  - case_id: srh-006-order-recent-set
+    source_cluster_id: srh-cluster-006
+    source_seed: "order-status|plural follow-up to three recently listed orders"
+  - case_id: srh-007-list-session
+    source_cluster_id: srh-cluster-007
+    source_seed: "order-list|request session-visible purchases without account binding"
+  - case_id: srh-008-list-account
+    source_cluster_id: srh-cluster-008
+    source_seed: "order-list|request complete verified-account purchase history"
+  - case_id: srh-009-cart-negation
+    source_cluster_id: srh-cluster-009
+    source_seed: "cart-read|negated removal followed by basket contents request"
+  - case_id: srh-010-cart-add
+    source_cluster_id: srh-cluster-010
+    source_seed: "cart-write|add a trail flask with owner-gathered item details"
+  - case_id: srh-011-cart-remove
+    source_cluster_id: srh-cluster-011
+    source_seed: "cart-write|remove unwanted charcoal beanie"
+  - case_id: srh-012-cart-quantity-asr
+    source_cluster_id: srh-cluster-012
+    source_seed: "cart-write|asr-like quantity correction to four"
+  - case_id: srh-013-checkout-nonempty
+    source_cluster_id: srh-cluster-013
+    source_seed: "checkout|submit nonempty basket now"
+  - case_id: srh-014-cancel-order
+    source_cluster_id: srh-cluster-014
+    source_seed: "cancel|stop shipment before dispatch"
+  - case_id: srh-015-refund-order
+    source_cluster_id: srh-cluster-015
+    source_seed: "refund|money-back request for cracked mug"
+  - case_id: srh-016-return-order
+    source_cluster_id: srh-cluster-016
+    source_seed: "return|send undersized boots back"
+  - case_id: srh-017-profile-address
+    source_cluster_id: srh-cluster-017
+    source_seed: "profile|redirect future deliveries by changing saved address"
+  - case_id: srh-018-profile-contact
+    source_cluster_id: srh-cluster-018
+    source_seed: "profile|replace saved contact channel"
+  - case_id: srh-019-verify-identity
+    source_cluster_id: srh-cluster-019
+    source_seed: "identity|start account verification"
+  - case_id: srh-020-switch-account
+    source_cluster_id: srh-cluster-020
+    source_seed: "identity|leave bound household account and use another"
+  - case_id: srh-021-identity-status
+    source_cluster_id: srh-cluster-021
+    source_seed: "identity|ask whether session is attached to an account"
+  - case_id: srh-022-abort-active
+    source_cluster_id: srh-cluster-022
+    source_seed: "control|explicitly abandon active refund without performing it"
+  - case_id: srh-023-human-handoff
+    source_cluster_id: srh-cluster-023
+    source_seed: "control|leave automation to converse with a human"
+  - case_id: srh-024-continue-refund
+    source_cluster_id: srh-cluster-024
+    source_seed: "continuation|payment destination fragment for active refund"
+  - case_id: srh-025-continue-catalog
+    source_cluster_id: srh-cluster-025
+    source_seed: "continuation|material refinement for active catalog search"
+  - case_id: srh-026-replace-cancel-return
+    source_cluster_id: srh-cluster-026
+    source_seed: "replacement|preserve shipment and start return instead of active cancellation"
+  - case_id: srh-027-replace-cart-read
+    source_cluster_id: srh-cluster-027
+    source_seed: "replacement|drop active cart edit and inspect basket"
+  - case_id: srh-028-quoted-command
+    source_cluster_id: srh-cluster-028
+    source_seed: "ambiguity|quoted destructive instruction requested for interpretation"
+  - case_id: srh-029-compound-workflow
+    source_cluster_id: srh-cluster-029
+    source_seed: "workflow|dependent add then checkout request spanning owners"
+  - case_id: srh-030-unavailable-ai-disclosure
+    source_cluster_id: srh-cluster-030
+    source_seed: "availability|assistant identity question when disclosure owner is absent"
+  - case_id: srh-031-unavailable-inventory
+    source_cluster_id: srh-cluster-031
+    source_seed: "availability|live shelf inventory request outside catalog ownership"
+  - case_id: srh-032-unavailable-cart-edit
+    source_cluster_id: srh-cluster-032
+    source_seed: "availability|cart add request under registry cohort without modify capability"
+  - case_id: srh-033-order-pronoun-ambiguous
+    source_cluster_id: srh-cluster-033
+    source_seed: "order-context|singular pronoun after two-order recent set"
+  - case_id: srh-034-profile-field-missing
+    source_cluster_id: srh-cluster-034
+    source_seed: "clarification|account detail change without address or contact choice"
+  - case_id: srh-035-confirmation-human
+    source_cluster_id: srh-cluster-035
+    source_seed: "confirmation-escape|explicit demand to exit automation"
+  - case_id: srh-036-confirmation-report
+    source_cluster_id: srh-cluster-036
+    source_seed: "confirmation-escape|reported supervisor approval without handoff request"
+  - case_id: srh-037-continue-order-target
+    source_cluster_id: srh-cluster-037
+    source_seed: "continuation|order reference fragment for active status owner"
+  - case_id: srh-038-replace-verification-status
+    source_cluster_id: srh-cluster-038
+    source_seed: "replacement|decline active verification and ask only for binding status"
