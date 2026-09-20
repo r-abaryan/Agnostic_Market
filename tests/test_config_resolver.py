@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agnostic_market.config.resolver import (
+    ConfigResolutionError,
     PolicyBoundsViolationError,
     SafetyLockViolationError,
     resolve_merchant_config,
@@ -116,6 +117,14 @@ def test_three_layer_merge_is_last_wins_and_deep() -> None:
     assert config.policies.refunds.auto_approve_under_usd == 50
     # template-only value carried through
     assert config.integration.catalog.freshness_sla_min == 15
+
+
+def test_invalid_policy_value_type_uses_the_resolution_error_contract() -> None:
+    bad = _override()
+    bad["policies"] = {"refunds": {"require_human_above_usd": "not-money"}}
+
+    with pytest.raises(ConfigResolutionError, match="invalid policy value types"):
+        resolve_merchant_config(_base(), _template(), bad)
 
 
 def test_override_touching_safety_locked_key_is_rejected() -> None:

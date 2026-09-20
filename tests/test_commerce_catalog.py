@@ -14,20 +14,36 @@ from agnostic_market.commerce.catalog import (
     CatalogProduct,
     CatalogProductSet,
     FixtureCatalog,
+    load_catalog_fixture,
     match_named_items,
     number_candidates,
 )
-from agnostic_market.commerce.orders import load_orders_fixture
+from agnostic_market.config.loader import ConfigError
 from agnostic_market.dtos.state import CartLine
 
 
 def _catalog(config_root: Path) -> FixtureCatalog:
-    fixture = load_orders_fixture(config_root, "acme_store")
+    fixture = load_catalog_fixture(config_root, "acme_store")
     return FixtureCatalog("acme_store", fixture)
 
 
 def _candidate(key: str, name: str) -> Candidate:
     return Candidate(key=key, sku=f"SKU-{key}", name=name, price_usd=1.0)
+
+
+def test_catalog_fixture_loads_from_its_own_family(config_root: Path) -> None:
+    fixture = load_catalog_fixture(config_root, "acme_store")
+
+    assert tuple(product.sku for product in fixture.products) == (
+        "SKU-RED-42",
+        "SKU-BLU-07",
+        "SKU-GRN-15",
+    )
+
+
+def test_catalog_fixture_missing_tenant_fails_loudly(config_root: Path) -> None:
+    with pytest.raises(ConfigError, match="config file not found"):
+        load_catalog_fixture(config_root, "unknown_store")
 
 
 def test_match_named_items_accepts_a_product_name_inside_natural_utterance() -> None:
@@ -196,7 +212,7 @@ def test_catalog_result_rejects_more_than_the_platform_bound() -> None:
 
 
 def test_fixture_catalog_requires_a_tenant_identity(config_root: Path) -> None:
-    fixture = load_orders_fixture(config_root, "acme_store")
+    fixture = load_catalog_fixture(config_root, "acme_store")
 
     with pytest.raises(ValueError, match="requires a tenant id"):
         FixtureCatalog(" ", fixture)

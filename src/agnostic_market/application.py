@@ -32,17 +32,24 @@ from agnostic_market.checkpoints import (
     graph_contract_fingerprint,
 )
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
+from agnostic_market.commerce.catalog import (
+    CatalogFixture,
+    CatalogPort,
+    FixtureCatalog,
+    load_catalog_fixture,
+)
+from agnostic_market.commerce.fixture_integrity import assert_fixture_bundle_integrity
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
     CustomerDirectoryPort,
-    assert_orders_have_customers,
+    CustomersFixture,
     load_customers_fixture,
 )
 from agnostic_market.commerce.orders import (
     GuestOrderScope,
     OrderPort,
+    OrdersFixture,
     OrderStore,
     RecentOrderContext,
     load_orders_fixture,
@@ -50,13 +57,13 @@ from agnostic_market.commerce.orders import (
 from agnostic_market.commerce.payment_instruments import (
     PaymentInstrumentDirectory,
     PaymentInstrumentPort,
-    assert_payment_instruments_have_customers,
+    PaymentInstrumentsFixture,
     load_payment_instruments_fixture,
 )
 from agnostic_market.commerce.profile import (
+    ProfileFixture,
     ProfilePort,
     ProfileStore,
-    assert_profiles_have_customers,
     load_profile_fixture,
 )
 from agnostic_market.commerce.verification import (
@@ -64,6 +71,7 @@ from agnostic_market.commerce.verification import (
     OtpProvider,
     RiskPort,
     RiskProvider,
+    VerificationFixture,
     VerificationStore,
     load_verification_fixture,
 )
@@ -82,6 +90,10 @@ from agnostic_market.durability.session_registry import (
 from agnostic_market.durability.session_state import (
     SessionStateCoordinator,
     SessionStatePersistencePort,
+)
+from agnostic_market.management.contracts import (
+    PublishedMerchantVersion,
+    published_merchant_runtime_version,
 )
 from agnostic_market.session import CallerContext, DurableSessionCloser
 from agnostic_market.tenancy.context import TenantBound, TenantContext
@@ -292,25 +304,86 @@ def build_fixture_tenant_services(
     tenant_id = tenant.tenant_id
     if telemetry.tenant_id != tenant_id:
         raise ValueError("telemetry service does not match the fixture tenant")
+    catalog_fixture = load_catalog_fixture(config_root, tenant_id)
     orders_fixture = load_orders_fixture(config_root, tenant_id)
     customers_fixture = load_customers_fixture(config_root, tenant_id)
     profile_fixture = load_profile_fixture(config_root, tenant_id)
     payment_fixture = load_payment_instruments_fixture(config_root, tenant_id)
     verification_fixture = load_verification_fixture(config_root, tenant_id)
-    assert_orders_have_customers(orders_fixture, customers_fixture)
-    assert_profiles_have_customers(profile_fixture, customers_fixture)
-    assert_payment_instruments_have_customers(payment_fixture, customers_fixture)
-    expected_factor_refs = {entry.factor_ref for entry in customers_fixture.customers.values()}
-    factor_refs = set(verification_fixture.otp_codes_by_factor_ref)
-    if factor_refs != expected_factor_refs:
-        missing = sorted(expected_factor_refs - factor_refs)
-        unknown = sorted(factor_refs - expected_factor_refs)
-        details = []
-        if missing:
-            details.append("missing factors: " + ", ".join(missing))
-        if unknown:
-            details.append("unknown factors: " + ", ".join(unknown))
-        raise ValueError("verification fixture does not match customers: " + "; ".join(details))
+    return _build_fixture_tenant_services(
+        tenant,
+        catalog_fixture=catalog_fixture,
+        orders_fixture=orders_fixture,
+        customers_fixture=customers_fixture,
+        profile_fixture=profile_fixture,
+        payment_fixture=payment_fixture,
+        verification_fixture=verification_fixture,
+        telemetry=telemetry,
+        checkpointer=checkpointer,
+    )
+
+
+def build_published_tenant_context(version: PublishedMerchantVersion) -> TenantContext:
+    """Pin a new session to one immutable management publication."""
+
+    return TenantContext(
+        tenant_id=version.tenant_id,
+        config_version=published_merchant_runtime_version(version),
+        policy=version.config.policies.to_policy_context(),
+    )
+
+
+def build_published_fixture_tenant_services(
+    version: PublishedMerchantVersion,
+    tenant: TenantContext,
+    *,
+    telemetry: TenantTelemetry,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> TenantServices:
+    """Compose development adapters from the exact fixtures pinned by a publication."""
+
+    if (
+        tenant.tenant_id != version.tenant_id
+        or tenant.config_version != published_merchant_runtime_version(version)
+        or tenant.policy != version.config.policies.to_policy_context()
+    ):
+        raise ValueError("tenant context does not match the published merchant version")
+    fixtures = version.fixtures
+    return _build_fixture_tenant_services(
+        tenant,
+        catalog_fixture=fixtures.catalog,
+        orders_fixture=fixtures.orders,
+        customers_fixture=fixtures.customers,
+        profile_fixture=fixtures.profiles,
+        payment_fixture=fixtures.payment_instruments,
+        verification_fixture=fixtures.verification,
+        telemetry=telemetry,
+        checkpointer=checkpointer,
+    )
+
+
+def _build_fixture_tenant_services(
+    tenant: TenantContext,
+    *,
+    catalog_fixture: CatalogFixture,
+    orders_fixture: OrdersFixture,
+    customers_fixture: CustomersFixture,
+    profile_fixture: ProfileFixture,
+    payment_fixture: PaymentInstrumentsFixture,
+    verification_fixture: VerificationFixture,
+    telemetry: TenantTelemetry,
+    checkpointer: BaseCheckpointSaver | None,
+) -> TenantServices:
+    tenant_id = tenant.tenant_id
+    if telemetry.tenant_id != tenant_id:
+        raise ValueError("telemetry service does not match the fixture tenant")
+    assert_fixture_bundle_integrity(
+        orders=orders_fixture,
+        customers=customers_fixture,
+        payment_instruments=payment_fixture,
+        profiles=profile_fixture,
+        verification=verification_fixture,
+    )
     checkpoint_boundary = (
         checkpointer
         if isinstance(checkpointer, SchemaValidatedCheckpointSaver)
@@ -318,7 +391,7 @@ def build_fixture_tenant_services(
     )
     return TenantServices(
         tenant_id=tenant_id,
-        catalog=FixtureCatalog(tenant_id, orders_fixture),
+        catalog=FixtureCatalog(tenant_id, catalog_fixture),
         order_store=OrderStore(tenant_id, orders_fixture.orders),
         customers=CustomerDirectory(tenant_id, customers_fixture),
         payment_instruments=PaymentInstrumentDirectory(tenant_id, payment_fixture),

@@ -19,7 +19,7 @@ _REPO_CONFIG_ROOT = _REPO_ROOT / "config"
 _TEST_ROOT = Path(__file__).resolve().parent
 _COMMITTED_FIXTURES = {
     family: _REPO_CONFIG_ROOT / "fixtures" / family / "acme_store.yaml"
-    for family in ("orders", "profiles")
+    for family in ("catalog", "orders", "profiles")
 }
 _SYNTHETIC_FIXTURES = {
     "customers": _TEST_ROOT / "synthetic_customers.yaml",

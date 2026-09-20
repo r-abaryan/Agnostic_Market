@@ -12,11 +12,10 @@ from datetime import date, datetime
 from decimal import Decimal
 from functools import wraps
 from pathlib import Path
-from typing import Concatenate, Literal, Protocol, runtime_checkable
+from typing import Concatenate, Literal, Never, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agnostic_market.commerce.catalog import CatalogFixture
 from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.money import UsdAmount, validate_usd
@@ -262,7 +261,7 @@ def render_batch_cancel_outcome(outcomes: Sequence[BatchCancelOutcome]) -> str:
 
 
 class _OrderEntry(BaseModel):
-    model_config = _STRICT
+    model_config = _FROZEN
 
     status: str = Field(min_length=1)
     summary: str = Field(min_length=1)
@@ -288,12 +287,62 @@ class _OrderEntry(BaseModel):
         return self
 
 
-class OrdersFixture(CatalogFixture):
+class _ImmutableOrderMap(dict[str, _OrderEntry]):
+    """Serializable mapping whose validated fixture content cannot drift in memory."""
+
+    @staticmethod
+    def _immutable() -> Never:
+        raise TypeError("validated order fixture mappings are immutable")
+
+    def __setitem__(self, key: str, value: _OrderEntry) -> None:
+        del key, value
+        self._immutable()
+
+    def __delitem__(self, key: str) -> None:
+        del key
+        self._immutable()
+
+    def clear(self) -> None:
+        self._immutable()
+
+    def pop(self, key: str, default: object = None) -> _OrderEntry:
+        del key, default
+        self._immutable()
+
+    def popitem(self) -> tuple[str, _OrderEntry]:
+        self._immutable()
+
+    def setdefault(self, key: str, default: _OrderEntry | None = None) -> _OrderEntry:
+        del key, default
+        self._immutable()
+
+    def update(self, *args: object, **kwargs: _OrderEntry) -> None:
+        del args, kwargs
+        self._immutable()
+
+    def __ior__(self, other: object) -> _ImmutableOrderMap:
+        del other
+        self._immutable()
+
+    def __copy__(self) -> _ImmutableOrderMap:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _ImmutableOrderMap:
+        memo[id(self)] = self
+        return self
+
+
+class OrdersFixture(BaseModel):
     """Validated stub SoR content for one merchant."""
 
-    model_config = _STRICT
+    model_config = _FROZEN
 
     orders: dict[str, _OrderEntry]
+
+    @model_validator(mode="after")
+    def _freeze_order_mapping(self) -> OrdersFixture:
+        object.__setattr__(self, "orders", _ImmutableOrderMap(self.orders))
+        return self
 
 
 class OrderCandidate(BaseModel):

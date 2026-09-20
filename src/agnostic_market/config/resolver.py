@@ -195,7 +195,10 @@ def resolve_merchant_config(
 
     merged = _deep_merge(_deep_merge(base, template), override)
     # Bounds check runs on the MERGED config while `_platform.limits` is still present.
-    _assert_policy_within_bounds(merged)
+    try:
+        _assert_policy_within_bounds(merged)
+    except TypeError as exc:
+        raise ConfigResolutionError("resolved config contains invalid policy value types") from exc
     # Platform-only sections (the lock declaration + the `_platform` safety block) are
     # directives, not MerchantConfig fields — drop them before validation. The DTO forbids
     # extras, so this also keeps them out of the effective merchant config.
