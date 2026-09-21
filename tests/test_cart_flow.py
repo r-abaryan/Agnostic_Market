@@ -38,7 +38,7 @@ from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
 from agnostic_market.checkpoints import CheckpointBinding, graph_contract_fingerprint
 from agnostic_market.commerce.cart import CartMutationError, CartStore
-from agnostic_market.commerce.catalog import FixtureCatalog
+from agnostic_market.commerce.catalog import FixtureCatalog, load_catalog_fixture
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectory,
@@ -93,7 +93,7 @@ def _build(
     telemetry=None,
 ):
     fixture = load_orders_fixture(config_root, "acme_store")
-    catalog = FixtureCatalog("acme_store", fixture)
+    catalog = FixtureCatalog("acme_store", load_catalog_fixture(config_root, "acme_store"))
     store = OrderStore("acme_store", fixture.orders)
     cart = cart or CartStore()
     recent_orders = recent_orders or RecentOrderContext(max_refs=_POLICY.cancel_batch_max)
@@ -272,7 +272,7 @@ async def test_typed_cart_mutation_requires_confirmation_before_effect(
     config_root: Path,
 ) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-confirmation"
 
     await graph.ainvoke(
@@ -555,7 +555,7 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
     sink = InMemoryTelemetrySink()
     telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("typed-cart-mutation")
     graph, _store, cart = _build(config_root, telemetry=telemetry)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     if starting_quantity:
         cart.add_item(
             sku=product.sku,
@@ -607,7 +607,7 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
 
 async def test_cart_mutation_decline_is_exact_and_has_no_effect(config_root: Path) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-decline"
     await graph.ainvoke(
         {
@@ -636,7 +636,7 @@ async def test_cart_mutation_unclear_twice_uses_one_fixed_retry_then_declines(
     config_root: Path,
 ) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-unclear"
     await graph.ainvoke(
         {
@@ -673,7 +673,7 @@ async def test_cart_mutation_human_reply_uses_the_existing_terminal_path(
     config_root: Path,
 ) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-human"
     await graph.ainvoke(
         {
@@ -706,7 +706,7 @@ async def test_cart_mutation_expiry_is_exact_and_does_not_consume_yes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-expiry"
     await graph.ainvoke(
         {
@@ -741,7 +741,7 @@ async def test_barged_cart_mutation_readback_reconfirms_before_effect(
     config_root: Path,
 ) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-barged"
     await graph.ainvoke(
         {
@@ -777,7 +777,7 @@ async def test_wrong_negative_family_nomination_cannot_mutate_without_consent(
     config_root: Path,
 ) -> None:
     graph, _store, cart = _build(config_root)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-wrong-negative-nomination"
 
     await graph.ainvoke(

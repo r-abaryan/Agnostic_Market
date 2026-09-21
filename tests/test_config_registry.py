@@ -83,6 +83,10 @@ def test_valid_template_name_loads(tmp_path: Path) -> None:
     registry = ConfigRegistry(tmp_path).load()
     assert registry.get("m1").config.merchant_id == "m1"
 
+    source = registry.source_override("m1")
+    source["merchant_id"] = "mutated"
+    assert registry.source_override("m1")["merchant_id"] == "m1"
+
 
 def test_both_repository_templates_resolve_the_closed_llm_role_map(
     config_root: Path,

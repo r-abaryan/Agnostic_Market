@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agnostic_market.config.resolver import (
+    ConfigResolutionError,
     PolicyBoundsViolationError,
     SafetyLockViolationError,
     resolve_merchant_config,
@@ -116,6 +117,39 @@ def test_three_layer_merge_is_last_wins_and_deep() -> None:
     assert config.policies.refunds.auto_approve_under_usd == 50
     # template-only value carried through
     assert config.integration.catalog.freshness_sla_min == 15
+
+
+def test_invalid_policy_value_type_uses_the_resolution_error_contract() -> None:
+    bad = _override()
+    bad["policies"] = {"refunds": {"require_human_above_usd": "not-money"}}
+
+    with pytest.raises(ConfigResolutionError, match="invalid policy value types"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (("policies",), "not-a-mapping"),
+        (("policies", "refunds"), []),
+        (("policies", "returns"), "not-a-mapping"),
+        (("policies", "security"), 3),
+        (("policies", "clarification_reask_max"), False),
+    ),
+)
+def test_non_mapping_policy_sections_use_the_resolution_error_contract(
+    path: tuple[str, ...], value: object
+) -> None:
+    bad = _override()
+    target = bad
+    for key in path[:-1]:
+        child = target.setdefault(key, {})
+        assert isinstance(child, dict)
+        target = child
+    target[path[-1]] = value
+
+    with pytest.raises(ConfigResolutionError, match="must be a mapping"):
+        resolve_merchant_config(_base(), _template(), bad)
 
 
 def test_override_touching_safety_locked_key_is_rejected() -> None:

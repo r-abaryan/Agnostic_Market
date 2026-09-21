@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import NoReturn
 
@@ -33,6 +34,8 @@ from livekit import agents
 from livekit.agents.voice import room_io
 
 from agnostic_market.agents.routing_activation import (
+    ConfiguredSemanticRouterFactory,
+    QualifiedSemanticRouterFactory,
     build_qualified_semantic_router_factory,
     semantic_routing_runtime_contract,
 )
@@ -89,6 +92,7 @@ from agnostic_market.llm.providers import (
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 from agnostic_market.tenancy.resolver import TenantResolutionError
 from agnostic_market.voice.admission import (
+    DevelopmentStandardVoiceJobAdmission,
     NetworkVoiceAdmissionPreflight,
     NetworkVoiceTenantAdmission,
     VoiceJobAdmission,
@@ -122,6 +126,16 @@ _CERTIFICATION_CONFIG_ENV = "VOICE_AGENT_CERTIFICATION_CONFIG"
 _BUILD_ARTIFACT_DIGEST_ENV = "VOICE_AGENT_BUILD_ARTIFACT_DIGEST"
 
 logger = logging.getLogger("voice_agent")
+_startup_stage: ContextVar[str] = ContextVar("voice_startup_stage", default="received")
+
+
+def _mark_startup_stage(stage: str) -> None:
+    _startup_stage.set(stage)
+    logger.info(
+        "voice startup stage=%s",
+        stage,
+        extra={"event": "voice_startup_stage", "startup_stage": stage},
+    )
 
 
 def _prewarm(_process: agents.JobProcess) -> None:
@@ -255,11 +269,15 @@ async def _certification_participant_identity(
     return participant.identity
 
 
-async def entrypoint(
+async def _run_entrypoint(
     ctx: agents.JobContext,
     *,
     certification_target: VoiceCertificationTarget | None = None,
+    development_network: bool = False,
 ) -> None:
+    if development_network and certification_target is not None:
+        raise RuntimeError("development network jobs cannot produce certification evidence")
+    _mark_startup_stage("configuration_load")
     certification_directive = None
     if certification_target is not None:
         certification_directive = validate_certification_job(ctx.job, certification_target)
@@ -273,11 +291,20 @@ async def entrypoint(
         else None
     )
     registry = ConfigRegistry(_CONFIG_ROOT).load()
-    admission_boundary = VoiceJobAdmission(
-        registry,
-        development_merchant_id=os.environ.get(_DEVELOPMENT_MERCHANT_ID_ENV),
+    _mark_startup_stage("admission_preflight")
+    admission_boundary = (
+        DevelopmentStandardVoiceJobAdmission(
+            registry,
+            merchant_id=os.environ.get(_DEVELOPMENT_MERCHANT_ID_ENV, ""),
+        )
+        if development_network
+        else VoiceJobAdmission(
+            registry,
+            development_merchant_id=os.environ.get(_DEVELOPMENT_MERCHANT_ID_ENV),
+        )
     )
     preflight = admission_boundary.preflight(ctx)
+    _mark_startup_stage("preflight_complete")
     tenant = preflight.tenant
     resolved = preflight.resolved
     if certification_target is not None:
@@ -300,20 +327,39 @@ async def entrypoint(
         max_report_age_days=targets.max_report_age_days,
     )
     require_llm_certification(resolved.config, conformance)
+    _mark_startup_stage("llm_certification_complete")
 
     gateway = LLMGateway(credentials, secrets)
     routing_structured_output_method = gateway.structured_output_method(resolved.config.llm.routing)
-    routing_factory = build_qualified_semantic_router_factory(
-        _CONFIG_ROOT,
-        selection=resolved.config.llm.routing,
-        credentials=credentials,
-        secrets=secrets,
-        structured_output_method=routing_structured_output_method,
-        timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
-        input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
-        max_report_age_days=targets.max_report_age_days,
-    )
+    _mark_startup_stage("routing_qualification")
+    qualified_routing_factory: QualifiedSemanticRouterFactory | None = None
+    if development_network:
+        logger.warning(
+            "using non-authorizing development semantic routing",
+            extra={"event": "development_routing_non_authorizing"},
+        )
+        routing_factory = ConfiguredSemanticRouterFactory(
+            selection=resolved.config.llm.routing,
+            credentials=credentials,
+            secrets=secrets,
+            structured_output_method=routing_structured_output_method,
+            timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
+            input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
+        )
+    else:
+        qualified_routing_factory = build_qualified_semantic_router_factory(
+            _CONFIG_ROOT,
+            selection=resolved.config.llm.routing,
+            credentials=credentials,
+            secrets=secrets,
+            structured_output_method=routing_structured_output_method,
+            timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
+            input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
+            max_report_age_days=targets.max_report_age_days,
+        )
+        routing_factory = qualified_routing_factory
     prepared_routing = prepare_application_routing(routing_factory)
+    _mark_startup_stage("routing_qualification_complete")
     operational_telemetry: TelemetryStore = (
         InMemoryTelemetrySink() if close_certification is not None else DisabledTelemetrySink()
     )
@@ -333,7 +379,10 @@ async def entrypoint(
     runtime_contract_fingerprint: str | None = None
     application_contract: VoiceApplicationContract | None = None
     loop: VoiceLoop | None = None
-    if isinstance(preflight, NetworkVoiceAdmissionPreflight):
+    if isinstance(preflight, NetworkVoiceAdmissionPreflight) and not development_network:
+        if qualified_routing_factory is None:
+            raise RuntimeError("production network jobs require qualified semantic routing")
+        _mark_startup_stage("platform_contract_load")
         platform_config = load_platform_runtime_config(_platform_config_path())
         application_dsn = secrets.resolve(platform_config.database.application_dsn_ref.uri)
         journey_corpus = load_latency_journey_corpus(
@@ -347,6 +396,7 @@ async def entrypoint(
         application_identity_target = certification_target or load_voice_certification_target(
             _required_absolute_path(_CERTIFICATION_CONFIG_ENV)
         )
+        _mark_startup_stage("application_contract_validation")
         application_contract = VoiceApplicationContract(
             durable_platform_fingerprint=runtime_contract_fingerprint,
             build_artifact_digest=_build_artifact_digest(),
@@ -357,9 +407,9 @@ async def entrypoint(
                 structured_output_method=routing_structured_output_method,
                 timeout_seconds=resolved.config.runtime.semantic_router_timeout_seconds,
                 input_max_chars=resolved.config.runtime.semantic_router_input_max_chars,
-                corpus_fingerprint=routing_factory.expected_corpus_fingerprint,
+                corpus_fingerprint=qualified_routing_factory.expected_corpus_fingerprint,
                 qualification_evidence_fingerprint=(
-                    routing_factory.expected_qualification_evidence_fingerprint
+                    qualified_routing_factory.expected_qualification_evidence_fingerprint
                 ),
             ),
             certification_target_fingerprint=voice_certification_target_fingerprint(
@@ -378,6 +428,7 @@ async def entrypoint(
                 required_measurement_surface=LatencyMeasurementSurface.VOICE_PROCESSING,
                 required_transport_surface=VoiceTransportSurface(preflight.participant_kind),
             )
+            _mark_startup_stage("latency_evidence_authorized")
         platform_resources = await DurablePlatformResources.open(
             platform_config,
             secrets,
@@ -388,12 +439,15 @@ async def entrypoint(
             ),
             application_dsn=application_dsn,
         )
+        _mark_startup_stage("platform_resources_opened")
     try:
+        _mark_startup_stage("transport_admission")
         admission = await admission_boundary.complete(
             ctx,
             preflight,
             timeout_seconds=resolved.config.runtime.voice_admission_timeout_seconds,
         )
+        _mark_startup_stage("transport_admitted")
         if certification_target is not None:
             if (
                 certification_measurements is None
@@ -429,6 +483,7 @@ async def entrypoint(
                 deployment_id=deployment_id,
                 config_version=tenant.config_version,
             )
+            _mark_startup_stage("durable_session_acquired")
         tenant_services = build_fixture_tenant_services(
             _CONFIG_ROOT,
             tenant,
@@ -465,6 +520,7 @@ async def entrypoint(
                 else None
             ),
         )
+        _mark_startup_stage("voice_loop_built")
         if certification_contract is not None:
             if certification_measurements is None:
                 raise RuntimeError("voice certification has no measurement collector")
@@ -519,10 +575,12 @@ async def entrypoint(
         # The disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1)) plays via the agent's own
         # on_enter hook - structurally first, before any user turn can be answered.
         await _start_admitted_session(ctx, loop, admission)
+        _mark_startup_stage("voice_session_started")
         # The thinking-sound earcon needs the room (a runtime concern); start it after the
         # session. Auto-plays while the agent is 'thinking', stops when it speaks (no overlap with
         # the answer or a readback). No-op/warn in console mode (LiveKit-managed).
         await loop.background_audio.start(room=ctx.room, agent_session=loop.session)
+        _mark_startup_stage("ready")
         if certification_assignment is not None and certification_measurements is not None:
             observation = certification_measurements.mark_ready(certification_assignment)
             await announce_voice_certification_ready(ctx.agent, certification_assignment)
@@ -555,6 +613,66 @@ async def entrypoint(
                 loop,
             )
         raise
+
+
+async def _entrypoint_with_diagnostics(
+    ctx: agents.JobContext,
+    *,
+    certification_target: VoiceCertificationTarget | None = None,
+    development_network: bool = False,
+) -> None:
+    """Run one job with privacy-safe, stage-correlated startup diagnostics."""
+
+    token = _startup_stage.set("received")
+    try:
+        await _run_entrypoint(
+            ctx,
+            certification_target=certification_target,
+            development_network=development_network,
+        )
+    except asyncio.CancelledError:
+        stage = _startup_stage.get()
+        logger.info(
+            "voice job cancelled stage=%s",
+            stage,
+            extra={"event": "voice_startup_cancelled", "startup_stage": stage},
+        )
+        raise
+    except BaseException as exc:
+        stage = _startup_stage.get()
+        logger.error(
+            "voice job failed stage=%s exception_type=%s",
+            stage,
+            type(exc).__name__,
+            extra={
+                "event": "voice_startup_failed",
+                "startup_stage": stage,
+                "exception_type": type(exc).__name__,
+            },
+        )
+        raise
+    finally:
+        _startup_stage.reset(token)
+
+
+async def entrypoint(
+    ctx: agents.JobContext,
+    *,
+    certification_target: VoiceCertificationTarget | None = None,
+) -> None:
+    """Run one production or certification job with stage-correlated diagnostics."""
+
+    await _entrypoint_with_diagnostics(ctx, certification_target=certification_target)
+
+
+async def development_network_entrypoint(ctx: agents.JobContext) -> None:
+    """Run one non-authorizing LiveKit development job with in-memory state."""
+
+    logger.warning(
+        "starting non-authorizing development network job",
+        extra={"event": "development_network_non_authorizing"},
+    )
+    await _entrypoint_with_diagnostics(ctx, development_network=True)
 
 
 if __name__ == "__main__":

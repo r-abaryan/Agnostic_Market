@@ -45,7 +45,7 @@ from agnostic_market.application import (
 )
 from agnostic_market.checkpoints import CheckpointScopeError
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog
+from agnostic_market.commerce.catalog import CatalogPort, FixtureCatalog, load_catalog_fixture
 from agnostic_market.commerce.identity import (
     CustomerDirectory,
     CustomerDirectoryPort,
@@ -549,7 +549,14 @@ async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backe
 ) -> None:
     isolated_config_root = tmp_path / "config"
     copytree(config_root, isolated_config_root)
-    for family in ("orders", "customers", "payment_instruments", "profiles", "verification"):
+    for family in (
+        "catalog",
+        "orders",
+        "customers",
+        "payment_instruments",
+        "profiles",
+        "verification",
+    ):
         copy2(
             isolated_config_root / "fixtures" / family / "acme_store.yaml",
             isolated_config_root / "fixtures" / family / "demo_shop.yaml",
@@ -558,7 +565,7 @@ async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backe
     tenants = tuple(
         build_tenant_context(registry, tenant_id) for tenant_id in ("acme_store", "demo_shop")
     )
-    orders = load_orders_fixture(isolated_config_root, "acme_store")
+    catalog = load_catalog_fixture(isolated_config_root, "acme_store")
     backend = InMemorySaver()
     services = tuple(
         build_fixture_tenant_services(
@@ -612,7 +619,7 @@ async def test_two_tenants_isolate_identical_logical_ids_on_one_checkpoint_backe
                 session_state_factory=same_logical_state,
             )
         )
-    product = orders.products[0]
+    product = catalog.products[0]
     line = CartLine(
         sku=product.sku,
         name=product.name,
@@ -911,7 +918,7 @@ async def test_application_redelivery_commits_one_placement_and_one_receipt(
         routing_factory=lambda _registry: recognizer,
         session_state_factory=fixed_state,
     )
-    product = load_orders_fixture(config_root, tenant.tenant_id).products[0]
+    product = load_catalog_fixture(config_root, tenant.tenant_id).products[0]
     application.state.cart_store.add_item(
         sku=product.sku,
         name=product.name,
@@ -994,7 +1001,7 @@ async def test_application_reconciles_receipt_after_external_effect_cancellation
         deployment_id=_TEST_DEPLOYMENT_ID,
         routing_factory=lambda _registry: recognizer,
     )
-    product = fixture.products[0]
+    product = load_catalog_fixture(config_root, tenant.tenant_id).products[0]
     application.state.cart_store.add_item(
         sku=product.sku,
         name=product.name,
@@ -1106,7 +1113,7 @@ async def test_in_memory_application_rejects_checkpoint_reconstruction(
         routing_factory=_routing_factory,
         session_state_factory=fixed_identity_state,
     )
-    product = load_orders_fixture(config_root, tenant.tenant_id).products[0]
+    product = load_catalog_fixture(config_root, tenant.tenant_id).products[0]
     first.state.cart_store.add_item(
         sku=product.sku,
         name=product.name,
@@ -1335,6 +1342,7 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
 @pytest.mark.asyncio
 async def test_application_response_model_timeout_is_bounded_and_effect_free(
     config_root: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
@@ -1358,7 +1366,8 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
     )
 
     try:
-        events = await engine_events(application.engine, "tell me about the rain jacket")
+        with caplog.at_level("WARNING", logger="agnostic_market.agents.recovery"):
+            events = await engine_events(application.engine, "tell me about the rain jacket")
         state = ReasoningState.model_validate(
             application.engine._graph.get_state(application.engine._config).values
         )
@@ -1372,6 +1381,17 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
         assert _fixture_order_store(services).placed_count == 0
         assert state.active_invocation is None
         assert not state.automation_terminal
+        failures = [
+            record
+            for record in caplog.records
+            if getattr(record, "log_event", None) == "model_node_failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0].node_name == "catalog_response"
+        assert failures[0].failure_category == "deadline_exceeded"
+        assert failures[0].exception_type == "TimeoutError"
+        assert failures[0].timeout_ms == pytest.approx(50.0)
+        assert failures[0].elapsed_ms >= 50.0
     finally:
         await application.state.caller_context.aclose_session()
 
@@ -1482,13 +1502,14 @@ async def test_application_rejects_every_cross_tenant_service(config_root: Path)
         tenant,
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
+    catalog = load_catalog_fixture(config_root, tenant.tenant_id)
     orders = load_orders_fixture(config_root, tenant.tenant_id)
     customers = load_customers_fixture(config_root, tenant.tenant_id)
     instruments = load_payment_instruments_fixture(config_root, tenant.tenant_id)
     profiles = load_profile_fixture(config_root, tenant.tenant_id)
     verification = load_verification_fixture(config_root, tenant.tenant_id)
     mismatches = {
-        "catalog": FixtureCatalog("other_store", orders),
+        "catalog": FixtureCatalog("other_store", catalog),
         "order_store": OrderStore("other_store", orders.orders),
         "customers": CustomerDirectory("other_store", customers),
         "payment_instruments": PaymentInstrumentDirectory("other_store", instruments),

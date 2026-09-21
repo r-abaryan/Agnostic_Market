@@ -8,6 +8,7 @@ from agnostic_market.commerce.catalog import (
     CatalogProduct,
     CatalogProductSet,
     FixtureCatalog,
+    load_catalog_fixture,
 )
 from agnostic_market.commerce.identity import (
     BoundIdentity,
@@ -61,6 +62,7 @@ __all__ = [
     "PlacedOrder",
     "assert_orders_have_customers",
     "assert_payment_instruments_have_customers",
+    "load_catalog_fixture",
     "load_customers_fixture",
     "load_orders_fixture",
     "load_payment_instruments_fixture",

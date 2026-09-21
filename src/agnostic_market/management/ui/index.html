@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Agnostic Market | Merchant Workbench</title>
+    <link rel="icon" href="/admin/assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/admin/assets/styles.css">
+    <script type="module" src="/admin/assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to workspace</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Merchant workspace controls">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">AM</span>
+          <div>
+            <p class="eyebrow">Agnostic Market</p>
+            <p class="brand-title">Merchant workbench</p>
+          </div>
+        </div>
+
+        <section class="workspace-picker" aria-labelledby="workspace-heading">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">Workspace</p>
+              <h1 id="workspace-heading">Configuration</h1>
+            </div>
+            <button id="refresh-merchants" class="text-button" type="button">Refresh</button>
+          </div>
+
+          <label for="merchant-select">Merchant</label>
+          <select id="merchant-select">
+            <option value="">Loading merchants...</option>
+          </select>
+
+          <label for="draft-id">Draft ID</label>
+          <input id="draft-id" value="working" autocomplete="off" spellcheck="false">
+
+          <div class="button-row">
+            <button id="load-draft" class="button secondary" type="button">Load draft</button>
+            <button id="seed-draft" class="button primary" type="button">Create draft</button>
+          </div>
+        </section>
+
+        <nav class="section-nav" aria-label="Workbench sections">
+          <a href="#overview">Overview</a>
+          <a href="#configuration">Configuration</a>
+          <a href="#catalog">Catalog</a>
+          <a href="#quality">Validate &amp; publish</a>
+          <a href="#simulation">Simulator</a>
+          <a href="#history">Versions &amp; audit</a>
+        </nav>
+
+        <div class="environment-note">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div>
+            <strong>Local development</strong>
+            <span>Loopback-only management boundary</span>
+          </div>
+        </div>
+      </aside>
+
+      <main id="main-content" class="main-content" tabindex="-1">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Selected merchant</p>
+            <h2 id="merchant-identity">No merchant selected</h2>
+          </div>
+          <div class="topbar-status">
+            <span id="draft-status" class="pill neutral">No draft loaded</span>
+            <span id="publication-status" class="pill neutral">No publication</span>
+          </div>
+        </header>
+
+        <div id="conflict-banner" class="conflict-banner" hidden role="alert">
+          <div>
+            <strong>The stored draft changed.</strong>
+            <span>Your local edits are preserved. Reload before trying to save again.</span>
+          </div>
+          <button id="reload-conflict" class="button warning" type="button">Reload stored draft</button>
+        </div>
+
+        <div id="global-status" class="sr-only" aria-live="polite"></div>
+        <div id="global-error" class="error-banner" role="alert" hidden></div>
+
+        <section id="overview" class="hero-card" aria-labelledby="overview-heading">
+          <div>
+            <p class="eyebrow">Development control plane</p>
+            <h2 id="overview-heading">Configure, verify, then publish.</h2>
+            <p class="hero-copy">Draft changes remain isolated until validation and explicit publication. The browser talks only to the typed management API.</p>
+          </div>
+          <dl class="metrics-grid">
+            <div><dt>Draft revision</dt><dd id="metric-revision">-</dd></div>
+            <div><dt>Catalog products</dt><dd id="metric-products">-</dd></div>
+            <div><dt>Published versions</dt><dd id="metric-versions">-</dd></div>
+          </dl>
+        </section>
+
+        <section id="empty-state" class="empty-state" aria-labelledby="empty-heading">
+          <p class="eyebrow">Ready when you are</p>
+          <h2 id="empty-heading">Choose a merchant and load a draft.</h2>
+          <p>If this merchant has no managed state yet, create a draft from its validated development configuration.</p>
+        </section>
+
+        <div id="workspace" hidden>
+          <section id="configuration" class="panel" aria-labelledby="configuration-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Draft source</p>
+                <h2 id="configuration-heading">Merchant configuration</h2>
+                <p>Edit the merchant override only. Base policy resolution and validation remain server-owned.</p>
+              </div>
+              <button id="save-configuration" class="button primary" type="button">Save next revision</button>
+            </div>
+            <label for="merchant-override">Merchant override JSON</label>
+            <textarea id="merchant-override" class="code-editor" rows="18" spellcheck="false" aria-describedby="configuration-help"></textarea>
+            <p id="configuration-help" class="field-help">Unknown fields fail closed. Saving creates exactly one optimistic-concurrency revision.</p>
+          </section>
+
+          <section id="catalog" class="panel" aria-labelledby="catalog-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Draft fixture</p>
+                <h2 id="catalog-heading">Product catalog</h2>
+                <p>Import a complete catalog document. Other fixture families are preserved atomically.</p>
+              </div>
+              <button id="save-catalog" class="button primary" type="button">Import catalog</button>
+            </div>
+            <label for="catalog-json">Catalog JSON</label>
+            <textarea id="catalog-json" class="code-editor" rows="14" spellcheck="false"></textarea>
+            <div class="table-wrap" tabindex="0" aria-label="Catalog preview">
+              <table>
+                <thead><tr><th scope="col">SKU</th><th scope="col">Product</th><th scope="col">USD</th></tr></thead>
+                <tbody id="catalog-table"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="quality" class="panel" aria-labelledby="quality-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Release discipline</p>
+                <h2 id="quality-heading">Validate and publish</h2>
+                <p>Validation is recorded. Publication is bound to the exact preview fingerprint shown here.</p>
+              </div>
+              <div class="button-row">
+                <button id="validate-draft" class="button secondary" type="button">Validate</button>
+                <button id="preview-draft" class="button secondary" type="button">Resolve preview</button>
+                <button id="publish-draft" class="button primary" type="button" disabled>Publish preview</button>
+              </div>
+            </div>
+            <div class="quality-grid">
+              <article class="subpanel">
+                <h3>Validation findings</h3>
+                <div id="validation-result" class="result-empty">Not validated yet.</div>
+              </article>
+              <article class="subpanel">
+                <h3>Resolved preview</h3>
+                <dl class="fingerprints">
+                  <div><dt>Preview</dt><dd id="preview-fingerprint">-</dd></div>
+                  <div><dt>Configuration</dt><dd id="config-fingerprint">-</dd></div>
+                  <div><dt>Fixtures</dt><dd id="fixture-fingerprint">-</dd></div>
+                </dl>
+              </article>
+            </div>
+          </section>
+
+          <section id="simulation" class="panel" aria-labelledby="simulation-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Published engine</p>
+                <h2 id="simulation-heading">Conversation simulator</h2>
+                <p>Run an isolated text session pinned to one immutable publication. Reset rebuilds the same publication and never edits the draft.</p>
+              </div>
+              <span id="simulation-status" class="pill neutral">Stopped</span>
+            </div>
+            <div class="simulation-controls">
+              <div>
+                <label for="simulation-id">Simulation ID</label>
+                <input id="simulation-id" value="workbench" autocomplete="off" spellcheck="false">
+              </div>
+              <div>
+                <label for="simulation-version">Published version</label>
+                <select id="simulation-version"></select>
+              </div>
+              <div class="button-row simulation-actions">
+                <button id="start-simulation" class="button primary" type="button">Start</button>
+                <button id="reset-simulation" class="button secondary" type="button" disabled>Reset</button>
+                <button id="close-simulation" class="button secondary" type="button" disabled>Close</button>
+              </div>
+            </div>
+            <div class="simulation-grid">
+              <article class="subpanel simulation-conversation">
+                <h3>Conversation</h3>
+                <ol id="simulation-transcript" class="transcript" aria-live="polite">
+                  <li class="result-empty">Start a simulation to send a turn.</li>
+                </ol>
+                <div class="turn-composer">
+                  <label for="simulation-turn">Caller turn</label>
+                  <textarea id="simulation-turn" rows="3" maxlength="20000" disabled></textarea>
+                  <label class="checkbox-row" for="readback-interrupted">
+                    <input id="readback-interrupted" type="checkbox" disabled>
+                    Confirmation readback was interrupted
+                  </label>
+                  <button id="send-simulation-turn" class="button primary" type="button" disabled>Send turn</button>
+                </div>
+              </article>
+              <article class="subpanel">
+                <h3>Bounded runtime evidence</h3>
+                <dl class="simulation-evidence">
+                  <div><dt>Publication</dt><dd id="simulation-publication">-</dd></div>
+                  <div><dt>Turns</dt><dd id="simulation-turn-count">0</dd></div>
+                  <div><dt>Session revision</dt><dd id="simulation-revision">0</dd></div>
+                  <div><dt>Cart total</dt><dd id="simulation-cart-total">$0.00</dd></div>
+                  <div><dt>Receipt counts</dt><dd id="simulation-receipts">cart 0, orders 0, profiles 0</dd></div>
+                  <div><dt>Last turn latency</dt><dd id="simulation-latency">-</dd></div>
+                </dl>
+                <div>
+                  <h3>Cart projection</h3>
+                  <ul id="simulation-cart" class="compact-list">
+                    <li class="result-empty">Cart is empty.</li>
+                  </ul>
+                </div>
+                <div>
+                  <h3>Last turn diagnostics</h3>
+                  <ul id="simulation-diagnostics" class="compact-list">
+                    <li class="result-empty">No turn diagnostics yet.</li>
+                  </ul>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section id="history" class="panel" aria-labelledby="history-heading">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Immutable record</p>
+                <h2 id="history-heading">Versions and audit history</h2>
+                <p>Compare value-free paths, inspect publication history, or roll back through a new immutable version.</p>
+              </div>
+              <button id="refresh-history" class="button secondary" type="button">Refresh history</button>
+            </div>
+            <div class="history-grid">
+              <article class="subpanel">
+                <h3>Published versions</h3>
+                <div id="version-list" class="result-empty">No published versions.</div>
+                <div class="compare-controls">
+                  <label for="base-version">Base</label>
+                  <select id="base-version"></select>
+                  <label for="target-version">Target</label>
+                  <select id="target-version"></select>
+                  <button id="compare-versions" class="button secondary" type="button">Compare</button>
+                </div>
+                <div id="version-diff" class="result-empty">Choose two versions to compare.</div>
+              </article>
+              <article class="subpanel">
+                <h3>Audit events</h3>
+                <ol id="audit-list" class="timeline"></ol>
+              </article>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <dialog id="confirmation-dialog" aria-labelledby="confirmation-title">
+      <form method="dialog">
+        <p class="eyebrow">Confirm operation</p>
+        <h2 id="confirmation-title">Continue?</h2>
+        <p id="confirmation-copy"></p>
+        <div class="button-row end">
+          <button value="cancel" class="button secondary">Cancel</button>
+          <button value="confirm" class="button danger">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

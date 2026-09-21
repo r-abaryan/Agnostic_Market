@@ -72,7 +72,7 @@ from agnostic_market.checkpoints import (
     graph_contract_fingerprint,
 )
 from agnostic_market.commerce.cart import CartMutationRecord, CartStore
-from agnostic_market.commerce.catalog import FixtureCatalog
+from agnostic_market.commerce.catalog import FixtureCatalog, load_catalog_fixture
 from agnostic_market.commerce.identity import (
     BoundIdentity,
     CallerIdentityStore,
@@ -276,7 +276,7 @@ def _engine(
     turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
 ) -> tuple[ReasoningEngine, OrderStore]:
     fixture = load_orders_fixture(config_root, "acme_store")
-    catalog = FixtureCatalog("acme_store", fixture)
+    catalog = FixtureCatalog("acme_store", load_catalog_fixture(config_root, "acme_store"))
     store = OrderStore("acme_store", fixture.orders)
     policy = make_policy(refund_returnless_under_usd=50.0)
     recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
@@ -365,7 +365,7 @@ def _engine(
 
 
 def _cart_with_fixture_product(config_root: Path, *, quantity: int = 1) -> CartStore:
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     cart.add_item(
         sku=product.sku,
@@ -1117,7 +1117,7 @@ async def test_same_id_redelivery_resumes_one_checkpointed_dispatch_without_rout
 async def test_duplicate_typed_cart_dispatch_cannot_resume_mutation_confirmation(
     config_root: Path,
 ) -> None:
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     frontline = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(raise_transport=True)

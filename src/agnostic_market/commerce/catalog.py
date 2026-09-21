@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.money import UsdAmount
 from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
 
@@ -32,7 +34,7 @@ class CatalogProduct(BaseModel):
 
 
 class CatalogFixture(BaseModel):
-    """Validated product data shared by fixture-backed commerce adapters."""
+    """Validated product data for one fixture-backed merchant catalog."""
 
     model_config = _FROZEN
 
@@ -49,6 +51,15 @@ class CatalogFixture(BaseModel):
         if duplicates:
             raise ValueError(f"product SKUs must be unique: {sorted(duplicates)!r}")
         return self
+
+
+def load_catalog_fixture(config_root: Path, merchant_id: str) -> CatalogFixture:
+    """Load and validate one merchant's independent catalog fixture."""
+    path = config_root / "fixtures" / "catalog" / f"{merchant_id}.yaml"
+    try:
+        return CatalogFixture.model_validate(load_yaml_layer(path))
+    except ValidationError as exc:
+        raise ConfigError(f"catalog fixture {path} failed validation:\n{exc}") from exc
 
 
 class CatalogProductSet(BaseModel):

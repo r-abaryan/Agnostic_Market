@@ -13,6 +13,7 @@ declared in the locked base (data) and enforced here (code) — "platform code +
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import ValidationError
@@ -94,9 +95,17 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
     Loud at config-load (like SafetyLockViolationError), not a silent clamp: a merchant learns
     at onboarding that a value is out of bounds, never gets a quietly-lowered guard mid-call.
     """
-    limits = merged.get("_platform", {}).get("limits", {})
-    policies = merged.get("policies", {})
-    refunds = policies.get("refunds", {})
+
+    def section(container: Mapping[str, Any], key: str, *, path: str) -> Mapping[str, Any]:
+        value = container.get(key, {})
+        if not isinstance(value, Mapping):
+            raise ConfigResolutionError(f"resolved config section '{path}' must be a mapping")
+        return value
+
+    platform = section(merged, "_platform", path="_platform")
+    limits = section(platform, "limits", path="_platform.limits")
+    policies = section(merged, "policies", path="policies")
+    refunds = section(policies, "refunds", path="policies.refunds")
 
     require_human = refunds.get("require_human_above_usd")
     ceiling = limits.get("refund_require_human_ceiling_usd")
@@ -135,7 +144,8 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
             f"{ttl_max} - the confirmation window may be shortened, never made unbounded"
         )
 
-    window = policies.get("returns", {}).get("window_days")
+    returns = section(policies, "returns", path="policies.returns")
+    window = returns.get("window_days")
     window_max = limits.get("return_window_max_days")
     if window is not None and window_max is not None and window > window_max:
         raise PolicyBoundsViolationError(
@@ -146,7 +156,7 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
     # Security attempt-budget ceilings: each is a value where LARGER weakens security, so the
     # ceiling caps the weakening (same direction as the money ceilings above). One loop over
     # (config key, ceiling key) pairs — four near-identical checks would be copy-paste.
-    security = policies.get("security", {})
+    security = section(policies, "security", path="policies.security")
     for field, ceiling_key in (
         ("otp_max_attempts", "otp_max_attempts_ceiling"),
         ("contact_reask_max", "contact_reask_ceiling"),
@@ -161,8 +171,16 @@ def _assert_policy_within_bounds(merged: dict[str, Any]) -> None:
                 "a merchant may tighten an attempt budget, never widen it past the platform bound"
             )
 
-    clarification = policies.get("clarification_reask_max", {})
-    clarification_ceiling = limits.get("clarification_reask_ceiling", {})
+    clarification = section(
+        policies,
+        "clarification_reask_max",
+        path="policies.clarification_reask_max",
+    )
+    clarification_ceiling = section(
+        limits,
+        "clarification_reask_ceiling",
+        path="_platform.limits.clarification_reask_ceiling",
+    )
     for owner in ("identity", "support", "cart", "router"):
         value = clarification.get(owner)
         limit = clarification_ceiling.get(owner)
@@ -195,7 +213,10 @@ def resolve_merchant_config(
 
     merged = _deep_merge(_deep_merge(base, template), override)
     # Bounds check runs on the MERGED config while `_platform.limits` is still present.
-    _assert_policy_within_bounds(merged)
+    try:
+        _assert_policy_within_bounds(merged)
+    except TypeError as exc:
+        raise ConfigResolutionError("resolved config contains invalid policy value types") from exc
     # Platform-only sections (the lock declaration + the `_platform` safety block) are
     # directives, not MerchantConfig fields — drop them before validation. The DTO forbids
     # extras, so this also keeps them out of the effective merchant config.
