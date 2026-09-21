@@ -38,7 +38,7 @@ from agnostic_market.agents.telemetry import (
     TenantTelemetry,
 )
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.catalog import FixtureCatalog
+from agnostic_market.commerce.catalog import CatalogFixture, FixtureCatalog, load_catalog_fixture
 from agnostic_market.commerce.identity import (
     BoundIdentity,
     CallerIdentityStore,
@@ -47,7 +47,6 @@ from agnostic_market.commerce.identity import (
 )
 from agnostic_market.commerce.orders import (
     GuestOrderScope,
-    OrdersFixture,
     OrderStore,
     RecentOrderContext,
     load_orders_fixture,
@@ -138,7 +137,9 @@ def _granted(*order_ids: str) -> CallerIdentityStore:
 def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
     fixture = load_orders_fixture(config_root, "acme_store")
     store = kwargs.pop("store", None) or OrderStore("acme_store", fixture.orders)
-    catalog = kwargs.pop("catalog", None) or FixtureCatalog("acme_store", fixture)
+    catalog = kwargs.pop("catalog", None) or FixtureCatalog(
+        "acme_store", load_catalog_fixture(config_root, "acme_store")
+    )
     # Routing projection and graph owners share these session stores.
     cart = kwargs.pop("cart_store", None) or CartStore()
     policy = kwargs.pop("policy", None) or make_policy(refund_returnless_under_usd=50.0)
@@ -231,7 +232,7 @@ def _graph(config_root: Path, fake: FakeChatModel, **kwargs):
 def test_graph_rejects_cross_tenant_dependencies(config_root: Path, dependency: str) -> None:
     fixture = load_orders_fixture(config_root, "acme_store")
     dependencies = {
-        "catalog": FixtureCatalog("other_store", fixture),
+        "catalog": FixtureCatalog("other_store", load_catalog_fixture(config_root, "acme_store")),
         "store": OrderStore("other_store", fixture.orders),
         "guest_orders": GuestOrderScope(tenant_id="other_store", session_id="foreign"),
         "customers": CustomerDirectory(
@@ -655,7 +656,8 @@ async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_cal
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = load_orders_fixture(config_root, "acme_store")
-    catalog = FixtureCatalog("acme_store", fixture)
+    catalog_fixture = load_catalog_fixture(config_root, "acme_store")
+    catalog = FixtureCatalog("acme_store", catalog_fixture)
     store = OrderStore("acme_store", fixture.orders)
     cart = CartStore()
     reasoning = FakeChatModel(emit_tool_calls=False)
@@ -685,7 +687,7 @@ async def test_complete_typed_cart_add_resolves_live_catalog_without_a_model_cal
         reasoning_model=reasoning,
         telemetry=telemetry,
     )
-    product = fixture.products[0]
+    product = catalog_fixture.products[0]
     turn_id = "typed-cart-add"
 
     result = await graph.ainvoke(
@@ -725,7 +727,7 @@ async def test_resolved_typed_cart_add_revalidates_the_live_catalog_before_effec
     store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
     cart = CartStore()
     graph = _graph(config_root, FakeChatModel(), store=store, cart_store=cart)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-resolved"
 
     result = await graph.ainvoke(
@@ -824,7 +826,7 @@ async def test_typed_cart_remove_and_set_resolve_only_live_cart_lines(
     quantity: int | None,
 ) -> None:
     store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     cart.add_item(
         sku=product.sku,
@@ -898,16 +900,16 @@ async def test_typed_cart_no_match_resets_only_item_and_asks_in_code(config_root
 async def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     config_root: Path,
 ) -> None:
-    fixture = load_orders_fixture(config_root, "acme_store")
-    payload = fixture.model_dump()
+    orders_fixture = load_orders_fixture(config_root, "acme_store")
+    payload = load_catalog_fixture(config_root, "acme_store").model_dump()
     duplicate = {
         **payload["products"][0],
         "sku": "SKU-DUPLICATE",
         "price_usd": payload["products"][0]["price_usd"] + 10,
     }
     payload["products"] = (*payload["products"], duplicate)
-    custom_fixture = OrdersFixture.model_validate(payload)
-    store = OrderStore("acme_store", custom_fixture.orders)
+    custom_fixture = CatalogFixture.model_validate(payload)
+    store = OrderStore("acme_store", orders_fixture.orders)
     catalog = FixtureCatalog("acme_store", custom_fixture)
     reasoning = FakeChatModel(
         scripted_calls=[
@@ -1049,7 +1051,7 @@ async def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path)
         cart_store=cart,
         reasoning_model=reasoning,
     )
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
 
     update = await graph.nodes["cart_capability_entry"].ainvoke(
         ReasoningState(
@@ -1322,7 +1324,7 @@ async def test_typed_place_order_snapshot_failure_recovers_without_effect_or_mod
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     cart = CartStore()
     cart.add_item(
         sku=product.sku,
@@ -1387,7 +1389,7 @@ async def test_typed_cart_recovery_reconciles_without_replaying_mutation(
         session_state=session_state,
         checkpointer=InMemorySaver(),
     )
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     real_apply = session_state.apply_cart_mutation
     if fails_after_mutation:
 
@@ -1459,7 +1461,7 @@ async def test_typed_cart_recovery_fails_closed_on_a_malformed_receipt(
         session_state=session_state,
         checkpointer=InMemorySaver(),
     )
-    product = load_orders_fixture(config_root, "acme_store").products[0]
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
     turn_id = "typed-cart-malformed-receipt"
     config = {"configurable": {"thread_id": turn_id}}
     await graph.ainvoke(
@@ -1620,7 +1622,7 @@ async def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_c
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lookup_queries: list[str] = []
-    fixture = load_orders_fixture(config_root, "acme_store")
+    fixture = load_catalog_fixture(config_root, "acme_store")
     catalog = FixtureCatalog("acme_store", fixture)
     real_search = catalog.search
 

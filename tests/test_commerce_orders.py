@@ -9,11 +9,13 @@ from pathlib import Path
 from threading import Barrier, Lock
 
 import pytest
+from pydantic import ValidationError
 
 from agnostic_market.commerce import orders as orders_module
 from agnostic_market.commerce.orders import (
     CancelError,
     GuestOrderScope,
+    OrdersFixture,
     OrderStore,
     RecentOrderContext,
     RefundError,
@@ -23,6 +25,28 @@ from agnostic_market.commerce.orders import (
 from agnostic_market.dtos.state import CartLine
 
 _ORIGINAL_INSTRUMENT = "original payment method"
+
+
+def test_orders_fixture_rejects_embedded_catalog_products() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        OrdersFixture.model_validate({"orders": {}, "products": []})
+
+
+def test_orders_fixture_is_an_immutable_snapshot(config_root: Path) -> None:
+    fixture = load_orders_fixture(config_root, "acme_store")
+    order = fixture.orders["ORD-1001"]
+    copied = fixture.model_copy(deep=True)
+
+    assert copied == fixture
+    assert copied.orders is fixture.orders
+    with pytest.raises(ValidationError, match="frozen"):
+        fixture.orders = {}
+    with pytest.raises(TypeError, match="immutable"):
+        fixture.orders["ORD-NEW"] = order
+    with pytest.raises(TypeError, match="immutable"):
+        fixture.orders.clear()
+    with pytest.raises(ValidationError, match="frozen"):
+        order.summary = "Changed after validation"
 
 
 def _store(config_root: Path) -> OrderStore:

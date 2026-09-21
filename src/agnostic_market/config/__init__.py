@@ -18,6 +18,7 @@ from agnostic_market.config.registry import (
     ConfigRegistry,
     ResolvedConfig,
     UnknownMerchantError,
+    resolve_merchant_override,
 )
 from agnostic_market.config.resolver import (
     ConfigResolutionError,
@@ -36,4 +37,5 @@ __all__ = [
     "load_yaml_bytes",
     "load_yaml_layer",
     "resolve_merchant_config",
+    "resolve_merchant_override",
 ]

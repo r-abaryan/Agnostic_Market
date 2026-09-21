@@ -81,9 +81,10 @@ assets/audio/        the pipeline thinking beep and the latency harness utteranc
 
 ## Development setup
 
-Requirements: Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). Docker is needed only for
-the default CI PostgreSQL harness; native binaries and a remote DSN also work. Provider credentials
-are needed only for voice, live conformance, or credentialed evaluation.
+Requirements: Python 3.12 or newer and [uv](https://docs.astral.sh/uv/). Node 20 or newer is used
+only by the dependency-free browser-client tests; running the workbench does not require npm.
+Docker is needed only for the default CI PostgreSQL harness; native binaries and a remote DSN also
+work. Provider credentials are needed only for voice, live conformance, or credentialed evaluation.
 
 Install the locked environment:
 
@@ -103,6 +104,54 @@ The offline suite assembles a complete synthetic configuration from committed fi
 artifacts. Runtime voice sessions require the fixture families under `config/fixtures/` until
 durable service adapters replace them.
 
+Run the local merchant administration API with an explicit operator identity and local SQLite
+state path:
+
+```bash
+uv run --no-sync python scripts/management_api.py \
+  --database .local/merchant-management.sqlite3 \
+  --actor-id local-operator
+```
+
+The development adapter is fixed to `127.0.0.1:8000`. Open the merchant workbench at
+`http://127.0.0.1:8000/admin` or inspect the OpenAPI document at
+`http://127.0.0.1:8000/docs`. It has no network authentication boundary and must not be exposed
+beyond loopback. Tenant and actor authority are derived from URL scope and process configuration,
+not accepted from write request bodies.
+
+The SQLite repository is disposable development state, not a compatibility surface. Contract
+changes advance its repository schema and reject an older database at startup. Stop the local
+server, remove the explicitly supplied `--database` file, and restart to create the current schema;
+drafts and publications must then be recreated through the management API.
+
+The same loopback process exposes the development text-simulation API. A simulation starts from one
+active or explicitly selected immutable publication, remains pinned to that publication across
+turns and resets, and uses isolated in-memory session state. Provider credentials remain server-side
+and are resolved from the existing environment-backed provider configuration only when a turn uses
+them. Turn results and the dedicated `/state` resource expose a bounded workbench projection of the
+cart, totals, order-context counts, committed receipt counts, turn count, and session revision. They
+do not expose identity bindings, order references, receipt payloads, checkpoint values, prompts, or
+secrets. The workbench simulator controls start or resume a named isolated session, send caller
+turns, render only caller-facing events, reset to the same immutable publication, and close the
+session. This development path does not authorize production routing or telephony.
+
+Versioned synthetic scenario bundles live under `config/datasets/`. Each bundle contains one
+complete tenant fixture snapshot plus a strict manifest that binds its tenant, revision, source,
+entity counts, intended capabilities, scenario tags, and fixture fingerprint. The management API
+imports the complete bundle atomically through
+`/v1/merchants/{tenant_id}/drafts/{draft_id}/dataset`; a partial family update or a manifest whose
+counts, tenant, or fingerprint do not match is rejected. The committed fashion and grocery bundles
+intentionally reuse several SKU, order, and customer identifiers with different tenant-owned data.
+They also include processing, shipped, delivered, and cancelled history plus customers with
+intentionally missing dependent profile or payment data, so their tests prove scoping and
+fail-closed availability behavior rather than depending on globally unique or uniformly complete
+fixtures.
+
+Simulator state includes a portable, value-free `committed_receipts` projection supplied through
+the commerce ports. It reports cumulative committed cart, order, and profile receipt counts without
+returning idempotency keys, customer references, order references, or receipt payloads. This is
+development inspection evidence, not a business-ledger export or production activation signal.
+
 Run the disposable-container PostgreSQL checkpoint harness used by CI:
 
 ```bash
@@ -118,6 +167,20 @@ requires an explicit `VOICE_AGENT_MERCHANT_ID`. Network workers additionally req
 Production composition also requires the issued
 `config/qualification/semantic_routing_release.json`; a standalone mutable routing report is not
 activation authority. See `.env.example` for the complete set.
+
+For a metadata-free LiveKit Cloud development session, set `VOICE_AGENT_MERCHANT_ID` and run the
+isolated development worker:
+
+```bash
+uv run python scripts/voice_agent_development.py dev --no-reload --log-level debug
+```
+
+It registers as `<production-agent-name>-development`, accepts only the LiveKit `dev` command and a
+standard participant, refuses production dispatch metadata, and uses in-memory session state. It
+uses the configured semantic recognizer without claiming immutable routing qualification, and does
+not exercise or authorize the durable platform. Production and certification workers retain their
+strict dispatch metadata, routing-release package, immutable build identity, and deployment-evidence
+gates.
 
 ## License
 

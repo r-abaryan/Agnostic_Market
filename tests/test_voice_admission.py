@@ -19,6 +19,7 @@ from agnostic_market.durability.latency import VoiceApplicationContract
 from agnostic_market.tenancy.resolver import TenantResolutionError, TenantResolver
 from agnostic_market.voice.admission import (
     ConsoleVoiceTenantAdmission,
+    DevelopmentStandardVoiceJobAdmission,
     NetworkVoiceTenantAdmission,
     VoiceJobAdmission,
     VoiceTenantAdmission,
@@ -308,6 +309,39 @@ async def test_non_sip_admission_requires_strict_explicit_dispatch_metadata(
             development_merchant_id="acme_store",
         )
     assert missing.connect_count == 0
+
+
+async def test_development_network_admission_is_explicit_and_standard_only(
+    registry: ConfigRegistry,
+) -> None:
+    job = _JobContext(fake=False)
+    boundary = DevelopmentStandardVoiceJobAdmission(registry, merchant_id="acme_store")
+
+    admitted = await boundary.complete(
+        job,  # type: ignore[arg-type]
+        boundary.preflight(job),  # type: ignore[arg-type]
+        timeout_seconds=_ADMISSION_TIMEOUT_SECONDS,
+    )
+
+    assert isinstance(admitted, NetworkVoiceTenantAdmission)
+    assert admitted.tenant.tenant_id == "acme_store"
+    assert admitted.participant_identity == "caller-primary"
+    assert job.wait_identity is None
+    assert job.wait_kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+
+    with pytest.raises(TenantResolutionError, match="refuses jobs carrying production metadata"):
+        boundary.preflight(
+            _JobContext(
+                fake=False,
+                metadata=(
+                    '{"schema_version":1,"merchant_id":"acme_store",'
+                    '"participant_kind":"standard","participant_identity":"caller-primary"}'
+                ),
+            )  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TenantResolutionError, match="requires a LiveKit network job"):
+        boundary.preflight(_JobContext(fake=True))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -1183,10 +1217,107 @@ def test_network_worker_requires_an_absolute_platform_config_path(tmp_path: Path
     ) == (methodology_path, report_path)
 
 
+def test_development_worker_accepts_only_dev_and_uses_a_distinct_agent_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import voice_agent, voice_agent_development
+
+    target = Path("config/platform/voice_certification.example.yaml").resolve()
+    monkeypatch.setenv("VOICE_AGENT_CERTIFICATION_CONFIG", str(target))
+    monkeypatch.setenv("VOICE_AGENT_MERCHANT_ID", "acme_store")
+
+    with pytest.raises(RuntimeError, match="accepts only"):
+        voice_agent_development._worker_options(("start",))
+
+    options = voice_agent_development._worker_options(("dev",))
+    assert options.entrypoint_fnc is voice_agent.development_network_entrypoint
+    assert options.agent_name == "agnostic-market-development"
+
+
+async def test_development_network_worker_serves_metadata_free_job_without_durable_activation(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from scripts import voice_agent
+
+    events: list[str] = []
+    resources = _WorkerPlatformResources(events)
+    _patch_durable_worker_dependencies(
+        monkeypatch,
+        config_root,
+        tmp_path / "platform.yaml",
+        events,
+        resources,
+    )
+    monkeypatch.setenv("VOICE_AGENT_MERCHANT_ID", "demo_shop")
+
+    def forbidden_routing_qualification(*_args, **_kwargs):
+        raise AssertionError("development network worker loaded routing release evidence")
+
+    monkeypatch.setattr(
+        voice_agent,
+        "build_qualified_semantic_router_factory",
+        forbidden_routing_qualification,
+    )
+
+    async def forbidden_open(*_args, **_kwargs):
+        raise AssertionError("development network worker opened durable platform resources")
+
+    monkeypatch.setattr(
+        voice_agent.DurablePlatformResources,
+        "open",
+        staticmethod(forbidden_open),
+    )
+
+    def build_services(_root, tenant, *, telemetry, checkpointer):
+        assert tenant.tenant_id == "demo_shop"
+        assert telemetry.tenant_id == "demo_shop"
+        assert checkpointer is None
+        events.append("tenant_services_built")
+        return object()
+
+    monkeypatch.setattr(voice_agent, "build_fixture_tenant_services", build_services)
+
+    async def build_loop(*_args, **kwargs):
+        assert kwargs["durable_session"] is None
+        events.append("voice_loop_build_started")
+        return _WorkerLoop(events)
+
+    monkeypatch.setattr(voice_agent, "build_voice_loop", build_loop)
+
+    class OrderedJob(_JobContext):
+        async def connect(self) -> None:
+            events.append("room_connected")
+            await super().connect()
+
+    job = OrderedJob(fake=False)
+    with caplog.at_level("WARNING", logger="voice_agent"):
+        await voice_agent.development_network_entrypoint(job)  # type: ignore[arg-type]
+
+    assert events == [
+        "routing_prepared",
+        "room_connected",
+        "tenant_services_built",
+        "voice_loop_build_started",
+        "shutdown_registered",
+        "session_started",
+        "background_audio_started",
+    ]
+    assert job.connect_count == 1
+    assert len(job.shutdown_callbacks) == 1
+    assert {getattr(record, "event", None) for record in caplog.records} >= {
+        "development_network_non_authorizing",
+        "development_routing_non_authorizing",
+    }
+
+
 async def test_network_worker_requires_immutable_build_identity_before_connecting(
     config_root: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     events: list[str] = []
     resources = _WorkerPlatformResources(events)
@@ -1208,11 +1339,22 @@ async def test_network_worker_requires_immutable_build_identity_before_connectin
 
     from scripts import voice_agent
 
-    with pytest.raises(RuntimeError, match="VOICE_AGENT_BUILD_ARTIFACT_DIGEST"):
+    with (
+        caplog.at_level("ERROR", logger="voice_agent"),
+        pytest.raises(RuntimeError, match="VOICE_AGENT_BUILD_ARTIFACT_DIGEST"),
+    ):
         await voice_agent.entrypoint(job)  # type: ignore[arg-type]
 
     assert "platform_opened" not in events
     assert job.connect_count == 0
+    failures = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "voice_startup_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].startup_stage == "application_contract_validation"
+    assert failures[0].exception_type == "RuntimeError"
 
 
 async def test_network_worker_acquires_durable_authority_before_runtime_composition(

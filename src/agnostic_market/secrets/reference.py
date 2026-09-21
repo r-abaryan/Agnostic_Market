@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
@@ -29,6 +29,15 @@ class SecretReference(BaseModel):
 
     provider: SecretProvider
     locator: SecretLocator
+
+    @classmethod
+    def from_uri(cls, value: str) -> Self:
+        """Parse one provider reference without resolving its secret value."""
+
+        provider, separator, locator = value.partition("://")
+        if not separator:
+            raise ValueError("secret reference must use provider://locator syntax")
+        return cls(provider=provider, locator=locator)
 
     @property
     def uri(self) -> str:

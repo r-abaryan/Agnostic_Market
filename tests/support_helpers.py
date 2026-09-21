@@ -24,7 +24,7 @@ from agnostic_market.checkpoints import (
     graph_contract_fingerprint,
 )
 from agnostic_market.commerce.cart import CartStore
-from agnostic_market.commerce.catalog import FixtureCatalog
+from agnostic_market.commerce.catalog import FixtureCatalog, load_catalog_fixture
 from agnostic_market.commerce.identity import (
     BoundIdentity,
     CallerIdentityStore,
@@ -105,7 +105,7 @@ def build_support_engine(
     if risk is not None and risk_flagged:
         raise ValueError("provide either a risk port or risk_flagged, not both")
     fixture = orders_fixture or load_orders_fixture(config_root, "acme_store")
-    catalog = FixtureCatalog("acme_store", fixture)
+    catalog = FixtureCatalog("acme_store", load_catalog_fixture(config_root, "acme_store"))
     store = OrderStore("acme_store", fixture.orders)
     recent_orders = RecentOrderContext(max_refs=policy.cancel_batch_max)
     cart = CartStore()

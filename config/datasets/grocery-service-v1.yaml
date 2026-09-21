@@ -1,0 +1,119 @@
+schema_version: 1
+manifest:
+  schema_version: 1
+  dataset_id: grocery-service-v1
+  tenant_id: demo_shop
+  revision: 1
+  generated_at: 2026-09-20T10:00:00Z
+  source_kind: hand_authored_synthetic
+  source_ref: grocery-scenario-source-v1
+  entity_counts:
+    catalog_products: 4
+    orders: 5
+    customers: 3
+    payment_instruments: 2
+    profiles: 2
+    verification_factors: 3
+  fixture_fingerprint: "704584ff3c98bc735fbd3b1912c585faf34669c3fa4070a59d710b54a34d4662"
+  covered_capabilities:
+    - cancel_orders
+    - change_profile
+    - list_orders
+    - modify_cart
+    - place_order
+    - refund_order
+    - return_order
+    - search_catalog
+    - verify_identity
+    - verify_order_status
+    - view_cart
+  scenario_tags:
+    - account-support
+    - cancelled-history
+    - grocery-substitution
+    - missing-dependent-data
+    - mixed-fulfillment
+fixtures:
+  catalog:
+    products:
+      - sku: SKU-SHARED-01
+        name: family vegetable box
+        price_usd: 24.00
+      - sku: SKU-GROCERY-02
+        name: oat breakfast bundle
+        price_usd: 11.75
+      - sku: SKU-GROCERY-03
+        name: pantry essentials crate
+        price_usd: 38.40
+      - sku: SKU-GROCERY-04
+        name: frozen berry selection
+        price_usd: 9.25
+  orders:
+    orders:
+      ORD-SHARED-01:
+        status: processing
+        summary: 1 family vegetable box
+        eta: "2026-09-21"
+        customer_ref: CUST-SHARED-01
+        total_usd: 24.00
+      ORD-GROCERY-02:
+        status: shipped
+        summary: 1 pantry essentials crate
+        eta: "2026-09-21"
+        customer_ref: CUST-GROCERY-02
+        total_usd: 38.40
+      ORD-GROCERY-03:
+        status: delivered
+        summary: 2 oat breakfast bundles
+        eta: "2026-09-18"
+        customer_ref: CUST-SHARED-01
+        total_usd: 23.50
+        delivered_at: "2026-09-18T08:00:00Z"
+      ORD-GROCERY-04:
+        status: delivered
+        summary: 3 frozen berry selections
+        eta: "2026-08-10"
+        customer_ref: CUST-GROCERY-03
+        total_usd: 27.75
+        delivered_at: "2026-08-10T08:00:00Z"
+      ORD-GROCERY-05:
+        status: cancelled
+        summary: 1 frozen berry selection
+        eta: "2026-09-01"
+        customer_ref: CUST-GROCERY-03
+        total_usd: 9.25
+  customers:
+    customers:
+      CUST-SHARED-01:
+        contact: alex.grocery@example.invalid
+        masked_contact: email ending example dot invalid
+        factor_ref: FACTOR-SHARED-01
+      CUST-GROCERY-02:
+        contact: +44 7700 900202
+        masked_contact: number ending 0202
+        factor_ref: FACTOR-GROCERY-02
+      CUST-GROCERY-03:
+        contact: sam.grocery@example.invalid
+        masked_contact: email ending example dot invalid
+        factor_ref: FACTOR-GROCERY-03
+  payment_instruments:
+    payment_instruments:
+      CUST-SHARED-01:
+        masked_ref: card ending 4201
+      CUST-GROCERY-02:
+        masked_ref: card ending 4202
+  profiles:
+    profiles:
+      CUST-SHARED-01:
+        address_on_file: 10 Synthetic Grocery Road
+        contact_on_file: email ending example dot invalid
+      CUST-GROCERY-02:
+        address_on_file: 20 Synthetic Grocery Road
+        contact_on_file: number ending 0202
+  verification:
+    otp_codes_by_factor_ref:
+      FACTOR-SHARED-01: "520201"
+      FACTOR-GROCERY-02: "520202"
+      FACTOR-GROCERY-03: "520203"
+    challenge_ttl_seconds: 300
+    proof_ttl_seconds: 300
