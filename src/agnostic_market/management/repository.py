@@ -36,7 +36,7 @@ from agnostic_market.management.contracts import (
     merchant_publication_intent_fingerprint,
 )
 
-_REPOSITORY_SCHEMA_VERSION = 5
+_REPOSITORY_SCHEMA_VERSION = 6
 _REPOSITORY_SCHEMA_TABLE = "management_repository_schema"
 _REPOSITORY_SCHEMA_STATEMENTS = (
     """
@@ -201,13 +201,6 @@ def _load_model[ModelT: BaseModel](
 ) -> ModelT:
     try:
         return model_type.model_validate_json(payload)
-    except (TypeError, ValueError, ValidationError) as exc:
-        raise ManagementRepositoryDataError(f"stored {subject} is invalid") from exc
-
-
-def _load_published_version(payload: str, *, subject: str) -> PublishedMerchantVersion:
-    try:
-        return PublishedMerchantVersion.from_persisted_json(payload)
     except (TypeError, ValueError, ValidationError) as exc:
         raise ManagementRepositoryDataError(f"stored {subject} is invalid") from exc
 
@@ -428,6 +421,10 @@ class SqliteMerchantConfigurationRepository:
                     raise ManagementRepositoryDataError(
                         "stored merchant draft does not match its repository key"
                     )
+                if current.dataset_manifest is not None and draft.dataset_manifest is None:
+                    raise ManagementRepositoryConflictError(
+                        "dataset provenance cannot be removed from a merchant draft"
+                    )
                 if current == draft:
                     if expected_revision == draft.revision - 1:
                         return current
@@ -491,7 +488,9 @@ class SqliteMerchantConfigurationRepository:
             raise ManagementRepositoryError("published version read failed") from exc
         if row is None:
             return None
-        return _load_published_version(row["payload"], subject="published merchant version")
+        return _load_model(
+            row["payload"], PublishedMerchantVersion, subject="published merchant version"
+        )
 
     def list_versions(self, tenant_id: str) -> tuple[PublishedMerchantVersion, ...]:
         try:
@@ -511,7 +510,9 @@ class SqliteMerchantConfigurationRepository:
             raise ManagementRepositoryError("published version listing failed") from exc
         versions: list[PublishedMerchantVersion] = []
         for row in rows:
-            version = _load_published_version(row["payload"], subject="published merchant version")
+            version = _load_model(
+                row["payload"], PublishedMerchantVersion, subject="published merchant version"
+            )
             if (
                 version.tenant_id != tenant_id
                 or version.version_id != row["version_id"]
@@ -544,7 +545,9 @@ class SqliteMerchantConfigurationRepository:
             raise ManagementRepositoryError("active merchant version read failed") from exc
         if row is None:
             return None
-        return _load_published_version(row["payload"], subject="active merchant version")
+        return _load_model(
+            row["payload"], PublishedMerchantVersion, subject="active merchant version"
+        )
 
     def list_audit_records(self, tenant_id: str) -> tuple[MerchantAuditRecord, ...]:
         try:
@@ -923,6 +926,10 @@ class SqliteMerchantConfigurationRepository:
                     raise ManagementRepositoryConflictError(
                         "publication preview fixtures do not match the source draft"
                     )
+                if source_draft.dataset_manifest != request.preview.dataset_manifest:
+                    raise ManagementRepositoryConflictError(
+                        "publication preview dataset manifest does not match the source draft"
+                    )
                 try:
                     resolved_source = resolve_merchant_override(
                         self._active_config_root,
@@ -962,9 +969,11 @@ class SqliteMerchantConfigurationRepository:
                     published_by=request.actor_id,
                     config=request.preview.config,
                     fixtures=request.preview.fixtures,
+                    dataset_manifest=request.preview.dataset_manifest,
                     config_fingerprint=request.preview.config_fingerprint,
                     fixture_fingerprint=request.preview.fixture_fingerprint,
                     schema_fingerprint=request.preview.schema_fingerprint,
+                    dataset_fingerprint=request.preview.dataset_fingerprint,
                 )
                 self._store_version(connection, version)
                 self._write_active_pointer(connection, version)
@@ -1090,13 +1099,20 @@ class SqliteMerchantConfigurationRepository:
                     raise ManagementRepositoryNotFoundError(
                         "rollback source version does not exist"
                     )
-                source = _load_published_version(
-                    source_row["payload"], subject="rollback source version"
+                latest = self._latest_version_pointer(connection, request.tenant_id)
+                if latest is None:
+                    raise ManagementRepositoryDataError(
+                        "active merchant version has no stored version history"
+                    )
+                source = _load_model(
+                    source_row["payload"],
+                    PublishedMerchantVersion,
+                    subject="rollback source version",
                 )
                 version = PublishedMerchantVersion(
                     tenant_id=request.tenant_id,
                     version_id=self._version_id_factory(),
-                    version_number=active["version_number"] + 1,
+                    version_number=latest["version_number"] + 1,
                     previous_version_id=active["version_id"],
                     source_draft_id=source.source_draft_id,
                     source_draft_revision=source.source_draft_revision,
@@ -1104,11 +1120,19 @@ class SqliteMerchantConfigurationRepository:
                     published_by=request.actor_id,
                     config=source.config,
                     fixtures=source.fixtures,
+                    dataset_manifest=source.dataset_manifest,
                     config_fingerprint=config_version(source.config.model_dump(mode="json")),
                     fixture_fingerprint=management_contracts.merchant_fixture_bundle_fingerprint(
                         source.fixtures
                     ),
                     schema_fingerprint=management_contracts.management_contract_schema_fingerprint(),
+                    dataset_fingerprint=(
+                        management_contracts.merchant_dataset_manifest_fingerprint(
+                            source.dataset_manifest
+                        )
+                        if source.dataset_manifest is not None
+                        else None
+                    ),
                 )
                 self._store_version(connection, version)
                 self._write_active_pointer(connection, version)

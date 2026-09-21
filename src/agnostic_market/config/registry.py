@@ -17,6 +17,7 @@ Expected config tree (BUILD_PLAN repo layout):
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,7 @@ class ConfigRegistry:
     def __init__(self, root: Path) -> None:
         self._root = root
         self._by_id: dict[str, ResolvedConfig] = {}
+        self._source_overrides: dict[str, dict[str, Any]] = {}
 
     @property
     def merchant_ids(self) -> frozenset[str]:
@@ -97,6 +99,7 @@ class ConfigRegistry:
             raise ConfigError(f"merchants directory not found: {merchants_dir}")
 
         resolved: dict[str, ResolvedConfig] = {}
+        source_overrides: dict[str, dict[str, Any]] = {}
         for override_path in sorted(merchants_dir.glob("*.yaml")):
             override = load_yaml_layer(override_path)
             merchant = _resolve_merchant_override(
@@ -110,13 +113,23 @@ class ConfigRegistry:
                     f"duplicate merchant_id '{merchant.config.merchant_id}' in {override_path}"
                 )
             resolved[merchant.config.merchant_id] = merchant
+            source_overrides[merchant.config.merchant_id] = override
 
         self._by_id = resolved
+        self._source_overrides = source_overrides
         return self
 
     def get(self, merchant_id: str) -> ResolvedConfig:
         try:
             return self._by_id[merchant_id]
+        except KeyError as exc:
+            raise UnknownMerchantError(f"no config for merchant_id '{merchant_id}'") from exc
+
+    def source_override(self, merchant_id: str) -> dict[str, Any]:
+        """Return a detached copy of the source layer resolved for one merchant."""
+
+        try:
+            return deepcopy(self._source_overrides[merchant_id])
         except KeyError as exc:
             raise UnknownMerchantError(f"no config for merchant_id '{merchant_id}'") from exc
 

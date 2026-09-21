@@ -34,6 +34,7 @@ from agnostic_market.management.contracts import (
     merchant_fixture_bundle_fingerprint,
     merchant_preview_fingerprint,
 )
+from agnostic_market.management.datasets import load_merchant_scenario_dataset
 from agnostic_market.management.repository import (
     ManagementRepositoryConflictError,
     ManagementRepositoryDataError,
@@ -204,6 +205,32 @@ def test_draft_write_is_compare_and_swap_and_exact_retry_is_idempotent(
         )
 
 
+def test_repository_rejects_removing_dataset_provenance_inside_the_transaction(
+    tmp_path: Path, config_root: Path
+) -> None:
+    repository = _repository(tmp_path, config_root)
+    dataset = load_merchant_scenario_dataset(config_root / "datasets" / "fashion-service-v1.yaml")
+    first = _draft(config_root).model_copy(
+        update={
+            "fixtures": dataset.fixtures,
+            "dataset_manifest": dataset.manifest,
+        }
+    )
+    repository.save_draft(first, expected_revision=0)
+    without_provenance = first.model_copy(
+        update={
+            "revision": 2,
+            "request_id": "draft-request-2",
+            "dataset_manifest": None,
+        }
+    )
+
+    with pytest.raises(ManagementRepositoryConflictError, match="provenance cannot be removed"):
+        repository.save_draft(without_provenance, expected_revision=1)
+
+    assert repository.get_draft("acme_store", "draft-1") == first
+
+
 def test_concurrent_draft_writers_cannot_silently_overwrite_each_other(
     tmp_path: Path, config_root: Path
 ) -> None:
@@ -258,7 +285,7 @@ def test_publication_atomically_creates_an_immutable_version_and_active_pointer(
     assert repository.get_version("acme_store", "version-1") == active
 
 
-def test_historical_version_read_does_not_require_the_current_schema_fingerprint(
+def test_published_version_read_requires_the_current_schema_fingerprint(
     tmp_path: Path,
     config_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -275,32 +302,11 @@ def test_historical_version_read_does_not_require_the_current_schema_fingerprint
         lambda: "0" * 64,
     )
 
-    restored = repository.get_active_version("acme_store")
-    assert restored is not None
-    assert restored == published
-    assert (
-        restored.schema_fingerprint != management_contracts.management_contract_schema_fingerprint()
-    )
-
-    rollback = repository.rollback(
-        MerchantRollbackRequest(
-            tenant_id="acme_store",
-            expected_active_version_id=receipt.version_id,
-            source_version_id=receipt.version_id,
-            actor_id="operator-2",
-            request_id="rollback-after-schema-change",
-        )
-    )
-    current = repository.get_active_version("acme_store")
-    assert current is not None
-    assert current.version_id == rollback.version_id
-    assert (
-        current.schema_fingerprint == management_contracts.management_contract_schema_fingerprint()
-    )
-    assert current.schema_fingerprint != published.schema_fingerprint
+    with pytest.raises(ManagementRepositoryDataError, match="stored active merchant version"):
+        repository.get_active_version("acme_store")
 
 
-def test_historical_version_read_still_rejects_raw_payload_tampering(
+def test_published_version_read_rejects_raw_payload_tampering(
     tmp_path: Path,
     config_root: Path,
 ) -> None:
@@ -561,6 +567,56 @@ def test_rollback_publishes_a_new_version_without_mutating_history(
     assert replayed == rollback.model_copy(update={"replayed": True})
 
 
+def test_rollback_keeps_version_numbers_monotonic_if_active_pointer_lags_history(
+    tmp_path: Path, config_root: Path
+) -> None:
+    repository = _repository(tmp_path, config_root)
+    repository.save_draft(_draft(config_root), expected_revision=0)
+    first = repository.publish(_publication(config_root))
+    repository.save_draft(
+        _draft(
+            config_root,
+            revision=2,
+            request_id="draft-request-2",
+            marker="second",
+        ),
+        expected_revision=1,
+    )
+    repository.publish(
+        _publication(
+            config_root,
+            request_id="publish-request-2",
+            expected_active_version_id=first.version_id,
+            draft_revision=2,
+        )
+    )
+    with repository._connect() as connection:
+        connection.execute(
+            """
+            UPDATE management_active_versions
+            SET version_id = ?, version_number = ?
+            WHERE tenant_id = ?
+            """,
+            (first.version_id, first.version_number, "acme_store"),
+        )
+
+    rollback = repository.rollback(
+        MerchantRollbackRequest(
+            tenant_id="acme_store",
+            expected_active_version_id=first.version_id,
+            source_version_id=first.version_id,
+            actor_id="operator-2",
+            request_id="rollback-after-pointer-repair",
+        )
+    )
+
+    assert rollback.version_number == 3
+    active = repository.get_active_version("acme_store")
+    assert active is not None
+    assert active.version_number == 3
+    assert active.previous_version_id == first.version_id
+
+
 def test_retirement_removes_only_the_active_pointer_and_republication_stays_monotonic(
     tmp_path: Path, config_root: Path
 ) -> None:
@@ -624,7 +680,7 @@ def test_retire_and_rollback_without_an_active_version_report_not_found(
         )
 
 
-def test_unsupported_repository_schema_is_rejected_without_mutation(
+def test_previous_repository_schema_is_rejected_without_mutation(
     tmp_path: Path,
     config_root: Path,
 ) -> None:
@@ -639,7 +695,7 @@ def test_unsupported_repository_schema_is_rejected_without_mutation(
             """
         )
         connection.execute(
-            "INSERT INTO management_repository_schema (singleton, schema_version) VALUES (1, 3)"
+            "INSERT INTO management_repository_schema (singleton, schema_version) VALUES (1, 5)"
         )
     with sqlite3.connect(database_path) as connection:
         before = connection.execute(

@@ -209,3 +209,33 @@ class VoiceJobAdmission:
                 )
 
         return participant.identity
+
+
+class DevelopmentStandardVoiceJobAdmission(VoiceJobAdmission):
+    """Admit one explicit tenant from the metadata-free LiveKit development console."""
+
+    def __init__(self, registry: ConfigRegistry, *, merchant_id: str) -> None:
+        super().__init__(registry, development_merchant_id=None)
+        canonical_merchant_id = merchant_id.strip()
+        if not canonical_merchant_id:
+            raise TenantResolutionError(
+                "development network admission requires VOICE_AGENT_MERCHANT_ID"
+            )
+        self._admitted_merchant_id = self._resolver.resolve_by_id(canonical_merchant_id)
+
+    def preflight(self, job_context: JobContext) -> VoiceAdmissionPreflight:
+        if job_context.is_fake_job():
+            raise TenantResolutionError(
+                "development network admission requires a LiveKit network job"
+            )
+        if job_context.job.metadata.strip():
+            raise TenantResolutionError(
+                "development network admission refuses jobs carrying production metadata"
+            )
+        return NetworkVoiceAdmissionPreflight(
+            tenant=build_tenant_context(self._registry, self._admitted_merchant_id),
+            resolved=self._registry.get(self._admitted_merchant_id),
+            participant_kind="standard",
+            participant_identity=None,
+            session_authority=_session_authority(job_context),
+        )

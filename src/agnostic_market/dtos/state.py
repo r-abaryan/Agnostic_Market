@@ -11,11 +11,18 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from langchain_core.messages import AnyMessage, HumanMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 from agnostic_market.dtos.money import UsdAmount
@@ -588,7 +595,7 @@ class ReasoningState(BaseModel):
 
 
 def validate_reasoning_state_keys(
-    values: Mapping[object, object],
+    values: Mapping[Any, object],
     *,
     allowed_keys: Collection[str] | None = None,
     source: str = "reasoning-state update",

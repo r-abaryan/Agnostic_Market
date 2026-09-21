@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Mapping
 from datetime import datetime
+from functools import cache
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationInfo, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 from agnostic_market.commerce.catalog import CatalogFixture
 from agnostic_market.commerce.fixture_integrity import assert_fixture_bundle_integrity
@@ -18,11 +24,11 @@ from agnostic_market.commerce.profile import ProfileFixture
 from agnostic_market.commerce.verification import VerificationFixture
 from agnostic_market.config.loader import ConfigError, config_version
 from agnostic_market.dtos.config import MerchantConfig
+from agnostic_market.dtos.orchestration import CapabilityId
 from agnostic_market.dtos.session import AuthorityIdentifier
 
 _CONTRACT = ConfigDict(extra="forbid", frozen=True, strict=True)
 _SHA256 = r"^[0-9a-f]{64}$"
-_PERSISTED_VERSION_CONTEXT = "persisted_merchant_version"
 
 ManagementFindingCode = Literal[
     "configuration_invalid",
@@ -79,12 +85,122 @@ def merchant_fixture_bundle_fingerprint(bundle: MerchantFixtureBundle) -> str:
     return config_version(bundle.model_dump(mode="json"))
 
 
+class MerchantDatasetEntityCounts(BaseModel):
+    """Value-free inventory used to audit a synthetic scenario dataset."""
+
+    model_config = _CONTRACT
+
+    catalog_products: int = Field(ge=0)
+    orders: int = Field(ge=0)
+    customers: int = Field(ge=0)
+    payment_instruments: int = Field(ge=0)
+    profiles: int = Field(ge=0)
+    verification_factors: int = Field(ge=0)
+
+
+def merchant_dataset_entity_counts(bundle: MerchantFixtureBundle) -> MerchantDatasetEntityCounts:
+    return MerchantDatasetEntityCounts(
+        catalog_products=len(bundle.catalog.products),
+        orders=len(bundle.orders.orders),
+        customers=len(bundle.customers.customers),
+        payment_instruments=len(bundle.payment_instruments.payment_instruments),
+        profiles=len(bundle.profiles.profiles),
+        verification_factors=len(bundle.verification.otp_codes_by_factor_ref),
+    )
+
+
+class MerchantDatasetManifest(BaseModel):
+    """Versioned provenance and intended coverage for one synthetic fixture bundle."""
+
+    model_config = _CONTRACT
+
+    schema_version: Literal[1] = 1
+    dataset_id: AuthorityIdentifier
+    tenant_id: AuthorityIdentifier
+    revision: int = Field(ge=1)
+    generated_at: datetime
+    source_kind: Literal[
+        "hand_authored_synthetic",
+        "generated_synthetic",
+        "management_derived",
+    ]
+    source_ref: AuthorityIdentifier
+    entity_counts: MerchantDatasetEntityCounts
+    fixture_fingerprint: str = Field(pattern=_SHA256)
+    covered_capabilities: tuple[AuthorityIdentifier, ...] = Field(max_length=32)
+    scenario_tags: tuple[AuthorityIdentifier, ...] = Field(min_length=1, max_length=32)
+
+    @field_validator("generated_at", mode="before")
+    @classmethod
+    def parse_json_timestamp(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+
+    @field_validator("covered_capabilities", "scenario_tags", mode="before")
+    @classmethod
+    def yaml_sequences_are_canonical_tuples(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("covered_capabilities")
+    @classmethod
+    def capabilities_are_current(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        supported = {capability.value for capability in CapabilityId}
+        unknown = sorted(set(value) - supported)
+        if unknown:
+            raise ValueError("dataset manifest contains unknown capability identifiers")
+        return value
+
+    @model_validator(mode="after")
+    def metadata_is_canonical(self) -> Self:
+        _require_aware(self.generated_at, field_name="generated_at")
+        for label, values in (
+            ("covered capabilities", self.covered_capabilities),
+            ("scenario tags", self.scenario_tags),
+        ):
+            if values != tuple(sorted(values)) or len(values) != len(set(values)):
+                raise ValueError(f"dataset manifest {label} must be ordered and unique")
+        return self
+
+
+def merchant_dataset_manifest_fingerprint(manifest: MerchantDatasetManifest) -> str:
+    return config_version(manifest.model_dump(mode="json"))
+
+
+class MerchantScenarioDataset(BaseModel):
+    """One importable, tenant-bound synthetic scenario dataset."""
+
+    model_config = _CONTRACT
+
+    schema_version: Literal[1] = 1
+    manifest: MerchantDatasetManifest
+    fixtures: MerchantFixtureBundle
+
+    @model_validator(mode="after")
+    def manifest_matches_fixtures(self) -> Self:
+        if self.manifest.fixture_fingerprint != merchant_fixture_bundle_fingerprint(self.fixtures):
+            raise ValueError("dataset manifest fingerprint does not match its fixtures")
+        if self.manifest.entity_counts != merchant_dataset_entity_counts(self.fixtures):
+            raise ValueError("dataset manifest entity counts do not match its fixtures")
+        return self
+
+
+@cache
 def management_contract_schema_fingerprint() -> str:
     """Identify the exact schemas accepted at the management boundary."""
 
     schemas = {
         "merchant_config": MerchantConfig.model_json_schema(),
         "merchant_fixtures": MerchantFixtureBundle.model_json_schema(),
+        "merchant_dataset": MerchantScenarioDataset.model_json_schema(),
     }
     return config_version(schemas)
 
@@ -104,6 +220,7 @@ class MerchantDraft(BaseModel):
     updated_at: datetime
     merchant_override: dict[str, JsonValue]
     fixtures: MerchantFixtureBundle
+    dataset_manifest: MerchantDatasetManifest | None = None
 
     @model_validator(mode="after")
     def validate_draft_timestamps(self) -> Self:
@@ -111,6 +228,10 @@ class MerchantDraft(BaseModel):
         _require_aware(self.updated_at, field_name="updated_at")
         if self.updated_at < self.created_at:
             raise ValueError("draft updated_at cannot precede created_at")
+        if self.dataset_manifest is not None:
+            if self.dataset_manifest.tenant_id != self.tenant_id:
+                raise ValueError("draft dataset manifest does not match its tenant")
+            MerchantScenarioDataset(manifest=self.dataset_manifest, fixtures=self.fixtures)
         return self
 
 
@@ -164,6 +285,18 @@ class MerchantDraftValidationRequest(BaseModel):
     request_id: AuthorityIdentifier
 
 
+class MerchantDraftSeedRequest(BaseModel):
+    """Create the first draft from validated active development configuration."""
+
+    model_config = _CONTRACT
+
+    schema_version: Literal[1] = 1
+    tenant_id: AuthorityIdentifier
+    draft_id: AuthorityIdentifier
+    actor_id: AuthorityIdentifier
+    request_id: AuthorityIdentifier
+
+
 class MerchantDatasetImportRequest(BaseModel):
     """Replace a draft's complete validated development dataset atomically."""
 
@@ -175,7 +308,27 @@ class MerchantDatasetImportRequest(BaseModel):
     expected_draft_revision: int = Field(ge=1)
     actor_id: AuthorityIdentifier
     request_id: AuthorityIdentifier
-    fixtures: MerchantFixtureBundle
+    dataset: MerchantScenarioDataset
+
+    @model_validator(mode="after")
+    def dataset_matches_tenant(self) -> Self:
+        if self.dataset.manifest.tenant_id != self.tenant_id:
+            raise ValueError("imported dataset does not match the request tenant")
+        return self
+
+
+class MerchantCatalogImportRequest(BaseModel):
+    """Replace only a draft catalog while preserving its other fixture families."""
+
+    model_config = _CONTRACT
+
+    schema_version: Literal[1] = 1
+    tenant_id: AuthorityIdentifier
+    draft_id: AuthorityIdentifier
+    expected_draft_revision: int = Field(ge=1)
+    actor_id: AuthorityIdentifier
+    request_id: AuthorityIdentifier
+    catalog: CatalogFixture
 
 
 def merchant_preview_fingerprint(
@@ -187,6 +340,7 @@ def merchant_preview_fingerprint(
     config_fingerprint: str,
     fixture_fingerprint: str,
     schema_fingerprint: str,
+    dataset_fingerprint: str | None = None,
 ) -> str:
     """Identify the stable, value-free content of one resolved preview."""
 
@@ -200,6 +354,7 @@ def merchant_preview_fingerprint(
             "config_fingerprint": config_fingerprint,
             "fixture_fingerprint": fixture_fingerprint,
             "schema_fingerprint": schema_fingerprint,
+            "dataset_fingerprint": dataset_fingerprint,
         }
     )
 
@@ -216,10 +371,12 @@ class ResolvedMerchantPreview(BaseModel):
     resolved_at: datetime
     config: MerchantConfig
     fixtures: MerchantFixtureBundle
+    dataset_manifest: MerchantDatasetManifest | None = None
     source_draft_fingerprint: str = Field(pattern=_SHA256)
     config_fingerprint: str = Field(pattern=_SHA256)
     fixture_fingerprint: str = Field(pattern=_SHA256)
     schema_fingerprint: str = Field(pattern=_SHA256)
+    dataset_fingerprint: str | None = Field(default=None, pattern=_SHA256)
     preview_fingerprint: str = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
@@ -231,6 +388,16 @@ class ResolvedMerchantPreview(BaseModel):
             raise ValueError("resolved config fingerprint does not match its payload")
         if self.fixture_fingerprint != merchant_fixture_bundle_fingerprint(self.fixtures):
             raise ValueError("fixture fingerprint does not match its payload")
+        if (self.dataset_manifest is None) != (self.dataset_fingerprint is None):
+            raise ValueError("preview dataset manifest and fingerprint must be present together")
+        if self.dataset_manifest is not None:
+            if self.dataset_manifest.tenant_id != self.tenant_id:
+                raise ValueError("preview dataset manifest does not match its tenant")
+            MerchantScenarioDataset(manifest=self.dataset_manifest, fixtures=self.fixtures)
+            if self.dataset_fingerprint != merchant_dataset_manifest_fingerprint(
+                self.dataset_manifest
+            ):
+                raise ValueError("preview dataset fingerprint does not match its manifest")
         if self.schema_fingerprint != management_contract_schema_fingerprint():
             raise ValueError("management schema fingerprint is not current")
         if self.preview_fingerprint != merchant_preview_fingerprint(
@@ -241,6 +408,7 @@ class ResolvedMerchantPreview(BaseModel):
             config_fingerprint=self.config_fingerprint,
             fixture_fingerprint=self.fixture_fingerprint,
             schema_fingerprint=self.schema_fingerprint,
+            dataset_fingerprint=self.dataset_fingerprint,
         ):
             raise ValueError("preview fingerprint does not match its bound content")
         return self
@@ -323,50 +491,31 @@ class PublishedMerchantVersion(BaseModel):
     published_by: AuthorityIdentifier
     config: MerchantConfig
     fixtures: MerchantFixtureBundle
+    dataset_manifest: MerchantDatasetManifest | None = None
     config_fingerprint: str = Field(pattern=_SHA256)
     fixture_fingerprint: str = Field(pattern=_SHA256)
     schema_fingerprint: str = Field(pattern=_SHA256)
-
-    @classmethod
-    def from_persisted_json(cls, payload: str) -> Self:
-        """Load one stored schema-versioned snapshot without applying current write gates."""
-
-        raw = json.loads(payload)
-        if not isinstance(raw, Mapping):
-            raise ValueError("published merchant version must be an object")
-        for payload_field, fingerprint_field, message in (
-            (
-                "config",
-                "config_fingerprint",
-                "published config fingerprint does not match its stored payload",
-            ),
-            (
-                "fixtures",
-                "fixture_fingerprint",
-                "published fixture fingerprint does not match its stored payload",
-            ),
-        ):
-            raw_payload = raw.get(payload_field)
-            expected = raw.get(fingerprint_field)
-            if (
-                isinstance(raw_payload, Mapping)
-                and isinstance(expected, str)
-                and config_version(dict(raw_payload)) != expected
-            ):
-                raise ValueError(message)
-        return cls.model_validate_json(payload, context={_PERSISTED_VERSION_CONTEXT: True})
+    dataset_fingerprint: str | None = Field(default=None, pattern=_SHA256)
 
     @model_validator(mode="after")
-    def validate_published_binding(self, info: ValidationInfo) -> Self:
+    def validate_published_binding(self) -> Self:
         _require_aware(self.published_at, field_name="published_at")
         if self.config.merchant_id != self.tenant_id:
             raise ValueError("published config does not match the version tenant")
-        if info.context and info.context.get(_PERSISTED_VERSION_CONTEXT):
-            return self
         if self.config_fingerprint != config_version(self.config.model_dump(mode="json")):
             raise ValueError("published config fingerprint does not match its payload")
         if self.fixture_fingerprint != merchant_fixture_bundle_fingerprint(self.fixtures):
             raise ValueError("published fixture fingerprint does not match its payload")
+        if (self.dataset_manifest is None) != (self.dataset_fingerprint is None):
+            raise ValueError("published dataset manifest and fingerprint must be present together")
+        if self.dataset_manifest is not None:
+            if self.dataset_manifest.tenant_id != self.tenant_id:
+                raise ValueError("published dataset manifest does not match its tenant")
+            MerchantScenarioDataset(manifest=self.dataset_manifest, fixtures=self.fixtures)
+            if self.dataset_fingerprint != merchant_dataset_manifest_fingerprint(
+                self.dataset_manifest
+            ):
+                raise ValueError("published dataset fingerprint does not match its manifest")
         if self.schema_fingerprint != management_contract_schema_fingerprint():
             raise ValueError("published management schema fingerprint is not current")
         return self
@@ -382,6 +531,7 @@ def published_merchant_runtime_version(version: PublishedMerchantVersion) -> str
             "config_fingerprint": version.config_fingerprint,
             "fixture_fingerprint": version.fixture_fingerprint,
             "schema_fingerprint": version.schema_fingerprint,
+            "dataset_fingerprint": version.dataset_fingerprint,
         }
     )
 
@@ -406,12 +556,14 @@ class MerchantVersionDiff(BaseModel):
     target_version_id: AuthorityIdentifier
     config_changes: tuple[MerchantVersionChange, ...]
     fixture_changes: tuple[MerchantVersionChange, ...]
+    dataset_changes: tuple[MerchantVersionChange, ...]
 
     @model_validator(mode="after")
     def validate_ordered_unique_paths(self) -> Self:
         for label, changes in (
             ("config", self.config_changes),
             ("fixture", self.fixture_changes),
+            ("dataset", self.dataset_changes),
         ):
             paths = tuple(change.path for change in changes)
             if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
@@ -420,7 +572,7 @@ class MerchantVersionDiff(BaseModel):
 
     @property
     def changed(self) -> bool:
-        return bool(self.config_changes or self.fixture_changes)
+        return bool(self.config_changes or self.fixture_changes or self.dataset_changes)
 
 
 class PublicationReceipt(BaseModel):

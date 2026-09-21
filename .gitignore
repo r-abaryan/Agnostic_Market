@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .test-tmp/
+.local/
 .ruff_cache/
 *.egg-info/
 build/

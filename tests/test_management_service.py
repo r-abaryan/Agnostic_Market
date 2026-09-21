@@ -6,15 +6,12 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from shutil import copytree
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 from telemetry_helpers import make_tenant_telemetry
 
-from agnostic_market.application import (
-    build_published_fixture_tenant_services,
-    build_published_tenant_context,
-)
 from agnostic_market.commerce.catalog import load_catalog_fixture
 from agnostic_market.commerce.identity import load_customers_fixture
 from agnostic_market.commerce.orders import load_orders_fixture
@@ -23,13 +20,18 @@ from agnostic_market.commerce.profile import load_profile_fixture
 from agnostic_market.commerce.verification import load_verification_fixture
 from agnostic_market.config.loader import load_yaml_layer
 from agnostic_market.management.contracts import (
+    MerchantCatalogImportRequest,
     MerchantDatasetImportRequest,
+    MerchantDatasetManifest,
     MerchantDraft,
     MerchantDraftPublicationRequest,
     MerchantDraftValidationRequest,
     MerchantFixtureBundle,
     MerchantRetirementRequest,
     MerchantRollbackRequest,
+    MerchantScenarioDataset,
+    merchant_dataset_entity_counts,
+    merchant_fixture_bundle_fingerprint,
 )
 from agnostic_market.management.repository import SqliteMerchantConfigurationRepository
 from agnostic_market.management.service import (
@@ -39,6 +41,10 @@ from agnostic_market.management.service import (
     MerchantManagementScopeError,
     MerchantManagementService,
     MerchantManagementValidationError,
+)
+from agnostic_market.management.simulation import (
+    build_published_fixture_tenant_services,
+    build_published_tenant_context,
 )
 
 _NOW = datetime(2026, 9, 19, 14, tzinfo=UTC)
@@ -55,7 +61,7 @@ def _bundle(config_root: Path) -> MerchantFixtureBundle:
     )
 
 
-def _override(config_root: Path) -> dict[str, object]:
+def _override(config_root: Path) -> dict[str, Any]:
     return load_yaml_layer(config_root / "merchants" / "acme_store.yaml")
 
 
@@ -64,7 +70,7 @@ def _draft(
     *,
     revision: int = 1,
     request_id: str = "draft-request-1",
-    override: dict[str, object] | None = None,
+    override: dict[str, Any] | None = None,
     fixtures: MerchantFixtureBundle | None = None,
 ) -> MerchantDraft:
     return MerchantDraft(
@@ -339,7 +345,21 @@ def test_complete_dataset_import_is_scoped_replay_safe_and_draft_only(
         expected_draft_revision=draft.revision,
         actor_id="operator-2",
         request_id="dataset-import-1",
-        fixtures=changed_fixtures,
+        dataset=MerchantScenarioDataset(
+            manifest=MerchantDatasetManifest(
+                dataset_id="service-import-v1",
+                tenant_id="acme_store",
+                revision=1,
+                generated_at=_NOW,
+                source_kind="hand_authored_synthetic",
+                source_ref="service-import-source-v1",
+                entity_counts=merchant_dataset_entity_counts(changed_fixtures),
+                fixture_fingerprint=merchant_fixture_bundle_fingerprint(changed_fixtures),
+                covered_capabilities=("search_catalog",),
+                scenario_tags=("catalog",),
+            ),
+            fixtures=changed_fixtures,
+        ),
     )
 
     with pytest.raises(MerchantManagementScopeError, match="tenant scope"):
@@ -410,6 +430,40 @@ def test_complete_dataset_import_is_scoped_replay_safe_and_draft_only(
             second_version,
             wrong_policy_tenant,
             telemetry=make_tenant_telemetry(wrong_policy_tenant.tenant_id),
+        )
+
+
+def test_catalog_import_exact_retry_replays_the_committed_draft(
+    tmp_path: Path, config_root: Path
+) -> None:
+    service = _service(tmp_path, config_root)
+    draft = service.save_draft("acme_store", _draft(config_root), expected_revision=0)
+    first_product = draft.fixtures.catalog.products[0]
+    changed_catalog = draft.fixtures.catalog.model_copy(
+        update={
+            "products": (
+                first_product.model_copy(update={"name": "Imported Development Product"}),
+                *draft.fixtures.catalog.products[1:],
+            )
+        }
+    )
+    request = MerchantCatalogImportRequest(
+        tenant_id="acme_store",
+        draft_id=draft.draft_id,
+        expected_draft_revision=draft.revision,
+        actor_id="operator-2",
+        request_id="catalog-import-1",
+        catalog=changed_catalog,
+    )
+
+    imported = service.import_catalog("acme_store", request)
+    replayed = service.import_catalog("acme_store", request)
+
+    assert replayed == imported
+    with pytest.raises(MerchantManagementReplayConflictError, match="different parameters"):
+        service.import_catalog(
+            "acme_store",
+            request.model_copy(update={"actor_id": "operator-3"}),
         )
 
 

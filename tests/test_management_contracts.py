@@ -176,14 +176,16 @@ def test_publication_receipt_distinguishes_publish_from_rollback(
     payload: dict[str, object],
 ) -> None:
     with pytest.raises(ValidationError, match="source version"):
-        PublicationReceipt(
-            tenant_id="acme_store",
-            request_id="request-1",
-            version_id="version-2",
-            version_number=2,
-            committed_at=_NOW,
-            replayed=False,
-            **payload,
+        PublicationReceipt.model_validate(
+            {
+                "tenant_id": "acme_store",
+                "request_id": "request-1",
+                "version_id": "version-2",
+                "version_number": 2,
+                "committed_at": _NOW,
+                "replayed": False,
+                **payload,
+            }
         )
 
 
@@ -211,4 +213,5 @@ def test_version_diff_requires_deterministic_unique_paths() -> None:
                 MerchantVersionChange(path=("a",), kind="added"),
             ),
             fixture_changes=(),
+            dataset_changes=(),
         )

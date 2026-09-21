@@ -21,7 +21,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agnostic_market.commerce.identity import CustomersFixture
-from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
+from agnostic_market.commerce.receipts import ProfileReceiptCounts, ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.confirmation import ProfileField
 from agnostic_market.tenancy.context import TenantBound, normalize_tenant_id
@@ -124,6 +124,8 @@ class ProfilePort(TenantBound, Protocol):
         field: ProfileField,
         new_value: str,
     ) -> ReceiptLookup[ProfileChangeRecord]: ...
+
+    def receipt_counts(self) -> ProfileReceiptCounts: ...
 
 
 class ProfileStore:
@@ -229,3 +231,9 @@ class ProfileStore:
         """How many DISTINCT changes this store has applied (test/verification surface)."""
         with self._lock:
             return len(self._changes_by_key)
+
+    def receipt_counts(self) -> ProfileReceiptCounts:
+        """Return value-free cumulative evidence from the committed change ledger."""
+
+        with self._lock:
+            return ProfileReceiptCounts(changes=len(self._changes_by_key))

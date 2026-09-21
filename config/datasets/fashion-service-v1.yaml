@@ -1,0 +1,119 @@
+schema_version: 1
+manifest:
+  schema_version: 1
+  dataset_id: fashion-service-v1
+  tenant_id: acme_store
+  revision: 1
+  generated_at: 2026-09-20T10:00:00Z
+  source_kind: hand_authored_synthetic
+  source_ref: fashion-scenario-source-v1
+  entity_counts:
+    catalog_products: 4
+    orders: 5
+    customers: 3
+    payment_instruments: 2
+    profiles: 2
+    verification_factors: 3
+  fixture_fingerprint: "a53840accf54b97b914a2b68393c899145609eb50915d5576f97d6ee8ec0d63d"
+  covered_capabilities:
+    - cancel_orders
+    - change_profile
+    - list_orders
+    - modify_cart
+    - place_order
+    - refund_order
+    - return_order
+    - search_catalog
+    - verify_identity
+    - verify_order_status
+    - view_cart
+  scenario_tags:
+    - account-support
+    - cancelled-history
+    - cart-checkout
+    - missing-dependent-data
+    - returns
+fixtures:
+  catalog:
+    products:
+      - sku: SKU-SHARED-01
+        name: weatherproof commuter jacket
+        price_usd: 149.00
+      - sku: SKU-FASHION-02
+        name: recycled canvas backpack
+        price_usd: 64.50
+      - sku: SKU-FASHION-03
+        name: everyday walking trainers
+        price_usd: 78.25
+      - sku: SKU-FASHION-04
+        name: merino travel scarf
+        price_usd: 32.00
+  orders:
+    orders:
+      ORD-SHARED-01:
+        status: processing
+        summary: 1 weatherproof commuter jacket
+        eta: "2026-09-24"
+        customer_ref: CUST-SHARED-01
+        total_usd: 149.00
+      ORD-FASHION-02:
+        status: shipped
+        summary: 1 recycled canvas backpack
+        eta: "2026-09-22"
+        customer_ref: CUST-FASHION-02
+        total_usd: 64.50
+      ORD-FASHION-03:
+        status: delivered
+        summary: 1 pair of everyday walking trainers
+        eta: "2026-09-12"
+        customer_ref: CUST-SHARED-01
+        total_usd: 78.25
+        delivered_at: "2026-09-12T10:00:00Z"
+      ORD-FASHION-04:
+        status: delivered
+        summary: 2 merino travel scarves
+        eta: "2026-08-01"
+        customer_ref: CUST-FASHION-03
+        total_usd: 64.00
+        delivered_at: "2026-08-01T10:00:00Z"
+      ORD-FASHION-05:
+        status: cancelled
+        summary: 1 recycled canvas backpack
+        eta: "2026-09-01"
+        customer_ref: CUST-FASHION-03
+        total_usd: 64.50
+  customers:
+    customers:
+      CUST-SHARED-01:
+        contact: alex.fashion@example.invalid
+        masked_contact: email ending example dot invalid
+        factor_ref: FACTOR-SHARED-01
+      CUST-FASHION-02:
+        contact: +1 555 010 2102
+        masked_contact: number ending 2102
+        factor_ref: FACTOR-FASHION-02
+      CUST-FASHION-03:
+        contact: sam.fashion@example.invalid
+        masked_contact: email ending example dot invalid
+        factor_ref: FACTOR-FASHION-03
+  payment_instruments:
+    payment_instruments:
+      CUST-SHARED-01:
+        masked_ref: card ending 3101
+      CUST-FASHION-02:
+        masked_ref: card ending 3102
+  profiles:
+    profiles:
+      CUST-SHARED-01:
+        address_on_file: 10 Synthetic Fashion Way
+        contact_on_file: email ending example dot invalid
+      CUST-FASHION-02:
+        address_on_file: 20 Synthetic Fashion Way
+        contact_on_file: number ending 2102
+  verification:
+    otp_codes_by_factor_ref:
+      FACTOR-SHARED-01: "410101"
+      FACTOR-FASHION-02: "410102"
+      FACTOR-FASHION-03: "410103"
+    challenge_ttl_seconds: 300
+    proof_ttl_seconds: 300

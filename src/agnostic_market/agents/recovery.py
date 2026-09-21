@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import threading
+import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -385,8 +386,27 @@ class _ModelNodeExecutionBoundary:
         runnable = node if isinstance(node, Runnable) else RunnableLambda(node)
 
         async def run(state: object, config: RunnableConfig) -> Any:
-            async with asyncio.timeout(self._timeout_seconds):
-                return await runnable.ainvoke(state, config)
+            started = time.perf_counter()
+            try:
+                async with asyncio.timeout(self._timeout_seconds):
+                    return await runnable.ainvoke(state, config)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                failure_category = (
+                    "deadline_exceeded" if isinstance(exc, TimeoutError) else "exception"
+                )
+                logger.warning(
+                    "model node execution failed node=%s failure_category=%s "
+                    "exception_type=%s elapsed_ms=%.3f timeout_ms=%.3f",
+                    node_name,
+                    failure_category,
+                    type(exc).__name__,
+                    elapsed_ms,
+                    self._timeout_seconds * 1000,
+                )
+                raise
 
         return run
 

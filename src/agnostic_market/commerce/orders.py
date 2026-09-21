@@ -16,7 +16,7 @@ from typing import Concatenate, Literal, Never, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
+from agnostic_market.commerce.receipts import OrderReceiptCounts, ReceiptLookup, classify_receipt
 from agnostic_market.config.loader import ConfigError, load_yaml_layer
 from agnostic_market.dtos.money import UsdAmount, validate_usd
 from agnostic_market.dtos.orchestration import OrderContextOperation
@@ -145,7 +145,7 @@ def render_order_status_line(
     # A shipped order whose ETA has PASSED must not say "on its way, that was expected by X" —
     # "on its way" (still coming) contradicts an overdue date. Speak the past-expectation as the
     # WHOLE status instead (terminal, no dangling "let me check" — F-11.1).
-    if status == "shipped" and _is_past_date_eta(eta, today):
+    if status == "shipped" and eta is not None and _is_past_date_eta(eta, today):
         spoken = datetime.strptime(eta, "%Y-%m-%d").date().strftime("%A %d %B")
         return f"Your order {order_id} - {items} - was expected by {spoken}."
     # An ETA is only meaningful for an IN-FLIGHT order — a delivered order already arrived and a
@@ -547,6 +547,8 @@ class OrderPort(TenantBound, Protocol):
 
     def order_item_summary(self, order_id: str) -> str: ...
 
+    def receipt_counts(self) -> OrderReceiptCounts: ...
+
 
 def _line_fingerprint(
     lines: Iterable[CartLine | PlacedLine],
@@ -794,7 +796,7 @@ class OrderStore:
     def __init__(self, tenant_id: str, orders: Mapping[str, _OrderEntry]) -> None:
         self.tenant_id = normalize_tenant_id(tenant_id, boundary="order store")
         self._lock = threading.RLock()
-        self._orders = {order_id: entry.model_copy(deep=True) for order_id, entry in orders.items()}
+        self._orders = dict(orders)
         # `_placed_by_key` is the committed placement/idempotency ledger. Caller visibility
         # belongs to the separately injected GuestOrderScope.
         self._placed_by_key: dict[str, PlacedOrder] = {}
@@ -1394,3 +1396,14 @@ class OrderStore:
     def cancel_count(self) -> int:
         """How many DISTINCT orders this store has cancelled (test/verification surface)."""
         return len(self._cancels_by_key)
+
+    @_synchronized
+    def receipt_counts(self) -> OrderReceiptCounts:
+        """Return value-free cumulative evidence from the committed receipt ledgers."""
+
+        return OrderReceiptCounts(
+            placements=len(self._placed_by_key),
+            refunds=len(self._refunds_by_key),
+            returns=len(self._returns_by_key),
+            cancellations=len(self._cancels_by_key),
+        )

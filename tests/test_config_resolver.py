@@ -127,6 +127,31 @@ def test_invalid_policy_value_type_uses_the_resolution_error_contract() -> None:
         resolve_merchant_config(_base(), _template(), bad)
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (("policies",), "not-a-mapping"),
+        (("policies", "refunds"), []),
+        (("policies", "returns"), "not-a-mapping"),
+        (("policies", "security"), 3),
+        (("policies", "clarification_reask_max"), False),
+    ),
+)
+def test_non_mapping_policy_sections_use_the_resolution_error_contract(
+    path: tuple[str, ...], value: object
+) -> None:
+    bad = _override()
+    target = bad
+    for key in path[:-1]:
+        child = target.setdefault(key, {})
+        assert isinstance(child, dict)
+        target = child
+    target[path[-1]] = value
+
+    with pytest.raises(ConfigResolutionError, match="must be a mapping"):
+        resolve_merchant_config(_base(), _template(), bad)
+
+
 def test_override_touching_safety_locked_key_is_rejected() -> None:
     bad = _override()
     bad["_platform"] = {"payment": {"out_of_band_only": False}}  # attempt to weaken PCI posture

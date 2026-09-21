@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agnostic_market.commerce.receipts import ReceiptLookup, classify_receipt
+from agnostic_market.commerce.receipts import CartReceiptCounts, ReceiptLookup, classify_receipt
 from agnostic_market.dtos.money import UsdAmount, validate_usd
 from agnostic_market.dtos.orchestration import CartOperation
 from agnostic_market.dtos.state import CartLine
@@ -280,6 +280,11 @@ class CartStore:
         """A frozen copy of the lines for `PendingPlacement` (the confirm/place nodes read
         THIS, never the live cart, so consent is over exactly what was read back)."""
         return tuple(self._lines.values())
+
+    def receipt_counts(self) -> CartReceiptCounts:
+        """Return value-free committed mutation evidence for this session cart."""
+
+        return CartReceiptCounts(mutations=len(self._mutations_by_key))
 
     def clear(self) -> None:
         """Clear caller-scoped lines and mutation receipts."""

@@ -6,10 +6,21 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
+from agnostic_market.commerce.catalog import load_catalog_fixture
+from agnostic_market.commerce.identity import load_customers_fixture
+from agnostic_market.commerce.orders import load_orders_fixture
+from agnostic_market.commerce.payment_instruments import load_payment_instruments_fixture
+from agnostic_market.commerce.profile import load_profile_fixture
+from agnostic_market.commerce.verification import load_verification_fixture
 from agnostic_market.config.loader import ConfigError
-from agnostic_market.config.registry import ResolvedConfig, resolve_merchant_override
+from agnostic_market.config.registry import (
+    ConfigRegistry,
+    ResolvedConfig,
+    UnknownMerchantError,
+    resolve_merchant_override,
+)
 from agnostic_market.config.resolver import (
     ConfigResolutionError,
     PolicyBoundsViolationError,
@@ -17,15 +28,19 @@ from agnostic_market.config.resolver import (
 )
 from agnostic_market.management.contracts import (
     MerchantAuditRecord,
+    MerchantCatalogImportRequest,
     MerchantDatasetImportRequest,
+    MerchantDatasetManifest,
     MerchantDraft,
     MerchantDraftPublicationRequest,
+    MerchantDraftSeedRequest,
     MerchantDraftValidationRequest,
     MerchantFixtureBundle,
     MerchantPublicationRequest,
     MerchantRetirementReceipt,
     MerchantRetirementRequest,
     MerchantRollbackRequest,
+    MerchantScenarioDataset,
     MerchantValidationFinding,
     MerchantValidationResult,
     MerchantVersionChange,
@@ -34,6 +49,8 @@ from agnostic_market.management.contracts import (
     PublishedMerchantVersion,
     ResolvedMerchantPreview,
     management_contract_schema_fingerprint,
+    merchant_dataset_entity_counts,
+    merchant_dataset_manifest_fingerprint,
     merchant_draft_fingerprint,
     merchant_fixture_bundle_fingerprint,
     merchant_preview_fingerprint,
@@ -169,6 +186,23 @@ def _fixture_family_changes(
     )
 
 
+def _dataset_manifest_changes(
+    base: MerchantDatasetManifest | None,
+    target: MerchantDatasetManifest | None,
+) -> tuple[MerchantVersionChange, ...]:
+    if base is None and target is None:
+        return ()
+    if base is None:
+        return (MerchantVersionChange(path=("manifest",), kind="added"),)
+    if target is None:
+        return (MerchantVersionChange(path=("manifest",), kind="removed"),)
+    return _value_free_changes(
+        base.model_dump(mode="json"),
+        target.model_dump(mode="json"),
+        path=("manifest",),
+    )
+
+
 class MerchantManagementService:
     """Resolve, validate, preview, and publish through one tenant-scoped boundary."""
 
@@ -185,6 +219,15 @@ class MerchantManagementService:
 
     def list_tenant_ids(self) -> tuple[str, ...]:
         return _repository_call(self._repository.list_tenant_ids)
+
+    def list_configured_tenant_ids(self) -> tuple[str, ...]:
+        """Return validated active development merchants visible to the workbench."""
+
+        try:
+            configured = ConfigRegistry(self._config_root).load().merchant_ids
+        except ConfigError as exc:
+            raise MerchantManagementError("active merchant configuration is invalid") from exc
+        return tuple(sorted(configured))
 
     def list_audit_history(self, tenant_id: str) -> tuple[MerchantAuditRecord, ...]:
         records = _repository_call(lambda: self._repository.list_audit_records(tenant_id))
@@ -209,6 +252,99 @@ class MerchantManagementService:
             lambda: self._repository.save_draft(draft, expected_revision=expected_revision)
         )
 
+    def write_draft(
+        self,
+        scope_tenant_id: str,
+        *,
+        draft_id: str,
+        revision: int,
+        actor_id: str,
+        request_id: str,
+        merchant_override: dict[str, JsonValue],
+        fixtures: MerchantFixtureBundle,
+        dataset_manifest: MerchantDatasetManifest | None,
+        expected_revision: int,
+    ) -> MerchantDraft:
+        """Store editable draft content with service-owned timestamps."""
+
+        existing = _repository_call(lambda: self._repository.get_draft(scope_tenant_id, draft_id))
+        now = self._clock()
+        created_at = now if existing is None else existing.created_at
+        updated_at = (
+            existing.updated_at if existing is not None and existing.revision == revision else now
+        )
+        return self.save_draft(
+            scope_tenant_id,
+            MerchantDraft(
+                tenant_id=scope_tenant_id,
+                draft_id=draft_id,
+                revision=revision,
+                actor_id=actor_id,
+                request_id=request_id,
+                created_at=created_at,
+                updated_at=updated_at,
+                merchant_override=merchant_override,
+                fixtures=fixtures,
+                dataset_manifest=dataset_manifest,
+            ),
+            expected_revision=expected_revision,
+        )
+
+    def seed_draft(
+        self,
+        scope_tenant_id: str,
+        request: MerchantDraftSeedRequest,
+    ) -> MerchantDraft:
+        """Copy validated development configuration into the first managed revision."""
+
+        self._require_scope(scope_tenant_id, request.tenant_id)
+        existing = _repository_call(
+            lambda: self._repository.get_draft(request.tenant_id, request.draft_id)
+        )
+        if existing is not None:
+            if (
+                existing.revision == 1
+                and existing.actor_id == request.actor_id
+                and existing.request_id == request.request_id
+            ):
+                return existing
+            raise MerchantManagementConflictError("merchant draft already exists")
+        try:
+            registry = ConfigRegistry(self._config_root).load()
+            merchant_override = registry.source_override(request.tenant_id)
+            fixtures = MerchantFixtureBundle(
+                catalog=load_catalog_fixture(self._config_root, request.tenant_id),
+                orders=load_orders_fixture(self._config_root, request.tenant_id),
+                customers=load_customers_fixture(self._config_root, request.tenant_id),
+                payment_instruments=load_payment_instruments_fixture(
+                    self._config_root, request.tenant_id
+                ),
+                profiles=load_profile_fixture(self._config_root, request.tenant_id),
+                verification=load_verification_fixture(self._config_root, request.tenant_id),
+            )
+        except UnknownMerchantError as exc:
+            raise MerchantManagementNotFoundError("configured merchant does not exist") from exc
+        except (ConfigError, ValidationError) as exc:
+            raise MerchantManagementError(
+                "active development configuration cannot seed a draft"
+            ) from exc
+        now = self._clock()
+        return self.save_draft(
+            scope_tenant_id,
+            MerchantDraft(
+                tenant_id=request.tenant_id,
+                draft_id=request.draft_id,
+                revision=1,
+                actor_id=request.actor_id,
+                request_id=request.request_id,
+                created_at=now,
+                updated_at=now,
+                merchant_override=merchant_override,
+                fixtures=fixtures,
+            ),
+            expected_revision=0,
+        )
+
     def import_dataset(
         self,
         scope_tenant_id: str,
@@ -218,7 +354,11 @@ class MerchantManagementService:
         draft = self.get_draft(request.tenant_id, request.draft_id)
         if draft.revision == request.expected_draft_revision + 1:
             if draft.request_id == request.request_id:
-                if draft.actor_id == request.actor_id and draft.fixtures == request.fixtures:
+                if (
+                    draft.actor_id == request.actor_id
+                    and draft.fixtures == request.dataset.fixtures
+                    and draft.dataset_manifest == request.dataset.manifest
+                ):
                     return draft
                 raise MerchantManagementReplayConflictError(
                     "management request id was reused with different parameters"
@@ -230,7 +370,10 @@ class MerchantManagementService:
             raise MerchantManagementConflictError(
                 "merchant draft no longer matches the expected revision"
             )
-        if draft.fixtures == request.fixtures:
+        if (
+            draft.fixtures == request.dataset.fixtures
+            and draft.dataset_manifest == request.dataset.manifest
+        ):
             raise MerchantManagementConflictError("dataset import does not change the draft")
         updated = MerchantDraft(
             tenant_id=draft.tenant_id,
@@ -241,13 +384,81 @@ class MerchantManagementService:
             created_at=draft.created_at,
             updated_at=self._clock(),
             merchant_override=draft.merchant_override,
-            fixtures=request.fixtures,
+            fixtures=request.dataset.fixtures,
+            dataset_manifest=request.dataset.manifest,
         )
         return _repository_call(
             lambda: self._repository.save_draft(
                 updated,
                 expected_revision=request.expected_draft_revision,
             )
+        )
+
+    def import_catalog(
+        self,
+        scope_tenant_id: str,
+        request: MerchantCatalogImportRequest,
+    ) -> MerchantDraft:
+        """Replace one catalog through the same atomic draft-revision boundary."""
+
+        self._require_scope(scope_tenant_id, request.tenant_id)
+        draft = self.get_draft(request.tenant_id, request.draft_id)
+        if (
+            draft.revision == request.expected_draft_revision + 1
+            and draft.request_id == request.request_id
+        ):
+            if (
+                draft.actor_id == request.actor_id
+                and draft.fixtures.catalog == request.catalog
+                and draft.dataset_manifest is not None
+                and draft.dataset_manifest.source_kind == "management_derived"
+                and draft.dataset_manifest.source_ref == request.request_id
+            ):
+                return draft
+            raise MerchantManagementReplayConflictError(
+                "management request id was reused with different parameters"
+            )
+        fixtures = draft.fixtures.model_copy(update={"catalog": request.catalog})
+        dataset_manifest = None
+        if draft.dataset_manifest is not None:
+            dataset_manifest = MerchantDatasetManifest(
+                dataset_id=draft.dataset_manifest.dataset_id,
+                tenant_id=draft.tenant_id,
+                revision=draft.dataset_manifest.revision + 1,
+                generated_at=self._clock(),
+                source_kind="management_derived",
+                source_ref=request.request_id,
+                entity_counts=merchant_dataset_entity_counts(fixtures),
+                fixture_fingerprint=merchant_fixture_bundle_fingerprint(fixtures),
+                covered_capabilities=draft.dataset_manifest.covered_capabilities,
+                scenario_tags=draft.dataset_manifest.scenario_tags,
+            )
+        if dataset_manifest is None:
+            dataset_manifest = MerchantDatasetManifest(
+                dataset_id=f"{request.tenant_id}-catalog-import",
+                tenant_id=request.tenant_id,
+                revision=1,
+                generated_at=self._clock(),
+                source_kind="management_derived",
+                source_ref=request.request_id,
+                entity_counts=merchant_dataset_entity_counts(fixtures),
+                fixture_fingerprint=merchant_fixture_bundle_fingerprint(fixtures),
+                covered_capabilities=("search_catalog",),
+                scenario_tags=("catalog",),
+            )
+        return self.import_dataset(
+            scope_tenant_id,
+            MerchantDatasetImportRequest(
+                tenant_id=request.tenant_id,
+                draft_id=request.draft_id,
+                expected_draft_revision=request.expected_draft_revision,
+                actor_id=request.actor_id,
+                request_id=request.request_id,
+                dataset=MerchantScenarioDataset(
+                    manifest=dataset_manifest,
+                    fixtures=fixtures,
+                ),
+            ),
         )
 
     def get_draft(self, tenant_id: str, draft_id: str) -> MerchantDraft:
@@ -336,6 +547,11 @@ class MerchantManagementService:
             raise MerchantManagementValidationError(validation)
         source_draft_fingerprint = merchant_draft_fingerprint(draft)
         fixture_fingerprint = merchant_fixture_bundle_fingerprint(draft.fixtures)
+        dataset_fingerprint = (
+            merchant_dataset_manifest_fingerprint(draft.dataset_manifest)
+            if draft.dataset_manifest is not None
+            else None
+        )
         preview_fingerprint = merchant_preview_fingerprint(
             tenant_id=draft.tenant_id,
             draft_id=draft.draft_id,
@@ -344,6 +560,7 @@ class MerchantManagementService:
             config_fingerprint=resolved.config_version,
             fixture_fingerprint=fixture_fingerprint,
             schema_fingerprint=validation.schema_fingerprint,
+            dataset_fingerprint=dataset_fingerprint,
         )
         return ResolvedMerchantPreview(
             tenant_id=draft.tenant_id,
@@ -352,10 +569,12 @@ class MerchantManagementService:
             resolved_at=validation.validated_at,
             config=resolved.config,
             fixtures=draft.fixtures,
+            dataset_manifest=draft.dataset_manifest,
             source_draft_fingerprint=source_draft_fingerprint,
             config_fingerprint=resolved.config_version,
             fixture_fingerprint=fixture_fingerprint,
             schema_fingerprint=validation.schema_fingerprint,
+            dataset_fingerprint=dataset_fingerprint,
             preview_fingerprint=preview_fingerprint,
         )
 
@@ -441,6 +660,10 @@ class MerchantManagementService:
                 target.config.model_dump(mode="json"),
             ),
             fixture_changes=_fixture_family_changes(base.fixtures, target.fixtures),
+            dataset_changes=_dataset_manifest_changes(
+                base.dataset_manifest,
+                target.dataset_manifest,
+            ),
         )
 
     def retire(

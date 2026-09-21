@@ -1342,6 +1342,7 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
 @pytest.mark.asyncio
 async def test_application_response_model_timeout_is_bounded_and_effect_free(
     config_root: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     tenant = _tenant()
     services = build_fixture_tenant_services(
@@ -1365,7 +1366,8 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
     )
 
     try:
-        events = await engine_events(application.engine, "tell me about the rain jacket")
+        with caplog.at_level("WARNING", logger="agnostic_market.agents.recovery"):
+            events = await engine_events(application.engine, "tell me about the rain jacket")
         state = ReasoningState.model_validate(
             application.engine._graph.get_state(application.engine._config).values
         )
@@ -1379,6 +1381,17 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
         assert _fixture_order_store(services).placed_count == 0
         assert state.active_invocation is None
         assert not state.automation_terminal
+        failures = [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "model_node_failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0].node_name == "catalog_response"
+        assert failures[0].failure_category == "deadline_exceeded"
+        assert failures[0].exception_type == "TimeoutError"
+        assert failures[0].timeout_ms == pytest.approx(50.0)
+        assert failures[0].elapsed_ms >= 50.0
     finally:
         await application.state.caller_context.aclose_session()
 

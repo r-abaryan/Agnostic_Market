@@ -91,10 +91,6 @@ from agnostic_market.durability.session_state import (
     SessionStateCoordinator,
     SessionStatePersistencePort,
 )
-from agnostic_market.management.contracts import (
-    PublishedMerchantVersion,
-    published_merchant_runtime_version,
-)
 from agnostic_market.session import CallerContext, DurableSessionCloser
 from agnostic_market.tenancy.context import TenantBound, TenantContext
 
@@ -310,7 +306,7 @@ def build_fixture_tenant_services(
     profile_fixture = load_profile_fixture(config_root, tenant_id)
     payment_fixture = load_payment_instruments_fixture(config_root, tenant_id)
     verification_fixture = load_verification_fixture(config_root, tenant_id)
-    return _build_fixture_tenant_services(
+    return build_fixture_tenant_services_from_fixtures(
         tenant,
         catalog_fixture=catalog_fixture,
         orders_fixture=orders_fixture,
@@ -323,46 +319,7 @@ def build_fixture_tenant_services(
     )
 
 
-def build_published_tenant_context(version: PublishedMerchantVersion) -> TenantContext:
-    """Pin a new session to one immutable management publication."""
-
-    return TenantContext(
-        tenant_id=version.tenant_id,
-        config_version=published_merchant_runtime_version(version),
-        policy=version.config.policies.to_policy_context(),
-    )
-
-
-def build_published_fixture_tenant_services(
-    version: PublishedMerchantVersion,
-    tenant: TenantContext,
-    *,
-    telemetry: TenantTelemetry,
-    checkpointer: BaseCheckpointSaver | None = None,
-) -> TenantServices:
-    """Compose development adapters from the exact fixtures pinned by a publication."""
-
-    if (
-        tenant.tenant_id != version.tenant_id
-        or tenant.config_version != published_merchant_runtime_version(version)
-        or tenant.policy != version.config.policies.to_policy_context()
-    ):
-        raise ValueError("tenant context does not match the published merchant version")
-    fixtures = version.fixtures
-    return _build_fixture_tenant_services(
-        tenant,
-        catalog_fixture=fixtures.catalog,
-        orders_fixture=fixtures.orders,
-        customers_fixture=fixtures.customers,
-        profile_fixture=fixtures.profiles,
-        payment_fixture=fixtures.payment_instruments,
-        verification_fixture=fixtures.verification,
-        telemetry=telemetry,
-        checkpointer=checkpointer,
-    )
-
-
-def _build_fixture_tenant_services(
+def build_fixture_tenant_services_from_fixtures(
     tenant: TenantContext,
     *,
     catalog_fixture: CatalogFixture,
@@ -374,6 +331,8 @@ def _build_fixture_tenant_services(
     telemetry: TenantTelemetry,
     checkpointer: BaseCheckpointSaver | None,
 ) -> TenantServices:
+    """Compose validated fixture adapters without importing a management contract."""
+
     tenant_id = tenant.tenant_id
     if telemetry.tenant_id != tenant_id:
         raise ValueError("telemetry service does not match the fixture tenant")

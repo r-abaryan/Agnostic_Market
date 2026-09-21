@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from agnostic_market.commerce.cart import CartStore
 from agnostic_market.commerce.orders import (
     CancelError,
     GuestOrderScope,
@@ -57,6 +59,63 @@ def test_receipt_result_shapes_are_closed_and_record_safe() -> None:
         NotCommittedReceipt.model_validate({"kind": "not_committed", "record": "must not leak"})
     with pytest.raises(ValidationError):
         CommittedReceipt[str].model_validate({"kind": "committed"})
+
+
+def test_receipt_count_inspection_is_value_free_and_covers_each_ledger(
+    config_root: Path,
+) -> None:
+    cart = CartStore()
+    orders = _orders(config_root)
+    profiles = _profiles(config_root)
+    line = _line()
+
+    cart.apply_confirmed_mutation(
+        "cart-key",
+        operation="add",
+        sku=line.sku,
+        name=line.name,
+        price_usd=line.price_usd,
+        quantity=1,
+        pre_confirm_quantity=0,
+    )
+    orders.place_cart("place-key", lines=[line], total_usd=Decimal("129.00"))
+    orders.issue_refund(
+        "refund-key",
+        order_id="ORD-1001",
+        amount_usd=Decimal("20.00"),
+        destination="original",
+        instrument_ref=_ORIGINAL_INSTRUMENT,
+    )
+    orders.create_return(
+        "return-key",
+        order_id="ORD-1003",
+        refund_due_usd=Decimal("20.00"),
+        destination="original",
+    )
+    orders.cancel_order("cancel-key", order_id="ORD-1002")
+    profiles.update_profile(
+        "profile-key",
+        customer_ref=_OWNER,
+        field="address",
+        new_value="7 Synthetic Street",
+    )
+
+    assert cart.receipt_counts().model_dump() == {"mutations": 1}
+    assert orders.receipt_counts().model_dump() == {
+        "placements": 1,
+        "refunds": 1,
+        "returns": 1,
+        "cancellations": 1,
+    }
+    assert profiles.receipt_counts().model_dump() == {"changes": 1}
+    serialized = (
+        cart.receipt_counts().model_dump_json()
+        + orders.receipt_counts().model_dump_json()
+        + profiles.receipt_counts().model_dump_json()
+    )
+    assert "cart-key" not in serialized
+    assert "ORD-" not in serialized
+    assert "CUST-" not in serialized
 
 
 def test_placement_receipt_is_exact_and_does_not_restore_principal_visibility(
