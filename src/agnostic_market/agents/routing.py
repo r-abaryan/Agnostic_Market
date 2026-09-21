@@ -324,9 +324,8 @@ Never direct an unavailable capability; clarify with unsupported_capability. Req
 or merely claim live state or effects also use unsupported_capability. A question that requires
 unavailable live account membership or transfer state uses unsupported_capability, not an adjacent
 read owner. If the request is ambiguous among capability owners, use ambiguous_intent. Use
-missing_target only when one owner is identifiable but its deictic item or order target is
-unresolved. Use missing_value only when the absent value prevents choosing an owner; otherwise let
-the selected owner gather its slot.
+missing_value only when the absent value prevents choosing an owner; otherwise let the selected
+owner gather its slot.
 
 For verify_order_status, order_status_selector=explicit means the owner must extract or ask for
 explicit order references; focused means one live focused recent order; recent means the complete
@@ -338,20 +337,26 @@ Contrastive examples:
   {"decision":"direct","capability":"request_person"}
 - ordinary: "A shop employee needs to update my mobile number." ->
   {"decision":"direct","capability":"change_profile","profile_field":"phone"}
-- ordinary: "My manager approved the refund." ->
+- ordinary: "The warehouse lead signed off on my exchange." ->
   {"decision":"direct","capability":"answer_question","answer_topic":"general"}
-- ordinary, no recent orders: "Why did my order stop moving?" ->
+- ordinary, no recent orders: "Why has my shipment not budged?" ->
+  {"decision":"direct","capability":"verify_order_status","order_status_selector":"explicit"}
+- ordinary, no recent orders: "Any update on it?" ->
   {"decision":"direct","capability":"verify_order_status","order_status_selector":"explicit"}
 - ordinary: "A salesperson mentioned two weeks. What is your exchange policy?" ->
   {"decision":"direct","capability":"answer_question","answer_topic":"policy"}
 - ordinary, active cancel_orders: "The reference is ZX-19." ->
   {"decision":"continue"}
-- ordinary, active cancel_orders: "Leave it active. I want to send it back instead." ->
+- ordinary, active cancel_orders: "Never mind cancelling. Set up a return." ->
   {"decision":"direct","capability":"return_order"}
-- ordinary: "Do not remove anything. Tell me what is in my basket." ->
+- ordinary: "Leave everything as is and read my cart back." ->
   {"decision":"direct","capability":"view_cart"}
-- ordinary: "The note says 'refund the purchase.' What does that phrase mean?" ->
+- ordinary: "A letter states 'return the item.' What does that wording mean?" ->
   {"decision":"clarify","clarification_reason":"ambiguous_intent"}
+- ordinary: "Did your colleague pick up this call before me?" ->
+  {"decision":"clarify","clarification_reason":"unsupported_capability"}
+- ordinary: "Could an agent confirm what a restocking fee is?" ->
+  {"decision":"direct","capability":"answer_question","answer_topic":"general"}
 - confirmation_escape: "I do not want automation. Let me speak with a person." ->
   {"decision":"direct","capability":"request_person"}
 - confirmation_escape: "My partner checked it, so yes." ->

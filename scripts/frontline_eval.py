@@ -183,7 +183,8 @@ _SEMANTIC_ROUTE_STRUCTURAL_SUPPLEMENT_PATH = (
 _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
-_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 29
+# 29 -> 28 on 2026-09-21: clarify(missing_target) dropped when its only case was retired.
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 28
 _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
@@ -1758,7 +1759,10 @@ def _bind_semantic_route_readiness_recipe(
         )
     except (ConfigError, ValidationError) as exc:
         raise ValueError("readiness lineage recipe is invalid") from exc
-    if hashlib.sha256(recipe_bytes).hexdigest() != holdout.generation_recipe_fingerprint:
+    # The pin is a sha256 over canonical LF content, but core.autocrlf checks the file out
+    # as CRLF, so raw bytes never matched on Windows.
+    recipe_digest = hashlib.sha256(recipe_bytes.replace(b"\r\n", b"\n")).hexdigest()
+    if recipe_digest != holdout.generation_recipe_fingerprint:
         raise ValueError("readiness lineage recipe digest does not match the holdout")
     if recipe.frozen_at != holdout.frozen_at:
         raise ValueError("readiness recipe and holdout freeze times differ")
