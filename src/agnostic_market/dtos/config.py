@@ -54,6 +54,15 @@ class ProviderModel(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # Pin for classifier roles; leave unset for authoring roles. Measured 2026-09-21
+    # on gpt-5.6-luna: default sampling misrouted 2/6, temperature 0 was stable, a
+    # seed made it worse.
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class LLMConfig(BaseModel):

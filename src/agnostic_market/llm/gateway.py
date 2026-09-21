@@ -76,8 +76,12 @@ class LLMGateway:
         api_key = self._secrets.resolve(entry.api_key_ref)
         if "reasoning_effort" in model_kwargs:
             raise GatewayError("configure reasoning_effort on ProviderModel, not gateway kwargs")
+        if "temperature" in model_kwargs:
+            raise GatewayError("configure temperature on ProviderModel, not gateway kwargs")
         if selection.reasoning_effort is not None:
             model_kwargs["reasoning_effort"] = selection.reasoning_effort
+        if selection.temperature is not None:
+            model_kwargs["temperature"] = selection.temperature
         # Transient-error retries (live call #13 F-13.1: a 529 'overloaded' mid-turn died
         # with NO retry): the provider SDK backs off on 429/5xx up to this many attempts.
         # One choke point for every model the platform builds; callers may still override.

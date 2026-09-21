@@ -3,7 +3,7 @@
 
 llm:
   response:  { provider: "anthropic", model: "claude-haiku-4-5" }
-  routing:   { provider: "openai", model: "gpt-5.4-mini" }
+  routing:   { provider: "openai", model: "gpt-5.4-mini", temperature: 0 }
   reasoning: { provider: "anthropic", model: "claude-opus-4-8" }
 
 policies:
