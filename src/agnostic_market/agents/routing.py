@@ -520,6 +520,8 @@ class RoutingAttempt:
     provider_call_outcome: ProviderCallOutcome
     projector_version: str = CONTEXT_PROJECTOR_VERSION
     reasoning_effort: ReasoningEffort | None = None
+    # Run identity, not a diagnostic: pinned and default-sampled runs must not pool.
+    temperature: float | None = None
     # Diagnostics: exception class only, never a message. None means the provider
     # boundary did not supply the value, never that it was inferred.
     observed_at: datetime | None = None
@@ -711,6 +713,7 @@ class SemanticRouter:
         self._provider = selection.provider
         self._model = selection.model
         self._reasoning_effort = selection.reasoning_effort
+        self._temperature = selection.temperature
         self._structured_output_method = structured_output_method
         self._timeout_seconds = timeout_seconds
         self._input_max_chars = input_max_chars
@@ -829,6 +832,7 @@ class SemanticRouter:
             timeout_seconds=self._timeout_seconds,
             provider_call_outcome=provider_call_outcome,
             reasoning_effort=self._reasoning_effort,
+            temperature=self._temperature,
             observed_at=observed_at,
             provider_error_category=provider_error_category,
             provider_request_id=_provider_request_id(raw),

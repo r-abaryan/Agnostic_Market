@@ -3295,7 +3295,15 @@ def test_cutover_uses_an_explicit_integer_acceptance_budget(
     assert any("acceptance exact count" in failure for failure in failures) is exact_budget_fails
 
 
-def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path) -> None:
+@pytest.mark.parametrize(
+    ("identity_field", "changed_value"),
+    (("timeout_seconds", 3.0), ("temperature", 0.0)),
+)
+def test_semantic_route_report_rejects_mixed_run_identity(
+    config_root: Path,
+    identity_field: str,
+    changed_value: float,
+) -> None:
     expected = RouteDecision.direct(ViewCart())
     result = SemanticRouteCaseResult(
         case_id="acceptance",
@@ -3323,9 +3331,9 @@ def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path
             provider_call_outcome="completed",
         ),
     )
-    changed_deadline = replace(
+    changed_identity = replace(
         result,
-        attempt=replace(result.attempt, timeout_seconds=3.0),
+        attempt=replace(result.attempt, **{identity_field: changed_value}),
     )
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     projected = corpus.projected_case
@@ -3340,7 +3348,7 @@ def test_semantic_route_report_rejects_mixed_deadline_identity(config_root: Path
     )
 
     with pytest.raises(ValueError, match="mixed run identities"):
-        candidate_runs = ((result,), (changed_deadline,), (result,))
+        candidate_runs = ((result,), (changed_identity,), (result,))
         incumbent_runs = ((result,), (result,), (result,))
         verdict = frontline_eval._semantic_series_verdict(
             candidate_runs,

@@ -94,11 +94,14 @@ def test_both_repository_templates_resolve_the_closed_llm_role_map(
     registry = ConfigRegistry(config_root).load()
 
     expected_routing = {
-        "acme_store": ("openai", "gpt-5.6-luna", "none"),
-        "demo_shop": ("openai", "gpt-5.4-mini", None),
+        "acme_store": ("openai", "gpt-5.6-luna", "none", 0.0),
+        "demo_shop": ("openai", "gpt-5.4-mini", None, 0.0),
     }
     for merchant_id in expected_routing:
         llm = registry.get(merchant_id).config.llm
+        # Classifier role only; authoring roles keep the provider default.
+        assert llm.response.temperature is None
+        assert llm.reasoning.temperature is None
         assert (llm.response.provider, llm.response.model) == (
             "anthropic",
             "claude-haiku-4-5",
@@ -107,6 +110,7 @@ def test_both_repository_templates_resolve_the_closed_llm_role_map(
             llm.routing.provider,
             llm.routing.model,
             llm.routing.reasoning_effort,
+            llm.routing.temperature,
         ) == expected_routing[merchant_id]
         assert (llm.reasoning.provider, llm.reasoning.model) == (
             "anthropic",

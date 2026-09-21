@@ -707,6 +707,7 @@ async def test_semantic_router_forwards_transport_and_returns_sanitized_attempt(
         "provider_call_outcome",
         "projector_version",
         "reasoning_effort",
+        "temperature",
         "observed_at",
         "provider_error_category",
         "provider_request_id",

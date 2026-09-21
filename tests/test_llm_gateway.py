@@ -99,6 +99,68 @@ def test_unknown_reasoning_effort_is_rejected() -> None:
         )
 
 
+def _recorded_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+    selection: ProviderModel,
+) -> dict[str, Any]:
+    received: dict[str, Any] = {}
+
+    def build(model: str, **kwargs: Any) -> object:
+        received.update(model=model, **kwargs)
+        return object()
+
+    monkeypatch.setattr("agnostic_market.llm.gateway.init_chat_model", build)
+    LLMGateway(_credentials(), RecordingResolver()).chat_model(selection)
+    return received
+
+
+def test_selection_temperature_is_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The router pins sampling; the gateway must actually send it."""
+    received = _recorded_kwargs(
+        monkeypatch,
+        ProviderModel(provider="openai", model="gpt-5.6-luna", temperature=0),
+    )
+
+    assert received["temperature"] == 0
+
+
+def test_temperature_is_absent_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Authoring roles must keep provider-default sampling, not an implicit zero."""
+    received = _recorded_kwargs(
+        monkeypatch,
+        ProviderModel(provider="anthropic", model="claude-haiku-4-5"),
+    )
+
+    assert "temperature" not in received
+
+
+def test_temperature_cannot_be_hidden_in_gateway_kwargs() -> None:
+    gateway = LLMGateway(_credentials(), RecordingResolver())
+
+    with pytest.raises(GatewayError, match="ProviderModel"):
+        gateway.chat_model(
+            ProviderModel(provider="openai", model="gpt-5.6-luna"),
+            temperature=0,
+        )
+
+
+@pytest.mark.parametrize("value", (-0.1, 2.1))
+def test_out_of_range_temperature_is_rejected(value: float) -> None:
+    with pytest.raises(ValidationError, match="temperature"):
+        ProviderModel(provider="openai", model="gpt-5.6-luna", temperature=value)
+
+
+def test_unset_temperature_does_not_change_serialization() -> None:
+    """An unset field must not appear, so existing configs and evidence stay byte-identical."""
+    selection = ProviderModel(provider="openai", model="gpt-5.6-luna", reasoning_effort="none")
+
+    assert selection.model_dump(mode="json") == {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "none",
+    }
+
+
 def test_structured_output_method_comes_from_provider_config() -> None:
     gateway = LLMGateway(_credentials(), RecordingResolver())
 

@@ -43,3 +43,9 @@ CLAUDE.md
 assets/audio/generate_thinking_beep.py
 .vscode/settings.json
 CLAUDE.md
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
