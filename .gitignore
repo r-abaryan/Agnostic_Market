@@ -26,13 +26,11 @@ dist/
 docs/
 config/telemetry/
 config/conformance/reports.json
-config/fixtures/
+config/qualification/*.json
 # The fixture-backed application now requires its independently validated catalog seed.
 # Keep the remaining local fixture families ignored unless they are already tracked.
 !config/fixtures/
 config/fixtures/*
-!config/fixtures/catalog/
-config/fixtures/catalog/*
 !config/fixtures/catalog/*.yaml
 config/platform/*.local.yaml
 # The frozen, operator-approved latency methodology is evidence, not machine-local

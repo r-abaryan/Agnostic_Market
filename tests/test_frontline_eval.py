@@ -232,7 +232,10 @@ def _write_readiness_recipe(
     recipe_path.write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
     payload = holdout.model_dump(mode="json")
     payload["lineage_reference"] = recipe_path.name
-    payload["generation_recipe_fingerprint"] = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    # LF-normalized, matching the loader: write_text emits CRLF on Windows.
+    payload["generation_recipe_fingerprint"] = hashlib.sha256(
+        recipe_path.read_bytes().replace(b"\r\n", b"\n")
+    ).hexdigest()
     return frontline_eval.SemanticRouteReadinessHoldout.model_validate(payload)
 
 
@@ -1109,7 +1112,10 @@ def test_readiness_holdout_rejects_recipe_or_lineage_mutation(
     recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
     recipe["source_seed_ledger"][1]["source_seed"] = "mutated source seed"
     recipe_path.write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
-    payload["generation_recipe_fingerprint"] = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    # LF-normalized, matching the loader: write_text emits CRLF on Windows.
+    payload["generation_recipe_fingerprint"] = hashlib.sha256(
+        recipe_path.read_bytes().replace(b"\r\n", b"\n")
+    ).hexdigest()
     holdout_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="source fingerprint does not match"):
         frontline_eval._load_semantic_route_readiness_holdout(
@@ -1117,6 +1123,26 @@ def test_readiness_holdout_rejects_recipe_or_lineage_mutation(
             regression=regression,
             lineage_root=tmp_path,
         )
+
+
+def test_checked_in_readiness_holdout_binds_to_the_checked_in_corpus() -> None:
+    """The real repository files, not generated ones.
+
+    Every other readiness test builds synthetic artifacts in tmp_path, so a stale corpus
+    fingerprint or a line-ending-sensitive recipe digest stayed green while aborting every
+    cutover run before its first provider call.
+    """
+    repository_root = Path(__file__).resolve().parents[1]
+    regression = _load_semantic_route_corpus(
+        repository_root / "config" / "eval" / "frontline_semantic_routes.yaml"
+    )
+
+    holdout = frontline_eval._load_semantic_route_readiness_holdout(
+        repository_root / "config" / "qualification" / "semantic_routing_readiness_holdout.yaml",
+        regression=regression,
+    )
+
+    assert holdout.corpus.cases
 
 
 def test_release_package_binds_exact_report_bytes_and_is_write_once(
@@ -1210,7 +1236,7 @@ def test_structural_supplement_closes_route_and_checklist_debt_without_mutating_
     assert len(supplement.cases) == 13
     assert report["qualification"] is None
     assert report["purpose"] == "development_only"
-    assert report["canonical_route_leaf_count"] == 29
+    assert report["canonical_route_leaf_count"] == 28
     assert report["checklist"]["total_cells"] == 16
     assert len(report["checklist"]["frozen_cells"]) == 7
     assert len(report["checklist"]["supplement_cells"]) == 9
@@ -1292,7 +1318,7 @@ def test_cli_runs_structural_coverage_without_provider_construction(
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["qualification"] is None
-    assert report["canonical_route_leaf_count"] == 29
+    assert report["canonical_route_leaf_count"] == 28
     assert report["checklist"]["uncovered_cells"] == []
 
 

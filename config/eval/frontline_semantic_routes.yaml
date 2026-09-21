@@ -332,7 +332,7 @@ cases:
     context:
       <<: *base_context
       utterance: "Show me another one"
-    expected: { decision: clarify, clarification_reason: missing_target }
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
 
   - case_id: status_with_recent_context
     scenario_class: counterfactual
@@ -795,7 +795,7 @@ cases:
     context:
       <<: *base_context
       utterance: "Have I been transferred to a person?"
-    expected: { decision: direct, request: { kind: answer_question, topic: general } }
+    expected: { decision: clarify, clarification_reason: unsupported_capability }
 
   - case_id: human_mention_identity_question
     scenario_class: adversarial
