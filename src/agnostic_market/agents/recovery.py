@@ -405,6 +405,14 @@ class _ModelNodeExecutionBoundary:
                     type(exc).__name__,
                     elapsed_ms,
                     self._timeout_seconds * 1000,
+                    extra={
+                        "log_event": "model_node_failed",
+                        "node_name": node_name,
+                        "failure_category": failure_category,
+                        "exception_type": type(exc).__name__,
+                        "elapsed_ms": elapsed_ms,
+                        "timeout_ms": self._timeout_seconds * 1000,
+                    },
                 )
                 raise
 

@@ -1384,7 +1384,7 @@ async def test_application_response_model_timeout_is_bounded_and_effect_free(
         failures = [
             record
             for record in caplog.records
-            if getattr(record, "event", None) == "model_node_failed"
+            if getattr(record, "log_event", None) == "model_node_failed"
         ]
         assert len(failures) == 1
         assert failures[0].node_name == "catalog_response"
