@@ -246,23 +246,34 @@ def test_speak_quantity_pluralizes_without_x_or_double_s(qty, name, expected) ->
 
 
 @pytest.mark.parametrize(
-    ("proposal_model", "arguments"),
+    "arguments",
     (
-        (cart_flow._ProposeKey, {"candidate_key": "1", "unexpected": True}),
-        (cart_flow._ProposeQuantity, {"quantity": 1, "unexpected": True}),
+        {"candidate_key": "1", "unexpected": True},
+        {"quantity": 1, "unexpected": True},
     ),
 )
-def test_cart_slot_models_reject_undeclared_fields(
-    proposal_model: type, arguments: dict[str, object]
-) -> None:
+def test_cart_slot_model_rejects_undeclared_fields(arguments: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
-        proposal_model.model_validate(arguments)
+        cart_flow._ProposeSlots.model_validate(arguments)
 
 
 @pytest.mark.parametrize("quantity", (True, False, "2"))
 def test_cart_quantity_slot_is_a_strict_integer(quantity: object) -> None:
     with pytest.raises(ValidationError, match="quantity"):
-        cart_flow._ProposeQuantity.model_validate({"quantity": quantity})
+        cart_flow._ProposeSlots.model_validate({"quantity": quantity})
+
+
+def test_cart_slot_model_carries_both_slots_so_one_turn_can_fill_both() -> None:
+    """The caller says item and quantity in one sentence; the tool must be able to carry both.
+
+    The previous two-tool shape offered only the item tool while selecting an item, so a
+    stated quantity had no field to land in and was re-asked on the next turn.
+    """
+
+    both = cart_flow._ProposeSlots.model_validate({"candidate_key": "1", "quantity": 2})
+    assert (both.candidate_key, both.quantity) == ("1", 2)
+    assert cart_flow._ProposeSlots.model_validate({"quantity": 2}).candidate_key is None
+    assert cart_flow._ProposeSlots.model_validate({"candidate_key": "1"}).quantity is None
 
 
 # --- whole-cart placement ----------------------------------------------------------------

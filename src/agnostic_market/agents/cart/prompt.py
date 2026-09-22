@@ -1,6 +1,6 @@
 """Cart model-facing instructions and candidate rendering.
 
-The cart model fills one missing typed request field, asks for clarification, or leaves the
+The cart model fills the missing typed request fields, asks for clarification, or leaves the
 capability. It selects only code-issued keys and never authors a SKU, price, total, or effect.
 
 Every rule below that reads like scar tissue IS scar tissue — each was paid for with a live
@@ -20,12 +20,13 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.state import PolicyContext
 
 _CART_CAPABILITY_INSTRUCTIONS = (
-    "YOUR part: fill exactly the one missing field of the active cart request. The operation and "
-    "every supplied field are FIXED; never replace them. Every response contains tool calls and "
-    "NO spoken text. Call {expected_tool} when the caller supplied the missing field. If the "
-    "caller "
-    "did not supply it clearly, call request_cart_clarification. If they changed subject or no "
-    "longer want this cart request, call leave_cart. Emit exactly one tool call.\n"
+    "YOUR part: fill every missing field of the active cart request that the caller supplied in "
+    "this turn, in one call. The operation and every field already marked FIXED below must never "
+    "be replaced or repeated. Every response contains tool calls and NO spoken text. Call "
+    "{expected_tool} with each missing field the caller gave, omitting any field they did not. "
+    "If they supplied none of the missing fields clearly, call request_cart_clarification. If "
+    "they changed subject or no longer want this cart request, call leave_cart. Emit exactly "
+    "one tool call.\n"
     "Active operation: {operation}. Fixed item: {item_state}. Fixed quantity: {quantity_state}.\n"
     "Current code-bounded options:\n{candidates}"
 )

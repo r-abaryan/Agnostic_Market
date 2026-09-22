@@ -41,6 +41,8 @@ from agnostic_market.dtos.orchestration import (
     CapabilityId,
     CartItemQuery,
     ChangeProfile,
+    Converse,
+    DiscloseAiIdentity,
     ExplicitOrderSet,
     ListOrders,
     ModifyCart,
@@ -119,6 +121,8 @@ def _proposal_payload_for_expected(
         payload["capability"] = request.kind
         if isinstance(request, AnswerQuestion):
             payload["answer_topic"] = request.topic
+        elif isinstance(request, Converse):
+            payload["conversation_act"] = request.act
         elif isinstance(request, ListOrders):
             payload["list_scope"] = request.scope
         elif isinstance(request, ModifyCart):
@@ -571,8 +575,8 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
     frontline = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(
         scripted_calls=[
-            [("provide_cart_item", {"candidate_key": "1"})],
-            [("provide_cart_quantity", {"quantity": 1})],
+            [("provide_cart_slots", {"candidate_key": "1"})],
+            [("provide_cart_slots", {"quantity": 1})],
         ],
     )
     runtime = await _build_eval_runtime(
@@ -891,7 +895,7 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     by_id = {case.case_id: case for case in corpus.cases}
 
     assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 59
-    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 34
+    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 35
     # Every counterfactual and asr_like case gates. Structural rule, chosen before
     # looking at any score: these are the cases that test whether the model reads
     # state rather than words, so they belong where a miss blocks.
@@ -908,8 +912,8 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
         "counterfactual",
         "asr_like",
     } == {case.scenario_class for case in corpus.cases}
-    assert by_id["ai_identity_owner_unavailable"].expected == RouteDecision.clarify(
-        "unsupported_capability"
+    assert by_id["acceptance_disclose_ai_identity"].expected == RouteDecision.direct(
+        DiscloseAiIdentity()
     )
     asr_request = by_id["asr_like_quantity"].expected.request
     assert isinstance(asr_request, ModifyCart)
@@ -965,7 +969,8 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
         for case in corpus.cases
         if case.evaluation_split == "acceptance" and case.expected.request is not None
     }
-    assert acceptance_capabilities == set(CapabilityId) - {CapabilityId.DISCLOSE_AI_IDENTITY}
+    # Every capability now has acceptance coverage, including the two migrated owners.
+    assert acceptance_capabilities == set(CapabilityId)
     assert isinstance(by_id["acceptance_abort_current"].expected.request, AbortCurrent)
     assert isinstance(by_id["acceptance_request_person"].expected.request, RequestPerson)
     confirmation_cases = [
@@ -1236,7 +1241,7 @@ def test_structural_supplement_closes_route_and_checklist_debt_without_mutating_
     assert len(supplement.cases) == 13
     assert report["qualification"] is None
     assert report["purpose"] == "development_only"
-    assert report["canonical_route_leaf_count"] == 28
+    assert report["canonical_route_leaf_count"] == 30
     assert report["checklist"]["total_cells"] == 16
     assert len(report["checklist"]["frozen_cells"]) == 7
     assert len(report["checklist"]["supplement_cells"]) == 9
@@ -1318,7 +1323,7 @@ def test_cli_runs_structural_coverage_without_provider_construction(
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["qualification"] is None
-    assert report["canonical_route_leaf_count"] == 28
+    assert report["canonical_route_leaf_count"] == 30
     assert report["checklist"]["uncovered_cells"] == []
 
 
@@ -2405,6 +2410,7 @@ def test_route_signature_keeps_only_reviewed_coarse_discriminators() -> None:
         "capability",
         "clarification_reason",
         "answer_topic",
+        "conversation_act",
         "list_scope",
         "cart_operation",
         "profile_field",
@@ -3507,7 +3513,9 @@ def test_cli_dispatches_semantic_route_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report_path = tmp_path / "semantic-routing.json"
-    received: list[tuple[Path, str, Path, float | None, ProviderModel | None]] = []
+    received: list[
+        tuple[Path, str, Path, float | None, ProviderModel | None, SemanticRouteEvalCorpus | None]
+    ] = []
 
     async def run(
         path: Path,
@@ -3516,9 +3524,17 @@ def test_cli_dispatches_semantic_route_mode(
         fixture_config_root: Path,
         diagnostic_timeout_seconds: float | None,
         candidate_selection: ProviderModel | None,
+        corpus: SemanticRouteEvalCorpus | None,
     ) -> int:
         received.append(
-            (path, gate, fixture_config_root, diagnostic_timeout_seconds, candidate_selection)
+            (
+                path,
+                gate,
+                fixture_config_root,
+                diagnostic_timeout_seconds,
+                candidate_selection,
+                corpus,
+            )
         )
         return 0
 
@@ -3530,7 +3546,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received == [(report_path, "cutover", frontline_eval._CONFIG_ROOT, None, None)]
+    assert received == [(report_path, "cutover", frontline_eval._CONFIG_ROOT, None, None, None)]
 
     assert (
         frontline_eval.main(
@@ -3544,7 +3560,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "shadow", frontline_eval._CONFIG_ROOT, None, None)
+    assert received[-1] == (report_path, "shadow", frontline_eval._CONFIG_ROOT, None, None, None)
 
     assert (
         frontline_eval.main(
@@ -3560,7 +3576,7 @@ def test_cli_dispatches_semantic_route_mode(
         )
         == 0
     )
-    assert received[-1] == (report_path, "diagnostic", frontline_eval._CONFIG_ROOT, 3.0, None)
+    assert received[-1] == (report_path, "diagnostic", frontline_eval._CONFIG_ROOT, 3.0, None, None)
 
     assert (
         frontline_eval.main(
@@ -3586,6 +3602,7 @@ def test_cli_dispatches_semantic_route_mode(
             model="gpt-5.6-luna",
             reasoning_effort="none",
         ),
+        None,
     )
 
 
@@ -3879,6 +3896,96 @@ def test_cli_rejects_unbounded_semantic_run_modes() -> None:
         )
 
 
+def test_cli_alternate_corpus_cannot_reach_qualifying_gates(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The runners raise if reached, so this proves unreachability rather than merely that
+    # some argument check happened to fire.
+    async def unreachable(*args: object, **kwargs: object) -> int:
+        raise AssertionError("an alternate corpus reached a qualifying run")
+
+    monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", unreachable)
+    monkeypatch.setattr(frontline_eval, "_run_semantic_route_cutover_suite", unreachable)
+    corpus = str(config_root / "eval" / "frontline_semantic_routes.yaml")
+    report = str(tmp_path / "report.json")
+    # An alternate corpus is diagnostic-only: it must not reach any path that qualifies
+    # a router or writes release evidence.
+    rejected = (
+        ["--semantic-routing-corpus", corpus],
+        ["--semantic-routing-eval", "--semantic-routing-corpus", corpus],
+        [
+            "--semantic-routing-eval",
+            "--semantic-routing-report",
+            report,
+            "--semantic-routing-corpus",
+            corpus,
+        ],
+        [
+            "--semantic-routing-eval",
+            "--semantic-routing-gate",
+            "shadow",
+            "--semantic-routing-report",
+            report,
+            "--semantic-routing-corpus",
+            corpus,
+        ],
+        [
+            "--semantic-routing-eval",
+            "--semantic-routing-gate",
+            "cutover",
+            "--semantic-routing-report",
+            report,
+            "--semantic-routing-readiness-holdout",
+            str(tmp_path / "holdout.yaml"),
+            "--semantic-routing-readiness-report",
+            str(tmp_path / "readiness.json"),
+            "--semantic-routing-release-evidence",
+            str(tmp_path / "evidence.json"),
+            "--semantic-routing-corpus",
+            corpus,
+        ],
+    )
+    for argv in rejected:
+        with pytest.raises(SystemExit):
+            frontline_eval.main(argv)
+    assert not (tmp_path / "report.json").exists()
+    assert not (tmp_path / "readiness.json").exists()
+    assert not (tmp_path / "evidence.json").exists()
+
+
+def test_cli_alternate_corpus_reaches_only_the_diagnostic_run(
+    config_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def capture(*args: object, **kwargs: object) -> int:
+        captured.clear()
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(frontline_eval, "_run_semantic_route_eval", capture)
+    diagnostic = [
+        "--semantic-routing-eval",
+        "--semantic-routing-gate",
+        "diagnostic",
+        "--semantic-routing-diagnostic-timeout-seconds",
+        "3.0",
+        "--semantic-routing-report",
+        str(tmp_path / "diagnostic.json"),
+    ]
+
+    assert frontline_eval.main(diagnostic) == 0
+    assert captured["corpus"] is None
+
+    alternate = str(config_root / "eval" / "frontline_semantic_routes.yaml")
+    assert frontline_eval.main([*diagnostic, "--semantic-routing-corpus", alternate]) == 0
+    assert isinstance(captured["corpus"], frontline_eval.SemanticRouteEvalCorpus)
+
+
 async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     config_root: Path,
     tmp_path: Path,
@@ -3903,15 +4010,21 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
         model="gpt-5.6-terra",
         reasoning_effort="none",
     )
+    # A model override must not change sampling; conformance rows carry no temperature.
+    assert config.llm.routing.temperature == 0.0
+    assert alternate_selection.temperature is None
+    pinned_candidate = alternate_selection.model_copy(
+        update={"temperature": config.llm.routing.temperature}
+    )
 
     def model_for(selection: ProviderModel) -> FakeChatModel:
         if selection == config.llm.reasoning:
             return reasoning_model
-        assert selection == alternate_selection
+        assert selection == pinned_candidate
         return alternate_model
 
     def method_for(selection: ProviderModel) -> str:
-        assert selection == alternate_selection
+        assert selection == pinned_candidate
         return "function_calling"
 
     selection = SimpleNamespace(
@@ -3968,6 +4081,7 @@ async def test_semantic_route_eval_runs_projector_and_routes_without_network(
     assert report["models"]["candidate"]["model"] == alternate_selection.model
     assert report["models"]["candidate"]["provider"] == alternate_selection.provider
     assert report["models"]["candidate"]["reasoning_effort"] == "none"
+    assert report["models"]["candidate"]["temperature"] == config.llm.routing.temperature
     assert config.llm.routing.model != alternate_selection.model
     assert report["models"]["incumbent"]["model"] == config.llm.response.model
     assert "cases" not in report["models"]["candidate"]

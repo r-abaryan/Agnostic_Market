@@ -36,6 +36,16 @@ type NonNegativeFiniteEpoch = Annotated[
 CancelScope = Literal["all_cancellable", "both_cancellable"]
 OrderContextOperation = Literal["read", "list", "place", "cancel", "refund", "return"]
 AnswerTopic = Literal["policy", "general"]
+# Closed social acts. Each value has an observed utterance in the 2026-09-21 baseline;
+# a value with no corpus case is an unexercised route leaf, so none are added on spec.
+ConversationAct = Literal[
+    "greeting",
+    "acknowledgment",
+    "farewell",
+    "capability_summary",
+    "channel_check",
+    "repair",
+]
 ListOrderScope = Literal["session", "account"]
 CartOperation = Literal["add", "remove", "set_quantity"]
 OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
@@ -62,6 +72,7 @@ class _CompleteIntentRequest(IntentRequestModel):
 
 class CapabilityId(StrEnum):
     ANSWER_QUESTION = "answer_question"
+    CONVERSE = "converse"
     SEARCH_CATALOG = "search_catalog"
     VERIFY_ORDER_STATUS = "verify_order_status"
     LIST_ORDERS = "list_orders"
@@ -380,6 +391,13 @@ class AbortCurrent(_CompleteIntentRequest):
     kind: Literal[CapabilityId.ABORT_CURRENT] = CapabilityId.ABORT_CURRENT
 
 
+class Converse(_CompleteIntentRequest):
+    model_config = _FROZEN
+
+    kind: Literal[CapabilityId.CONVERSE] = CapabilityId.CONVERSE
+    act: ConversationAct
+
+
 class DiscloseAiIdentity(_CompleteIntentRequest):
     model_config = _FROZEN
 
@@ -394,6 +412,7 @@ class RequestPerson(_CompleteIntentRequest):
 
 IntentRequest = Annotated[
     AnswerQuestion
+    | Converse
     | SearchCatalog
     | VerifyOrderStatus
     | ListOrders
@@ -526,6 +545,7 @@ class RouteProposal(BaseModel):
     capability: CapabilityId | None = None
     clarification_reason: ClarificationReason | None = None
     answer_topic: AnswerTopic | None = None
+    conversation_act: ConversationAct | None = None
     list_scope: ListOrderScope | None = None
     cart_operation: CartOperation | None = None
     profile_field: ProfileField | None = None
@@ -637,6 +657,9 @@ class RoutingContext(BaseModel):
     active_capability: CapabilityId | None = None
     recent_order_operation: OrderContextOperation | None = None
     recent_order_count: int = Field(default=0, ge=0)
+    # Presence only. The reference itself is never projected: the router selects an owner and
+    # never a target, and the owner re-resolves focus against live state.
+    has_focused_order: StrictBool = False
     cart_state: Literal["empty", "nonempty"]
     available_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
 

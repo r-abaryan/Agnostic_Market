@@ -46,6 +46,13 @@ GUEST_LIST_CLOSE = "To pull up any other orders on an account, I can verify you 
 # instructions and decline copy stay with their owning flows.
 ACCOUNT_CONTACT_QUESTION = "What email address or phone number is on the account?"
 ORDER_NUMBER_QUESTION = "What is the order number, for example ORD-1234?"
+# Spoken only when the caller named no reference AND nothing is visible to them, so asking for
+# a number would be a dead end. It must not claim the account has no orders: an unbound caller
+# has not been checked against one.
+NO_VISIBLE_ORDERS_LINE = (
+    "I don't have any orders from this call yet. If you have an order number I can check it, "
+    "or I can verify your account to look up your order history."
+)
 
 
 def guest_list_close() -> str:

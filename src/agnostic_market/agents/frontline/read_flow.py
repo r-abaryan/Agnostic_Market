@@ -13,7 +13,12 @@ from langgraph.graph import END
 from langgraph.types import Command, interrupt
 
 from agnostic_market.agents._consent import classify_confirmation
-from agnostic_market.agents._copy import ACCOUNT_CONTACT_QUESTION, ORDER_NUMBER_QUESTION, warm_close
+from agnostic_market.agents._copy import (
+    ACCOUNT_CONTACT_QUESTION,
+    NO_VISIBLE_ORDERS_LINE,
+    ORDER_NUMBER_QUESTION,
+    warm_close,
+)
 from agnostic_market.agents.frontline.typed_prompt import (
     ORDER_TARGET_PROPOSAL_PROMPT,
     compose_answer_response_prompt,
@@ -67,6 +72,7 @@ ORDER_STATUS_TARGET_ASK_NODE = "order_status_target_ask"
 ORDER_STATUS_TARGET_PROPOSE_NODE = "order_status_target_propose"
 ORDER_STATUS_TARGET_CONFIRM_NODE = "order_status_target_confirm"
 ORDER_STATUS_TARGET_REJECT_NODE = "order_status_target_reject"
+ORDER_STATUS_NO_VISIBLE_ORDERS_NODE = "order_status_no_visible_orders"
 ORDER_STATUS_FULFILL_NODE = "order_status_fulfill"
 READ_FLOW_SPEAKABLE_NODES = frozenset(
     {
@@ -75,6 +81,7 @@ READ_FLOW_SPEAKABLE_NODES = frozenset(
         ANSWER_UNSUPPORTED_NODE,
         ORDER_STATUS_TARGET_ASK_NODE,
         ORDER_STATUS_TARGET_REJECT_NODE,
+        ORDER_STATUS_NO_VISIBLE_ORDERS_NODE,
         ORDER_STATUS_FULFILL_NODE,
     }
 )
@@ -101,6 +108,7 @@ class ReadFlowNodes:
     order_status_target_propose: Callable[[ReasoningState], Awaitable[Command]]
     order_status_target_confirm: Callable[[ReasoningState], Command]
     order_status_target_reject: Callable[[ReasoningState], dict[str, object]]
+    order_status_no_visible_orders: Callable[[ReasoningState], dict[str, object]]
     order_status_fulfill: Callable[[ReasoningState], Awaitable[Command]]
     speakable_nodes: frozenset[str]
     model_speech_nodes: frozenset[str]
@@ -191,6 +199,10 @@ def build_read_flow_nodes(
             and all(re.fullmatch(r"ORD-\d+", ref) is not None for ref in refs)
         )
         if not accepted:
+            # An empty ref set means the caller named nothing, which is a different question
+            # from naming something unusable. Only the first can be a dead end.
+            if not refs and identity_store.current() is None and not guest_orders.order_refs:
+                return Command(goto=ORDER_STATUS_NO_VISIBLE_ORDERS_NODE)
             return Command(goto=ORDER_STATUS_TARGET_ASK_NODE)
         request = VerifyOrderStatus(target=ExplicitOrderSet(order_refs=refs))
         return Command(
@@ -249,6 +261,13 @@ def build_read_flow_nodes(
             goto=ORDER_STATUS_TARGET_REJECT_NODE,
             update={"active_invocation": None},
         )
+
+    def order_status_no_visible_orders_node(state: ReasoningState) -> dict[str, object]:
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
+            raise TypeError("no-visible-orders reply requires an active invocation")
+        # Retained like the target ask, so a number given next turn continues this owner.
+        return {"messages": [AIMessage(NO_VISIBLE_ORDERS_LINE)]}
 
     def order_status_target_reject_node(state: ReasoningState) -> dict[str, object]:
         if state.active_invocation is not None:
@@ -443,7 +462,9 @@ def build_read_flow_nodes(
         if not isinstance(current.content, str):
             raise TypeError("catalog response requires plain committed caller text")
 
-        result = catalog.search(request.query)
+        # The caller's words reach the model already; give it the live catalog rather than a
+        # lexically pre-filtered subset, so meaning decides the match and alternatives exist.
+        result = catalog.browse()
         response = await response_model.ainvoke(
             [
                 SystemMessage(compose_catalog_response_prompt(display_name, policy, result)),
@@ -537,6 +558,7 @@ def build_read_flow_nodes(
         order_status_target_propose=order_status_target_propose_node,
         order_status_target_confirm=order_status_target_confirm_node,
         order_status_target_reject=order_status_target_reject_node,
+        order_status_no_visible_orders=order_status_no_visible_orders_node,
         order_status_fulfill=order_status_fulfill_node,
         speakable_nodes=READ_FLOW_SPEAKABLE_NODES,
         model_speech_nodes=READ_FLOW_MODEL_SPEECH_NODES,

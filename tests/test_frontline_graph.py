@@ -23,6 +23,7 @@ from policy_helpers import make_policy
 from telemetry_helpers import make_session_telemetry
 from verification_helpers import grant_verification, make_otp_provider
 
+from agnostic_market.agents.capabilities import CapabilityRegistry as _CapabilityRegistry
 from agnostic_market.agents.frontline import build_frontline_graph, read_flow
 from agnostic_market.agents.frontline import graph as frontline_graph
 from agnostic_market.agents.recovery import (
@@ -357,6 +358,8 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.PLACE_ORDER,
         CapabilityId.SEARCH_CATALOG,
         CapabilityId.ANSWER_QUESTION,
+        CapabilityId.CONVERSE,
+        CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.VERIFY_ORDER_STATUS,
         CapabilityId.ABORT_CURRENT,
         CapabilityId.REQUEST_PERSON,
@@ -369,6 +372,8 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "cart_capability_entry",
         "catalog_entry",
         "answer_response",
+        "converse",
+        "disclose_ai_identity",
         "order_status_entry",
         "abort_current",
         "request_person",
@@ -381,9 +386,9 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
     # An unmigrated id must be ABSENT, never resolving to some fallback owner.
     # The unmigrated set is named, not counted: a count stays green if one id gains an owner
     # while another is added, and it names nothing when it breaks.
-    assert set(CapabilityId) - set(registry.capability_ids) == {
-        CapabilityId.DISCLOSE_AI_IDENTITY,
-    }
+    # Every id now has an owner. The named-set form is kept: it fails loudly if an id is
+    # added without a graph node rather than passing on a count.
+    assert set(CapabilityId) - set(registry.capability_ids) == set()
     assert registry.resolve(SearchCatalog(query="shoes")).node_name == "catalog_entry"
     assert graph.builder.nodes["catalog_entry"].ends == (
         "catalog_response",
@@ -410,6 +415,8 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         "order_status_fulfill",
     )
     assert graph.builder.nodes["order_status_target_propose"].ends == (
+        "order_status_target_ask",
+        "order_status_no_visible_orders",
         "order_status_target_reject",
         "order_status_fulfill",
     )
@@ -602,7 +609,18 @@ def test_invalid_dispatch_envelope_closes_without_executing_an_owner(
 ) -> None:
     sink = InMemoryTelemetrySink()
     telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("invalid-dispatch")
-    graph = _graph(config_root, FakeChatModel(), telemetry=telemetry)
+    # Every CapabilityId now has an owner, so an unowned id is only expressible against a
+    # registry that lacks one. Envelope revalidation coerces a typed request back to its
+    # registered class by kind, so a bad request type cannot stand in for this.
+    registry_kwargs: dict[str, object] = {}
+    if failure == "unregistered":
+        full = frontline_graph.build_frontline_capability_registry()
+        registry_kwargs["capability_registry"] = _CapabilityRegistry(
+            spec
+            for capability_id, spec in full.specs.items()
+            if capability_id is not CapabilityId.DISCLOSE_AI_IDENTITY
+        )
+    graph = _graph(config_root, FakeChatModel(), telemetry=telemetry, **registry_kwargs)
     invocation = ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1")
     envelope: object = (
         CapabilityDispatchEnvelope(
@@ -757,8 +775,8 @@ async def test_typed_cart_gathers_one_slot_per_committed_turn(config_root: Path)
     cart = CartStore()
     reasoning = NativeAsyncOnlyFakeChatModel(
         scripted_calls=[
-            [("provide_cart_item", {"candidate_key": "1"})],
-            [("provide_cart_quantity", {"quantity": 2})],
+            [("provide_cart_slots", {"candidate_key": "1"})],
+            [("provide_cart_slots", {"quantity": 2})],
         ]
     )
     graph = _graph(
@@ -913,8 +931,8 @@ async def test_typed_cart_duplicate_name_selection_retains_the_resolved_sku(
     catalog = FixtureCatalog("acme_store", custom_fixture)
     reasoning = FakeChatModel(
         scripted_calls=[
-            [("provide_cart_item", {"candidate_key": "2"})],
-            [("provide_cart_quantity", {"quantity": 2})],
+            [("provide_cart_slots", {"candidate_key": "2"})],
+            [("provide_cart_slots", {"quantity": 2})],
         ],
         record_prompts=True,
     )
@@ -1012,7 +1030,7 @@ async def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
     config_root: Path,
 ) -> None:
     reasoning = FakeChatModel(
-        scripted_calls=[[("provide_cart_item", {"candidate_key": "1"})]],
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": "1"})]],
         record_prompts=True,
     )
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
@@ -1040,8 +1058,8 @@ async def test_typed_cart_slot_model_sees_only_the_current_committed_utterance(
 async def test_typed_cart_boolean_quantity_performs_no_effect(config_root: Path) -> None:
     reasoning = FakeChatModel(
         scripted_calls=[
-            [("provide_cart_quantity", {"quantity": True})],
-            [("provide_cart_quantity", {"quantity": True})],
+            [("provide_cart_slots", {"quantity": True})],
+            [("provide_cart_slots", {"quantity": True})],
         ]
     )
     cart = CartStore()
@@ -1106,8 +1124,8 @@ async def test_two_invalid_typed_cart_item_keys_enter_bounded_clarification(
 ) -> None:
     reasoning = FakeChatModel(
         scripted_calls=[
-            [("provide_cart_item", {"candidate_key": "999"})],
-            [("provide_cart_item", {"candidate_key": "still-not-valid"})],
+            [("provide_cart_slots", {"candidate_key": "999"})],
+            [("provide_cart_slots", {"candidate_key": "still-not-valid"})],
         ]
     )
     graph = _graph(config_root, FakeChatModel(), reasoning_model=reasoning)
@@ -1144,8 +1162,8 @@ async def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing
 ) -> None:
     reasoning = FakeChatModel(
         scripted_calls=[
-            [("provide_cart_quantity", {"quantity": 99})],
-            [("provide_cart_item", {"candidate_key": "1"})],
+            [("provide_cart_slots", {"quantity": 99})],
+            [("provide_cart_slots", {"candidate_key": "1"})],
         ]
     )
     cart = CartStore()
@@ -1174,8 +1192,10 @@ async def test_typed_cart_rejects_a_fixed_slot_proposal_then_accepts_the_missing
     assert isinstance(pending, PendingCartMutation)
     assert pending.quantity == 2
     assert reasoning.invoke_count == 2
+    # One tool now carries both slots, so a proposal for an already-fixed slot is rejected by
+    # the flow with a specific reason rather than by the unknown-tool path.
     assert any(
-        isinstance(message, ToolMessage) and "Unavailable action" in str(message.content)
+        isinstance(message, ToolMessage) and "still missing" in str(message.content)
         for message in update["messages"]
     )
 
@@ -1646,16 +1666,18 @@ async def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_c
     )
 
     assert response_model.invoke_count == 1
-    assert lookup_queries == ["running"]
+    # No lexical narrowing: the owner hands the model the live catalog and one model call
+    # both selects and speaks.
+    assert lookup_queries == []
     assert response_model.emitted_messages[-1].tool_calls == []
     assert result["active_invocation"] is None
     assert _only_spoken(result) == "We carry trail running shoes for $89.99."
     prompt = response_model._seen_prompts[-1]
     assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
-    assert "waterproof rain jacket" not in prompt
+    assert "waterproof rain jacket; SKU SKU-BLU-07; price $129.00" in prompt
 
 
-async def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
+async def test_catalog_prompt_grounds_every_named_product_in_the_live_catalog(
     config_root: Path,
 ) -> None:
     response_model = FakeChatModel(
@@ -1676,11 +1698,13 @@ async def test_catalog_no_match_prompt_does_not_authorize_a_relevance_claim(
         "No catalog name matched. The catalog contains trail running shoes."
     )
     prompt = response_model._seen_prompts[-1]
-    assert "Do not claim that other products match" in prompt
+    # Offering a listed alternative is now allowed; asserting a product the caller named
+    # exists is still not. The grounding guardrails carry that distinction.
+    assert "Name only products from the list" in prompt
     assert "Do not invent products" in prompt
-    assert "- No matching catalog products." in prompt
-    assert "trail running shoes" not in prompt
-    assert "waterproof rain jacket" not in prompt
+    assert "claim a product exists because the caller asked for it" in prompt
+    assert "If nothing is a genuine fit, say so plainly" in prompt
+    assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
 
 
 async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
@@ -2456,7 +2480,13 @@ async def test_order_status_owner_gathers_target_then_uses_one_non_speaking_prop
         turn_id="status-opening",
         text="Where is my order?",
     )
-    assert _only_spoken(opening) == "What is the order number, for example ORD-1234?"
+    # The caller named no reference and has nothing visible, so demanding an order number
+    # would be a dead end. The owner is still retained, so the number given next turn
+    # continues this flow rather than starting over.
+    assert _only_spoken(opening) == (
+        "I don't have any orders from this call yet. If you have an order number I can check "
+        "it, or I can verify your account to look up your order history."
+    )
     retained = opening["active_invocation"]
     assert retained is not None
 
@@ -2880,6 +2910,9 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
             "entry",
             "request_person",
             "abort_current",
+            "order_status_no_visible_orders",
+            "converse",
+            "disclose_ai_identity",
             "owner_declined",
             "router_no_action",
             "cart_clarify",

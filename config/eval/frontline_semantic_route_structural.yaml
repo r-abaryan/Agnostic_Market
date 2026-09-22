@@ -1,9 +1,9 @@
 schema_version: "1"
 purpose: development_only
-frozen_corpus_fingerprint: 72d92a245422a74d2334216e1062ad6fecac7c03033c79e68157b776672bd837
-route_schema_fingerprint: c117cf4c0c259dea449c5b05adc17bc351ef9a43d546d61027e5e51237961623
-registry_fingerprint: d50355f1ccb888953fcca5e07c87ed6c6909eaf9bf6163f29a75f43c11e66660
-context_projector_version: "3"
+frozen_corpus_fingerprint: 90793a1aa4990336863a5b18a6152d964ce03b2c573af84e26c9da0a34e9342e
+route_schema_fingerprint: 3e4057658d7b47455328c30738b330243074325fd4c9fc427c9159e79237ad41
+registry_fingerprint: c72ab9001f3027187614715babad11295d57701018c4db582cd8eac05bc894a4
+context_projector_version: "4"
 
 cases:
   - case_id: structural_remove_base
@@ -31,6 +31,8 @@ cases:
         - place_order
         - search_catalog
         - answer_question
+        - converse
+        - disclose_ai_identity
         - verify_order_status
         - abort_current
         - request_person

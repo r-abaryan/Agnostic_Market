@@ -21,30 +21,36 @@ def compose_catalog_response_prompt(
     policy: PolicyContext,
     result: CatalogProductSet,
 ) -> str:
-    """Bound a product answer to one current catalog lookup."""
+    """Bound a product answer to the live catalog the caller can actually be sold."""
 
     if result.products:
         catalog_facts = "\n".join(
             f"- {product.name}; SKU {product.sku}; price ${product.price_usd:.2f}"
             for product in result.products
         )
-        lookup_instruction = "Answer using only the matching catalog facts below."
-    else:
-        catalog_facts = "- No matching catalog products."
         lookup_instruction = (
-            "Say that no catalog product matched the request. Do not claim that other products "
-            "match or list products absent from the result."
+            "Decide which of the products below the caller means. Match on meaning, not on "
+            "shared words: a request for a jacket is served by any jacket, and an everyday "
+            "word for a product kind is served by the stocked item of that kind. Extra "
+            "describing words in the request do not have to appear in a product name. If "
+            "nothing is a genuine fit, say so plainly and offer the closest products that are "
+            "listed, so the caller hears a real alternative rather than a dead end."
         )
+    else:
+        catalog_facts = "- The catalog is empty."
+        lookup_instruction = "Say that there are no products to offer right now."
     return "\n".join(
         (
             compose_shared_context(display_name, policy),
             "",
             "You are the product-catalog response owner. This is a read-only answer.",
             lookup_instruction,
-            "Do not invent products, prices, SKUs, stock, shipping, or availability.",
+            "Name only products from the list, using their listed name and price. Do not "
+            "invent products, prices, SKUs, stock, shipping, or availability, and do not "
+            "claim a product exists because the caller asked for it.",
             "Keep the spoken answer to one or two short sentences.",
             "",
-            "Live catalog result:",
+            "Live catalog:",
             catalog_facts,
         )
     )

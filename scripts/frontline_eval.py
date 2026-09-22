@@ -123,6 +123,7 @@ from agnostic_market.dtos.orchestration import (
     CancelOrders,
     CapabilityId,
     ChangeProfile,
+    Converse,
     FocusedOrderSet,
     IntentRequest,
     ListOrders,
@@ -184,7 +185,7 @@ _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
 # 29 -> 28 on 2026-09-21: clarify(missing_target) dropped when its only case was retired.
-_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 28
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 30
 _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
@@ -2032,6 +2033,7 @@ def _ordered_capabilities(
 _ROUTE_SIGNATURE_DISCRIMINATORS = frozenset(
     {
         "answer_topic",
+        "conversation_act",
         "list_scope",
         "cart_operation",
         "profile_field",
@@ -2132,6 +2134,7 @@ def _route_signature(
         "capability": None,
         "clarification_reason": None,
         "answer_topic": None,
+        "conversation_act": None,
         "list_scope": None,
         "cart_operation": None,
         "profile_field": None,
@@ -2151,6 +2154,8 @@ def _route_signature(
     signature["capability"] = request.kind.value
     if isinstance(request, AnswerQuestion):
         signature["answer_topic"] = request.topic
+    elif isinstance(request, Converse):
+        signature["conversation_act"] = request.act
     elif isinstance(request, ListOrders):
         signature["list_scope"] = request.scope
     elif isinstance(request, ModifyCart):
@@ -2181,6 +2186,7 @@ def _require_producible_ground_truth(
         decision="direct",
         capability=signature["capability"],
         answer_topic=signature["answer_topic"],
+        conversation_act=signature["conversation_act"],
         list_scope=signature["list_scope"],
         cart_operation=signature["cart_operation"],
         profile_field=signature["profile_field"],
@@ -3534,9 +3540,14 @@ async def _run_semantic_route_eval(
         candidate_model = selection.routing_model
         candidate_structured_output_method = selection.routing_structured_output_method
     else:
-        candidate_model = selection.gateway.chat_model(candidate_selection)
+        # A model override must not also change sampling: conformance rows carry no
+        # temperature, so inherit the pinned routing value.
+        effective_candidate = candidate_selection.model_copy(
+            update={"temperature": config.llm.routing.temperature}
+        )
+        candidate_model = selection.gateway.chat_model(effective_candidate)
         candidate_structured_output_method = selection.gateway.structured_output_method(
-            candidate_selection
+            effective_candidate
         )
     repetitions = 1 if gate == "diagnostic" else _SEMANTIC_ROUTE_QUALIFICATION_REPETITIONS
     if gate == "diagnostic":
@@ -4474,6 +4485,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--semantic-routing-corpus",
+        type=Path,
+        help=(
+            "evaluation-only semantic-route corpus override; requires an explicit report "
+            "path and the diagnostic gate"
+        ),
+    )
+    parser.add_argument(
         "--semantic-routing-data-partition",
         action="append",
         type=Path,
@@ -4562,6 +4581,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--semantic-routing-candidate requires --semantic-routing-eval")
     if args.semantic_routing_candidate is not None and args.semantic_routing_report is None:
         parser.error("--semantic-routing-candidate requires --semantic-routing-report")
+    if args.semantic_routing_corpus is not None and not args.semantic_routing_eval:
+        parser.error("--semantic-routing-corpus requires --semantic-routing-eval")
+    if args.semantic_routing_corpus is not None and args.semantic_routing_report is None:
+        parser.error("--semantic-routing-corpus requires --semantic-routing-report")
     if args.semantic_routing_candidate is not None:
         try:
             args.semantic_routing_candidate = _resolve_conformance_target(
@@ -4592,6 +4615,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.semantic_routing_eval:
         semantic_gate = args.semantic_routing_gate or "cutover"
+        # Checked before the cutover-suite branch so an override can never be silently ignored.
+        if args.semantic_routing_corpus is not None and semantic_gate != "diagnostic":
+            parser.error("--semantic-routing-corpus requires the diagnostic gate")
         if any(value is not None for value in routing_cutover_suite_options):
             if semantic_gate != "cutover":
                 parser.error("routing cutover suite requires the cutover gate")
@@ -4635,6 +4661,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--semantic-routing-diagnostic-timeout-seconds requires the diagnostic gate"
                 )
             diagnostic_timeout_seconds = None
+        alternate_corpus = None
+        if args.semantic_routing_corpus is not None:
+            try:
+                alternate_corpus = _load_semantic_route_corpus(args.semantic_routing_corpus)
+            except (ConfigError, ValidationError) as exc:
+                parser.error(str(exc))
         return asyncio.run(
             _run_semantic_route_eval(
                 args.semantic_routing_report or _SEMANTIC_ROUTE_REPORT_PATH,
@@ -4642,6 +4674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fixture_config_root=_CONFIG_ROOT,
                 diagnostic_timeout_seconds=diagnostic_timeout_seconds,
                 candidate_selection=args.semantic_routing_candidate,
+                corpus=alternate_corpus,
             )
         )
     if args.recovery_certification is not None:

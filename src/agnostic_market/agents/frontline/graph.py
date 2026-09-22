@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -30,6 +32,7 @@ from agnostic_market.agents.frontline.read_flow import (
     CATALOG_RESPONSE_NODE,
     ORDER_STATUS_ENTRY_NODE,
     ORDER_STATUS_FULFILL_NODE,
+    ORDER_STATUS_NO_VISIBLE_ORDERS_NODE,
     ORDER_STATUS_TARGET_ASK_NODE,
     ORDER_STATUS_TARGET_CONFIRM_NODE,
     ORDER_STATUS_TARGET_PROPOSE_NODE,
@@ -79,6 +82,8 @@ from agnostic_market.dtos.orchestration import (
     CapabilityDispatchEnvelope,
     CapabilityId,
     ChangeProfile,
+    Converse,
+    DiscloseAiIdentity,
     ListOrders,
     ModifyCart,
     PlaceOrder,
@@ -105,6 +110,40 @@ _CAPABILITY_DISPATCH_NODE = "capability_dispatch"
 _ROUTER_NO_ACTION_NODE = "router_no_action"
 _ABORT_CURRENT_NODE = "abort_current"
 _REQUEST_PERSON_NODE = "request_person"
+_CONVERSE_NODE = "converse"
+_DISCLOSE_AI_IDENTITY_NODE = "disclose_ai_identity"
+# Platform-owned and versioned. A merchant supplies display_name only: the AI-identification
+# clause is not merchant-editable (COMPLIANCE.md 31-33), unlike call_start_disclosure.
+_AI_IDENTITY_DISCLOSURE_VERSION = "1"
+_AI_IDENTITY_DISCLOSURE = (
+    "Yes, I am an AI assistant for {display_name}, not a person. "
+    "I can keep helping, or put you through to someone."
+)
+_CONVERSE_LINES: Mapping[str, str] = MappingProxyType(
+    {
+        "greeting": "Hello, you're through to {display_name}. What can I help you with?",
+        "acknowledgment": "You're welcome.",
+        "farewell": "Thanks for calling {display_name}. Goodbye.",
+        "channel_check": "Yes, I can hear you clearly. Go ahead.",
+        "repair": "Sorry about that. Could you say that again?",
+    }
+)
+# Caller-facing phrase per capability. capability_summary is rendered from the session's real
+# registry, so an unavailable capability can never be offered.
+_CAPABILITY_CALLER_PHRASES: Mapping[CapabilityId, str] = MappingProxyType(
+    {
+        CapabilityId.VERIFY_ORDER_STATUS: "check an order",
+        CapabilityId.LIST_ORDERS: "go through your orders",
+        CapabilityId.CANCEL_ORDERS: "cancel an order",
+        CapabilityId.REFUND_ORDER: "arrange a refund",
+        CapabilityId.RETURN_ORDER: "start a return",
+        CapabilityId.SEARCH_CATALOG: "find a product",
+        CapabilityId.VIEW_CART: "read back your basket",
+        CapabilityId.MODIFY_CART: "change your basket",
+        CapabilityId.PLACE_ORDER: "place your order",
+        CapabilityId.CHANGE_PROFILE: "update your details",
+    }
+)
 _CAPABILITY_DISPATCH_REJECTED_LINE = "I couldn't complete that request. Please try again."
 _ROUTER_NO_ACTION_LINES = {
     "ambiguous_intent": ("I'm not sure what you'd like me to do. Could you say that another way?"),
@@ -154,6 +193,8 @@ def build_frontline_capability_registry() -> CapabilityRegistry:
     order_status_entry = CapabilityEntry(ORDER_STATUS_ENTRY_NODE)
     abort_current_entry = CapabilityEntry(_ABORT_CURRENT_NODE)
     request_person_entry = CapabilityEntry(_REQUEST_PERSON_NODE)
+    converse_entry = CapabilityEntry(_CONVERSE_NODE)
+    disclose_ai_identity_entry = CapabilityEntry(_DISCLOSE_AI_IDENTITY_NODE)
     return CapabilityRegistry(
         (
             CapabilitySpec(CapabilityId.LIST_ORDERS, ListOrders, support_entry),
@@ -173,6 +214,12 @@ def build_frontline_capability_registry() -> CapabilityRegistry:
             CapabilitySpec(CapabilityId.PLACE_ORDER, PlaceOrder, cart_entry),
             CapabilitySpec(CapabilityId.SEARCH_CATALOG, SearchCatalog, catalog_entry),
             CapabilitySpec(CapabilityId.ANSWER_QUESTION, AnswerQuestion, answer_entry),
+            CapabilitySpec(CapabilityId.CONVERSE, Converse, converse_entry),
+            CapabilitySpec(
+                CapabilityId.DISCLOSE_AI_IDENTITY,
+                DiscloseAiIdentity,
+                disclose_ai_identity_entry,
+            ),
             CapabilitySpec(
                 CapabilityId.VERIFY_ORDER_STATUS,
                 VerifyOrderStatus,
@@ -211,6 +258,8 @@ FRONTLINE_SPEAKABLE_NODES = frozenset(
         "handover",
         "automation_terminal_response",
         _ABORT_CURRENT_NODE,
+        _CONVERSE_NODE,
+        _DISCLOSE_AI_IDENTITY_NODE,
         "owner_declined",
         "principal_warning",
         _CAPABILITY_DISPATCH_NODE,
@@ -406,6 +455,47 @@ def build_frontline_graph(
         return {
             **clear_automation_state(),
             "messages": [AIMessage("Okay. I've stopped that request.")],
+        }
+
+    def capability_summary_line() -> str:
+        offered = [
+            phrase
+            for capability_id, phrase in _CAPABILITY_CALLER_PHRASES.items()
+            if capability_id in capability_registry.capability_ids
+        ]
+        if not offered:
+            return "I can put you through to someone who can help."
+        listed = (
+            offered[0] if len(offered) == 1 else ", ".join(offered[:-1]) + f", or {offered[-1]}"
+        )
+        return f"I can {listed}. What would you like to do?"
+
+    def converse_node(state: ReasoningState) -> dict[str, object]:
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, Converse):
+            raise TypeError("converse owner requires a converse invocation")
+        act = invocation.request.act
+        routing_telemetry.record({"event": "conversation_act_served", "act": act})
+        line = (
+            capability_summary_line()
+            if act == "capability_summary"
+            else _CONVERSE_LINES[act].format(display_name=display_name)
+        )
+        return {**clear_automation_state(), "messages": [AIMessage(line)]}
+
+    def disclose_ai_identity_node(state: ReasoningState) -> dict[str, object]:
+        invocation = state.active_invocation
+        if invocation is None or not isinstance(invocation.request, DiscloseAiIdentity):
+            raise TypeError("ai-identity owner requires a disclosure invocation")
+        routing_telemetry.record(
+            {
+                "event": "ai_identity_disclosed",
+                "template_version": _AI_IDENTITY_DISCLOSURE_VERSION,
+            }
+        )
+        return {
+            **clear_automation_state(),
+            "messages": [AIMessage(_AI_IDENTITY_DISCLOSURE.format(display_name=display_name))],
         }
 
     def owner_declined_node(_state: ReasoningState) -> dict[str, object]:
@@ -955,6 +1045,18 @@ def build_frontline_graph(
         AbandonmentKind.PURE_ABORT,
     )
     node_registry.register(
+        _CONVERSE_NODE,
+        converse_node,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
+        _DISCLOSE_AI_IDENTITY_NODE,
+        disclose_ai_identity_node,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
+    )
+    node_registry.register(
         "owner_declined",
         owner_declined_node,
         ExceptionAction.SAFE_ABORT,
@@ -1121,9 +1223,17 @@ def build_frontline_graph(
         ExceptionAction.SAFE_ABORT,
         AbandonmentKind.PURE_ABORT,
         destinations=(
+            ORDER_STATUS_TARGET_ASK_NODE,
+            ORDER_STATUS_NO_VISIBLE_ORDERS_NODE,
             ORDER_STATUS_TARGET_REJECT_NODE,
             ORDER_STATUS_FULFILL_NODE,
         ),
+    )
+    node_registry.register(
+        ORDER_STATUS_NO_VISIBLE_ORDERS_NODE,
+        reads.order_status_no_visible_orders,
+        ExceptionAction.SAFE_ABORT,
+        AbandonmentKind.PURE_ABORT,
     )
     node_registry.register(
         ORDER_STATUS_TARGET_CONFIRM_NODE,
@@ -1383,6 +1493,8 @@ def build_frontline_graph(
     )
     graph.add_edge(_REQUEST_PERSON_NODE, "handover")
     graph.add_edge(_ABORT_CURRENT_NODE, END)
+    graph.add_edge(_CONVERSE_NODE, END)
+    graph.add_edge(_DISCLOSE_AI_IDENTITY_NODE, END)
     graph.add_edge("owner_declined", END)
     graph.add_edge("handover", "automation_terminal_response")
     graph.add_conditional_edges(
@@ -1455,6 +1567,7 @@ def build_frontline_graph(
     graph.add_edge(ANSWER_UNSUPPORTED_NODE, END)
     graph.add_edge(ORDER_STATUS_TARGET_ASK_NODE, END)
     graph.add_edge(ORDER_STATUS_TARGET_REJECT_NODE, END)
+    graph.add_edge(ORDER_STATUS_NO_VISIBLE_ORDERS_NODE, END)
     graph.add_edge("support_clarify", END)
     graph.add_conditional_edges(
         "support_guardrail",
