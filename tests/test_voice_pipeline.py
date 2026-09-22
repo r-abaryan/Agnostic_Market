@@ -381,7 +381,7 @@ async def test_engine_seam_wiring(config_root: Path) -> None:
     assert loop.application.engine is loop.engine
     assert adapter._session is loop.session
     assert isinstance(loop.engine, ReasoningEngine)
-    assert loop.engine._cancellation_quiescence_timeout_seconds == 2.0
+    assert loop.engine._cancellation_quiescence_timeout_seconds == 10.0
     assert loop.engine._node_execution_tracker is loop.engine._graph.node_execution_tracker
     assert not await loop.engine.apending_interrupt()  # fresh thread
 
