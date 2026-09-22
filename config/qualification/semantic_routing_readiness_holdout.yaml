@@ -4,7 +4,7 @@ steward_id: project-owner
 frozen_at: "2026-09-19T18:32:42.1779564+01:00"
 lineage_reference: config/qualification/semantic_routing_readiness_recipe.yaml
 generation_recipe_fingerprint: 3227e80a804119b36443cf8c4281c92a37533eb204520d360b107437e7ffa0d0
-source_disjoint_from_corpus_fingerprint: 72d92a245422a74d2334216e1062ad6fecac7c03033c79e68157b776672bd837
+source_disjoint_from_corpus_fingerprint: 90793a1aa4990336863a5b18a6152d964ce03b2c573af84e26c9da0a34e9342e
 labels_not_used_for_selection: true
 
 lineage:
@@ -156,6 +156,8 @@ corpus:
         - place_order
         - search_catalog
         - answer_question
+        - converse
+        - disclose_ai_identity
         - verify_order_status
         - abort_current
         - request_person
@@ -229,6 +231,7 @@ corpus:
         utterance: "Where has that one got to now?"
         recent_order_operation: return
         recent_order_count: 1
+        has_focused_order: true
       expected:
         decision: direct
         request:
@@ -622,6 +625,8 @@ corpus:
           - place_order
           - search_catalog
           - answer_question
+          - converse
+          - disclose_ai_identity
           - verify_order_status
           - abort_current
           - request_person

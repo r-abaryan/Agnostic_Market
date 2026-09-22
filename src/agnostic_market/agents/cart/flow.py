@@ -120,16 +120,17 @@ def _placement_confirmation_phrase(
     return validate_confirmation_rendering(policy, rendered, phrase)
 
 
-class _ProposeKey(BaseModel):
+class _ProposeSlots(BaseModel):
+    """Every fillable cart slot in one proposal.
+
+    Both are optional because the caller may supply either or both in a turn; the flow
+    rejects a field offered for a slot that is already fixed, and rejects an empty proposal.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    candidate_key: str
-
-
-class _ProposeQuantity(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    quantity: int = Field(strict=True, ge=0)
+    candidate_key: str | None = None
+    quantity: int | None = Field(default=None, strict=True, ge=0)
 
 
 _MutationOperation = Literal["add", "remove", "set_quantity"]
@@ -185,13 +186,11 @@ def build_cart_nodes(
         raise NotImplementedError("intercepted by the capability entry; never executed")
 
     @tool
-    def provide_cart_item(candidate_key: str) -> str:
-        """Supply only the missing item using its current code-bounded option number."""
-        raise NotImplementedError("intercepted by the capability entry; never executed")
+    def provide_cart_slots(candidate_key: str | None = None, quantity: int | None = None) -> str:
+        """Supply the missing item option number and whole-number quantity the caller gave.
 
-    @tool
-    def provide_cart_quantity(quantity: int) -> str:
-        """Supply only the missing whole-number quantity for the active cart request."""
+        Omit a field the caller did not supply, and never send one already fixed.
+        """
         raise NotImplementedError("intercepted by the capability entry; never executed")
 
     def _mutation_ack(added: list[CartLine], fragments: list[str], *, invalid: int = 0) -> str:
@@ -408,7 +407,7 @@ def build_cart_nodes(
             live_item = None
 
         if selecting_item or not request.is_slot_complete():
-            proposal_tool = provide_cart_item if selecting_item else provide_cart_quantity
+            proposal_tool = provide_cart_slots
             prompt_candidates = candidates if selecting_item else number_candidates([live_item])
             capability_model = reasoning_model.bind_tools(
                 (proposal_tool, request_cart_clarification, leave_cart)
@@ -443,29 +442,35 @@ def build_cart_nodes(
                     return clarify("item" if selecting_item else "quantity")
                 if call["name"] == expected_tool:
                     try:
-                        if selecting_item:
-                            proposal = _ProposeKey.model_validate(call["args"])
+                        proposal = _ProposeSlots.model_validate(call["args"])
+                        if proposal.candidate_key is None and proposal.quantity is None:
+                            raise ValueError("proposal supplied no missing field")
+                        if proposal.candidate_key is not None and not selecting_item:
+                            raise ValueError("item is already fixed")
+                        if proposal.quantity is not None and request.quantity is not None:
+                            raise ValueError("quantity is already fixed")
+                        if proposal.candidate_key is None:
+                            item = request.item
+                        else:
                             chosen = by_key.get(proposal.candidate_key)
                             if chosen is None:
                                 raise ValueError("unknown candidate key")
-                            updated = ModifyCart(
-                                operation=request.operation,
-                                item=ResolvedCartItemRef(sku=chosen.sku),
-                                quantity=request.quantity,
-                            )
-                        else:
-                            proposal = _ProposeQuantity.model_validate(call["args"])
-                            if request.operation == "add" and proposal.quantity < 1:
-                                raise ValueError("add quantity must be positive")
-                            updated = ModifyCart(
-                                operation=request.operation,
-                                item=request.item,
-                                quantity=proposal.quantity,
-                            )
+                            item = ResolvedCartItemRef(sku=chosen.sku)
+                        quantity = (
+                            request.quantity if proposal.quantity is None else proposal.quantity
+                        )
+                        if request.operation == "add" and quantity is not None and quantity < 1:
+                            raise ValueError("add quantity must be positive")
+                        updated = ModifyCart(
+                            operation=request.operation,
+                            item=item,
+                            quantity=quantity,
+                        )
                     except (TypeError, ValueError):
                         new_messages.append(
                             ToolMessage(
-                                "The proposal was invalid. Fill only the missing field.",
+                                "The proposal was invalid. Send only fields the caller "
+                                "supplied that are still missing.",
                                 tool_call_id=call["id"],
                             )
                         )

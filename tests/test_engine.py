@@ -39,6 +39,7 @@ from turn_helpers import (
 )
 from verification_helpers import make_otp_provider
 
+from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
     GraphTurnLatencyMeasurement,
@@ -50,6 +51,7 @@ from agnostic_market.agents.engine import (
     _TurnSpeech,
 )
 from agnostic_market.agents.frontline import MODEL_SPEECH_NODES, build_frontline_graph
+from agnostic_market.agents.frontline.graph import build_frontline_capability_registry
 from agnostic_market.agents.recovery import (
     AUTOMATION_TERMINAL_LINE,
     TURN_FALLBACK_LINE,
@@ -274,6 +276,7 @@ def _engine(
     response_model_node_timeout_seconds: float = 2.0,
     reasoning_model_node_timeout_seconds: float = 6.0,
     turn_latency_observer: Callable[[GraphTurnLatencyMeasurement], None] | None = None,
+    capability_registry: CapabilityRegistry | None = None,
 ) -> tuple[ReasoningEngine, OrderStore]:
     fixture = load_orders_fixture(config_root, "acme_store")
     catalog = FixtureCatalog("acme_store", load_catalog_fixture(config_root, "acme_store"))
@@ -319,6 +322,7 @@ def _engine(
         reasoning_model_node_timeout_seconds=reasoning_model_node_timeout_seconds,
         session_telemetry=telemetry,
         checkpointer=checkpointer if checkpointer is not None else build_checkpointer(),
+        **({} if capability_registry is None else {"capability_registry": capability_registry}),
     )
     if routing_recognizer is not None and routing_model is not None:
         raise ValueError("test engine accepts either a routing recognizer or routing model")
@@ -1199,11 +1203,19 @@ async def test_restored_unregistered_invocation_speaks_once_and_releases_the_nex
         }
     )
     reasoning = FakeChatModel(emit_tool_calls=False)
+    # Every CapabilityId now has an owner, so an unregistered invocation is only
+    # expressible against a registry that lacks one.
+    full = build_frontline_capability_registry()
     engine, _ = _engine(
         config_root,
         frontline=frontline,
         reasoning=reasoning,
         thread_id="unregistered-invocation",
+        capability_registry=CapabilityRegistry(
+            spec
+            for capability_id, spec in full.specs.items()
+            if capability_id is not CapabilityId.DISCLOSE_AI_IDENTITY
+        ),
     )
     origin_id = "removed-capability-origin"
     engine._graph.update_state(

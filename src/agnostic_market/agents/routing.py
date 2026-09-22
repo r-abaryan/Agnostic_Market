@@ -35,6 +35,7 @@ from agnostic_market.dtos.orchestration import (
     CancelOrders,
     CapabilityId,
     ChangeProfile,
+    Converse,
     DiscloseAiIdentity,
     FocusedOrderSet,
     IntentRequest,
@@ -59,7 +60,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.state import ReasoningState
 
-CONTEXT_PROJECTOR_VERSION = "3"
+CONTEXT_PROJECTOR_VERSION = "4"
 ProviderCallOutcome = Literal[
     "completed",
     "deadline_exceeded",
@@ -87,6 +88,12 @@ def _materialize_answer(proposal: RouteProposal) -> IntentRequest:
     if proposal.answer_topic is None:
         raise ValueError("answer_question requires answer_topic")
     return AnswerQuestion(topic=proposal.answer_topic)
+
+
+def _materialize_converse(proposal: RouteProposal) -> IntentRequest:
+    if proposal.conversation_act is None:
+        raise ValueError("converse requires conversation_act")
+    return Converse(act=proposal.conversation_act)
 
 
 def _materialize_list_orders(proposal: RouteProposal) -> IntentRequest:
@@ -128,6 +135,17 @@ _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingP
             commerce_effect=False,
             unsafe_misroute=False,
             materialize=_materialize_answer,
+        ),
+        CapabilityId.CONVERSE: _CapabilityDefinition(
+            meaning=(
+                "social turns that carry no task: greeting, thanks or acknowledgment, farewell, "
+                "asking what you can do, checking the line is working, or asking you to repeat. "
+                "Never use it when the same turn also asks for a task."
+            ),
+            discriminators=frozenset({"conversation_act"}),
+            commerce_effect=False,
+            unsafe_misroute=False,
+            materialize=_materialize_converse,
         ),
         CapabilityId.SEARCH_CATALOG: _CapabilityDefinition(
             meaning="find or describe products from the catalog; not live inventory state.",
@@ -330,9 +348,25 @@ owner gather its slot.
 For verify_order_status, order_status_selector=explicit means the owner must extract or ask for
 explicit order references; focused means one live focused recent order; recent means the complete
 recent order set. With no recent order context, use explicit so the owner gathers the target.
+When has_focused_order is true, a caller asking about their order without naming one means that
+focused order: use focused rather than making the owner ask for a reference it already holds.
 Pronouns may use focused/recent only when the supplied recent context supports them.
 
 Contrastive examples:
+- ordinary, one focused recent order: "Any news on my order?" ->
+  {"decision":"direct","capability":"verify_order_status","order_status_selector":"focused"}
+- ordinary: "Run through everything I have bought from you." ->
+  {"decision":"direct","capability":"list_orders","list_scope":"account"}
+- ordinary: "Stick three of the wool socks in for me." ->
+  {"decision":"direct","capability":"modify_cart","cart_operation":"add"}
+- ordinary: "Hi there." ->
+  {"decision":"direct","capability":"converse","conversation_act":"greeting"}
+- ordinary: "That's everything, thanks. Bye." ->
+  {"decision":"direct","capability":"converse","conversation_act":"farewell"}
+- ordinary: "Sorry, what was that?" ->
+  {"decision":"direct","capability":"converse","conversation_act":"repair"}
+- ordinary: "Hello, I want to check my order." ->
+  {"decision":"direct","capability":"verify_order_status","order_status_selector":"explicit"}
 - ordinary: "Stop the automated help and connect me with a staff member." ->
   {"decision":"direct","capability":"request_person"}
 - ordinary: "A shop employee needs to update my mobile number." ->
@@ -418,6 +452,7 @@ def project_routing_context(
             active_capability=active.capability if active is not None else None,
             recent_order_operation=recent.operation,
             recent_order_count=len(recent.order_refs),
+            has_focused_order=recent.focused_order_ref is not None,
             cart_state="empty" if cart_store.is_empty() else "nonempty",
             available_capabilities=registry.capability_ids,
         )
@@ -447,10 +482,14 @@ def resolve_route(context: RoutingContext, decision: RouteDecision) -> RouteReso
             return RoutingFailure(reason="decision_rejected")
         if request.kind not in context.available_capabilities:
             return RouteDecision.clarify("unsupported_capability")
-        if (
-            isinstance(request, VerifyOrderStatus)
-            and isinstance(request.target, (FocusedOrderSet, RecentOrderSet))
-            and context.recent_order_count == 0
+        if isinstance(request, VerifyOrderStatus) and (
+            (
+                isinstance(request.target, FocusedOrderSet | RecentOrderSet)
+                and context.recent_order_count == 0
+            )
+            # A focused target with no focused order resolves to nothing and the owner ends up
+            # asking for a reference anyway; downgrade so it asks for one deliberately.
+            or (isinstance(request.target, FocusedOrderSet) and not context.has_focused_order)
         ):
             return RouteDecision.direct(VerifyOrderStatus())
     return decision

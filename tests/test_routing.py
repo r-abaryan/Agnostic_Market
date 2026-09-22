@@ -17,6 +17,7 @@ from agnostic_market.agents.capabilities import (
 )
 from agnostic_market.agents.recovery import CommerceEffectFinishers
 from agnostic_market.agents.routing import (
+    _CAPABILITY_DEFINITIONS,
     COMMERCE_EFFECT_CAPABILITIES,
     CONTEXT_PROJECTOR_VERSION,
     ROUTE_SCHEMA_FINGERPRINT,
@@ -45,6 +46,7 @@ from agnostic_market.dtos.orchestration import (
     CancelOrders,
     CapabilityId,
     ChangeProfile,
+    Converse,
     DiscloseAiIdentity,
     FocusedOrderSet,
     IntentRequestModel,
@@ -414,8 +416,14 @@ async def test_confirmation_escape_projects_its_scope_for_the_one_recognizer() -
 
 
 def test_route_materializer_covers_every_capability_from_one_coarse_contract() -> None:
+    # A focused target is only executable with a focused order, so the context must supply one
+    # for the focused arm of this contract to survive resolve_route.
     context = _context(*CapabilityId).model_copy(
-        update={"recent_order_operation": "read", "recent_order_count": 2}
+        update={
+            "recent_order_operation": "read",
+            "recent_order_count": 2,
+            "has_focused_order": True,
+        }
     )
     cases = (
         (
@@ -509,6 +517,14 @@ def test_route_materializer_covers_every_capability_from_one_coarse_contract() -
             AbortCurrent(),
         ),
         (
+            RouteProposal(
+                decision="direct",
+                capability=CapabilityId.CONVERSE,
+                conversation_act="greeting",
+            ),
+            Converse(act="greeting"),
+        ),
+        (
             RouteProposal(decision="direct", capability=CapabilityId.DISCLOSE_AI_IDENTITY),
             DiscloseAiIdentity(),
         ),
@@ -581,9 +597,76 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "7bbb480182eeff423ba16f839ae7a721683e47a87781ee6e5e7a36f168ce36af"
+        "dfb9275edcca5025ad652f7d9b9b625dda22b21638b098ede6b4cd3c8816e41a"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
+
+
+def test_projector_carries_focus_presence_so_a_focused_route_stays_executable() -> None:
+    """Two recent orders with a focus and two without project identically without this.
+
+    A caller asking about "my order" right after placing one met the owner asking for a
+    reference the session already held, because the focus never reached the router.
+    """
+
+    registry = _registry(VerifyOrderStatus)
+    state = ReasoningState(
+        messages=[HumanMessage("older", id="older-turn")],
+        consumed_turn_ids=("older-turn",),
+    )
+
+    def project(recent: RecentOrderContext) -> RoutingContext:
+        result = project_routing_context(
+            CommittedTurn(text="any news on my order?", message_id="fresh-turn"),
+            state,
+            identity_store=CallerIdentityStore(),
+            cart_store=CartStore(),
+            recent_orders=recent,
+            registry=registry,
+        )
+        assert isinstance(result, RoutingContext)
+        return result
+
+    single = RecentOrderContext(max_refs=3)
+    single.record(("ORD-1001",), operation="place")
+    assert single.snapshot().focused_order_ref == "ORD-1001"
+    assert project(single).has_focused_order is True
+
+    unfocused = RecentOrderContext(max_refs=3)
+    unfocused.record(("ORD-1001", "ORD-1002"), operation="list")
+    assert unfocused.snapshot().focused_order_ref is None
+    assert project(unfocused).has_focused_order is False
+
+    # The two contexts must not be indistinguishable, which was the defect.
+    assert project(single) != project(unfocused)
+
+
+def test_every_declared_discriminator_has_a_prompt_example() -> None:
+    """A required field no example teaches is a live rejection waiting to happen.
+
+    `converse` shipped without one and every greeting was rejected as decision_rejected,
+    because the schema marks the field optional while the capability table requires it.
+    """
+
+    examples = ROUTER_SYSTEM_PROMPT.split("Contrastive examples:", 1)[1]
+    taught: dict[str, set[str]] = {}
+    for line in examples.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        payload = json.loads(stripped)
+        capability = payload.get("capability")
+        if capability is None:
+            continue
+        taught.setdefault(capability, set()).update(payload.keys())
+
+    untaught = sorted(
+        f"{capability.value}.{field}"
+        for capability, definition in _CAPABILITY_DEFINITIONS.items()
+        for field in definition.discriminators
+        if field not in taught.get(capability.value, set())
+    )
+    assert untaught == []
 
 
 def test_commerce_effect_capabilities_match_the_post_commit_boundary() -> None:

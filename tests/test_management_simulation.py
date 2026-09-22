@@ -185,8 +185,8 @@ async def test_simulator_projects_bounded_commerce_state_after_a_real_cart_flow(
         service,
         reasoning=FakeChatModel(
             scripted_calls=[
-                [("provide_cart_item", {"candidate_key": "1"})],
-                [("provide_cart_quantity", {"quantity": 2})],
+                [("provide_cart_slots", {"candidate_key": "1"})],
+                [("provide_cart_slots", {"quantity": 2})],
             ]
         ),
     )

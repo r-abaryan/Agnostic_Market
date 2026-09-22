@@ -23,6 +23,8 @@ cases:
         - place_order
         - search_catalog
         - answer_question
+        - converse
+        - disclose_ai_identity
         - verify_order_status
         - abort_current
         - request_person
@@ -204,15 +206,15 @@ cases:
       decision: direct
       request: { kind: view_identity_status }
 
-  - case_id: ai_identity_owner_unavailable
-    scenario_class: counterfactual
+  - case_id: acceptance_disclose_ai_identity
+    scenario_class: direct
     risk_class: *critical
     risk_domain: compliance_control
     evaluation_split: &acceptance acceptance
     context:
       <<: *base_context
       utterance: "Are you an AI assistant?"
-    expected: { decision: clarify, clarification_reason: unsupported_capability }
+    expected: { decision: direct, request: { kind: disclose_ai_identity } }
 
   - case_id: policy_answer_shadow_only
     scenario_class: direct
@@ -344,6 +346,7 @@ cases:
       utterance: "What is its status?"
       recent_order_operation: read
       recent_order_count: 1
+      has_focused_order: true
     expected:
       decision: direct
       request:
@@ -816,6 +819,18 @@ cases:
       <<: *base_context
       utterance: "What does human review mean?"
     expected: { decision: direct, request: { kind: answer_question, topic: general } }
+
+  - case_id: acceptance_converse_greeting
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Hi there"
+    expected:
+      decision: direct
+      request: { kind: converse, act: greeting }
 
   - case_id: acceptance_abort_current
     scenario_class: direct

@@ -124,6 +124,7 @@ def test_route_proposal_exposes_only_coarse_ownership_fields() -> None:
         "capability",
         "clarification_reason",
         "answer_topic",
+        "conversation_act",
         "list_scope",
         "cart_operation",
         "profile_field",
@@ -751,6 +752,7 @@ def test_every_capability_id_has_one_valid_intent_shape() -> None:
         CapabilityId.SWITCH_ACCOUNT: {"kind": "switch_account"},
         CapabilityId.VIEW_IDENTITY_STATUS: {"kind": "view_identity_status"},
         CapabilityId.ABORT_CURRENT: {"kind": "abort_current"},
+        CapabilityId.CONVERSE: {"kind": "converse", "act": "greeting"},
         CapabilityId.DISCLOSE_AI_IDENTITY: {"kind": "disclose_ai_identity"},
         CapabilityId.REQUEST_PERSON: {"kind": "request_person"},
     }
@@ -1035,7 +1037,11 @@ def test_routing_context_is_bounded_and_authority_free() -> None:
         "cart_state",
         "available_capabilities",
         "routing_scope",
+        # Presence of a focused order, never the reference. The router picks an owner, not a
+        # target, and the owner re-resolves focus against live state.
+        "has_focused_order",
     }
+    assert context.has_focused_order is False
     with pytest.raises(ValidationError):
         RoutingContext(
             utterance="cancel all my orders",

@@ -819,8 +819,8 @@ async def test_application_completes_stt_shaped_cart_clarification_and_consent(
     response = FakeChatModel(raise_transport=True)
     reasoning = FakeChatModel(
         scripted_calls=[
-            [("provide_cart_item", {"candidate_key": "1"})],
-            [("provide_cart_quantity", {"quantity": 2})],
+            [("provide_cart_slots", {"candidate_key": "1"})],
+            [("provide_cart_slots", {"quantity": 2})],
         ]
     )
     application = await build_application_session(
@@ -1323,7 +1323,9 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
     assert reasoning.invoke_count == 0
     prompt = response._seen_prompts[-1]
     assert "waterproof rain jacket; SKU SKU-BLU-07; price $129.00" in prompt
-    assert "trail running shoes" not in prompt
+    # The owner now sees the live catalog, not a lexically pre-filtered subset, so meaning
+    # decides the match and the model can offer a real alternative.
+    assert "trail running shoes; SKU SKU-RED-42" in prompt
     assert application.state.cart_store.is_empty()
     assert _fixture_order_store(services).placed_count == 0
     operational_sink = services.telemetry.operational_sink

@@ -121,8 +121,10 @@ class OperationalTelemetryEvent(StrEnum):
 
 
 class RoutingEvidenceTelemetryEvent(StrEnum):
+    AI_IDENTITY_DISCLOSED = auto()
     CAPABILITY_ANSWERED = auto()
     CAPABILITY_OWNER_DECLINED = auto()
+    CONVERSATION_ACT_SERVED = auto()
     SEMANTIC_HUMAN_REQUESTED = auto()
     SEMANTIC_REQUEST_ABORTED = auto()
     SEMANTIC_ROUTE = auto()
