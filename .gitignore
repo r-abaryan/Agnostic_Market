@@ -29,7 +29,6 @@ config/conformance/reports.json
 config/qualification/*.json
 # The fixture-backed application now requires its independently validated catalog seed.
 # Keep the remaining local fixture families ignored unless they are already tracked.
-!config/fixtures/
 config/fixtures/*
 !config/fixtures/catalog/*.yaml
 config/platform/*.local.yaml
@@ -40,7 +39,6 @@ CLAUDE.md
 
 assets/audio/generate_thinking_beep.py
 .vscode/settings.json
-CLAUDE.md
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
