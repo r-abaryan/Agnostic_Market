@@ -124,6 +124,7 @@ def test_route_proposal_exposes_only_coarse_ownership_fields() -> None:
         "capability",
         "clarification_reason",
         "answer_topic",
+        "cancel_selector",
         "conversation_act",
         "list_scope",
         "cart_operation",

@@ -481,7 +481,11 @@ def test_route_materializer_covers_every_capability_from_one_coarse_contract() -
         ),
         (RouteProposal(decision="direct", capability=CapabilityId.PLACE_ORDER), PlaceOrder()),
         (
-            RouteProposal(decision="direct", capability=CapabilityId.CANCEL_ORDERS),
+            RouteProposal(
+                decision="direct",
+                capability=CapabilityId.CANCEL_ORDERS,
+                cancel_selector="explicit",
+            ),
             CancelOrders(),
         ),
         (
@@ -597,7 +601,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "dfb9275edcca5025ad652f7d9b9b625dda22b21638b098ede6b4cd3c8816e41a"
+        "522b139d541ebc3dd30226e5f26d6a27a363d605da81f84352f369ecf7b6ab72"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 

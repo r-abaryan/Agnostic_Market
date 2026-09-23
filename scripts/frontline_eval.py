@@ -185,7 +185,7 @@ _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
 # 29 -> 28 on 2026-09-21: clarify(missing_target) dropped when its only case was retired.
-_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 30
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 35
 _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
@@ -2033,6 +2033,7 @@ def _ordered_capabilities(
 _ROUTE_SIGNATURE_DISCRIMINATORS = frozenset(
     {
         "answer_topic",
+        "cancel_selector",
         "conversation_act",
         "list_scope",
         "cart_operation",
@@ -2134,6 +2135,7 @@ def _route_signature(
         "capability": None,
         "clarification_reason": None,
         "answer_topic": None,
+        "cancel_selector": None,
         "conversation_act": None,
         "list_scope": None,
         "cart_operation": None,
@@ -2156,6 +2158,10 @@ def _route_signature(
         signature["answer_topic"] = request.topic
     elif isinstance(request, Converse):
         signature["conversation_act"] = request.act
+    elif isinstance(request, CancelOrders):
+        signature["cancel_selector"] = (
+            "focused" if isinstance(request.target, FocusedOrderSet) else "explicit"
+        )
     elif isinstance(request, ListOrders):
         signature["list_scope"] = request.scope
     elif isinstance(request, ModifyCart):
@@ -2186,6 +2192,7 @@ def _require_producible_ground_truth(
         decision="direct",
         capability=signature["capability"],
         answer_topic=signature["answer_topic"],
+        cancel_selector=signature["cancel_selector"],
         conversation_act=signature["conversation_act"],
         list_scope=signature["list_scope"],
         cart_operation=signature["cart_operation"],

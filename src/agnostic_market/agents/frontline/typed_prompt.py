@@ -48,6 +48,9 @@ def compose_catalog_response_prompt(
             "Name only products from the list, using their listed name and price. Do not "
             "invent products, prices, SKUs, stock, shipping, or availability, and do not "
             "claim a product exists because the caller asked for it.",
+            "Answer about the products and nothing else. Never offer to add anything to the "
+            "cart, place an order, or take any other action: a different owner does that, and "
+            "a promise made here cannot be kept.",
             "Keep the spoken answer to one or two short sentences.",
             "",
             "Live catalog:",

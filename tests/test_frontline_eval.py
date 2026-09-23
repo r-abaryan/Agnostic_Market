@@ -44,6 +44,7 @@ from agnostic_market.dtos.orchestration import (
     Converse,
     DiscloseAiIdentity,
     ExplicitOrderSet,
+    FocusedOrderSet,
     ListOrders,
     ModifyCart,
     OrderTargetProposal,
@@ -123,6 +124,10 @@ def _proposal_payload_for_expected(
             payload["answer_topic"] = request.topic
         elif isinstance(request, Converse):
             payload["conversation_act"] = request.act
+        elif isinstance(request, CancelOrders):
+            payload["cancel_selector"] = (
+                "focused" if isinstance(request.target, FocusedOrderSet) else "explicit"
+            )
         elif isinstance(request, ListOrders):
             payload["list_scope"] = request.scope
         elif isinstance(request, ModifyCart):
@@ -894,8 +899,8 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     by_id = {case.case_id: case for case in corpus.cases}
 
-    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 59
-    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 35
+    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 64
+    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 36
     # Every counterfactual and asr_like case gates. Structural rule, chosen before
     # looking at any score: these are the cases that test whether the model reads
     # state rather than words, so they belong where a miss blocks.
@@ -1241,7 +1246,7 @@ def test_structural_supplement_closes_route_and_checklist_debt_without_mutating_
     assert len(supplement.cases) == 13
     assert report["qualification"] is None
     assert report["purpose"] == "development_only"
-    assert report["canonical_route_leaf_count"] == 30
+    assert report["canonical_route_leaf_count"] == 35
     assert report["checklist"]["total_cells"] == 16
     assert len(report["checklist"]["frozen_cells"]) == 7
     assert len(report["checklist"]["supplement_cells"]) == 9
@@ -1323,7 +1328,7 @@ def test_cli_runs_structural_coverage_without_provider_construction(
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["qualification"] is None
-    assert report["canonical_route_leaf_count"] == 30
+    assert report["canonical_route_leaf_count"] == 35
     assert report["checklist"]["uncovered_cells"] == []
 
 
@@ -2410,6 +2415,7 @@ def test_route_signature_keeps_only_reviewed_coarse_discriminators() -> None:
         "capability",
         "clarification_reason",
         "answer_topic",
+        "cancel_selector",
         "conversation_act",
         "list_scope",
         "cart_operation",

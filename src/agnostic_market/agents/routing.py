@@ -96,6 +96,14 @@ def _materialize_converse(proposal: RouteProposal) -> IntentRequest:
     return Converse(act=proposal.conversation_act)
 
 
+def _materialize_cancel_orders(proposal: RouteProposal) -> IntentRequest:
+    if proposal.cancel_selector == "focused":
+        return CancelOrders(target=FocusedOrderSet())
+    if proposal.cancel_selector == "explicit":
+        return CancelOrders()
+    raise ValueError("cancel_orders requires cancel_selector")
+
+
 def _materialize_list_orders(proposal: RouteProposal) -> IntentRequest:
     if proposal.list_scope is None:
         raise ValueError("list_orders requires list_scope")
@@ -190,11 +198,15 @@ _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingP
             materialize=lambda _proposal: PlaceOrder(),
         ),
         CapabilityId.CANCEL_ORDERS: _CapabilityDefinition(
-            meaning="cancel one or more existing orders before fulfillment.",
-            discriminators=frozenset(),
+            meaning=(
+                "cancel one or more existing orders before fulfillment. cancel_selector="
+                "focused means the one order already in focus; explicit means the owner must "
+                "gather which orders the caller means."
+            ),
+            discriminators=frozenset({"cancel_selector"}),
             commerce_effect=True,
             unsafe_misroute=True,
-            materialize=lambda _proposal: CancelOrders(),
+            materialize=_materialize_cancel_orders,
         ),
         CapabilityId.REFUND_ORDER: _CapabilityDefinition(
             meaning="request money back for an existing order.",
@@ -350,13 +362,25 @@ explicit order references; focused means one live focused recent order; recent m
 recent order set. With no recent order context, use explicit so the owner gathers the target.
 When has_focused_order is true, a caller asking about their order without naming one means that
 focused order: use focused rather than making the owner ask for a reference it already holds.
+For list_orders, list_scope=session covers only orders placed during this call and needs no
+account; account reaches a verified account, so an unbound caller must verify first, which clears
+this call's cart and order context. When bound_customer is false, choose session unless the caller
+explicitly asks for their account or their past history: the session answer already offers
+verification, so it costs the caller nothing and discards nothing. When bound_customer is true,
+follow what they asked for.
 Pronouns may use focused/recent only when the supplied recent context supports them.
 
 Contrastive examples:
+- ordinary, one focused recent order: "Cancel the one I just placed." ->
+  {"decision":"direct","capability":"cancel_orders","cancel_selector":"focused"}
+- ordinary, no recent orders: "I need to cancel an order." ->
+  {"decision":"direct","capability":"cancel_orders","cancel_selector":"explicit"}
 - ordinary, one focused recent order: "Any news on my order?" ->
   {"decision":"direct","capability":"verify_order_status","order_status_selector":"focused"}
 - ordinary: "Run through everything I have bought from you." ->
   {"decision":"direct","capability":"list_orders","list_scope":"account"}
+- ordinary: "Anything I have ordered since we started talking?" ->
+  {"decision":"direct","capability":"list_orders","list_scope":"session"}
 - ordinary: "Stick three of the wool socks in for me." ->
   {"decision":"direct","capability":"modify_cart","cart_operation":"add"}
 - ordinary: "Hi there." ->
@@ -492,6 +516,12 @@ def resolve_route(context: RoutingContext, decision: RouteDecision) -> RouteReso
             or (isinstance(request.target, FocusedOrderSet) and not context.has_focused_order)
         ):
             return RouteDecision.direct(VerifyOrderStatus())
+        if (
+            isinstance(request, CancelOrders)
+            and isinstance(request.target, FocusedOrderSet)
+            and not context.has_focused_order
+        ):
+            return RouteDecision.direct(CancelOrders())
     return decision
 
 

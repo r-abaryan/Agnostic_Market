@@ -30,7 +30,7 @@ caller speech
     -> ReasoningEngine
     -> one semantic recognizer
     -> typed dispatch or bounded no-action envelope
-    -> immutable capability registry (16 typed entries)
+    -> immutable capability registry (18 typed entries)
     -> one deterministic capability owner
     -> live authorization, policy, consent, and effect boundary
     -> validated caller-facing result
@@ -119,38 +119,30 @@ The development adapter is fixed to `127.0.0.1:8000`. Open the merchant workbenc
 beyond loopback. Tenant and actor authority are derived from URL scope and process configuration,
 not accepted from write request bodies.
 
-The SQLite repository is disposable development state, not a compatibility surface. Contract
-changes advance its repository schema and reject an older database at startup. Stop the local
-server, remove the explicitly supplied `--database` file, and restart to create the current schema;
-drafts and publications must then be recreated through the management API.
+The SQLite repository is disposable development state, not a compatibility surface. Its schema
+version is checked at startup, but that covers table layout only: each published version also
+carries the management contract fingerprint, which moves whenever `MerchantConfig` changes, and a
+stale one surfaces later as a failure on the version endpoints. Either way the remedy is the same,
+so stop the server, remove the `--database` file, restart, and recreate drafts and publications
+through the API.
 
-The same loopback process exposes the development text-simulation API. A simulation starts from one
-active or explicitly selected immutable publication, remains pinned to that publication across
-turns and resets, and uses isolated in-memory session state. Provider credentials remain server-side
-and are resolved from the existing environment-backed provider configuration only when a turn uses
-them. Turn results and the dedicated `/state` resource expose a bounded workbench projection of the
-cart, totals, order-context counts, committed receipt counts, turn count, and session revision. They
-do not expose identity bindings, order references, receipt payloads, checkpoint values, prompts, or
-secrets. The workbench simulator controls start or resume a named isolated session, send caller
-turns, render only caller-facing events, reset to the same immutable publication, and close the
-session. This development path does not authorize production routing or telephony.
+The same process exposes the development text-simulation API. A simulation pins one immutable
+publication across turns and resets, uses isolated in-memory session state, and resolves
+server-side credentials only when a turn needs them. Turn results and `/state` expose a bounded
+projection (cart, totals, order-context counts, committed receipt counts, turn count, session
+revision) and never identity bindings, order references, receipt payloads, checkpoint values,
+prompts, or secrets. That projection includes a value-free `committed_receipts` count supplied
+through the commerce ports: development inspection evidence, not a ledger export or an activation
+signal. This path does not authorize production routing or telephony.
 
-Versioned synthetic scenario bundles live under `config/datasets/`. Each bundle contains one
-complete tenant fixture snapshot plus a strict manifest that binds its tenant, revision, source,
-entity counts, intended capabilities, scenario tags, and fixture fingerprint. The management API
-imports the complete bundle atomically through
-`/v1/merchants/{tenant_id}/drafts/{draft_id}/dataset`; a partial family update or a manifest whose
-counts, tenant, or fingerprint do not match is rejected. The committed fashion and grocery bundles
-intentionally reuse several SKU, order, and customer identifiers with different tenant-owned data.
-They also include processing, shipped, delivered, and cancelled history plus customers with
-intentionally missing dependent profile or payment data, so their tests prove scoping and
-fail-closed availability behavior rather than depending on globally unique or uniformly complete
-fixtures.
-
-Simulator state includes a portable, value-free `committed_receipts` projection supplied through
-the commerce ports. It reports cumulative committed cart, order, and profile receipt counts without
-returning idempotency keys, customer references, order references, or receipt payloads. This is
-development inspection evidence, not a business-ledger export or production activation signal.
+Versioned synthetic scenario bundles live under `config/datasets/`: one complete tenant fixture
+snapshot plus a manifest binding its tenant, revision, source, entity counts, intended
+capabilities, scenario tags, and fixture fingerprint. Import is atomic through
+`/v1/merchants/{tenant_id}/drafts/{draft_id}/dataset`, and a partial family update or a mismatched
+manifest is rejected. The fashion and grocery bundles deliberately reuse SKU, order, and customer
+identifiers across tenants and include cancelled history and customers missing dependent profile
+or payment data, so their tests prove scoping and fail-closed behavior rather than relying on
+globally unique or uniformly complete fixtures.
 
 Run the disposable-container PostgreSQL checkpoint harness used by CI:
 
@@ -158,15 +150,14 @@ Run the disposable-container PostgreSQL checkpoint harness used by CI:
 uv run --no-sync python scripts/postgres_checkpoint_harness.py
 ```
 
-To run the voice worker, copy `.env.example` to `.env` and supply provider and LiveKit credentials.
-`VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact, and console mode also
-requires an explicit `VOICE_AGENT_MERCHANT_ID`. Network workers additionally require
-`VOICE_AGENT_PLATFORM_CONFIG`, `VOICE_AGENT_CERTIFICATION_CONFIG`, and
-`VOICE_AGENT_BUILD_ARTIFACT_DIGEST`, and the absolute `VOICE_AGENT_LATENCY_METHODOLOGY` and
-`VOICE_AGENT_LATENCY_REPORT` paths carrying schema-5 voice evidence for the deployed runtime.
-Production composition also requires the issued
-`config/qualification/semantic_routing_release.json`; a standalone mutable routing report is not
-activation authority. See `.env.example` for the complete set.
+To run the voice worker, copy `.env.example` to `.env` and supply provider and LiveKit
+credentials. `VOICE_AGENT_DEPLOYMENT_ID` must identify the immutable deployed artifact, and
+console mode also requires `VOICE_AGENT_MERCHANT_ID`. Network workers additionally require
+`VOICE_AGENT_PLATFORM_CONFIG`, `VOICE_AGENT_CERTIFICATION_CONFIG`,
+`VOICE_AGENT_BUILD_ARTIFACT_DIGEST`, and absolute `VOICE_AGENT_LATENCY_METHODOLOGY` and
+`VOICE_AGENT_LATENCY_REPORT` paths carrying schema-5 voice evidence. Production composition also
+requires the issued `config/qualification/semantic_routing_release.json`; a standalone mutable
+routing report is not activation authority. See `.env.example` for the complete set.
 
 For a metadata-free LiveKit Cloud development session, set `VOICE_AGENT_MERCHANT_ID` and run the
 isolated development worker:
@@ -175,12 +166,11 @@ isolated development worker:
 uv run python scripts/voice_agent_development.py dev --no-reload --log-level debug
 ```
 
-It registers as `<production-agent-name>-development`, accepts only the LiveKit `dev` command and a
-standard participant, refuses production dispatch metadata, and uses in-memory session state. It
-uses the configured semantic recognizer without claiming immutable routing qualification, and does
-not exercise or authorize the durable platform. Production and certification workers retain their
-strict dispatch metadata, routing-release package, immutable build identity, and deployment-evidence
-gates.
+It registers as `<production-agent-name>-development`, accepts only the LiveKit `dev` command and
+a standard participant, refuses production dispatch metadata, and uses in-memory session state. It
+uses the configured semantic recognizer without claiming routing qualification and does not
+exercise the durable platform. Production and certification workers retain their strict dispatch
+metadata, routing-release package, immutable build identity, and deployment-evidence gates.
 
 ## License
 

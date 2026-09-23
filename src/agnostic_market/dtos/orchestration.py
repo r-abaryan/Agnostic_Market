@@ -49,6 +49,9 @@ ConversationAct = Literal[
 ListOrderScope = Literal["session", "account"]
 CartOperation = Literal["add", "remove", "set_quantity"]
 OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
+# The router names which order the caller meant, never which order to act on: the owner
+# re-resolves focus and still confirms before any cancellation.
+CancelRouteSelector = Literal["explicit", "focused"]
 VerificationPurpose = Literal["identity", "profile", "refund"]
 
 
@@ -546,6 +549,7 @@ class RouteProposal(BaseModel):
     clarification_reason: ClarificationReason | None = None
     answer_topic: AnswerTopic | None = None
     conversation_act: ConversationAct | None = None
+    cancel_selector: CancelRouteSelector | None = None
     list_scope: ListOrderScope | None = None
     cart_operation: CartOperation | None = None
     profile_field: ProfileField | None = None

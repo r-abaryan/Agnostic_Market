@@ -820,6 +820,80 @@ cases:
       utterance: "What does human review mean?"
     expected: { decision: direct, request: { kind: answer_question, topic: general } }
 
+  # Near-identical wording to list_account_orders; bound_customer is the distinguishing
+  # signal. Account scope on an unbound caller starts verification, which clears the cart.
+  - case_id: list_orders_unbound_defaults_to_session
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Can you list my orders?"
+    expected:
+      decision: direct
+      request: { kind: list_orders, scope: session }
+
+  - case_id: converse_acknowledgment
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Perfect, that works."
+    expected:
+      decision: direct
+      request: { kind: converse, act: acknowledgment }
+
+  - case_id: converse_farewell
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Right, I will let you go."
+    expected:
+      decision: direct
+      request: { kind: converse, act: farewell }
+
+  - case_id: converse_capability_summary
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What sort of things can you sort out?"
+    expected:
+      decision: direct
+      request: { kind: converse, act: capability_summary }
+
+  - case_id: converse_channel_check
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Is the line still working?"
+    expected:
+      decision: direct
+      request: { kind: converse, act: channel_check }
+
+  - case_id: converse_repair
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Say that again for me?"
+    expected:
+      decision: direct
+      request: { kind: converse, act: repair }
+
   - case_id: acceptance_converse_greeting
     scenario_class: direct
     risk_class: *standard

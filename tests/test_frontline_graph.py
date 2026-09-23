@@ -1702,6 +1702,8 @@ async def test_catalog_prompt_grounds_every_named_product_in_the_live_catalog(
     # exists is still not. The grounding guardrails carry that distinction.
     assert "Name only products from the list" in prompt
     assert "Do not invent products" in prompt
+    # The owner is read-only; offering to act produces a promise the next turn cannot keep.
+    assert "Never offer to add anything to the" in prompt
     assert "claim a product exists because the caller asked for it" in prompt
     assert "If nothing is a genuine fit, say so plainly" in prompt
     assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
