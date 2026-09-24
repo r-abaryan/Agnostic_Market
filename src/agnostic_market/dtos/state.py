@@ -42,8 +42,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["3"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "3"
+CheckpointSchemaVersion = Literal["4"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "4"
 
 
 class CheckpointSchemaError(ValueError):
@@ -452,6 +452,30 @@ PendingClarification = Annotated[
 ]
 
 
+class ProductOffer(BaseModel):
+    """Products the catalog owner named in its own previous answer.
+
+    Deliberately NOT `pending_`-prefixed: `validate_automation_state_clear` forces every
+    prefixed field into the automation reset, which `capability_dispatch` applies on the very
+    turn that routes the caller's "yes". Staleness is computed from `turn_id` against the
+    admitted turn ledger, never maintained by clearing rules.
+    """
+
+    model_config = _FROZEN
+
+    skus: tuple[str, ...] = Field(min_length=1)
+    turn_id: NonEmptyText
+
+    @field_validator("skus")
+    @classmethod
+    def skus_are_unique_and_nonblank(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("offered SKUs must not be blank")
+        if len(value) != len(set(value)):
+            raise ValueError("offered SKUs must be unique")
+        return value
+
+
 class ClarificationLiveness(BaseModel):
     """Consecutive clarification questions for one explicit owner."""
 
@@ -523,6 +547,9 @@ class ReasoningState(BaseModel):
     pending_clarification: PendingClarification | None = None
     # One liveness tracker owned by an invocation or consecutive router clarification.
     clarification_liveness: ClarificationLiveness | None = None
+    # What the catalog owner last offered, so the next turn can honour an acceptance. Outside
+    # the automation reset on purpose (see ProductOffer); liveness is turn adjacency.
+    product_offer: ProductOffer | None = None
 
     @classmethod
     def from_checkpoint(cls, values: Mapping[str, object]) -> Self:
@@ -537,6 +564,25 @@ class ReasoningState(BaseModel):
             return cls.model_validate(values)
         except (StateSchemaError, ValidationError) as exc:
             raise CheckpointSchemaError("persisted state violates the checkpoint schema") from exc
+
+    def live_product_offer(self, turn_id: str | None = None) -> ProductOffer | None:
+        """Return the offer only when it was made on the turn immediately before this one.
+
+        Computed, never maintained: no flow has to remember to clear the offer, and an
+        unrelated intervening turn retires it by construction. Filtering the current turn out
+        first keeps the answer correct whether or not it has already been admitted.
+        """
+
+        offer = self.product_offer
+        if offer is None:
+            return None
+        current = (
+            turn_id
+            if turn_id is not None
+            else (self.consumed_turn_ids[-1] if self.consumed_turn_ids else None)
+        )
+        prior = tuple(item for item in self.consumed_turn_ids if item != current)
+        return offer if prior and prior[-1] == offer.turn_id else None
 
     def last_user_text(self) -> str:
         """Return the latest committed caller text."""

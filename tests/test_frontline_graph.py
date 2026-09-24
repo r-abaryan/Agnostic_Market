@@ -18,6 +18,7 @@ from llm_fakes import (
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
     NativeAsyncOnlyFakeChatModel,
+    catalog_answer_args,
 )
 from policy_helpers import make_policy
 from telemetry_helpers import make_session_telemetry
@@ -1652,8 +1653,10 @@ async def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_c
 
     monkeypatch.setattr(catalog, "search", observed_search)
     response_model = NativeAsyncOnlyFakeChatModel(
-        emit_tool_calls=False,
-        text_response="We carry trail running shoes for $89.99.",
+        structured_args=catalog_answer_args(
+            "We carry trail running shoes for $89.99.",
+            "SKU-RED-42",
+        ),
         record_prompts=True,
     )
     graph = _graph(config_root, response_model, catalog=catalog)
@@ -1669,20 +1672,162 @@ async def test_catalog_owner_uses_one_live_lookup_and_one_tool_incapable_model_c
     # No lexical narrowing: the owner hands the model the live catalog and one model call
     # both selects and speaks.
     assert lookup_queries == []
-    assert response_model.emitted_messages[-1].tool_calls == []
     assert result["active_invocation"] is None
     assert _only_spoken(result) == "We carry trail running shoes for $89.99."
+    # The owner records what it named, so the next turn can honour an acceptance.
+    assert result["product_offer"].skus == ("SKU-RED-42",)
     prompt = response_model._seen_prompts[-1]
     assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
     assert "waterproof rain jacket; SKU SKU-BLU-07; price $129.00" in prompt
+
+
+async def test_catalog_owner_records_only_skus_the_live_catalog_supplied(
+    config_root: Path,
+) -> None:
+    """The SKUs are model-reported, so the guarantee is validation, not construction.
+
+    Without the filter an invented reference would seed a cart on the caller's next "yes".
+    """
+
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args(
+            "We have trail running shoes at $89.99.",
+            "SKU-RED-42",
+            "SKU-NOT-STOCKED",
+        ),
+    )
+    graph = _graph(config_root, response_model)
+
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="catalog-offer",
+        text="Tell me about running shoes.",
+    )
+
+    assert _only_spoken(result) == "We have trail running shoes at $89.99."
+    assert result["product_offer"].skus == ("SKU-RED-42",)
+    assert result["product_offer"].turn_id == "catalog-offer"
+
+
+async def test_catalog_owner_drops_a_sku_its_own_answer_never_named(
+    config_root: Path,
+) -> None:
+    """Existence is not the property that matters: a live SKU the answer never spoke would
+    focus a product the caller never heard, and the next "yes" would act on it."""
+
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args(
+            "We have trail running shoes at $89.99.",
+            "SKU-BLU-07",
+        ),
+    )
+    graph = _graph(config_root, response_model)
+
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="running"),
+        turn_id="catalog-mismatched-sku",
+        text="Tell me about running shoes.",
+    )
+
+    # SKU-BLU-07 is the live rain jacket, so the existence check alone would have accepted it.
+    assert _only_spoken(result) == "We have trail running shoes at $89.99."
+    assert "product_offer" not in result
+
+
+async def test_catalog_owner_refuses_an_offer_reference_a_longer_name_swallows(
+    config_root: Path,
+) -> None:
+    """Where one product name sits inside another, prose cannot say which was offered.
+
+    The acme fixture has three unrelated names and cannot exercise this, so the catalog here
+    is built with a prefix family on purpose. A plain substring or word-run check accepts the
+    shorter name whenever the longer one is spoken.
+    """
+
+    catalog = FixtureCatalog(
+        "acme_store",
+        CatalogFixture.model_validate(
+            {
+                "products": [
+                    {"sku": "SKU-PLAIN", "name": "rain jacket", "price_usd": "79.00"},
+                    {"sku": "SKU-PROOF", "name": "waterproof rain jacket", "price_usd": "129.00"},
+                ]
+            }
+        ),
+    )
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args(
+            "We have the waterproof rain jacket for $129.00.",
+            "SKU-PLAIN",
+        ),
+    )
+    graph = _graph(config_root, response_model, catalog=catalog)
+
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="rain jacket"),
+        turn_id="catalog-subphrase",
+        text="Do you have a rain jacket?",
+    )
+
+    # "rain jacket" is both a substring and a whole word run inside the spoken name.
+    assert "product_offer" not in result
+
+
+async def test_catalog_owner_records_no_offer_for_a_suitability_answer(
+    config_root: Path,
+) -> None:
+    """An answer that only assesses a product is not an offer to add it.
+
+    The router treats a live offer as grounds to read "yes" as a cart add, so recording one
+    here would turn "is this any good for cycling?" plus "yes" into an add the caller never
+    asked for. Measured: the owner leaves offered_skus empty for suitability and price answers.
+    """
+
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args(
+            "The waterproof rain jacket is designed for hiking, so it may work for cycling.",
+        ),
+    )
+    graph = _graph(config_root, response_model)
+
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="rain jacket for cycling"),
+        turn_id="catalog-suitability",
+        text="Is the rain jacket any good for cycling?",
+    )
+
+    assert "product_offer" not in result
+
+
+async def test_catalog_owner_records_no_offer_when_it_names_no_product(
+    config_root: Path,
+) -> None:
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args("We do not stock anything like that."),
+    )
+    graph = _graph(config_root, response_model)
+
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="anvils"),
+        turn_id="catalog-no-offer",
+        text="Do you sell anvils?",
+    )
+
+    assert "product_offer" not in result
 
 
 async def test_catalog_prompt_grounds_every_named_product_in_the_live_catalog(
     config_root: Path,
 ) -> None:
     response_model = FakeChatModel(
-        emit_tool_calls=False,
-        text_response="No catalog name matched. The catalog contains trail running shoes.",
+        structured_args=catalog_answer_args(
+            "No catalog name matched. The catalog contains trail running shoes.",
+        ),
         record_prompts=True,
     )
     graph = _graph(config_root, response_model)
@@ -1702,8 +1847,19 @@ async def test_catalog_prompt_grounds_every_named_product_in_the_live_catalog(
     # exists is still not. The grounding guardrails carry that distinction.
     assert "Name only products from the list" in prompt
     assert "Do not invent products" in prompt
-    # The owner is read-only; offering to act produces a promise the next turn cannot keep.
-    assert "Never offer to add anything to the" in prompt
+    # Offering a cart add is allowed again now that the offer is recorded and the next turn
+    # can honour it. Every other offer stays forbidden, because only the cart add is an offer
+    # another owner can actually carry out.
+    assert "you may offer to add one you named to the cart" in prompt
+    assert "Never offer to place an order, check an order, change an account" in prompt
+    assert "never claim anything has already happened" in prompt
+    assert "Answer about the products and nothing else" in prompt
+    assert "Set offered_skus to the SKUs of the products you are putting to the caller" in prompt
+    # Both directions are pinned: an add-offer records, a factual answer does not.
+    assert "Include a product whenever you suggest or recommend it, or ask whether to add it" in (
+        prompt
+    )
+    assert "Leave offered_skus empty when you are only listing what exists" in prompt
     assert "claim a product exists because the caller asked for it" in prompt
     assert "If nothing is a genuine fit, say so plainly" in prompt
     assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
@@ -1714,7 +1870,7 @@ async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
 ) -> None:
     graph = _graph(
         config_root,
-        FakeChatModel(emit_tool_calls=False, text_response="We carry trail running shoes."),
+        FakeChatModel(structured_args=catalog_answer_args("We carry trail running shoes.")),
     )
 
     result = await graph.ainvoke(
@@ -1746,7 +1902,7 @@ async def test_catalog_answer_telemetry_uses_the_id_matched_committed_turn(
 async def test_catalog_owner_fills_only_the_query_from_the_admitted_opening_turn(
     config_root: Path,
 ) -> None:
-    response_model = FakeChatModel(emit_tool_calls=False, text_response="We carry everyday socks.")
+    response_model = FakeChatModel(structured_args=catalog_answer_args("We carry everyday socks."))
     graph = _graph(config_root, response_model)
     opening = await _typed_read(
         graph,
@@ -1800,7 +1956,7 @@ async def test_catalog_owner_recovers_without_answer_telemetry_on_a_blank_model_
 ) -> None:
     graph = _graph(
         config_root,
-        FakeChatModel(emit_tool_calls=False, text_response=text_response),
+        FakeChatModel(structured_args=catalog_answer_args(text_response)),
     )
 
     result = await _typed_read(
@@ -1821,7 +1977,7 @@ async def test_catalog_owner_rejects_model_text_over_the_platform_limit(
     limit = 40
     graph = _graph(
         config_root,
-        FakeChatModel(emit_tool_calls=False, text_response="x" * (limit + 1)),
+        FakeChatModel(structured_args=catalog_answer_args("x" * (limit + 1))),
         caller_audible_model_text_max_chars=limit,
     )
 
@@ -2136,7 +2292,13 @@ def test_answer_owner_uses_the_required_configured_structured_transport(config_r
 
     _graph(config_root, response_model, structured_output_method=configured_method)
 
-    assert response_model.structured_methods == (configured_method, configured_method)
+    # Three typed owners now share the one configured transport: the bounded answer, the order
+    # target proposal, and the catalog answer that carries what it offered.
+    assert response_model.structured_methods == (
+        configured_method,
+        configured_method,
+        configured_method,
+    )
 
 
 async def test_order_status_owner_grants_and_renders_one_explicit_order_without_model_speech(

@@ -15,6 +15,7 @@ from llm_fakes import (
     TEST_STRUCTURED_OUTPUT_METHOD,
     ExplodingOnceFakeChatModel,
     FakeChatModel,
+    catalog_answer_args,
 )
 from policy_helpers import make_policy
 from pydantic import ValidationError
@@ -737,8 +738,10 @@ async def test_evaluator_executes_a_seeded_catalog_owner_with_real_fresh_turn_sp
 ) -> None:
     config = ConfigRegistry(config_root).load().get("acme_store").config
     routing = FakeChatModel(
-        emit_tool_calls=False,
-        text_response="We carry trail running shoes for $89.99.",
+        structured_args=catalog_answer_args(
+            "We carry trail running shoes for $89.99.",
+            "SKU-RED-42",
+        ),
     )
     reasoning = FakeChatModel(emit_tool_calls=False)
     runtime = await _build_eval_runtime(
@@ -899,8 +902,8 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     by_id = {case.case_id: case for case in corpus.cases}
 
-    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 64
-    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 36
+    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 67
+    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 39
     # Every counterfactual and asr_like case gates. Structural rule, chosen before
     # looking at any score: these are the cases that test whether the model reads
     # state rather than words, so they belong where a miss blocks.
@@ -3411,6 +3414,12 @@ async def test_read_owner_corpus_runs_through_the_production_graph_without_netwo
     routing = FakeChatModel(
         text_response="The trail running shoes cost $89.99.",
         structured_args={
+            "CatalogAnswer": (
+                {
+                    "answer": "The trail running shoes cost $89.99.",
+                    "offered_skus": ["SKU-RED-42"],
+                },
+            ),
             "AnswerResponse": (
                 {
                     "decision": "answer",
@@ -3428,7 +3437,7 @@ async def test_read_owner_corpus_runs_through_the_production_graph_without_netwo
                     "answer": "That policy detail is not available.",
                 },
                 {"decision": "unsupported", "answer": None},
-            )
+            ),
         },
     )
     config = ConfigRegistry(config_root).load().get("acme_store").config

@@ -1157,6 +1157,81 @@ cases:
       utterance: "can someone explain these charges?"
     expected: { decision: clarify, clarification_reason: ambiguous_intent }
 
+  - case_id: offer_accepted_reaches_the_cart
+    scenario_class: counterfactual
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Yes, please"
+      has_offered_product: true
+    expected:
+      decision: direct
+      request: { kind: modify_cart, operation: add, item: null, quantity: null }
+
+  - case_id: offer_accepted_by_reference_reaches_the_cart
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Yeah, that one"
+      has_offered_product: true
+    expected:
+      decision: direct
+      request: { kind: modify_cart, operation: add, item: null, quantity: null }
+
+  - case_id: offer_declined_is_not_a_cart_request
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "No thanks"
+      has_offered_product: true
+    expected:
+      decision: direct
+      request: { kind: converse, act: acknowledgment }
+
+  - case_id: confirmation_without_an_offer_stays_ambiguous
+    scenario_class: counterfactual
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Yes, please"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: offer_does_not_capture_an_unrelated_request
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What is the status of my order?"
+      has_offered_product: true
+    expected:
+      decision: direct
+      request: { kind: verify_order_status, target: null }
+
+  - case_id: acceptance_offer_accepted_reaches_the_cart
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *acceptance
+    context:
+      <<: *base_context
+      utterance: "Yes, go ahead"
+      has_offered_product: true
+    expected:
+      decision: direct
+      request: { kind: modify_cart, operation: add, item: null, quantity: null }
+
 projected_case:
   case_id: fixture_projected_view_cart
   scenario_class: direct

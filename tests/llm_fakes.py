@@ -89,7 +89,29 @@ CONFORMANT_STRUCTURED_ARGS: dict[str, tuple[dict[str, Any], ...]] = {
         {"relationship": "alternative", "order_refs": ["ORD-1001", "ORD-1002"]},
         {"relationship": "ambiguous", "order_refs": []},
     ),
+    "CatalogAnswer": (
+        {
+            "answer": "A light, cushioned running shoe. It grips well on wet roads.",
+            "offered_skus": [],
+        },
+    ),
 }
+
+
+def catalog_answer_args(
+    answer: str,
+    *offered_skus: str,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Structured payload for the catalog owner, which speaks through a typed answer."""
+
+    # Merged, not replacing: a bare single-key table leaves every other schema falling back to
+    # canned_args, which has no entry for them, so the failure surfaces as an opaque
+    # validation error instead of "no payload configured".
+    return {
+        **CONFORMANT_STRUCTURED_ARGS,
+        "CatalogAnswer": ({"answer": answer, "offered_skus": list(offered_skus)},),
+    }
+
 
 _TEXT_RESPONSE = "A light, cushioned running shoe. It grips well on wet roads."
 
