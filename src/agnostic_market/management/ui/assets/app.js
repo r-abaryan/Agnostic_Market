@@ -9,7 +9,12 @@ import {
   simulationTurnRequest,
   simulationMessages,
 } from "./client.js";
-import { createVoiceController, supportSummary, voiceSupport } from "./voice.js";
+import {
+  captureSupport,
+  createVoiceController,
+  describeEngines,
+  supportSummary,
+} from "./voice.js";
 
 const api = new ManagementApi();
 
@@ -30,6 +35,9 @@ const state = {
   simulationLatency: null,
   pendingSimulationTurn: null,
   busy: false,
+  voiceMode: "manual",
+  handsFreeArmed: false,
+  voiceAwaitingReply: false,
 };
 
 const elements = Object.fromEntries(
@@ -48,6 +56,8 @@ const elements = Object.fromEntries(
     "global-error",
     "empty-state",
     "workspace",
+    "section-nav",
+    "overview-simulator-link",
     "metric-revision",
     "metric-products",
     "metric-versions",
@@ -95,12 +105,17 @@ const elements = Object.fromEntries(
     "voice-state-label",
     "voice-support",
     "voice-listen",
+    "voice-send-capture",
+    "voice-mode-manual",
+    "voice-mode-auto",
     "voice-speak-replies",
   ].map((id) => [id, document.getElementById(id)]),
 );
 
 const VOICE_STATE_LABELS = {
   idle: "Idle",
+  arming: "Starting microphone",
+  "barge-ready": "Listening while speaking",
   listening: "Listening",
   thinking: "Working",
   speaking: "Speaking",
@@ -108,48 +123,118 @@ const VOICE_STATE_LABELS = {
 };
 
 const voice = createVoiceController({
+  api,
+  tenantId: () => state.merchantId,
+  // The version the simulation pinned, so speech matches the publication under test.
+  versionId: () => state.simulation?.publication_version_id ?? "",
   onState(next) {
     const orb = elements["voice-orb"];
+    const previous = orb.dataset.state;
     orb.dataset.state = next;
     const label = VOICE_STATE_LABELS[next] ?? "Idle";
     orb.setAttribute("aria-label", `Voice assistant state: ${label.toLowerCase()}`);
     elements["voice-state-label"].textContent = label;
-    elements["voice-listen"].textContent = next === "listening" ? "Stop listening" : "Hold to speak";
+    syncVoiceAvailability();
+    if (next === "speaking") queueHandsFreeMonitor();
+    if (next === "listening" && previous === "barge-ready") {
+      state.voiceAwaitingReply = false;
+    }
+    if (next === "acknowledged" || next === "idle") {
+      if (next === "acknowledged") state.voiceAwaitingReply = false;
+      queueHandsFreeListen();
+    }
+  },
+  onLevel(level) {
+    const orb = elements["voice-orb"];
+    orb.style.setProperty("--voice-scale", (1 + level * 0.2).toFixed(3));
+    orb.style.setProperty("--voice-glow", (0.32 + level * 0.5).toFixed(3));
+    orb.style.setProperty("--voice-wave-amplitude", (0.35 + level * 0.9).toFixed(3));
+  },
+  onBargeIn() {
+    noteInterruptedReadback();
+    state.voiceAwaitingReply = false;
   },
   onTranscript(heard) {
     // Heard speech fills the same composer the text path uses, so one send path stays authoritative.
     elements["simulation-turn"].value = heard;
     announce(`Heard: ${heard}`);
-    if (state.simulation && !state.busy) sendSimulationTurn();
+    if (state.simulation && !state.busy) void sendSimulationTurn();
   },
-  onError(message) {
+  onError(message, category) {
     // The announce channel is sr-only, so a sighted operator saw nothing when the microphone
     // failed. Voice problems belong on the voice panel, where the control that failed lives.
     elements["voice-support"].textContent = message;
     elements["voice-support"].classList.add("voice-support-alert");
     announce(message);
+    if (category === "capture" || category === "transcription") state.handsFreeArmed = false;
     syncVoiceAvailability();
   },
 });
 
-function speakLatestReply() {
+function speakLatestReply(replies) {
   if (!elements["voice-speak-replies"].checked) {
     voice.acknowledge();
     return;
   }
   // Only the assistant's own lines are spoken; caller echoes would read the operator back to itself.
-  const spoken = [...state.simulationMessages]
+  const spoken = [...replies]
     .reverse()
     .find((message) => message.kind !== "caller");
-  voice.speak(spoken?.text ?? "");
+  void voice.speak(spoken?.text ?? "");
+  syncVoiceAvailability();
+}
+
+function noteInterruptedReadback() {
+  if (state.simulationMessages.at(-1)?.kind === "confirmation") {
+    elements["readback-interrupted"].checked = true;
+  }
 }
 
 function syncVoiceAvailability() {
   const active = Boolean(state.simulation);
+  const automatic = state.voiceMode === "auto";
+  const capturing = voice.acquiring || voice.state === "listening" ||
+    voice.state === "barge-ready";
   elements["voice-listen"].disabled =
-    state.busy || !active || !voiceSupport.input || voice.inputBlocked;
-  elements["voice-speak-replies"].disabled = !voiceSupport.output;
-  if (!voiceSupport.output) elements["voice-speak-replies"].checked = false;
+    state.busy || !active || !captureSupport.input || voice.inputBlocked;
+  if (automatic) {
+    elements["voice-listen"].textContent = state.handsFreeArmed
+      ? "Stop hands-free"
+      : "Start hands-free";
+  } else {
+    elements["voice-listen"].textContent = voice.acquiring
+      ? "Cancel microphone request"
+      : voice.state === "listening" ? "Cancel listening" : "Start listening";
+  }
+  elements["voice-listen"].setAttribute(
+    "aria-pressed",
+    String(automatic ? state.handsFreeArmed : capturing),
+  );
+  elements["voice-send-capture"].hidden = automatic;
+  elements["voice-send-capture"].disabled = state.busy || voice.state !== "listening";
+  elements["voice-mode-manual"].disabled = state.busy;
+  elements["voice-mode-auto"].disabled = state.busy;
+  elements["voice-speak-replies"].disabled = !captureSupport.output;
+  if (!captureSupport.output) elements["voice-speak-replies"].checked = false;
+}
+
+function queueHandsFreeListen() {
+  if (!state.handsFreeArmed || state.voiceAwaitingReply || state.busy || !state.simulation) return;
+  queueMicrotask(() => {
+    if (!state.handsFreeArmed || state.voiceAwaitingReply || state.busy || !state.simulation) return;
+    if (voice.state !== "idle" && voice.state !== "acknowledged") return;
+    void voice.listen({ autoSendOnSilence: true });
+  });
+}
+
+function queueHandsFreeMonitor() {
+  if (!state.handsFreeArmed || state.busy || !state.simulation) return;
+  queueMicrotask(() => {
+    if (state.handsFreeArmed && !state.busy && state.simulation &&
+        voice.state === "speaking" && !voice.acquiring) {
+      void voice.listen({ autoSendOnSilence: true, monitorPlayback: true });
+    }
+  });
 }
 
 function requestId(prefix) {
@@ -441,6 +526,11 @@ function renderWorkspace() {
   const hasDraft = Boolean(state.draft);
   elements["empty-state"].hidden = hasDraft;
   elements.workspace.hidden = !hasDraft;
+  elements["overview-simulator-link"].hidden = !hasDraft;
+  for (const link of elements["section-nav"].querySelectorAll("[data-needs-draft]")) {
+    link.hidden = !hasDraft;
+  }
+  scheduleNavigationUpdate();
   elements["merchant-identity"].textContent = state.merchantId || "No merchant selected";
   elements["draft-status"].textContent = hasDraft ? `Draft r${state.draft.revision}` : "No draft loaded";
   elements["draft-status"].className = `pill ${hasDraft ? "active" : "neutral"}`;
@@ -672,6 +762,8 @@ async function startSimulation() {
   state.simulationLatency = null;
   state.pendingSimulationTurn = null;
   renderSimulation();
+  // The bound voice belongs to the pinned publication, so it is resolved once one exists.
+  await refreshVoiceIdentity();
   announce(
     `${opened.resumed ? "Resumed" : "Started"} simulation on ${opened.status.publication_version_id}.`,
   );
@@ -684,6 +776,7 @@ async function sendSimulationTurn() {
     showError(new ManagementApiError(422, "invalid_request"));
     return;
   }
+  if (voice.playbackActive) noteInterruptedReadback();
   const turn = simulationTurnRequest(
     state.pendingSimulationTurn,
     {
@@ -695,7 +788,8 @@ async function sendSimulationTurn() {
     () => requestId("simulation-turn"),
   );
   state.pendingSimulationTurn = turn;
-  voice.think();
+  state.voiceAwaitingReply = state.handsFreeArmed;
+  void voice.think();
   const result = await runAction("Running the caller turn", () =>
     api.sendSimulationTurn(
       turn.tenantId,
@@ -706,13 +800,16 @@ async function sendSimulationTurn() {
     ),
   );
   if (!result) {
-    voice.reset();
+    state.handsFreeArmed = false;
+    state.voiceAwaitingReply = false;
+    void voice.reset();
     return;
   }
   state.pendingSimulationTurn = null;
+  const replies = simulationMessages(result.events);
   state.simulationMessages.push(
     { kind: "caller", text },
-    ...simulationMessages(result.events),
+    ...replies,
   );
   state.simulationDiagnostics = simulationDiagnostics(result);
   state.simulationState = result.state;
@@ -720,15 +817,19 @@ async function sendSimulationTurn() {
   elements["simulation-turn"].value = "";
   elements["readback-interrupted"].checked = false;
   renderSimulation();
-  speakLatestReply();
+  speakLatestReply(replies);
   announce(`Completed simulation turn ${result.turn_number}.`);
 }
 
 async function resetSimulation() {
   if (!state.simulation) return;
-  const reset = await runAction("Resetting the isolated simulation", () =>
-    api.resetSimulation(state.merchantId, state.simulation.simulation_id),
-  );
+  const reset = await runAction("Resetting the isolated simulation", async () => {
+    state.handsFreeArmed = false;
+    state.voiceAwaitingReply = false;
+    // Stop local capture even if the remote reset is slow or fails.
+    await voice.reset();
+    return api.resetSimulation(state.merchantId, state.simulation.simulation_id);
+  });
   if (!reset) return;
   state.simulation = reset;
   state.simulationState = await runAction("Inspecting reset state", () =>
@@ -746,6 +847,9 @@ async function closeSimulation() {
   if (!state.simulation) return;
   const simulationId = state.simulation.simulation_id;
   const closed = await runAction("Closing the isolated simulation", async () => {
+    state.handsFreeArmed = false;
+    state.voiceAwaitingReply = false;
+    await voice.reset();
     await api.closeSimulation(state.merchantId, simulationId);
     return true;
   });
@@ -756,8 +860,8 @@ async function closeSimulation() {
   state.simulationDiagnostics = [];
   state.simulationLatency = null;
   state.pendingSimulationTurn = null;
-  voice.reset();
   renderSimulation();
+  await refreshVoiceIdentity();
   announce("Closed the isolated simulation.");
 }
 
@@ -823,15 +927,90 @@ elements["simulation-turn"].addEventListener("keydown", (event) => {
 elements["reset-simulation"].addEventListener("click", resetSimulation);
 elements["close-simulation"].addEventListener("click", closeSimulation);
 elements["voice-listen"].addEventListener("click", () => {
-  if (voice.state === "listening") voice.stopListening();
-  else voice.listen();
+  if (state.voiceMode === "auto") {
+    state.handsFreeArmed = !state.handsFreeArmed;
+    if (state.handsFreeArmed) {
+      if (voice.state === "speaking") queueHandsFreeMonitor();
+      else queueHandsFreeListen();
+    }
+    else void voice.cancelListening();
+  } else if (voice.state === "listening" || voice.acquiring) {
+    void voice.cancelListening();
+  } else {
+    if (voice.playbackActive) noteInterruptedReadback();
+    void voice.listen();
+  }
+  syncVoiceAvailability();
 });
+elements["voice-send-capture"].addEventListener("click", () => {
+  void voice.stopListening();
+});
+for (const mode of ["voice-mode-manual", "voice-mode-auto"]) {
+  elements[mode].addEventListener("change", () => {
+    state.voiceMode = elements["voice-mode-auto"].checked ? "auto" : "manual";
+    state.handsFreeArmed = false;
+    void voice.cancelListening();
+    syncVoiceAvailability();
+  });
+}
 elements["voice-speak-replies"].addEventListener("change", () => {
-  if (!elements["voice-speak-replies"].checked) voice.stopSpeaking();
+  if (!elements["voice-speak-replies"].checked) {
+    voice.stopSpeaking();
+    state.voiceAwaitingReply = false;
+    queueHandsFreeListen();
+  }
+  syncVoiceAvailability();
 });
 
 elements["voice-support"].textContent = supportSummary();
 syncVoiceAvailability();
 
+const navigationLinks = [...elements["section-nav"].querySelectorAll("a[href^='#']")];
+let navigationUpdateQueued = false;
+
+function scheduleNavigationUpdate() {
+  if (navigationUpdateQueued) return;
+  navigationUpdateQueued = true;
+  requestAnimationFrame(() => {
+    navigationUpdateQueued = false;
+    const cutoff = Math.min(200, window.innerHeight * 0.3);
+    let current = navigationLinks[0];
+    for (const link of navigationLinks) {
+      if (link.hidden) continue;
+      const section = document.getElementById(link.hash.slice(1));
+      if (section?.getClientRects().length && section.getBoundingClientRect().top <= cutoff) {
+        current = link;
+      }
+    }
+    for (const link of navigationLinks) {
+      if (link === current) link.setAttribute("aria-current", "location");
+      else link.removeAttribute("aria-current");
+    }
+  });
+}
+
+window.addEventListener("scroll", scheduleNavigationUpdate, { passive: true });
+window.addEventListener("resize", scheduleNavigationUpdate);
+
+async function refreshVoiceIdentity() {
+  // Name the engines the preview actually uses, so nobody has to infer them from config.
+  // Identity belongs to a publication, so it resolves once a simulation has pinned one.
+  const versionId = state.simulation?.publication_version_id;
+  if (!state.merchantId || !versionId) {
+    elements["voice-support"].textContent = `${supportSummary()} Start a simulation to bind a voice.`;
+    return;
+  }
+  try {
+    const identity = await api.getVoiceIdentity(state.merchantId, versionId);
+    elements["voice-support"].textContent = `${supportSummary()} ${describeEngines(identity)}`;
+    elements["voice-support"].classList.remove("voice-support-alert");
+  } catch {
+    elements["voice-support"].textContent =
+      "Voice preview is not configured on this server. The text path is unaffected.";
+  }
+}
+
 await refreshMerchants();
 if (state.merchantId) await loadWorkspace();
+await refreshVoiceIdentity();
+elements["merchant-select"].addEventListener("change", refreshVoiceIdentity);

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path as FileSystemPath
 from typing import Annotated, Literal
@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from agnostic_market.commerce.catalog import CatalogFixture, CatalogProduct
+from agnostic_market.dtos.config import VoiceConfig
 from agnostic_market.dtos.session import AuthorityIdentifier
 from agnostic_market.management.contracts import (
     MerchantAuditRecord,
@@ -54,6 +55,12 @@ from agnostic_market.management.simulation import (
     SimulationSessionStatus,
     SimulationStateProjection,
     SimulationTurnResult,
+)
+from agnostic_market.management.voice_preview import (
+    CAPTURE_SAMPLE_RATE,
+    MAX_CAPTURE_SECONDS,
+    MAX_SPEECH_CHARS,
+    VoicePreview,
 )
 
 _TRANSPORT = ConfigDict(extra="forbid", frozen=True)
@@ -262,6 +269,34 @@ class _UncachedStaticFiles(StaticFiles):
         return response
 
 
+class MerchantVoicePreviewIdentity(BaseModel):
+    """Which configured engines a preview exercises. Identity, never credentials."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tts_provider: str
+    tts_model: str
+    voice_id: str
+    stt_provider: str
+    stt_model: str
+    capture_sample_rate: int
+    max_capture_seconds: int
+
+
+class MerchantVoiceSpeechRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text: str = Field(min_length=1, max_length=MAX_SPEECH_CHARS)
+
+
+class MerchantVoiceTranscript(BaseModel):
+    """An empty transcript means silence, which is a result rather than a failure."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text: str
+
+
 logger = logging.getLogger("agnostic_market.management.api")
 
 
@@ -297,6 +332,7 @@ def create_management_app(
     *,
     development_actor_id: str,
     simulator: PublishedMerchantSimulator | None = None,
+    voice_preview: Callable[[VoiceConfig], VoicePreview] | None = None,
 ) -> FastAPI:
     """Build the local adapter with one deployment-owned development actor."""
 
@@ -321,6 +357,13 @@ def create_management_app(
         if simulator is None:
             raise MerchantSimulationError("text simulation is not configured")
         return simulator
+
+    def require_voice_preview(tenant_id: str, version_id: str) -> VoicePreview:
+        if voice_preview is None:
+            raise MerchantSimulationError("voice preview is not configured")
+        # Bound to the published version the simulator pins, not to the current config tree.
+        published = service.get_version(tenant_id, version_id)
+        return voice_preview(published.config.voice)
 
     @app.get("/admin", include_in_schema=False)
     def management_ui() -> FileResponse:
@@ -603,6 +646,54 @@ def create_management_app(
         version_id: _VersionPath,
     ) -> PublishedMerchantVersion:
         return service.get_version(tenant_id, version_id)
+
+    @app.get(
+        "/v1/merchants/{tenant_id}/versions/{version_id}/voice",
+        response_model=MerchantVoicePreviewIdentity,
+    )
+    def voice_identity(
+        tenant_id: _TenantPath,
+        version_id: _VersionPath,
+    ) -> MerchantVoicePreviewIdentity:
+        """Name the engines a preview will use, so the page never guesses at them."""
+        preview = require_voice_preview(tenant_id, version_id)
+        tts_provider, tts_model, voice_id = preview.tts_identity
+        stt_provider, stt_model = preview.stt_identity
+        return MerchantVoicePreviewIdentity(
+            tts_provider=tts_provider,
+            tts_model=tts_model,
+            voice_id=voice_id,
+            stt_provider=stt_provider,
+            stt_model=stt_model,
+            capture_sample_rate=CAPTURE_SAMPLE_RATE,
+            max_capture_seconds=MAX_CAPTURE_SECONDS,
+        )
+
+    @app.post("/v1/merchants/{tenant_id}/versions/{version_id}/voice/speech")
+    async def synthesize_speech(
+        tenant_id: _TenantPath,
+        version_id: _VersionPath,
+        payload: Annotated[MerchantVoiceSpeechRequest, Body()],
+    ) -> Response:
+        speech = await require_voice_preview(tenant_id, version_id).synthesize(payload.text)
+        # Audio is returned as bytes rather than base64 so the page can stream it straight
+        # into an audio element without holding a second copy in memory.
+        return Response(content=speech.audio_wav, media_type="audio/wav")
+
+    @app.post(
+        "/v1/merchants/{tenant_id}/versions/{version_id}/voice/transcript",
+        response_model=MerchantVoiceTranscript,
+    )
+    async def transcribe_capture(
+        tenant_id: _TenantPath,
+        version_id: _VersionPath,
+        request: Request,
+    ) -> MerchantVoiceTranscript:
+        # Raw 16-bit mono PCM at CAPTURE_SAMPLE_RATE. A container would need decoding here,
+        # and the browser can resample without one.
+        captured = await request.body()
+        text = await require_voice_preview(tenant_id, version_id).transcribe(captured)
+        return MerchantVoiceTranscript(text=text)
 
     @app.post(
         "/v1/merchants/{tenant_id}/simulations/{simulation_id}",

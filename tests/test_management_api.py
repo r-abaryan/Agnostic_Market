@@ -20,12 +20,17 @@ from agnostic_market.commerce.payment_instruments import load_payment_instrument
 from agnostic_market.commerce.profile import load_profile_fixture
 from agnostic_market.commerce.verification import load_verification_fixture
 from agnostic_market.config.loader import load_yaml_layer
+from agnostic_market.dtos.config import VoiceConfig
 from agnostic_market.management.api import create_management_app
 from agnostic_market.management.contracts import MerchantDraft, MerchantFixtureBundle
 from agnostic_market.management.datasets import load_merchant_scenario_dataset
 from agnostic_market.management.repository import SqliteMerchantConfigurationRepository
 from agnostic_market.management.service import MerchantManagementService
 from agnostic_market.management.simulation import PublishedMerchantSimulator
+from agnostic_market.management.voice_preview import (
+    CAPTURE_SAMPLE_RATE,
+    SynthesizedSpeech,
+)
 from scripts import management_api
 
 _NOW = datetime(2026, 9, 20, 12, tzinfo=UTC)
@@ -607,3 +612,187 @@ def test_internal_response_validation_failures_are_bounded(
         assert response.status_code == 500
         assert response.json() == {"schema_version": 1, "code": "service_unavailable"}
         assert sentinel not in response.text
+
+
+def _publish(client: TestClient, config_root: Path) -> str:
+    """Publish one version so a voice preview has a publication to bind to."""
+    _save_draft(client, config_root)
+    preview = client.post(
+        "/v1/merchants/acme_store/drafts/draft-1/preview",
+        json={"schema_version": 1, "draft_revision": 1},
+    )
+    assert preview.status_code == 200
+    publish = client.post(
+        "/v1/merchants/acme_store/drafts/draft-1/publication",
+        json={
+            "schema_version": 1,
+            "draft_revision": 1,
+            "expected_preview_fingerprint": preview.json()["preview_fingerprint"],
+            "expected_active_version_id": None,
+            "request_id": "publish-voice",
+        },
+    )
+    assert publish.status_code == 200
+    return str(publish.json()["version_id"])
+
+
+class _StubVoicePreview:
+    """Stands in for the provider-backed preview so these contracts cost no provider calls."""
+
+    tts_identity = ("cartesia", "sonic-3.5-2026-05-04", "voice-abc")
+    stt_identity = ("deepgram", "nova-3")
+
+    def __init__(self, voice: VoiceConfig | None = None) -> None:
+        self.voice = voice
+        self.spoken: list[str] = []
+        self.captured: list[bytes] = []
+
+    async def synthesize(self, text: str) -> SynthesizedSpeech:
+        self.spoken.append(text)
+        return SynthesizedSpeech(
+            audio_wav=b"RIFF....WAVEfmt ",
+            provider="cartesia",
+            model="sonic-3.5-2026-05-04",
+            voice_id="voice-abc",
+        )
+
+    async def transcribe(self, pcm: bytes) -> str:
+        self.captured.append(pcm)
+        return "two of those please"
+
+
+def _voice_client(tmp_path: Path, config_root: Path, preview: _StubVoicePreview) -> TestClient:
+    repository = SqliteMerchantConfigurationRepository(
+        tmp_path / "management-voice.sqlite3",
+        active_config_root=config_root,
+        clock=lambda: _NOW,
+        version_id_factory=lambda: "version-1",
+    )
+    service = MerchantManagementService(config_root, repository, clock=lambda: _NOW)
+
+    def factory(voice: VoiceConfig) -> _StubVoicePreview:
+        # Record what the app resolved, so the binding can be asserted rather than assumed.
+        preview.voice = voice
+        return preview
+
+    return TestClient(
+        create_management_app(
+            service,
+            development_actor_id="local-operator",
+            voice_preview=factory,
+        )
+    )
+
+
+def test_voice_preview_names_its_engines_without_exposing_credentials(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    client = _voice_client(tmp_path, config_root, _StubVoicePreview())
+
+    _publish(client, config_root)
+    response = client.get("/v1/merchants/acme_store/versions/version-1/voice")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tts_provider"] == "cartesia"
+    assert body["voice_id"] == "voice-abc"
+    assert body["stt_model"] == "nova-3"
+    assert body["capture_sample_rate"] == CAPTURE_SAMPLE_RATE
+    # Identity only: a key or secret must never reach the page.
+    assert not any("key" in field or "secret" in field for field in body)
+
+
+def test_voice_preview_resolves_the_published_version_not_the_live_config(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    """The simulator pins one immutable publication; the voice must come from that version.
+
+    Reading the current config tree instead would let a later voice edit change what the
+    preview speaks without changing the version it claims to exercise.
+    """
+
+    preview = _StubVoicePreview()
+    client = _voice_client(tmp_path, config_root, preview)
+    version_id = _publish(client, config_root)
+
+    response = client.get(f"/v1/merchants/acme_store/versions/{version_id}/voice")
+
+    assert response.status_code == 200
+    published = client.get(f"/v1/merchants/acme_store/versions/{version_id}").json()
+    assert preview.voice is not None
+    assert preview.voice.model_dump(mode="json") == published["config"]["voice"]
+
+
+def test_voice_preview_rejects_a_version_that_does_not_exist(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    client = _voice_client(tmp_path, config_root, _StubVoicePreview())
+
+    assert client.get("/v1/merchants/acme_store/versions/version-404/voice").status_code == 404
+
+
+def test_voice_preview_returns_audio_bytes_rather_than_encoded_json(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    preview = _StubVoicePreview()
+    client = _voice_client(tmp_path, config_root, preview)
+    _publish(client, config_root)
+
+    response = client.post(
+        "/v1/merchants/acme_store/versions/version-1/voice/speech",
+        json={"text": "We have a waterproof rain jacket for $129.00."},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.content.startswith(b"RIFF")
+    assert preview.spoken == ["We have a waterproof rain jacket for $129.00."]
+
+
+def test_voice_preview_transcribes_raw_capture_without_a_container(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    preview = _StubVoicePreview()
+    client = _voice_client(tmp_path, config_root, preview)
+    pcm = b"\x00\x01" * 400
+
+    _publish(client, config_root)
+    response = client.post(
+        "/v1/merchants/acme_store/versions/version-1/voice/transcript", content=pcm
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "two of those please"}
+    assert preview.captured == [pcm]
+
+
+def test_voice_preview_rejects_empty_speech_before_reaching_a_provider(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    preview = _StubVoicePreview()
+    client = _voice_client(tmp_path, config_root, preview)
+
+    response = client.post(
+        "/v1/merchants/acme_store/versions/version-1/voice/speech", json={"text": ""}
+    )
+
+    assert response.status_code == 422
+    assert preview.spoken == []
+
+
+def test_voice_endpoints_fail_closed_when_the_preview_is_not_configured(
+    tmp_path: Path,
+    config_root: Path,
+) -> None:
+    # The default server build has no voice preview; the text path must be unaffected.
+    client = _client(tmp_path, config_root)
+
+    base = "/v1/merchants/acme_store/versions/version-1/voice"
+    assert client.get(base).status_code == 503
+    assert client.post(f"{base}/speech", json={"text": "hello"}).status_code == 503

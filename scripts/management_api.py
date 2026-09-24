@@ -10,12 +10,13 @@ from dotenv import load_dotenv
 
 from agnostic_market.agents.routing_activation import ConfiguredSemanticRouterFactory
 from agnostic_market.application import ApplicationModels, RoutingFactory
-from agnostic_market.dtos.config import MerchantConfig
+from agnostic_market.dtos.config import MerchantConfig, VoiceConfig
 from agnostic_market.llm.gateway import LLMGateway, load_provider_credentials
 from agnostic_market.management.api import create_management_app
 from agnostic_market.management.repository import SqliteMerchantConfigurationRepository
 from agnostic_market.management.service import MerchantManagementService
 from agnostic_market.management.simulation import PublishedMerchantSimulator
+from agnostic_market.management.voice_preview import VoicePreview
 from agnostic_market.secrets.env_resolver import EnvSecretResolver
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[1] / "config"
@@ -96,10 +97,17 @@ def serve(
         models_factory=models_factory,
         routing_factory=routing_factory,
     )
+
+    def voice_preview(voice: VoiceConfig) -> VoicePreview:
+        # The app resolves the voice config from the published version the simulator pinned;
+        # this only supplies the provider plumbing, so the preview cannot drift to live YAML.
+        return VoicePreview(voice, credentials, secrets)
+
     app = create_management_app(
         service,
         development_actor_id=actor_id,
         simulator=simulator,
+        voice_preview=voice_preview,
     )
     uvicorn.run(app, host="127.0.0.1", port=port)
 
