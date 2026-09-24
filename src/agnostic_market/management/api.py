@@ -244,6 +244,24 @@ class MerchantSimulationTurn(BaseModel):
     readback_interrupted: bool = False
 
 
+class _UncachedStaticFiles(StaticFiles):
+    """Serve workbench assets without heuristic caching.
+
+    StaticFiles sends only last-modified and etag. With no cache-control a browser is free to
+    reuse a module without revalidating, which serves a stale script against fresh markup and
+    looks like the page silently ignoring its own controls. These assets are loopback-only
+    development state and are edited constantly, so correctness beats the saved request.
+    """
+
+    def is_not_modified(self, response_headers, request_headers) -> bool:
+        return False
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["cache-control"] = "no-store"
+        return response
+
+
 logger = logging.getLogger("agnostic_market.management.api")
 
 
@@ -743,7 +761,7 @@ def create_management_app(
 
     app.mount(
         "/admin/assets",
-        StaticFiles(directory=_UI_ROOT / "assets"),
+        _UncachedStaticFiles(directory=_UI_ROOT / "assets"),
         name="management-ui-assets",
     )
     return app

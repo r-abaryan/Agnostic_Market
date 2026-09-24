@@ -9,6 +9,7 @@ import {
   simulationTurnRequest,
   simulationMessages,
 } from "./client.js";
+import { createVoiceController, supportSummary, voiceSupport } from "./voice.js";
 
 const api = new ManagementApi();
 
@@ -90,8 +91,66 @@ const elements = Object.fromEntries(
     "confirmation-dialog",
     "confirmation-title",
     "confirmation-copy",
+    "voice-orb",
+    "voice-state-label",
+    "voice-support",
+    "voice-listen",
+    "voice-speak-replies",
   ].map((id) => [id, document.getElementById(id)]),
 );
+
+const VOICE_STATE_LABELS = {
+  idle: "Idle",
+  listening: "Listening",
+  thinking: "Working",
+  speaking: "Speaking",
+  acknowledged: "Received",
+};
+
+const voice = createVoiceController({
+  onState(next) {
+    const orb = elements["voice-orb"];
+    orb.dataset.state = next;
+    const label = VOICE_STATE_LABELS[next] ?? "Idle";
+    orb.setAttribute("aria-label", `Voice assistant state: ${label.toLowerCase()}`);
+    elements["voice-state-label"].textContent = label;
+    elements["voice-listen"].textContent = next === "listening" ? "Stop listening" : "Hold to speak";
+  },
+  onTranscript(heard) {
+    // Heard speech fills the same composer the text path uses, so one send path stays authoritative.
+    elements["simulation-turn"].value = heard;
+    announce(`Heard: ${heard}`);
+    if (state.simulation && !state.busy) sendSimulationTurn();
+  },
+  onError(message) {
+    // The announce channel is sr-only, so a sighted operator saw nothing when the microphone
+    // failed. Voice problems belong on the voice panel, where the control that failed lives.
+    elements["voice-support"].textContent = message;
+    elements["voice-support"].classList.add("voice-support-alert");
+    announce(message);
+    syncVoiceAvailability();
+  },
+});
+
+function speakLatestReply() {
+  if (!elements["voice-speak-replies"].checked) {
+    voice.acknowledge();
+    return;
+  }
+  // Only the assistant's own lines are spoken; caller echoes would read the operator back to itself.
+  const spoken = [...state.simulationMessages]
+    .reverse()
+    .find((message) => message.kind !== "caller");
+  voice.speak(spoken?.text ?? "");
+}
+
+function syncVoiceAvailability() {
+  const active = Boolean(state.simulation);
+  elements["voice-listen"].disabled =
+    state.busy || !active || !voiceSupport.input || voice.inputBlocked;
+  elements["voice-speak-replies"].disabled = !voiceSupport.output;
+  if (!voiceSupport.output) elements["voice-speak-replies"].checked = false;
+}
 
 function requestId(prefix) {
   return `${prefix}-${crypto.randomUUID()}`;
@@ -144,6 +203,7 @@ function syncButtonStates() {
   elements["simulation-version"].disabled = state.busy || simulationActive;
   elements["merchant-select"].disabled = state.busy || simulationActive;
   elements["draft-id"].disabled = state.busy || simulationActive;
+  syncVoiceAvailability();
   for (const button of document.querySelectorAll("[data-rollback-version]")) {
     button.disabled =
       state.busy || !canRollback(state.activeVersion?.version_id, button.dataset.rollbackVersion);
@@ -635,6 +695,7 @@ async function sendSimulationTurn() {
     () => requestId("simulation-turn"),
   );
   state.pendingSimulationTurn = turn;
+  voice.think();
   const result = await runAction("Running the caller turn", () =>
     api.sendSimulationTurn(
       turn.tenantId,
@@ -644,7 +705,10 @@ async function sendSimulationTurn() {
       turn.readbackInterrupted,
     ),
   );
-  if (!result) return;
+  if (!result) {
+    voice.reset();
+    return;
+  }
   state.pendingSimulationTurn = null;
   state.simulationMessages.push(
     { kind: "caller", text },
@@ -656,6 +720,7 @@ async function sendSimulationTurn() {
   elements["simulation-turn"].value = "";
   elements["readback-interrupted"].checked = false;
   renderSimulation();
+  speakLatestReply();
   announce(`Completed simulation turn ${result.turn_number}.`);
 }
 
@@ -691,6 +756,7 @@ async function closeSimulation() {
   state.simulationDiagnostics = [];
   state.simulationLatency = null;
   state.pendingSimulationTurn = null;
+  voice.reset();
   renderSimulation();
   announce("Closed the isolated simulation.");
 }
@@ -756,6 +822,16 @@ elements["simulation-turn"].addEventListener("keydown", (event) => {
 });
 elements["reset-simulation"].addEventListener("click", resetSimulation);
 elements["close-simulation"].addEventListener("click", closeSimulation);
+elements["voice-listen"].addEventListener("click", () => {
+  if (voice.state === "listening") voice.stopListening();
+  else voice.listen();
+});
+elements["voice-speak-replies"].addEventListener("change", () => {
+  if (!elements["voice-speak-replies"].checked) voice.stopSpeaking();
+});
+
+elements["voice-support"].textContent = supportSummary();
+syncVoiceAvailability();
 
 await refreshMerchants();
 if (state.merchantId) await loadWorkspace();

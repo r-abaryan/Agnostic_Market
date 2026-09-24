@@ -1,23 +1,27 @@
 :root {
   color-scheme: dark;
-  --bg: #08100f;
-  --surface: #101b19;
-  --surface-raised: #152421;
-  --surface-soft: #1a2c28;
-  --border: #29423c;
-  --border-strong: #3d5d55;
-  --text: #edf8f3;
-  --muted: #9eb9b0;
-  --accent: #8ef0b6;
-  --accent-strong: #46cf83;
-  --accent-ink: #062314;
-  --warning: #f0ca72;
-  --danger: #ff8f88;
-  --focus: #b7f7cf;
-  --shadow: 0 24px 80px rgb(0 0 0 / 28%);
-  --radius-lg: 24px;
-  --radius-md: 16px;
-  --radius-sm: 10px;
+  /* Near-neutral surfaces with one restrained accent. The accent carries state, not decoration. */
+  --bg: #0a0d0c;
+  --surface: #121716;
+  --surface-raised: #171d1c;
+  --surface-soft: #1c2422;
+  --border: #262e2c;
+  --border-strong: #36403d;
+  --text: #e7ecea;
+  --muted: #94a09c;
+  --accent: #5fc79a;
+  --accent-strong: #34a877;
+  --accent-ink: #04170f;
+  --warning: #d8b169;
+  --danger: #e58a84;
+  --focus: #8fd9b6;
+  --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 8px 24px rgb(0 0 0 / 22%);
+  --radius-lg: 12px;
+  --radius-md: 10px;
+  --radius-sm: 7px;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 680;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
 }
@@ -31,10 +35,7 @@ body {
   min-width: 320px;
   min-height: 100vh;
   color: var(--text);
-  background:
-    radial-gradient(circle at 86% 4%, rgb(39 110 83 / 24%), transparent 30rem),
-    radial-gradient(circle at 20% 96%, rgb(26 80 66 / 18%), transparent 34rem),
-    var(--bg);
+  background: var(--bg);
 }
 
 button, input, select, textarea { font: inherit; }
@@ -64,15 +65,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .sidebar {
   position: fixed;
   inset: 0 auto 0 0;
-  width: 300px;
+  width: 280px;
   display: flex;
   flex-direction: column;
   gap: 2rem;
   padding: 2rem 1.5rem;
   overflow-y: auto;
-  background: rgb(10 20 18 / 94%);
+  background: rgb(10 13 12 / 96%);
   border-right: 1px solid var(--border);
-  backdrop-filter: blur(22px);
+  backdrop-filter: blur(12px);
 }
 
 .brand-lockup, .section-heading, .topbar, .button-row, .environment-note {
@@ -87,22 +88,23 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   width: 44px;
   height: 44px;
   place-items: center;
-  color: var(--accent-ink);
-  background: linear-gradient(145deg, var(--accent), var(--accent-strong));
-  border-radius: 14px;
-  font-weight: 850;
-  letter-spacing: -.04em;
-  box-shadow: 0 10px 30px rgb(70 207 131 / 20%);
+  color: var(--accent);
+  background: var(--surface-soft);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: .82rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .02em;
 }
 
-.brand-title { margin: .18rem 0 0; font-weight: 740; }
+.brand-title { margin: .18rem 0 0; font-weight: var(--weight-semibold); }
 
 .eyebrow {
   margin: 0;
   color: var(--accent);
-  font-size: .72rem;
-  font-weight: 800;
-  letter-spacing: .14em;
+  font-size: .68rem;
+  font-weight: var(--weight-semibold);
+  letter-spacing: .08em;
   text-transform: uppercase;
 }
 
@@ -125,7 +127,7 @@ p { color: var(--muted); line-height: 1.65; }
 .section-heading.compact { align-items: center; }
 .section-heading p { max-width: 68ch; margin-bottom: 0; }
 
-label { color: var(--muted); font-size: .78rem; font-weight: 700; }
+label { color: var(--muted); font-size: .78rem; font-weight: var(--weight-medium); }
 
 select, input, textarea {
   width: 100%;
@@ -145,14 +147,14 @@ select:hover, input:hover, textarea:hover { border-color: #598076; }
 .button, .icon-button, .text-button {
   border: 0;
   cursor: pointer;
-  font-weight: 760;
-  transition: transform 120ms ease, filter 120ms ease, opacity 120ms ease;
+  font-weight: var(--weight-semibold);
+  transition: background-color 120ms ease, border-color 120ms ease, opacity 120ms ease;
 }
 
-.button:hover:not(:disabled), .icon-button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.08); }
+.button:hover:not(:disabled), .icon-button:hover:not(:disabled) { filter: brightness(1.1); }
 .button:disabled, .icon-button:disabled, .text-button:disabled { cursor: not-allowed; opacity: .42; }
 
-.button { min-height: 40px; padding: .65rem .95rem; border-radius: 999px; }
+.button { min-height: 38px; padding: .6rem .9rem; border-radius: var(--radius-sm); }
 .button.primary { color: var(--accent-ink); background: var(--accent); }
 .button.secondary { color: var(--text); background: var(--surface-soft); border: 1px solid var(--border-strong); }
 .button.warning { color: #2f2100; background: var(--warning); }
@@ -266,6 +268,124 @@ tbody tr:last-child td { border-bottom: 0; }
 .simulation-actions { padding-bottom: 1px; }
 .simulation-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr); gap: 1rem; }
 .simulation-conversation { display: grid; gap: 1rem; }
+
+/* Voice ------------------------------------------------------------------ */
+/* The orb spans both columns so it reads as the session's status, not a widget beside it. */
+.simulation-voice { grid-column: 1 / -1; display: grid; gap: 1rem; }
+.voice-scope { margin: -.4rem 0 .2rem; max-width: 74ch; font-size: .78rem; }
+.voice-stage { display: flex; align-items: center; gap: 1.1rem; }
+.voice-readout { display: grid; gap: .2rem; }
+.voice-state { margin: 0; color: var(--text); font-size: .95rem; font-weight: var(--weight-semibold); }
+.voice-support { margin: 0; font-size: .78rem; }
+.voice-support-alert { color: var(--warning); }
+.voice-actions { justify-content: space-between; }
+
+.voice-orb {
+  position: relative;
+  display: grid;
+  flex: none;
+  width: 68px;
+  height: 68px;
+  place-items: center;
+}
+
+.voice-core, .voice-halo {
+  position: absolute;
+  border-radius: 50%;
+}
+
+.voice-core {
+  width: 26px;
+  height: 26px;
+  background: var(--accent-strong);
+  transition: background-color 200ms ease, width 200ms ease, height 200ms ease;
+}
+
+.voice-halo {
+  width: 100%;
+  height: 100%;
+  border: 1px solid var(--accent);
+  opacity: 0;
+}
+
+.voice-wave {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 26px;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.voice-wave i {
+  display: block;
+  width: 3px;
+  height: 6px;
+  background: var(--accent-ink);
+  border-radius: 2px;
+}
+
+/* Idle: a slow breath, enough to show the session is live without drawing the eye. */
+.voice-orb[data-state="idle"] .voice-core { animation: voice-breathe 3.6s ease-in-out infinite; }
+.voice-orb[data-state="idle"] .voice-halo { animation: voice-ring 3.6s ease-out infinite; }
+
+/* Listening: faster rings and a live waveform, so an open microphone is unmistakable. */
+.voice-orb[data-state="listening"] .voice-core { width: 34px; height: 34px; background: var(--accent); }
+.voice-orb[data-state="listening"] .voice-halo { animation: voice-ring 1.5s ease-out infinite; }
+.voice-orb[data-state="listening"] .voice-wave { opacity: 1; }
+.voice-orb[data-state="listening"] .voice-wave i { animation: voice-bar 760ms ease-in-out infinite; }
+
+/* Thinking: one rotating arc. No rings, because nothing is being heard or said. */
+.voice-orb[data-state="thinking"] .voice-core { width: 20px; height: 20px; background: var(--muted); }
+.voice-orb[data-state="thinking"]::after {
+  content: "";
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0 65%, var(--accent) 88%, transparent 100%);
+  -webkit-mask: radial-gradient(circle, transparent 0 28px, #000 29px);
+  mask: radial-gradient(circle, transparent 0 28px, #000 29px);
+  animation: voice-spin 1.15s linear infinite;
+}
+
+/* Speaking: the waveform carries the motion and the rings hold steady behind it. */
+.voice-orb[data-state="speaking"] .voice-core { width: 38px; height: 38px; background: var(--accent); }
+.voice-orb[data-state="speaking"] .voice-halo { opacity: .35; }
+.voice-orb[data-state="speaking"] .voice-wave { opacity: 1; }
+.voice-orb[data-state="speaking"] .voice-wave i { animation: voice-bar 520ms ease-in-out infinite; }
+
+/* Acknowledged: one outward ring, then the controller returns the orb to idle. */
+.voice-orb[data-state="acknowledged"] .voice-core { width: 30px; height: 30px; background: var(--accent); }
+.voice-orb[data-state="acknowledged"] .voice-halo { animation: voice-ring 900ms ease-out 1; }
+
+.voice-wave i:nth-child(2) { animation-delay: 90ms; }
+.voice-wave i:nth-child(3) { animation-delay: 180ms; }
+.voice-wave i:nth-child(4) { animation-delay: 270ms; }
+.voice-wave i:nth-child(5) { animation-delay: 360ms; }
+.voice-halo.delayed { animation-delay: 750ms !important; }
+
+@keyframes voice-breathe {
+  0%, 100% { transform: scale(1); opacity: .75; }
+  50% { transform: scale(1.12); opacity: 1; }
+}
+
+@keyframes voice-ring {
+  0% { transform: scale(.42); opacity: .55; }
+  70% { opacity: .12; }
+  100% { transform: scale(1); opacity: 0; }
+}
+
+@keyframes voice-bar {
+  0%, 100% { height: 6px; }
+  50% { height: 20px; }
+}
+
+@keyframes voice-spin {
+  to { transform: rotate(360deg); }
+}
+
 .transcript { display: grid; gap: .7rem; min-height: 180px; max-height: 420px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
 .transcript li { max-width: 88%; padding: .75rem .9rem; border-radius: var(--radius-sm); white-space: pre-wrap; }
 .transcript .caller { justify-self: end; color: var(--accent-ink); background: var(--accent); }
@@ -313,5 +433,13 @@ dialog form { padding: 1rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
+  }
+  /* The waveform stays visible so speaking and listening remain distinguishable without motion. */
+  .voice-orb[data-state="listening"] .voice-wave,
+  .voice-orb[data-state="speaking"] .voice-wave { opacity: 1; }
+  .voice-orb[data-state="idle"] .voice-halo { opacity: .18; }
 }

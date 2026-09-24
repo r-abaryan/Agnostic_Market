@@ -12,6 +12,11 @@ import {
   simulationTurnRequest,
   simulationMessages,
 } from "../../src/agnostic_market/management/ui/assets/client.js";
+import {
+  recognitionFailure,
+  spokenText,
+  supportSummary,
+} from "../../src/agnostic_market/management/ui/assets/voice.js";
 
 test("API errors expose bounded status and code without reflecting response text", async () => {
   const api = new ManagementApi(async () =>
@@ -257,4 +262,34 @@ test("an unchanged simulation turn reuses its request id until completion", () =
   assert.strictEqual(retry, first);
   assert.equal(retry.requestId, "simulation-turn-1");
   assert.equal(changed.requestId, "simulation-turn-2");
+});
+
+test("spoken text collapses whitespace and is bounded before it reaches the speech queue", () => {
+  assert.equal(spokenText("  We have   trail\n running shoes. "), "We have trail running shoes.");
+  assert.equal(spokenText(null), "");
+  assert.equal(spokenText(undefined), "");
+
+  const long = spokenText("a".repeat(2000));
+  assert.equal(long.length, 1203);
+  assert.ok(long.endsWith("..."));
+});
+
+test("speech support is reported per capability rather than as one on-or-off claim", () => {
+  assert.match(supportSummary({ input: true, output: true }), /Microphone and playback/);
+  assert.match(supportSummary({ input: false, output: true }), /Playback only/);
+  assert.match(supportSummary({ input: true, output: false }), /Microphone only/);
+  assert.match(supportSummary({ input: false, output: false }), /neither/);
+});
+
+test("a blocked speech backend is named, not reported as a generic failure", () => {
+  // Brave and some Chromium builds expose webkitSpeechRecognition while stripping the service,
+  // so the constructor check passes and the first start() is the only honest signal.
+  assert.match(recognitionFailure("network"), /blocks the speech service/);
+  assert.match(recognitionFailure("service-not-allowed"), /refused the speech service/);
+  assert.match(recognitionFailure("not-allowed"), /permission was refused/);
+  assert.match(recognitionFailure("audio-capture"), /No microphone/);
+
+  // Transient outcomes must not latch the control off.
+  assert.equal(recognitionFailure("no-speech"), null);
+  assert.equal(recognitionFailure("aborted"), null);
 });
