@@ -306,6 +306,31 @@ def test_published_version_read_requires_the_current_schema_fingerprint(
         repository.get_active_version("acme_store")
 
 
+def test_contract_drift_is_rejected_when_the_repository_is_reopened(
+    tmp_path: Path,
+    config_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repository schema version covers table layout only, so contract drift needs its
+    own startup check; otherwise it first appears as an opaque 503 from a version endpoint."""
+
+    repository = _repository(tmp_path, config_root)
+    repository.save_draft(_draft(config_root), expected_revision=0)
+    repository.publish(_publication(config_root))
+
+    # Reopening an unchanged database must stay silent.
+    _repository(tmp_path, config_root)
+
+    monkeypatch.setattr(
+        management_contracts,
+        "management_contract_schema_fingerprint",
+        lambda: "0" * 64,
+    )
+
+    with pytest.raises(ManagementRepositoryDataError, match="superseded contract schema"):
+        _repository(tmp_path, config_root)
+
+
 def test_published_version_read_rejects_raw_payload_tampering(
     tmp_path: Path,
     config_root: Path,

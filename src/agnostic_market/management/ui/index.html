@@ -192,6 +192,40 @@
               </div>
             </div>
             <div class="simulation-grid">
+              <article class="subpanel simulation-voice">
+                <h3>Voice</h3>
+                <p class="voice-scope">
+                  Browser speech driving the text simulator, for hands-free operation of this
+                  page. It is not the voice pipeline: Deepgram, Cartesia, LiveKit turn
+                  admission, barge-in and AI disclosure are not exercised here. Test those with
+                  the LiveKit console or the development worker.
+                </p>
+                <div class="voice-stage">
+                  <div id="voice-orb" class="voice-orb" data-state="idle" role="img"
+                       aria-label="Voice assistant state: idle">
+                    <span class="voice-halo" aria-hidden="true"></span>
+                    <span class="voice-halo delayed" aria-hidden="true"></span>
+                    <span class="voice-core" aria-hidden="true"></span>
+                    <span class="voice-wave" aria-hidden="true">
+                      <i></i><i></i><i></i><i></i><i></i>
+                    </span>
+                  </div>
+                  <div class="voice-readout">
+                    <p id="voice-state-label" class="voice-state">Idle</p>
+                    <p id="voice-support" class="voice-support">Checking browser speech support...</p>
+                  </div>
+                </div>
+                <div class="button-row voice-actions">
+                  <button id="voice-listen" class="button secondary" type="button" disabled>
+                    Hold to speak
+                  </button>
+                  <label class="checkbox-row" for="voice-speak-replies">
+                    <input id="voice-speak-replies" type="checkbox" checked disabled>
+                    Speak assistant replies
+                  </label>
+                </div>
+              </article>
+
               <article class="subpanel simulation-conversation">
                 <h3>Conversation</h3>
                 <ol id="simulation-transcript" class="transcript" aria-live="polite">

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path as FileSystemPath
@@ -243,6 +244,27 @@ class MerchantSimulationTurn(BaseModel):
     readback_interrupted: bool = False
 
 
+class _UncachedStaticFiles(StaticFiles):
+    """Serve workbench assets without heuristic caching.
+
+    StaticFiles sends only last-modified and etag. With no cache-control a browser is free to
+    reuse a module without revalidating, which serves a stale script against fresh markup and
+    looks like the page silently ignoring its own controls. These assets are loopback-only
+    development state and are edited constantly, so correctness beats the saved request.
+    """
+
+    def is_not_modified(self, response_headers, request_headers) -> bool:
+        return False
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["cache-control"] = "no-store"
+        return response
+
+
+logger = logging.getLogger("agnostic_market.management.api")
+
+
 def _error_response(
     code: ManagementApiErrorCode,
     status_code: int,
@@ -367,8 +389,10 @@ def create_management_app(
     @app.exception_handler(MerchantManagementError)
     async def service_failure(
         _request: Request,
-        _exc: MerchantManagementError,
+        exc: MerchantManagementError,
     ) -> JSONResponse:
+        # The response is deliberately opaque; the cause must still reach the operator.
+        logger.exception("management request failed", exc_info=exc)
         return _error_response("service_unavailable", 503)
 
     @app.exception_handler(MerchantSimulationNotFoundError)
@@ -395,8 +419,9 @@ def create_management_app(
     @app.exception_handler(MerchantSimulationError)
     async def simulation_failure(
         _request: Request,
-        _exc: MerchantSimulationError,
+        exc: MerchantSimulationError,
     ) -> JSONResponse:
+        logger.exception("management simulation failed", exc_info=exc)
         return _error_response("service_unavailable", 503)
 
     @app.get("/v1/merchants", response_model=MerchantListResponse)
@@ -736,7 +761,7 @@ def create_management_app(
 
     app.mount(
         "/admin/assets",
-        StaticFiles(directory=_UI_ROOT / "assets"),
+        _UncachedStaticFiles(directory=_UI_ROOT / "assets"),
         name="management-ui-assets",
     )
     return app

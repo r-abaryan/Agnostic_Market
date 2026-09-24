@@ -119,12 +119,12 @@ The development adapter is fixed to `127.0.0.1:8000`. Open the merchant workbenc
 beyond loopback. Tenant and actor authority are derived from URL scope and process configuration,
 not accepted from write request bodies.
 
-The SQLite repository is disposable development state, not a compatibility surface. Its schema
-version is checked at startup, but that covers table layout only: each published version also
-carries the management contract fingerprint, which moves whenever `MerchantConfig` changes, and a
-stale one surfaces later as a failure on the version endpoints. Either way the remedy is the same,
-so stop the server, remove the `--database` file, restart, and recreate drafts and publications
-through the API.
+The SQLite repository is disposable development state, not a compatibility surface. Two things
+are checked when it opens: the schema version, which covers table layout only, and the management
+contract fingerprint carried by each published version, which moves whenever `MerchantConfig`
+changes. Both reject the database at startup rather than on a later version read, and both name the
+same remedy, so stop the server, remove the `--database` file, restart, and recreate drafts and
+publications through the API.
 
 The same process exposes the development text-simulation API. A simulation pins one immutable
 publication across turns and resets, uses isolated in-memory session state, and resolves
