@@ -46,6 +46,50 @@ export class ManagementApi {
     return payload;
   }
 
+  getVoiceIdentity(tenantId, versionId) {
+    return this.request(
+      `/v1/merchants/${encoded(tenantId)}/versions/${encoded(versionId)}/voice`,
+    );
+  }
+
+  // Audio, not JSON, so these two bypass `request` while keeping its error semantics: the
+  // response body is never reflected into the thrown error.
+  async synthesizeSpeech(tenantId, versionId, text) {
+    const path = `/v1/merchants/${encoded(tenantId)}/versions/${encoded(versionId)}/voice/speech`;
+    const response = await this.fetchImpl(path, {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { accept: "audio/wav", "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!response.ok) {
+      throw new ManagementApiError(response.status, "service_unavailable");
+    }
+    return response.blob();
+  }
+
+  async transcribeCapture(tenantId, versionId, pcm) {
+    const path = `/v1/merchants/${encoded(tenantId)}/versions/${encoded(versionId)}/voice/transcript`;
+    const response = await this.fetchImpl(path, {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { accept: "application/json", "content-type": "application/octet-stream" },
+      body: pcm,
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new ManagementApiError(response.status, "service_unavailable");
+    }
+    if (!response.ok) {
+      throw new ManagementApiError(response.status, payload?.code ?? "service_unavailable");
+    }
+    return payload;
+  }
+
   listMerchants() {
     return this.request("/v1/merchants");
   }
