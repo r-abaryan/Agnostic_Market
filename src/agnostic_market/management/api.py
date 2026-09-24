@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path as FileSystemPath
@@ -243,6 +244,9 @@ class MerchantSimulationTurn(BaseModel):
     readback_interrupted: bool = False
 
 
+logger = logging.getLogger("agnostic_market.management.api")
+
+
 def _error_response(
     code: ManagementApiErrorCode,
     status_code: int,
@@ -367,8 +371,10 @@ def create_management_app(
     @app.exception_handler(MerchantManagementError)
     async def service_failure(
         _request: Request,
-        _exc: MerchantManagementError,
+        exc: MerchantManagementError,
     ) -> JSONResponse:
+        # The response is deliberately opaque; the cause must still reach the operator.
+        logger.exception("management request failed", exc_info=exc)
         return _error_response("service_unavailable", 503)
 
     @app.exception_handler(MerchantSimulationNotFoundError)
@@ -395,8 +401,9 @@ def create_management_app(
     @app.exception_handler(MerchantSimulationError)
     async def simulation_failure(
         _request: Request,
-        _exc: MerchantSimulationError,
+        exc: MerchantSimulationError,
     ) -> JSONResponse:
+        logger.exception("management simulation failed", exc_info=exc)
         return _error_response("service_unavailable", 503)
 
     @app.get("/v1/merchants", response_model=MerchantListResponse)

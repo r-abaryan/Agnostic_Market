@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from collections.abc import Callable, Iterator
@@ -196,6 +197,13 @@ def _model_payload(model: BaseModel) -> str:
     return model.model_dump_json()
 
 
+def _stored_schema_fingerprint(payload: str) -> str | None:
+    try:
+        return json.loads(payload).get("schema_fingerprint")
+    except (TypeError, ValueError):
+        return None
+
+
 def _load_model[ModelT: BaseModel](
     payload: str, model_type: type[ModelT], *, subject: str
 ) -> ModelT:
@@ -284,6 +292,29 @@ class SqliteMerchantConfigurationRepository:
         finally:
             connection.close()
 
+    def _require_current_contract_fingerprint(self, connection: sqlite3.Connection) -> None:
+        """Reject contract drift at startup instead of on the first version read.
+
+        The repository schema version covers table layout only. A published version also
+        embeds the management contract fingerprint, and a change to MerchantConfig moves it,
+        which otherwise surfaces as an opaque 503 from every version endpoint.
+        """
+
+        current = management_contracts.management_contract_schema_fingerprint()
+        stale = [
+            row["version_id"]
+            for row in connection.execute(
+                "SELECT version_id, payload FROM management_versions"
+            ).fetchall()
+            if _stored_schema_fingerprint(row["payload"]) != current
+        ]
+        if stale:
+            raise ManagementRepositoryDataError(
+                "management repository holds publications from a superseded contract schema "
+                f"({len(stale)} of them, first {stale[0]!r}); this database is disposable "
+                "development state, so remove the --database file and republish"
+            )
+
     def _initialize(self) -> None:
         try:
             with self._transaction() as connection:
@@ -312,6 +343,7 @@ class SqliteMerchantConfigurationRepository:
                         raise ManagementRepositoryDataError(
                             "management repository schema is incomplete"
                         )
+                    self._require_current_contract_fingerprint(connection)
                     return
                 if existing_tables:
                     raise ManagementRepositoryDataError(
