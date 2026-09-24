@@ -19,6 +19,7 @@ from llm_fakes import (
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
     NativeAsyncBlockingFakeChatModel,
+    catalog_answer_args,
 )
 from policy_helpers import make_policy
 from routing_helpers import ArchitectureRoutingRecognizer
@@ -1293,8 +1294,10 @@ async def test_natural_catalog_request_reaches_grounded_owner_and_speech(
         telemetry=make_tenant_telemetry(tenant.tenant_id),
     )
     response = FakeChatModel(
-        emit_tool_calls=False,
-        text_response="Yes, we carry the waterproof rain jacket for $129.00.",
+        structured_args=catalog_answer_args(
+            "Yes, we carry the waterproof rain jacket for $129.00.",
+            "SKU-BLU-07",
+        ),
         record_prompts=True,
     )
     reasoning = FakeChatModel(raise_transport=True)

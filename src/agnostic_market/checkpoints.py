@@ -61,6 +61,7 @@ from agnostic_market.dtos.state import (
     PendingProfileChange,
     PendingRefund,
     PendingReturn,
+    ProductOffer,
     ReasoningState,
     StateSchemaError,
     SupportClarification,
@@ -110,6 +111,7 @@ _CHECKPOINT_CHANNEL_DTOS = (
     CartClarification,
     ClarificationLiveness,
     HandoffRequest,
+    ProductOffer,
 )
 _CHECKPOINT_NESTED_ENUMS = (
     CapabilityId,

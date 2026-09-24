@@ -299,6 +299,15 @@ def build_cart_nodes(
         request = invocation.request
         new_messages: list = []
 
+        # The router never fills item, so an empty item cannot mean "the caller referred back".
+        # Mark what was just offered and let the selector weigh it against the caller's words:
+        # substituting it would turn "add two socks" after a jacket offer into a jacket request.
+        # Anchored on the turn that opened this invocation, not the latest admitted turn: a
+        # slot-gathering round trip spans turns, and the offer belongs to the request it
+        # started rather than to whichever turn happens to be current.
+        offer = state.live_product_offer(invocation.opened_turn_id)
+        offered_skus = offer.skus if offer is not None and request.operation == "add" else ()
+
         def domain():
             if request.operation != "add":
                 items = list(cart_store.view())
@@ -419,6 +428,7 @@ def build_cart_nodes(
                     policy,
                     request,
                     proposal_tool.name,
+                    offered_skus=offered_skus if selecting_item else (),
                 )
             )
             current_user_message = state.current_committed_user_message()

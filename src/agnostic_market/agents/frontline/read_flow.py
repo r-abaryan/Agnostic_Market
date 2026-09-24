@@ -26,7 +26,11 @@ from agnostic_market.agents.frontline.typed_prompt import (
 )
 from agnostic_market.agents.model_speech import CallerAudibleModelTextPolicy
 from agnostic_market.agents.telemetry import TelemetryRecorder, record_capability_answered
-from agnostic_market.commerce.catalog import CatalogPort
+from agnostic_market.commerce.catalog import (
+    CatalogPort,
+    name_is_subphrase_of,
+    text_speaks_name,
+)
 from agnostic_market.commerce.identity import (
     CallerIdentityStore,
     CustomerDirectoryPort,
@@ -48,6 +52,7 @@ from agnostic_market.dtos.orchestration import (
     AnswerQuestion,
     AnswerResponse,
     CapabilityId,
+    CatalogAnswer,
     ExplicitOrderSet,
     FocusedOrderSet,
     OrderTargetProposal,
@@ -55,7 +60,12 @@ from agnostic_market.dtos.orchestration import (
     SearchCatalog,
     VerifyOrderStatus,
 )
-from agnostic_market.dtos.state import HandoffRequest, PolicyContext, ReasoningState
+from agnostic_market.dtos.state import (
+    HandoffRequest,
+    PolicyContext,
+    ProductOffer,
+    ReasoningState,
+)
 from agnostic_market.durability.session_state import (
     SessionStateCoordinator,
     recent_orders_operation_id,
@@ -139,6 +149,10 @@ def build_read_flow_nodes(
     )
     order_target_model = response_model.with_structured_output(
         OrderTargetProposal,
+        method=structured_output_method,
+    )
+    catalog_model = response_model.with_structured_output(
+        CatalogAnswer,
         method=structured_output_method,
     )
 
@@ -465,17 +479,41 @@ def build_read_flow_nodes(
         # The caller's words reach the model already; give it the live catalog rather than a
         # lexically pre-filtered subset, so meaning decides the match and alternatives exist.
         result = catalog.browse()
-        response = await response_model.ainvoke(
+        response = await catalog_model.ainvoke(
             [
                 SystemMessage(compose_catalog_response_prompt(display_name, policy, result)),
                 current,
             ]
         )
-        if not isinstance(response, AIMessage):
-            raise TypeError("catalog response model returned an incompatible message")
-        if response.tool_calls:
-            raise ValueError("catalog response model returned an unexpected tool call")
-        model_text_policy.validate(response.text)
+        if not isinstance(response, CatalogAnswer):
+            raise TypeError("catalog response model returned an incompatible result")
+        model_text_policy.validate(response.answer)
+
+        # Validation, not construction. Existence alone is not the property that matters: a SKU
+        # can name a live product the answer never mentioned, and a later "yes" would then focus
+        # a product the caller never heard. Keep only SKUs whose listed name the answer actually
+        # spoke, as a run of words rather than a substring.
+        #
+        # Then refuse an ambiguous reference. Where one product name sits inside another,
+        # speaking the longer name speaks the shorter one too, so prose cannot say which was
+        # offered. Dropping the contained name loses an offer; keeping it would record a
+        # product the caller never heard, and only one of those is recoverable.
+        live_by_sku = {product.sku: product for product in result.products}
+        spoken_names = {
+            sku: product.name
+            for sku, product in live_by_sku.items()
+            if text_speaks_name(response.answer, product.name)
+        }
+        offered = tuple(
+            sku
+            for sku in response.offered_skus
+            if sku in spoken_names
+            and not any(
+                name_is_subphrase_of(spoken_names[sku], other)
+                for other_sku, other in spoken_names.items()
+                if other_sku != sku
+            )
+        )
 
         record_capability_answered(
             routing_telemetry,
@@ -483,10 +521,17 @@ def build_read_flow_nodes(
             CapabilityId.SEARCH_CATALOG.value,
             answer_source="grounded_model_response",
         )
-        return Command(
-            goto=END,
-            update={"active_invocation": None, "messages": [response]},
-        )
+        update: dict[str, object] = {
+            "active_invocation": None,
+            "messages": [AIMessage(response.answer)],
+        }
+        if offered:
+            # The admitted turn id, not the message id: identical by construction here, and
+            # the ledger entry is the one the liveness rule compares against.
+            update["product_offer"] = ProductOffer(
+                skus=offered, turn_id=state.consumed_turn_ids[-1]
+            )
+        return Command(goto=END, update=update)
 
     async def answer_response_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
