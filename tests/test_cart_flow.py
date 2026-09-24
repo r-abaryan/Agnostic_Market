@@ -65,7 +65,7 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     PlaceOrder,
 )
-from agnostic_market.dtos.state import PendingCartMutation
+from agnostic_market.dtos.state import PendingCartMutation, ProductOffer
 from agnostic_market.durability.session_registry import InMemoryCheckpointGenerationAuthority
 from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
@@ -320,6 +320,145 @@ async def test_typed_cart_mutation_requires_confirmation_before_effect(
     assert cart.view()[0].quantity == 2
     assert graph.get_state(_CFG).values.get("pending_cart_mutation") is None
     assert any(product.name in line for line in _ai_texts(out))
+
+
+async def test_an_offered_product_is_marked_for_the_selector_not_substituted(
+    config_root: Path,
+) -> None:
+    """Marking keeps every product reachable; substituting made the offer override the caller.
+
+    The router never fills item (`_materialize_modify_cart` passes operation alone), so an
+    empty item is not evidence that the caller referred back to the offer.
+    """
+
+    products = load_catalog_fixture(config_root, "acme_store").products
+    offered = next(p for p in products if "jacket" in p.name.lower())
+    offered_key = str(products.index(offered) + 1)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": offered_key, "quantity": 2})]],
+        record_prompts=True,
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    turn_id = "offer-accepted"
+
+    await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(content="what jackets do you have?", id="offer-turn"),
+                HumanMessage(content="yes, add two of those", id=turn_id),
+            ],
+            "consumed_turn_ids": ("offer-turn", turn_id),
+            "product_offer": ProductOffer(skus=(offered.sku,), turn_id="offer-turn"),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    prompt = selector._seen_prompts[-1]
+    # Every product stays selectable, and only the offered one carries the marker.
+    for product in products:
+        assert product.name in prompt
+    assert f"{offered.name} - ${offered.price_usd:.2f} each (JUST OFFERED)" in prompt
+    assert prompt.count("(JUST OFFERED)") == 1
+
+    paused = graph.get_state(_CFG)
+    assert cart.is_empty()
+    assert paused.interrupts
+    assert paused.interrupts[0].value == f"Just to confirm: add 2 of {offered.name} to your cart?"
+
+
+async def test_a_named_product_is_not_overridden_by_a_prior_offer(config_root: Path) -> None:
+    """Reproduced defect: "add two socks" after a jacket offer read back the JACKET.
+
+    Substitution made the socks unreachable: the candidate list held the offered jacket alone,
+    so no key existed for what the caller actually said. The prompt assertions below matter
+    too: without them this passes even with the marker feature removed entirely, because the
+    scripted selector returns the socks either way.
+    """
+
+    products = load_catalog_fixture(config_root, "acme_store").products
+    offered = next(p for p in products if "jacket" in p.name.lower())
+    named = next(p for p in products if "socks" in p.name.lower())
+    named_key = str(products.index(named) + 1)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": named_key, "quantity": 2})]],
+        record_prompts=True,
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    turn_id = "named-different"
+
+    await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(content="what jackets do you have?", id="offer-turn"),
+                HumanMessage(content=f"add two {named.name}", id=turn_id),
+            ],
+            "consumed_turn_ids": ("offer-turn", turn_id),
+            "product_offer": ProductOffer(skus=(offered.sku,), turn_id="offer-turn"),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    # The offer was live and marked, and still did not win: that is the property under test,
+    # not merely that the scripted key resolved.
+    prompt = selector._seen_prompts[-1]
+    assert f"{offered.name} - ${offered.price_usd:.2f} each (JUST OFFERED)" in prompt
+    assert f"{named.name} - ${named.price_usd:.2f} each" in prompt
+    assert "a prior offer never overrides what they just asked for" in prompt
+
+    paused = graph.get_state(_CFG)
+    assert cart.is_empty()
+    assert paused.interrupts
+    assert paused.interrupts[0].value == f"Just to confirm: add 2 of {named.name} to your cart?"
+    assert paused.values["pending_cart_mutation"].sku == named.sku
+
+
+async def test_a_stale_offer_is_not_marked_for_the_selector(config_root: Path) -> None:
+    """One unrelated turn after the offer retires it, so nothing is marked and nothing is
+    preferred. The selector sees the plain catalog it would have seen without any offer."""
+
+    products = load_catalog_fixture(config_root, "acme_store").products
+    offered = next(p for p in products if "jacket" in p.name.lower())
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": "1"})]],
+        record_prompts=True,
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    turn_id = "stale-offer-accepted"
+
+    await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(content="what jackets do you have?", id="offer-turn"),
+                HumanMessage(content="what are your hours?", id="unrelated-turn"),
+                HumanMessage(content="add two of those", id=turn_id),
+            ],
+            "consumed_turn_ids": ("offer-turn", "unrelated-turn", turn_id),
+            "product_offer": ProductOffer(skus=(offered.sku,), turn_id="offer-turn"),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add", quantity=2),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    prompt = selector._seen_prompts[-1]
+    assert "(JUST OFFERED)" not in prompt
+    for product in products:
+        assert product.name in prompt
+
+    paused = graph.get_state(_CFG)
+    assert cart.is_empty()
+    # The selector's own choice stands; the retired offer neither supplied nor biased it.
+    assert paused.values["pending_cart_mutation"].sku == products[0].sku
 
 
 def test_confirmed_cart_mutation_is_store_idempotent() -> None:

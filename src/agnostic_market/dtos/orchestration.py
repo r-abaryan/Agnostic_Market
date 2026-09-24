@@ -193,6 +193,28 @@ class AnswerResponse(BaseModel):
         return self
 
 
+class CatalogAnswer(BaseModel):
+    """Catalog-owner output: the spoken answer plus the SKUs that answer named.
+
+    The SKUs are model-reported, so the guarantee is VALIDATION, not construction: the owner
+    rejects any SKU that was not in the live catalog it just served. Code cannot render the
+    sentence without losing meaning-based matching, so the weaker word is the honest one.
+    """
+
+    model_config = _FROZEN
+
+    answer: NonEmptyText
+    offered_skus: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _offered_skus_are_unique_and_nonblank(self) -> CatalogAnswer:
+        if any(not sku.strip() for sku in self.offered_skus):
+            raise ValueError("offered SKUs must not be blank")
+        if len(self.offered_skus) != len(set(self.offered_skus)):
+            raise ValueError("offered SKUs must be unique")
+        return self
+
+
 class SearchCatalog(IntentRequestModel):
     model_config = _FROZEN
 
@@ -664,6 +686,9 @@ class RoutingContext(BaseModel):
     # Presence only. The reference itself is never projected: the router selects an owner and
     # never a target, and the owner re-resolves focus against live state.
     has_focused_order: StrictBool = False
+    # Presence only, same discipline: the offered SKUs stay in the checkpoint and the owner
+    # re-resolves them against the live catalog.
+    has_offered_product: StrictBool = False
     cart_state: Literal["empty", "nonempty"]
     available_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
 

@@ -145,6 +145,7 @@ from agnostic_market.dtos.state import (
     PendingProfileChange,
     PendingRefund,
     PendingReturn,
+    ProductOffer,
     ReasoningState,
     StateSchemaError,
     SupportClarification,
@@ -2874,6 +2875,7 @@ def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> No
 
 
 _CHECKPOINT_CHANNEL_VALUES = (
+    ProductOffer(skus=("SKU-1",), turn_id="turn-1"),
     ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1"),
     CapabilityDispatchEnvelope(
         turn_id="turn-1",

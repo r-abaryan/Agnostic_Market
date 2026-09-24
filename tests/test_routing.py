@@ -15,7 +15,7 @@ from agnostic_market.agents.capabilities import (
     CapabilityRegistry,
     CapabilitySpec,
 )
-from agnostic_market.agents.recovery import CommerceEffectFinishers
+from agnostic_market.agents.recovery import CommerceEffectFinishers, clear_automation_state
 from agnostic_market.agents.routing import (
     _CAPABILITY_DEFINITIONS,
     COMMERCE_EFFECT_CAPABILITIES,
@@ -68,7 +68,7 @@ from agnostic_market.dtos.orchestration import (
     ViewCart,
     ViewIdentityStatus,
 )
-from agnostic_market.dtos.state import ReasoningState
+from agnostic_market.dtos.state import ProductOffer, ReasoningState
 
 _SELECTION = ProviderModel(provider="fake", model="router")
 
@@ -601,7 +601,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "522b139d541ebc3dd30226e5f26d6a27a363d605da81f84352f369ecf7b6ab72"
+        "ec8c105d62f96a1d22a7ac10f8a9960b1f65c82f321a24c6052b7fa45f7130ec"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -643,6 +643,70 @@ def test_projector_carries_focus_presence_so_a_focused_route_stays_executable() 
 
     # The two contexts must not be indistinguishable, which was the defect.
     assert project(single) != project(unfocused)
+
+
+def test_projector_reports_an_offer_only_on_the_turn_that_answers_it() -> None:
+    """The offer is retired by turn adjacency, so no flow has to remember to clear it.
+
+    Without the adjacency rule a recorded offer would keep resolving a later "yes" that was
+    answering something else entirely.
+    """
+
+    registry = _registry(VerifyOrderStatus)
+    offer = ProductOffer(skus=("SKU-RED-42",), turn_id="offer-turn")
+
+    def project(state: ReasoningState, message_id: str) -> RoutingContext:
+        result = project_routing_context(
+            CommittedTurn(text="yes please", message_id=message_id),
+            state,
+            identity_store=CallerIdentityStore(),
+            cart_store=CartStore(),
+            recent_orders=RecentOrderContext(max_refs=3),
+            registry=registry,
+        )
+        assert isinstance(result, RoutingContext)
+        return result
+
+    answering = ReasoningState(
+        messages=[HumanMessage("what socks do you have?", id="offer-turn")],
+        consumed_turn_ids=("offer-turn", "reply-turn"),
+        product_offer=offer,
+    )
+    assert project(answering, "reply-turn").has_offered_product is True
+
+    intervened = ReasoningState(
+        messages=[HumanMessage("what socks do you have?", id="offer-turn")],
+        consumed_turn_ids=("offer-turn", "unrelated-turn", "reply-turn"),
+        product_offer=offer,
+    )
+    assert project(intervened, "reply-turn").has_offered_product is False
+
+    without = ReasoningState(
+        messages=[HumanMessage("what socks do you have?", id="offer-turn")],
+        consumed_turn_ids=("offer-turn", "reply-turn"),
+    )
+    assert project(without, "reply-turn").has_offered_product is False
+
+
+def test_a_product_offer_survives_the_automation_reset_that_dispatch_applies() -> None:
+    """A `pending_`-prefixed name would be wiped on the very turn that routes the "yes".
+
+    `validate_automation_state_clear` forces every prefixed field into the reset map, and
+    `capability_dispatch` applies that map before handing the turn to the cart owner.
+    """
+
+    offer = ProductOffer(skus=("SKU-RED-42",), turn_id="offer-turn")
+    state = ReasoningState(
+        messages=[HumanMessage("what socks do you have?", id="offer-turn")],
+        consumed_turn_ids=("offer-turn", "reply-turn"),
+        product_offer=offer,
+    )
+
+    survived = state.model_copy(update=clear_automation_state())
+
+    assert survived.product_offer == offer
+    assert survived.active_invocation is None
+    assert survived.pending_cart_mutation is None
 
 
 def test_every_declared_discriminator_has_a_prompt_example() -> None:

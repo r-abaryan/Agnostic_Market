@@ -121,6 +121,25 @@ def _contains_token_sequence(haystack: tuple[str, ...], needle: tuple[str, ...])
     )
 
 
+def text_speaks_name(text: str, name: str) -> bool:
+    """Whether `text` says `name` as a whole run of words, not merely as a substring."""
+
+    return _contains_token_sequence(_word_tokens(text), _word_tokens(name))
+
+
+def name_is_subphrase_of(inner: str, outer: str) -> bool:
+    """Whether `inner` is a strictly shorter run of words inside `outer`.
+
+    A catalog with "rain jacket" and "waterproof rain jacket" cannot be disambiguated from
+    prose alone: whenever the longer name is spoken the shorter one is spoken too. Callers
+    use this to refuse the ambiguous reference rather than guess between them.
+    """
+
+    inner_tokens = _word_tokens(inner)
+    outer_tokens = _word_tokens(outer)
+    return inner_tokens != outer_tokens and _contains_token_sequence(outer_tokens, inner_tokens)
+
+
 def _rank_named_items[T: _NamedItem](items: Sequence[T], query: str) -> list[tuple[int, T]]:
     query_tokens = _word_tokens(query)
     if not query_tokens:

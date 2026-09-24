@@ -60,7 +60,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.state import ReasoningState
 
-CONTEXT_PROJECTOR_VERSION = "4"
+CONTEXT_PROJECTOR_VERSION = "5"
 ProviderCallOutcome = Literal[
     "completed",
     "deadline_exceeded",
@@ -368,6 +368,11 @@ this call's cart and order context. When bound_customer is false, choose session
 explicitly asks for their account or their past history: the session answer already offers
 verification, so it costs the caller nothing and discards nothing. When bound_customer is true,
 follow what they asked for.
+When has_offered_product is true, the assistant's own previous turn named specific products and the
+caller is replying to that offer. A reply that accepts it, confirms it, points at it, or asks for a
+quantity of it is direct modify_cart with cart_operation=add; the cart owner already holds which
+products were named and asks for anything missing. A reply that declines the offer is not a cart
+request.
 Pronouns may use focused/recent only when the supplied recent context supports them.
 
 Contrastive examples:
@@ -477,6 +482,7 @@ def project_routing_context(
             recent_order_operation=recent.operation,
             recent_order_count=len(recent.order_refs),
             has_focused_order=recent.focused_order_ref is not None,
+            has_offered_product=state.live_product_offer(turn.message_id) is not None,
             cart_state="empty" if cart_store.is_empty() else "nonempty",
             available_capabilities=registry.capability_ids,
         )

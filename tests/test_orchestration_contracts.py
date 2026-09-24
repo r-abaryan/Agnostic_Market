@@ -1041,8 +1041,11 @@ def test_routing_context_is_bounded_and_authority_free() -> None:
         # Presence of a focused order, never the reference. The router picks an owner, not a
         # target, and the owner re-resolves focus against live state.
         "has_focused_order",
+        # Same discipline for the product offer: presence only, never the offered SKUs.
+        "has_offered_product",
     }
     assert context.has_focused_order is False
+    assert context.has_offered_product is False
     with pytest.raises(ValidationError):
         RoutingContext(
             utterance="cancel all my orders",
