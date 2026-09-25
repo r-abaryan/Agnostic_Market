@@ -60,7 +60,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.state import ReasoningState
 
-CONTEXT_PROJECTOR_VERSION = "5"
+CONTEXT_PROJECTOR_VERSION = "6"
 ProviderCallOutcome = Literal[
     "completed",
     "deadline_exceeded",
@@ -373,6 +373,17 @@ caller is replying to that offer. A reply that accepts it, confirms it, points a
 quantity of it is direct modify_cart with cart_operation=add; the cart owner already holds which
 products were named and asks for anything missing. A reply that declines the offer is not a cart
 request.
+When has_product_reference is true, a product was discussed in the preceding turn. An explicit
+request to add that product is direct modify_cart with cart_operation=add; the cart owner resolves
+the product. A question about a just-offered or just-referenced product, its price, or its
+properties is direct search_catalog. A bare "yes" or "go ahead" with only a product reference
+and no actionable offer is clarify ambiguous_intent, never a cart add.
+With a nonempty cart, a clear question about the cart or basket total is direct view_cart; that
+owner reports live items and their total, not an amount owed or already charged. "What is my
+total?" may use view_cart when the cart is the only grounded monetary referent. A vague cost or
+amount-due question with both a cart and a product or order referent is ambiguous_intent. A clear
+question about the referenced product's price goes to search_catalog; an existing order's status
+or amount belongs to its order owner. The caller's words decide when multiple referents exist.
 Pronouns may use focused/recent only when the supplied recent context supports them.
 
 Contrastive examples:
@@ -414,6 +425,16 @@ Contrastive examples:
   {"decision":"direct","capability":"return_order"}
 - ordinary: "Leave everything as is and read my cart back." ->
   {"decision":"direct","capability":"view_cart"}
+- ordinary, cart nonempty: "What does my basket come to?" ->
+  {"decision":"direct","capability":"view_cart"}
+- ordinary, product just referenced: "How much is that jacket?" ->
+  {"decision":"direct","capability":"search_catalog"}
+- ordinary, product just referenced, no offer: "Add it to my cart." ->
+  {"decision":"direct","capability":"modify_cart","cart_operation":"add"}
+- ordinary, product just referenced, no offer: "Yes." ->
+  {"decision":"clarify","clarification_reason":"ambiguous_intent"}
+- ordinary, cart nonempty, product just referenced: "How much will it cost?" ->
+  {"decision":"clarify","clarification_reason":"ambiguous_intent"}
 - ordinary: "A letter states 'return the item.' What does that wording mean?" ->
   {"decision":"clarify","clarification_reason":"ambiguous_intent"}
 - ordinary: "Did your colleague pick up this call before me?" ->
@@ -483,6 +504,7 @@ def project_routing_context(
             recent_order_count=len(recent.order_refs),
             has_focused_order=recent.focused_order_ref is not None,
             has_offered_product=state.live_product_offer(turn.message_id) is not None,
+            has_product_reference=state.live_product_reference(turn.message_id) is not None,
             cart_state="empty" if cart_store.is_empty() else "nonempty",
             available_capabilities=registry.capability_ids,
         )

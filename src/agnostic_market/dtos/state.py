@@ -42,8 +42,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["4"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "4"
+CheckpointSchemaVersion = Literal["5"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "5"
 
 
 class CheckpointSchemaError(ValueError):
@@ -469,11 +469,29 @@ class ProductOffer(BaseModel):
     @field_validator("skus")
     @classmethod
     def skus_are_unique_and_nonblank(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not item.strip() for item in value):
-            raise ValueError("offered SKUs must not be blank")
-        if len(value) != len(set(value)):
-            raise ValueError("offered SKUs must be unique")
-        return value
+        return _validate_product_skus(value)
+
+
+def _validate_product_skus(value: tuple[str, ...]) -> tuple[str, ...]:
+    if any(not item.strip() for item in value):
+        raise ValueError("product SKUs must not be blank")
+    if len(value) != len(set(value)):
+        raise ValueError("product SKUs must be unique")
+    return value
+
+
+class ProductReference(BaseModel):
+    """Catalog products discussed on the prior admitted turn, without add authority."""
+
+    model_config = _FROZEN
+
+    skus: tuple[str, ...] = Field(min_length=1)
+    turn_id: NonEmptyText
+
+    @field_validator("skus")
+    @classmethod
+    def skus_are_unique_and_nonblank(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _validate_product_skus(value)
 
 
 class ClarificationLiveness(BaseModel):
@@ -550,6 +568,8 @@ class ReasoningState(BaseModel):
     # What the catalog owner last offered, so the next turn can honour an acceptance. Outside
     # the automation reset on purpose (see ProductOffer); liveness is turn adjacency.
     product_offer: ProductOffer | None = None
+    # Product focus supports explicit follow-up questions/actions, never bare assent.
+    product_reference: ProductReference | None = None
 
     @classmethod
     def from_checkpoint(cls, values: Mapping[str, object]) -> Self:
@@ -574,15 +594,28 @@ class ReasoningState(BaseModel):
         """
 
         offer = self.product_offer
-        if offer is None:
-            return None
+        return (
+            offer if offer is not None and self._is_previous_turn(offer.turn_id, turn_id) else None
+        )
+
+    def live_product_reference(self, turn_id: str | None = None) -> ProductReference | None:
+        """Return product focus only for the immediately preceding admitted turn."""
+
+        reference = self.product_reference
+        return (
+            reference
+            if reference is not None and self._is_previous_turn(reference.turn_id, turn_id)
+            else None
+        )
+
+    def _is_previous_turn(self, recorded_turn_id: str, turn_id: str | None) -> bool:
         current = (
             turn_id
             if turn_id is not None
             else (self.consumed_turn_ids[-1] if self.consumed_turn_ids else None)
         )
         prior = tuple(item for item in self.consumed_turn_ids if item != current)
-        return offer if prior and prior[-1] == offer.turn_id else None
+        return bool(prior and prior[-1] == recorded_turn_id)
 
     def last_user_text(self) -> str:
         """Return the latest committed caller text."""

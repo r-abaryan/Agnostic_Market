@@ -65,7 +65,7 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     PlaceOrder,
 )
-from agnostic_market.dtos.state import PendingCartMutation, ProductOffer
+from agnostic_market.dtos.state import PendingCartMutation, ProductOffer, ProductReference
 from agnostic_market.durability.session_registry import InMemoryCheckpointGenerationAuthority
 from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
@@ -368,6 +368,70 @@ async def test_an_offered_product_is_marked_for_the_selector_not_substituted(
     assert cart.is_empty()
     assert paused.interrupts
     assert paused.interrupts[0].value == f"Just to confirm: add 2 of {offered.name} to your cart?"
+
+
+async def test_explicit_add_uses_reference_without_treating_it_as_an_offer(
+    config_root: Path,
+) -> None:
+    products = load_catalog_fixture(config_root, "acme_store").products
+    jacket = next(product for product in products if "jacket" in product.name)
+    key = str(products.index(jacket) + 1)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": key, "quantity": 2})]],
+        record_prompts=True,
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(content="It is $129.00.", id="price-turn"),
+                HumanMessage(content="Add it to my cart, two please", id="add-turn"),
+            ],
+            "consumed_turn_ids": ("price-turn", "add-turn"),
+            "product_reference": ProductReference(skus=(jacket.sku,), turn_id="price-turn"),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"), opened_turn_id="add-turn"
+            ),
+        },
+        _CFG,
+    )
+    prompt = selector._seen_prompts[-1]
+    assert f"{jacket.name} - ${jacket.price_usd:.2f} each (JUST REFERENCED)" in prompt
+    assert "(JUST OFFERED)" not in prompt
+    assert "Bare agreement" in prompt
+    assert cart.is_empty()
+    assert graph.get_state(_CFG).interrupts[0].value == (
+        f"Just to confirm: add 2 of {jacket.name} to your cart?"
+    )
+
+
+async def test_reference_alone_cannot_turn_bare_assent_into_a_cart_add(
+    config_root: Path,
+) -> None:
+    products = load_catalog_fixture(config_root, "acme_store").products
+    jacket = next(product for product in products if "jacket" in product.name)
+    key = str(products.index(jacket) + 1)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": key, "quantity": 1})]],
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    result = await graph.ainvoke(
+        {
+            "messages": [
+                HumanMessage(content="It is $129.00.", id="price-turn"),
+                HumanMessage(content="Yes", id="yes-turn"),
+            ],
+            "consumed_turn_ids": ("price-turn", "yes-turn"),
+            "product_reference": ProductReference(skus=(jacket.sku,), turn_id="price-turn"),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"), opened_turn_id="yes-turn"
+            ),
+        },
+        _CFG,
+    )
+    assert selector.invoke_count == 0
+    assert cart.is_empty()
+    assert "Which item would you like?" in _ai_texts(result)
 
 
 async def test_a_named_product_is_not_overridden_by_a_prior_offer(config_root: Path) -> None:

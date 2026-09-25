@@ -62,6 +62,7 @@ from agnostic_market.dtos.state import (
     PendingRefund,
     PendingReturn,
     ProductOffer,
+    ProductReference,
     ReasoningState,
     StateSchemaError,
     SupportClarification,
@@ -112,6 +113,7 @@ _CHECKPOINT_CHANNEL_DTOS = (
     ClarificationLiveness,
     HandoffRequest,
     ProductOffer,
+    ProductReference,
 )
 _CHECKPOINT_NESTED_ENUMS = (
     CapabilityId,

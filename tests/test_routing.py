@@ -68,7 +68,7 @@ from agnostic_market.dtos.orchestration import (
     ViewCart,
     ViewIdentityStatus,
 )
-from agnostic_market.dtos.state import ProductOffer, ReasoningState
+from agnostic_market.dtos.state import ProductOffer, ProductReference, ReasoningState
 
 _SELECTION = ProviderModel(provider="fake", model="router")
 
@@ -601,7 +601,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "ec8c105d62f96a1d22a7ac10f8a9960b1f65c82f321a24c6052b7fa45f7130ec"
+        "8492aae5690004cf3e5445b766242b2147b98a10091f84036fd92a42e6590496"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -688,6 +688,28 @@ def test_projector_reports_an_offer_only_on_the_turn_that_answers_it() -> None:
     assert project(without, "reply-turn").has_offered_product is False
 
 
+def test_projector_keeps_product_reference_separate_from_actionable_offer() -> None:
+    registry = _registry(VerifyOrderStatus)
+    state = ReasoningState(
+        messages=[HumanMessage("It is $129.00.", id="price-turn")],
+        consumed_turn_ids=("price-turn", "reply-turn"),
+        product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="price-turn"),
+    )
+    context = project_routing_context(
+        CommittedTurn(text="add it", message_id="reply-turn"),
+        state,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=3),
+        registry=registry,
+    )
+    assert isinstance(context, RoutingContext)
+    assert context.has_product_reference is True
+    assert context.has_offered_product is False
+    assert state.live_product_reference("reply-turn") is not None
+    assert state.live_product_offer("reply-turn") is None
+
+
 def test_a_product_offer_survives_the_automation_reset_that_dispatch_applies() -> None:
     """A `pending_`-prefixed name would be wiped on the very turn that routes the "yes".
 
@@ -696,15 +718,18 @@ def test_a_product_offer_survives_the_automation_reset_that_dispatch_applies() -
     """
 
     offer = ProductOffer(skus=("SKU-RED-42",), turn_id="offer-turn")
+    reference = ProductReference(skus=("SKU-RED-42",), turn_id="offer-turn")
     state = ReasoningState(
         messages=[HumanMessage("what socks do you have?", id="offer-turn")],
         consumed_turn_ids=("offer-turn", "reply-turn"),
         product_offer=offer,
+        product_reference=reference,
     )
 
     survived = state.model_copy(update=clear_automation_state())
 
     assert survived.product_offer == offer
+    assert survived.product_reference == reference
     assert survived.active_invocation is None
     assert survived.pending_cart_mutation is None
 

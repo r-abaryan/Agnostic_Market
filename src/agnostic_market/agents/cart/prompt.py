@@ -34,6 +34,11 @@ _CART_CAPABILITY_INSTRUCTIONS = (
     "just asked for.\n"
     "When more than one option is marked JUST OFFERED and the caller's reply does not "
     "single one out, call request_cart_clarification rather than picking one.\n"
+    "A JUST REFERENCED option was discussed, but was not necessarily offered to add. Use it "
+    "only when the caller explicitly asks to add that product. Bare agreement such as yes "
+    "or go ahead cannot select JUST REFERENCED; without a JUST OFFERED option, ask for "
+    "clarification. If several JUST REFERENCED options fit and the caller does not single "
+    "one out, ask which item rather than picking. An explicitly named different item wins.\n"
     "Active operation: {operation}. Fixed item: {item_state}. Fixed quantity: {quantity_state}.\n"
     "Current code-bounded options:\n{candidates}"
 )
@@ -42,6 +47,7 @@ _CART_CAPABILITY_INSTRUCTIONS = (
 def render_candidates(
     candidates: list[Candidate],
     offered_skus: tuple[str, ...] = (),
+    referenced_skus: tuple[str, ...] = (),
 ) -> str:
     """The numbered option list the model chooses from (keyed 1..N; TTS never reads this -
     it's model-facing, the spoken lines are authored separately in flow.py).
@@ -50,9 +56,11 @@ def render_candidates(
     it or naming something else entirely, and only their words settle which.
     """
     offered = set(offered_skus)
+    referenced = set(referenced_skus)
     return "\n".join(
         f"[{c.key}] {c.name} - ${c.price_usd:.2f} each"
         + (" (JUST OFFERED)" if c.sku in offered else "")
+        + (" (JUST REFERENCED)" if c.sku in referenced else "")
         for c in candidates
     )
 
@@ -64,6 +72,7 @@ def compose_cart_capability_prompt(
     request: ModifyCart,
     expected_tool: str,
     offered_skus: tuple[str, ...] = (),
+    referenced_skus: tuple[str, ...] = (),
 ) -> str:
     """Tool-only prompt for one missing typed Cart slot; code owns options and rendering."""
     if isinstance(request.item, CartItemChoices):
@@ -78,6 +87,6 @@ def compose_cart_capability_prompt(
         operation=request.operation,
         item_state=item_state,
         quantity_state=quantity_state,
-        candidates=render_candidates(candidates, offered_skus) or "(none)",
+        candidates=render_candidates(candidates, offered_skus, referenced_skus) or "(none)",
     )
     return f"{compose_shared_context(display_name, policy)}\n{body}"

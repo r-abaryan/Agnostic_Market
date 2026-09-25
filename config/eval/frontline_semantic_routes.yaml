@@ -1232,6 +1232,101 @@ cases:
       decision: direct
       request: { kind: modify_cart, operation: add, item: null, quantity: null }
 
+  - case_id: development_cart_total_question
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What does my basket come to?"
+      cart_state: nonempty
+    expected: { decision: direct, request: { kind: view_cart } }
+
+  - case_id: development_cart_total_with_offer
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What is the total in my cart?"
+      cart_state: nonempty
+      has_offered_product: true
+    expected: { decision: direct, request: { kind: view_cart } }
+
+  - case_id: development_cart_total_with_reference
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "How much is my basket total?"
+      cart_state: nonempty
+      has_product_reference: true
+    expected: { decision: direct, request: { kind: view_cart } }
+
+  - case_id: development_product_price_with_cart
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "How much is that jacket?"
+      cart_state: nonempty
+      has_product_reference: true
+    expected: { decision: direct, request: { kind: search_catalog, query: null } }
+
+  - case_id: development_explicit_add_from_reference
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Add it to my cart, two please"
+      has_product_reference: true
+    expected:
+      decision: direct
+      request: { kind: modify_cart, operation: add, item: null, quantity: null }
+
+  - case_id: development_bare_yes_reference_only
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Yes"
+      has_product_reference: true
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: development_vague_cost_with_cart_and_reference
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "How much will it cost?"
+      cart_state: nonempty
+      has_product_reference: true
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: development_product_question_after_offer
+    scenario_class: adversarial
+    risk_class: *standard
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Is that jacket waterproof?"
+      has_offered_product: true
+      has_product_reference: true
+    expected: { decision: direct, request: { kind: search_catalog, query: null } }
+
 projected_case:
   case_id: fixture_projected_view_cart
   scenario_class: direct

@@ -194,24 +194,26 @@ class AnswerResponse(BaseModel):
 
 
 class CatalogAnswer(BaseModel):
-    """Catalog-owner output: the spoken answer plus the SKUs that answer named.
+    """Catalog-owner output: spoken answer, actionable offers, and discussed products.
 
-    The SKUs are model-reported, so the guarantee is VALIDATION, not construction: the owner
-    rejects any SKU that was not in the live catalog it just served. Code cannot render the
-    sentence without losing meaning-based matching, so the weaker word is the honest one.
+    The SKU sets are model-reported, so the guarantee is VALIDATION, not construction. The
+    owner checks live catalog membership and whether each product was named in the answer
+    or was a live incoming reference. Only offered_skus may license a following bare assent.
     """
 
     model_config = _FROZEN
 
     answer: NonEmptyText
     offered_skus: tuple[str, ...] = ()
+    referenced_skus: tuple[str, ...] = ()
 
     @model_validator(mode="after")
-    def _offered_skus_are_unique_and_nonblank(self) -> CatalogAnswer:
-        if any(not sku.strip() for sku in self.offered_skus):
-            raise ValueError("offered SKUs must not be blank")
-        if len(self.offered_skus) != len(set(self.offered_skus)):
-            raise ValueError("offered SKUs must be unique")
+    def _product_skus_are_unique_and_nonblank(self) -> CatalogAnswer:
+        for skus in (self.offered_skus, self.referenced_skus):
+            if any(not sku.strip() for sku in skus):
+                raise ValueError("product SKUs must not be blank")
+            if len(skus) != len(set(skus)):
+                raise ValueError("product SKUs must be unique")
         return self
 
 
@@ -689,6 +691,8 @@ class RoutingContext(BaseModel):
     # Presence only, same discipline: the offered SKUs stay in the checkpoint and the owner
     # re-resolves them against the live catalog.
     has_offered_product: StrictBool = False
+    # Presence only; the catalog and cart owners re-resolve SKUs against live products.
+    has_product_reference: StrictBool = False
     cart_state: Literal["empty", "nonempty"]
     available_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
 

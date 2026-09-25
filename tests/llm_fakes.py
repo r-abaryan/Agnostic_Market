@@ -93,6 +93,7 @@ CONFORMANT_STRUCTURED_ARGS: dict[str, tuple[dict[str, Any], ...]] = {
         {
             "answer": "A light, cushioned running shoe. It grips well on wet roads.",
             "offered_skus": [],
+            "referenced_skus": [],
         },
     ),
 }
@@ -101,6 +102,7 @@ CONFORMANT_STRUCTURED_ARGS: dict[str, tuple[dict[str, Any], ...]] = {
 def catalog_answer_args(
     answer: str,
     *offered_skus: str,
+    referenced_skus: tuple[str, ...] = (),
 ) -> dict[str, tuple[dict[str, Any], ...]]:
     """Structured payload for the catalog owner, which speaks through a typed answer."""
 
@@ -109,7 +111,13 @@ def catalog_answer_args(
     # validation error instead of "no payload configured".
     return {
         **CONFORMANT_STRUCTURED_ARGS,
-        "CatalogAnswer": ({"answer": answer, "offered_skus": list(offered_skus)},),
+        "CatalogAnswer": (
+            {
+                "answer": answer,
+                "offered_skus": list(offered_skus),
+                "referenced_skus": list(referenced_skus),
+            },
+        ),
     }
 
 

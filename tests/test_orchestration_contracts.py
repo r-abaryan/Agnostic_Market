@@ -1043,9 +1043,11 @@ def test_routing_context_is_bounded_and_authority_free() -> None:
         "has_focused_order",
         # Same discipline for the product offer: presence only, never the offered SKUs.
         "has_offered_product",
+        "has_product_reference",
     }
     assert context.has_focused_order is False
     assert context.has_offered_product is False
+    assert context.has_product_reference is False
     with pytest.raises(ValidationError):
         RoutingContext(
             utterance="cancel all my orders",

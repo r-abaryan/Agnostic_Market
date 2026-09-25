@@ -902,7 +902,7 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     by_id = {case.case_id: case for case in corpus.cases}
 
-    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 67
+    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 75
     assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 39
     # Every counterfactual and asr_like case gates. Structural rule, chosen before
     # looking at any score: these are the cases that test whether the model reads

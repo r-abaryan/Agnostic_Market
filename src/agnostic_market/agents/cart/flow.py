@@ -21,7 +21,7 @@ from langchain_core.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field
 
-from agnostic_market.agents._consent import classify_confirmation
+from agnostic_market.agents._consent import classify_confirmation, classify_consent
 from agnostic_market.agents._copy import warm_close
 from agnostic_market.agents._toolcalls import (
     ack_extra_tool_calls,
@@ -307,6 +307,10 @@ def build_cart_nodes(
         # started rather than to whichever turn happens to be current.
         offer = state.live_product_offer(invocation.opened_turn_id)
         offered_skus = offer.skus if offer is not None and request.operation == "add" else ()
+        reference = state.live_product_reference(invocation.opened_turn_id)
+        referenced_skus = (
+            reference.skus if reference is not None and request.operation == "add" else ()
+        )
 
         def domain():
             if request.operation != "add":
@@ -352,6 +356,21 @@ def build_cart_nodes(
                 "execution_owner": None,
                 "pending_ack": _EMPTY_CART_REVIEW_LINE,
             }
+
+        # A product reference grounds an explicit add request but is not an offer. Even if
+        # the semantic router misroutes a bare assent, the cart owner must not promote it to
+        # an item choice. Reuse the code-owned bounded consent grammar; this is a guard on an
+        # already selected owner, not another intent router.
+        current_message = state.current_committed_user_message()
+        if (
+            request.operation == "add"
+            and request.item is None
+            and not offered_skus
+            and current_message is not None
+            and isinstance(current_message.content, str)
+            and classify_consent(current_message.content) == "yes"
+        ):
+            return clarify("item")
 
         items, candidates, by_key = domain()
         if request.operation != "add" and not items:
@@ -429,6 +448,7 @@ def build_cart_nodes(
                     request,
                     proposal_tool.name,
                     offered_skus=offered_skus if selecting_item else (),
+                    referenced_skus=referenced_skus if selecting_item else (),
                 )
             )
             current_user_message = state.current_committed_user_message()

@@ -64,6 +64,7 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     PolicyContext,
     ProductOffer,
+    ProductReference,
     ReasoningState,
 )
 from agnostic_market.durability.session_state import (
@@ -479,9 +480,15 @@ def build_read_flow_nodes(
         # The caller's words reach the model already; give it the live catalog rather than a
         # lexically pre-filtered subset, so meaning decides the match and alternatives exist.
         result = catalog.browse()
+        prior_reference = state.live_product_reference(invocation.opened_turn_id)
+        prior_skus = prior_reference.skus if prior_reference is not None else ()
         response = await catalog_model.ainvoke(
             [
-                SystemMessage(compose_catalog_response_prompt(display_name, policy, result)),
+                SystemMessage(
+                    compose_catalog_response_prompt(
+                        display_name, policy, result, referenced_skus=prior_skus
+                    )
+                ),
                 current,
             ]
         )
@@ -504,14 +511,22 @@ def build_read_flow_nodes(
             for sku, product in live_by_sku.items()
             if text_speaks_name(response.answer, product.name)
         }
-        offered = tuple(
+        unambiguous_spoken = {
             sku
-            for sku in response.offered_skus
-            if sku in spoken_names
-            and not any(
+            for sku in spoken_names
+            if not any(
                 name_is_subphrase_of(spoken_names[sku], other)
                 for other_sku, other in spoken_names.items()
                 if other_sku != sku
+            )
+        }
+        offered = tuple(sku for sku in response.offered_skus if sku in unambiguous_spoken)
+        # A newly named product replaces prior focus. A pronoun answer may carry the previous
+        # live reference only when it names no product and the model reports that reference.
+        eligible_reference = unambiguous_spoken or (set(prior_skus) & live_by_sku.keys())
+        referenced = tuple(
+            dict.fromkeys(
+                sku for sku in (*response.referenced_skus, *offered) if sku in eligible_reference
             )
         )
 
@@ -524,6 +539,11 @@ def build_read_flow_nodes(
         update: dict[str, object] = {
             "active_invocation": None,
             "messages": [AIMessage(response.answer)],
+            "product_reference": (
+                ProductReference(skus=referenced, turn_id=state.consumed_turn_ids[-1])
+                if referenced
+                else None
+            ),
         }
         if offered:
             # The admitted turn id, not the message id: identical by construction here, and

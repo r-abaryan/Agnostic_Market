@@ -20,12 +20,15 @@ def compose_catalog_response_prompt(
     display_name: str,
     policy: PolicyContext,
     result: CatalogProductSet,
+    referenced_skus: tuple[str, ...] = (),
 ) -> str:
     """Bound a product answer to the live catalog the caller can actually be sold."""
 
     if result.products:
+        referenced = set(referenced_skus)
         catalog_facts = "\n".join(
             f"- {product.name}; SKU {product.sku}; price ${product.price_usd:.2f}"
+            + (" (JUST REFERENCED)" if product.sku in referenced else "")
             for product in result.products
         )
         lookup_instruction = (
@@ -60,6 +63,14 @@ def compose_catalog_response_prompt(
             "you are only listing what exists or answering a factual question such as a price "
             "or whether a product suits a purpose: the caller's next word may be yes, and yes "
             "must mean the products you actually put forward.",
+            "Set referenced_skus to the live products this answer actually discusses, "
+            "whether you name them or answer with a pronoun. A JUST REFERENCED product was "
+            "discussed in the preceding turn; use it only when the caller refers back to it. "
+            "An explicitly named different product takes precedence. If the caller asks about "
+            "a different kind of product and none fits, return referenced_skus empty rather "
+            "than carrying forward the old focus. If several marked products fit an unclear "
+            "question, ask which one in prose, retain those choices in referenced_skus, and "
+            "leave offered_skus empty. A factual answer does not itself offer to add anything.",
             "Keep the spoken answer to one or two short sentences.",
             "",
             "Live catalog:",

@@ -102,6 +102,8 @@ from agnostic_market.dtos.state import (
     ClarificationLiveness,
     HandoffSource,
     PendingCartMutation,
+    ProductOffer,
+    ProductReference,
     ReasoningState,
 )
 from agnostic_market.durability.session_state import SessionStateCoordinator
@@ -1801,6 +1803,155 @@ async def test_catalog_owner_records_no_offer_for_a_suitability_answer(
     )
 
     assert "product_offer" not in result
+
+
+async def test_catalog_fact_refreshes_reference_without_refreshing_offer(
+    config_root: Path,
+) -> None:
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args("It is $129.00.", referenced_skus=("SKU-BLU-07",)),
+        record_prompts=True,
+    )
+    graph = _graph(config_root, response_model)
+    result = await graph.ainvoke(
+        _admitted_turn(
+            "How much is it?",
+            turn_id="price-turn",
+            consumed_turn_ids=("offer-turn", "price-turn"),
+            product_offer=ProductOffer(skus=("SKU-BLU-07",), turn_id="offer-turn"),
+            product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="offer-turn"),
+            active_invocation=ActiveInvocation(
+                request=SearchCatalog(query="How much is it?"),
+                opened_turn_id="price-turn",
+            ),
+        )
+    )
+    assert result["product_reference"] == ProductReference(
+        skus=("SKU-BLU-07",), turn_id="price-turn"
+    )
+    assert ReasoningState.model_validate(result).live_product_offer("next-turn") is None
+    assert "JUST REFERENCED" in response_model._seen_prompts[-1]
+
+
+async def test_catalog_no_match_clears_old_reference(config_root: Path) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(structured_args=catalog_answer_args("We do not stock tents.")),
+    )
+    result = await graph.ainvoke(
+        _admitted_turn(
+            "Do you sell tents?",
+            turn_id="tent-turn",
+            consumed_turn_ids=("offer-turn", "tent-turn"),
+            product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="offer-turn"),
+            active_invocation=ActiveInvocation(
+                request=SearchCatalog(query="tents"), opened_turn_id="tent-turn"
+            ),
+        )
+    )
+    assert result["product_reference"] is None
+
+
+async def test_catalog_new_named_product_replaces_old_reference(config_root: Path) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args=catalog_answer_args(
+                "The merino hiking socks are $14.50.",
+                referenced_skus=("SKU-BLU-07", "SKU-GRN-15"),
+            )
+        ),
+    )
+    result = await graph.ainvoke(
+        _admitted_turn(
+            "What about the socks?",
+            turn_id="socks-turn",
+            consumed_turn_ids=("jacket-turn", "socks-turn"),
+            product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="jacket-turn"),
+            active_invocation=ActiveInvocation(
+                request=SearchCatalog(query="socks"), opened_turn_id="socks-turn"
+            ),
+        )
+    )
+    assert result["product_reference"].skus == ("SKU-GRN-15",)
+
+
+async def test_catalog_drops_a_delisted_previous_reference(config_root: Path) -> None:
+    catalog = FixtureCatalog(
+        "acme_store",
+        CatalogFixture.model_validate(
+            {
+                "products": [
+                    {"sku": "SKU-GRN-15", "name": "merino hiking socks", "price_usd": "14.50"}
+                ]
+            }
+        ),
+    )
+    response_model = FakeChatModel(
+        structured_args=catalog_answer_args(
+            "That product is no longer listed.", referenced_skus=("SKU-BLU-07",)
+        ),
+        record_prompts=True,
+    )
+    graph = _graph(config_root, response_model, catalog=catalog)
+    result = await graph.ainvoke(
+        _admitted_turn(
+            "How much is it?",
+            turn_id="delisted-turn",
+            consumed_turn_ids=("jacket-turn", "delisted-turn"),
+            product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="jacket-turn"),
+            active_invocation=ActiveInvocation(
+                request=SearchCatalog(query="How much is it?"), opened_turn_id="delisted-turn"
+            ),
+        )
+    )
+    assert result["product_reference"] is None
+    assert "SKU-BLU-07" not in response_model._seen_prompts[-1]
+
+
+async def test_catalog_multiple_references_can_clarify_without_offering(
+    config_root: Path,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args=catalog_answer_args(
+                "Do you mean the waterproof rain jacket or the merino hiking socks?",
+                referenced_skus=("SKU-BLU-07", "SKU-GRN-15"),
+            )
+        ),
+    )
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="How much is it?"),
+        turn_id="which-product",
+        text="How much is it?",
+    )
+    assert "product_offer" not in result
+    assert result["product_reference"].skus == ("SKU-BLU-07", "SKU-GRN-15")
+
+
+async def test_catalog_keeps_reference_and_offer_as_distinct_sku_sets(
+    config_root: Path,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args=catalog_answer_args(
+                "The waterproof rain jacket is $129.00. Would you like the merino hiking socks?",
+                "SKU-GRN-15",
+                referenced_skus=("SKU-BLU-07", "SKU-GRN-15"),
+            )
+        ),
+    )
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="jacket and socks"),
+        turn_id="mixed-turn",
+        text="Tell me about jackets and socks.",
+    )
+    assert result["product_offer"].skus == ("SKU-GRN-15",)
+    assert result["product_reference"].skus == ("SKU-BLU-07", "SKU-GRN-15")
 
 
 async def test_catalog_owner_records_no_offer_when_it_names_no_product(

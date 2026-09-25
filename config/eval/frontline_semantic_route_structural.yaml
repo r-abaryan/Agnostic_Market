@@ -1,9 +1,9 @@
 schema_version: "1"
 purpose: development_only
-frozen_corpus_fingerprint: 833614025f51932191e62ec978194a3f97bfa996930bab3e473589a87c84eb14
+frozen_corpus_fingerprint: 6c9f2104b117b552dafb1534c340298f99804efa4f99bbeccb61aafbe626b4d0
 route_schema_fingerprint: ed11f9536689ea7f523b341eae289181d12026d5837a056dc91644f3ad5d5c6e
 registry_fingerprint: c72ab9001f3027187614715babad11295d57701018c4db582cd8eac05bc894a4
-context_projector_version: "5"
+context_projector_version: "6"
 
 cases:
   - case_id: structural_remove_base
