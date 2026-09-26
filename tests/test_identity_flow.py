@@ -35,7 +35,7 @@ from agnostic_market.dtos.state import (
 )
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 _VALID_OTP = "482913"
 _CUST2_OTP = "739204"
 _CUST1_REF = "CUST-001"

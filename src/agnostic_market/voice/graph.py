@@ -6,9 +6,8 @@ Per turn it:
   - extracts the NEW committed user turn from the transport input (the adapter passes the
     full chat_ctx history each call; the engine's thread checkpoint carries history, so
     only the last user message is fed — feeding the full list would duplicate state);
-  - gathers the §4a perception fact: whether the caller barged over the pending
-    confirmation readback (`ChatMessage.interrupted` on the last assistant history item —
-    consent over a truncated readback is not consent, VOICE_PIPELINE §4a);
+  - gathers the playback fact for the assistant reply to the preceding caller turn;
+    unknown or interrupted playback cannot authorize consent (VOICE_PIPELINE section 4a);
   - calls `engine.stream_turn(CommittedTurn(...), TurnFacts(...))` and renders TurnEvents as plain
     strings (LLMAdapter's `_to_chat_chunk` accepts str — verified from plugin source).
 
@@ -23,7 +22,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.dtos.events import CommittedTurn, TurnEvent, TurnFacts
@@ -65,24 +64,64 @@ class GraphVoiceAdapter:
                 )
         return None
 
-    def _readback_interrupted(self) -> bool:
-        """§4a fact: was the last agent utterance (the pending readback) barged over?
-
-        Only meaningful while the engine is paused at a confirmation interrupt; reads
-        `interrupted` from the most recent assistant item in the session history.
-        """
+    def _readback_interrupted(self, state: dict[str, Any], turn: CommittedTurn) -> bool | None:
+        """Read playback only for the reply to the preceding caller turn."""
+        messages = [
+            message
+            for message in state.get("messages", [])
+            if isinstance(message, (AIMessage, HumanMessage))
+        ]
+        if (
+            len(messages) < 3
+            or not isinstance(messages[-1], HumanMessage)
+            or messages[-1].id != turn.message_id
+        ):
+            logger.debug("assistant playback status unavailable: turn history incomplete")
+            return None
+        previous_user_index = next(
+            (
+                index
+                for index in range(len(messages) - 2, -1, -1)
+                if isinstance(messages[index], HumanMessage)
+            ),
+            None,
+        )
+        if previous_user_index is None:
+            logger.debug("assistant playback status unavailable: preceding caller turn absent")
+            return None
+        replies = [
+            message
+            for message in messages[previous_user_index + 1 : -1]
+            if isinstance(message, AIMessage)
+        ]
+        if len(replies) != 1 or not replies[0].id:
+            logger.warning(
+                "assistant playback status unavailable: preceding reply absent or ambiguous"
+            )
+            return None
+        reply_id = replies[0].id
         if self._session is None:
-            return False
+            logger.warning("assistant playback status unavailable: session unattached")
+            return None
         try:
             items = list(self._session.history.items)
         except AttributeError:
-            return False
-        for item in reversed(items):
-            is_message = getattr(item, "type", None) == "message"
-            if is_message and getattr(item, "role", "") == "assistant":
-                interrupted = getattr(item, "interrupted", None)
-                return interrupted if isinstance(interrupted, bool) else True
-        return False
+            logger.warning("assistant playback status unavailable: history inaccessible")
+            return None
+        matches = [item for item in items if getattr(item, "id", None) == reply_id]
+        if (
+            len(matches) != 1
+            or getattr(matches[0], "type", None) != "message"
+            or getattr(matches[0], "role", None) != "assistant"
+        ):
+            logger.warning("assistant playback status unavailable: reply not in history")
+            return None
+        interrupted = getattr(matches[0], "interrupted", None)
+        if isinstance(interrupted, bool):
+            logger.debug("assistant playback status correlated: interrupted=%s", interrupted)
+            return interrupted
+        logger.warning("assistant playback status unavailable: interruption flag invalid")
+        return None
 
     def _observe(self, observer: Callable[..., None] | None, *values: object) -> None:
         if observer is None:
@@ -108,7 +147,7 @@ class GraphVoiceAdapter:
                 logger.warning("voice adapter: no user message in transport input; empty turn")
                 return
             self._observe(self._turn_started_observer)
-            facts = TurnFacts(readback_interrupted=self._readback_interrupted())
+            facts = TurnFacts(readback_interrupted=self._readback_interrupted(state, turn))
             async for event in self._engine.stream_turn(turn, facts):
                 self._observe(self._turn_event_observer, event)
                 # Token / spoken-message / interrupt prompt — all graph-authored text.

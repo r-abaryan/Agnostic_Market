@@ -39,6 +39,7 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
+    PendingAck,
     PendingRefund,
     ReasoningState,
     open_active_invocation,
@@ -196,7 +197,7 @@ async def test_every_ordinary_recovery_action_has_one_closed_result(
             trigger="node_exception",
         ),
         execution_owner="support",
-        pending_ack="stale",
+        pending_ack=PendingAck(text="stale"),
         identity_claim_misses=1,
     )
 

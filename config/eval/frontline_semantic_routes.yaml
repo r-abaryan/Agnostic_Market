@@ -1327,6 +1327,64 @@ cases:
       has_product_reference: true
     expected: { decision: direct, request: { kind: search_catalog, query: null } }
 
+  - case_id: development_open_help_bare_yes
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Yes"
+      awaiting_reply_kind: open_help
+    expected: { decision: direct, request: { kind: converse, act: invite_request } }
+
+  - case_id: development_open_help_bare_no
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "No"
+      awaiting_reply_kind: open_help
+    expected: { decision: direct, request: { kind: converse, act: farewell } }
+
+  - case_id: development_open_help_elaborated_yes
+    scenario_class: direct
+    risk_class: *standard
+    risk_domain: ordinary_intent
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Yes, one more thing"
+      awaiting_reply_kind: open_help
+    expected: { decision: direct, request: { kind: converse, act: invite_request } }
+
+  - case_id: development_open_help_task_wins
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "No, actually check my order status"
+      awaiting_reply_kind: open_help
+    expected:
+      decision: direct
+      request: { kind: verify_order_status, target: null }
+
+  - case_id: development_open_help_yes_cannot_add_cart
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_effect
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Yes"
+      cart_state: nonempty
+      awaiting_reply_kind: open_help
+    expected: { decision: direct, request: { kind: converse, act: invite_request } }
+
 projected_case:
   case_id: fixture_projected_view_cart
   scenario_class: direct

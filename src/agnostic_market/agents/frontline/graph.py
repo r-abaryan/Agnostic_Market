@@ -100,6 +100,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
+    AssistantPrompt,
     HandoffRequest,
     HandoffSource,
     PolicyContext,
@@ -124,6 +125,7 @@ _CONVERSE_LINES: Mapping[str, str] = MappingProxyType(
         "greeting": "Hello, you're through to {display_name}. What can I help you with?",
         "acknowledgment": "You're welcome.",
         "farewell": "Thanks for calling {display_name}. Goodbye.",
+        "invite_request": "Of course. What can I help you with?",
         "channel_check": "Yes, I can hear you clearly. Go ahead.",
         "repair": "Sorry about that. Could you say that again?",
     }
@@ -365,14 +367,20 @@ def build_frontline_graph(
             state.active_invocation.request, ViewCart
         ):
             raise TypeError("cart view render requires a view-cart invocation")
-        line = _cart_view_line(f" {warm_close()}")
+        has_cart = not cart_store.is_empty()
+        line = _cart_view_line(f" {warm_close()}" if has_cart else "")
         record_capability_answered(
             routing_telemetry,
             state.last_user_text(),
             CapabilityId.VIEW_CART.value,
             answer_source="code_authored_read",
         )
-        return {"active_invocation": None, "messages": [AIMessage(line)]}
+        update: dict[str, object] = {"active_invocation": None, "messages": [AIMessage(line)]}
+        if has_cart:
+            update["assistant_prompt"] = AssistantPrompt(
+                kind="open_help", turn_id=state.consumed_turn_ids[-1]
+            )
+        return update
 
     def identity_status_render_node(state: ReasoningState) -> dict[str, object]:
         """Typed `ViewIdentityStatus` owner: bound or unbound, read from the LIVE store.
@@ -395,7 +403,12 @@ def build_frontline_graph(
             CapabilityId.VIEW_IDENTITY_STATUS.value,
             answer_source="code_authored_read",
         )
-        return {"active_invocation": None, "messages": [AIMessage(line)]}
+        update: dict[str, object] = {"active_invocation": None, "messages": [AIMessage(line)]}
+        if verified:
+            update["assistant_prompt"] = AssistantPrompt(
+                kind="open_help", turn_id=state.consumed_turn_ids[-1]
+            )
+        return update
 
     def handover_node(state: ReasoningState) -> dict[str, object]:
         """Terminate automation and emit the bounded human-onramp package."""
@@ -481,7 +494,15 @@ def build_frontline_graph(
             if act == "capability_summary"
             else _CONVERSE_LINES[act].format(display_name=display_name)
         )
-        return {**clear_automation_state(), "messages": [AIMessage(line)]}
+        update: dict[str, object] = {
+            **clear_automation_state(),
+            "messages": [AIMessage(line)],
+        }
+        if act in {"greeting", "capability_summary", "invite_request"}:
+            update["assistant_prompt"] = AssistantPrompt(
+                kind="open_help", turn_id=state.consumed_turn_ids[-1]
+            )
+        return update
 
     def disclose_ai_identity_node(state: ReasoningState) -> dict[str, object]:
         invocation = state.active_invocation

@@ -1177,6 +1177,7 @@ class ReasoningEngine:
         self,
         turn: CommittedTurn,
         state: ReasoningState,
+        facts: TurnFacts,
     ) -> dict[str, object]:
         message_id = turn.message_id
         if message_id is None:
@@ -1200,7 +1201,11 @@ class ReasoningEngine:
             )
             return payload
 
-        resolution = await self._routing.resolve(turn, state)
+        resolution = await self._routing.resolve(
+            turn,
+            state,
+            assistant_prompt_completed=facts.readback_interrupted is False,
+        )
         if isinstance(resolution, RouteDecision) and resolution.decision == "direct":
             request = resolution.request
             if request is not None:
@@ -1540,7 +1545,7 @@ class ReasoningEngine:
                             return
                         resume_payload: dict[str, object] = {
                             "text": turn.text,
-                            "readback_interrupted": facts.readback_interrupted,
+                            "readback_interrupted": facts.readback_interrupted is not False,
                         }
                         handoff_source = await self._confirmation_handoff_source(
                             turn,
@@ -1564,7 +1569,7 @@ class ReasoningEngine:
                     yield await self._aenter_last_resort()
                     return
                 else:
-                    payload = await self._ordinary_turn_payload(turn, snapshot_state)
+                    payload = await self._ordinary_turn_payload(turn, snapshot_state, facts)
                 speech = _TurnSpeech(self._speakable, self._model_speech)
                 spans = _GraphSpans(self._model_execution_nodes)
                 while True:

@@ -65,7 +65,12 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     PlaceOrder,
 )
-from agnostic_market.dtos.state import PendingCartMutation, ProductOffer, ProductReference
+from agnostic_market.dtos.state import (
+    AssistantPrompt,
+    PendingCartMutation,
+    ProductOffer,
+    ProductReference,
+)
 from agnostic_market.durability.session_registry import InMemoryCheckpointGenerationAuthority
 from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
@@ -817,6 +822,7 @@ async def test_typed_cart_mutations_confirm_then_apply_one_authoritative_effect(
     assert graph.get_state(_CFG).values.get("execution_owner") is None
     assert len(_ai_texts(out)) == 1
     assert product.name in _ai_texts(out)[0]
+    assert out["assistant_prompt"] == AssistantPrompt(kind="open_help", turn_id=turn_id)
 
 
 async def test_cart_mutation_decline_is_exact_and_has_no_effect(config_root: Path) -> None:

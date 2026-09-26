@@ -60,7 +60,7 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.state import ReasoningState
 
-CONTEXT_PROJECTOR_VERSION = "6"
+CONTEXT_PROJECTOR_VERSION = "8"
 ProviderCallOutcome = Literal[
     "completed",
     "deadline_exceeded",
@@ -147,7 +147,8 @@ _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingP
         CapabilityId.CONVERSE: _CapabilityDefinition(
             meaning=(
                 "social turns that carry no task: greeting, thanks or acknowledgment, farewell, "
-                "asking what you can do, checking the line is working, or asking you to repeat. "
+                "accepting an open invitation for more help, asking what you can do, checking "
+                "the line is working, or asking you to repeat. "
                 "Never use it when the same turn also asks for a task."
             ),
             discriminators=frozenset({"conversation_act"}),
@@ -378,6 +379,11 @@ request to add that product is direct modify_cart with cart_operation=add; the c
 the product. A question about a just-offered or just-referenced product, its price, or its
 properties is direct search_catalog. A bare "yes" or "go ahead" with only a product reference
 and no actionable offer is clarify ambiguous_intent, never a cart add.
+When awaiting_reply_kind is open_help, the assistant just asked whether the caller needs anything
+else. A bare affirmative with no task is direct converse invite_request: ask what they need next.
+A clear decline with no task is direct converse farewell. If the caller states a new task, route
+that task normally instead. This prompt is not consent for a product or commerce effect. It does
+not override an active capability, actionable product offer, or code-owned confirmation.
 With a nonempty cart, a clear question about the cart or basket total is direct view_cart; that
 owner reports live items and their total, not an amount owed or already charged. "What is my
 total?" may use view_cart when the cart is the only grounded monetary referent. A vague cost or
@@ -433,6 +439,12 @@ Contrastive examples:
   {"decision":"direct","capability":"modify_cart","cart_operation":"add"}
 - ordinary, product just referenced, no offer: "Yes." ->
   {"decision":"clarify","clarification_reason":"ambiguous_intent"}
+- ordinary, awaiting open_help: "Yes, one more thing." ->
+  {"decision":"direct","capability":"converse","conversation_act":"invite_request"}
+- ordinary, awaiting open_help: "No." ->
+  {"decision":"direct","capability":"converse","conversation_act":"farewell"}
+- ordinary, awaiting open_help: "Yes, check my order status." ->
+  {"decision":"direct","capability":"verify_order_status","order_status_selector":"explicit"}
 - ordinary, cart nonempty, product just referenced: "How much will it cost?" ->
   {"decision":"clarify","clarification_reason":"ambiguous_intent"}
 - ordinary: "A letter states 'return the item.' What does that wording mean?" ->
@@ -485,8 +497,9 @@ def project_routing_context(
     recent_orders: RecentOrderContext,
     registry: CapabilityRegistry,
     routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary",
+    assistant_prompt_completed: bool = False,
 ) -> RoutingContext | RoutingFailure:
-    """Build the bounded router input from the admitted turn and live session state."""
+    """Project live state; expose an open-help prompt only with playback completion."""
 
     try:
         if turn.message_id is None:
@@ -505,6 +518,12 @@ def project_routing_context(
             has_focused_order=recent.focused_order_ref is not None,
             has_offered_product=state.live_product_offer(turn.message_id) is not None,
             has_product_reference=state.live_product_reference(turn.message_id) is not None,
+            awaiting_reply_kind=(
+                prompt.kind
+                if assistant_prompt_completed
+                and (prompt := state.live_assistant_prompt(turn.message_id)) is not None
+                else None
+            ),
             cart_state="empty" if cart_store.is_empty() else "nonempty",
             available_capabilities=registry.capability_ids,
         )
@@ -676,6 +695,7 @@ class RoutingSession:
         state: ReasoningState,
         *,
         routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary",
+        assistant_prompt_completed: bool = False,
     ) -> RoutingContext | RoutingFailure:
         """Project one admitted ordinary turn before graph execution."""
 
@@ -687,14 +707,22 @@ class RoutingSession:
             recent_orders=self._recent_orders,
             registry=self._registry,
             routing_scope=routing_scope,
+            assistant_prompt_completed=assistant_prompt_completed,
         )
 
     async def resolve(
         self,
         turn: CommittedTurn,
         state: ReasoningState,
+        *,
+        assistant_prompt_completed: bool = False,
     ) -> RouteResolution:
-        return await self._resolve(turn, state, routing_scope=None)
+        return await self._resolve(
+            turn,
+            state,
+            routing_scope=None,
+            assistant_prompt_completed=assistant_prompt_completed,
+        )
 
     async def resolve_confirmation_escape(
         self,
@@ -703,7 +731,12 @@ class RoutingSession:
     ) -> RouteResolution:
         """Use the same semantic router only to detect a control escape from consent."""
 
-        return await self._resolve(turn, state, routing_scope="confirmation_escape")
+        return await self._resolve(
+            turn,
+            state,
+            routing_scope="confirmation_escape",
+            assistant_prompt_completed=False,
+        )
 
     async def _resolve(
         self,
@@ -711,6 +744,7 @@ class RoutingSession:
         state: ReasoningState,
         *,
         routing_scope: str | None,
+        assistant_prompt_completed: bool,
     ) -> RouteResolution:
         turn_id = turn.message_id
         if turn_id is None:
@@ -719,6 +753,7 @@ class RoutingSession:
             turn,
             state,
             routing_scope=routing_scope or "ordinary",
+            assistant_prompt_completed=assistant_prompt_completed,
         )
         if isinstance(projection, RoutingFailure):
             event = _routing_resolution_event(turn_id, projection)

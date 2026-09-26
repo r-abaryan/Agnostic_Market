@@ -3687,7 +3687,7 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         assert prepared_state.pending_recovery is not None
         assert prepared_state.pending_recovery.origin_node == "cart_mutation_apply"
 
-        await engine_events(recovered.engine, "continue", TurnFacts())
+        await engine_events(recovered.engine, "continue", TurnFacts(readback_interrupted=False))
         completed = ReasoningState.from_checkpoint(
             (await recovered.assembly.graph.aget_state(recovered.engine._config)).values
         )
@@ -3699,7 +3699,9 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         assert recovered.state.cart_store.view()[0].quantity == 1
         assert durable_after_recovery.record.session_revision == 1
 
-        readback = await engine_events(recovered.engine, "place my order", TurnFacts())
+        readback = await engine_events(
+            recovered.engine, "place my order", TurnFacts(readback_interrupted=False)
+        )
         paused = ReasoningState.from_checkpoint(
             (await recovered.assembly.graph.aget_state(recovered.engine._config)).values
         )
@@ -3737,7 +3739,7 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         stale_consent = await committed_turn_events(
             confirmation_application.engine,
             CommittedTurn(text="yes", message_id="restored-stale-confirmation"),
-            TurnFacts(),
+            TurnFacts(readback_interrupted=False),
         )
         after_stale_consent = ReasoningState.from_checkpoint(
             (
@@ -3763,7 +3765,7 @@ async def test_durable_platform_resources_open_with_the_pinned_application_role(
         await committed_turn_events(
             confirmation_application.engine,
             CommittedTurn(text="yes", message_id="restored-fresh-confirmation"),
-            TurnFacts(),
+            TurnFacts(readback_interrupted=False),
         )
         assert (
             confirmation_services.order_store.placement_receipt(

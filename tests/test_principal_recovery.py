@@ -45,7 +45,7 @@ from agnostic_market.durability.session_registry import (
 )
 from agnostic_market.durability.session_state import SessionStateCoordinator
 
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 _CUST1_OTP = TEST_OTP_CODES["CUST-001"]
 _CUST2_OTP = TEST_OTP_CODES["CUST-002"]
 _CUST1 = BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119")

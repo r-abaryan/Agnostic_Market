@@ -94,7 +94,7 @@ class _TurnProbeExecution:
                     text=self.contract.utterance,
                     message_id=f"{self.sample_id}-turn",
                 ),
-                TurnFacts(),
+                TurnFacts(readback_interrupted=False),
             )
         ]
         if len(self.execution.measurements) != 1:
@@ -286,7 +286,7 @@ async def _prepare_journey(
                 text=utterance,
                 message_id=f"setup-{contract.journey_id}-{index}",
             ),
-            TurnFacts(),
+            TurnFacts(readback_interrupted=False),
         ):
             pass
     _require_cart_lines(contract.initial_cart, execution.loop, phase="setup")

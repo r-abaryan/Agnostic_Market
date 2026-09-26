@@ -59,7 +59,7 @@ from agnostic_market.dtos.state import (
 )
 
 _POLICY = make_policy()
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 # ORD-1002 is CUST-002's, "processing" — the canonical guest target. An unverified caller
 # references it by ID (the guest path); its key never appears in their prompt.
 _CANCEL_1002 = {"propose_cancel": {"order_keys": ["ORD-1002"]}}

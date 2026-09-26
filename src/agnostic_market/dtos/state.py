@@ -28,6 +28,7 @@ from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 from agnostic_market.dtos.money import UsdAmount
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
+    AssistantPromptKind,
     CancellableOrderScope,
     CapabilityDispatchEnvelope,
     CartOperation,
@@ -42,8 +43,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["5"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "5"
+CheckpointSchemaVersion = Literal["6"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "6"
 
 
 class CheckpointSchemaError(ValueError):
@@ -494,6 +495,24 @@ class ProductReference(BaseModel):
         return _validate_product_skus(value)
 
 
+class AssistantPrompt(BaseModel):
+    """Code-authored question awaiting the next admitted caller turn only."""
+
+    model_config = _FROZEN
+
+    kind: AssistantPromptKind
+    turn_id: NonEmptyText
+
+
+class PendingAck(BaseModel):
+    """Cart speech and its dialogue move, carried together until the speakable node."""
+
+    model_config = _FROZEN
+
+    text: NonEmptyText
+    assistant_prompt_kind: AssistantPromptKind | None = None
+
+
 class ClarificationLiveness(BaseModel):
     """Consecutive clarification questions for one explicit owner."""
 
@@ -559,7 +578,7 @@ class ReasoningState(BaseModel):
     # `cart_ack` node (mutation acks, the review_cart listing, the empty-cart response).
     # Separate from the closed clarification selector below because these lines carry dynamic
     # cart contents/totals. Reset at entry_node; cleared by cart_ack (clear-before-speak).
-    pending_ack: str | None = None
+    pending_ack: PendingAck | None = None
     # Turn-scoped instruction for a flow-owned, code-authored clarification line. Each
     # transactional flow writes its own selector atomically as it yields to its renderer.
     pending_clarification: PendingClarification | None = None
@@ -570,6 +589,8 @@ class ReasoningState(BaseModel):
     product_offer: ProductOffer | None = None
     # Product focus supports explicit follow-up questions/actions, never bare assent.
     product_reference: ProductReference | None = None
+    # Conversational context only. It cannot authorize an effect or replace a flow owner.
+    assistant_prompt: AssistantPrompt | None = None
 
     @classmethod
     def from_checkpoint(cls, values: Mapping[str, object]) -> Self:
@@ -605,6 +626,16 @@ class ReasoningState(BaseModel):
         return (
             reference
             if reference is not None and self._is_previous_turn(reference.turn_id, turn_id)
+            else None
+        )
+
+    def live_assistant_prompt(self, turn_id: str | None = None) -> AssistantPrompt | None:
+        """Return a code-authored question only for the immediately following caller turn."""
+
+        prompt = self.assistant_prompt
+        return (
+            prompt
+            if prompt is not None and self._is_previous_turn(prompt.turn_id, turn_id)
             else None
         )
 
