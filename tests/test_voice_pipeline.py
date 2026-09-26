@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from livekit.agents import Agent
+from livekit.agents import Agent, AgentHandoff
 from livekit.plugins import cartesia, deepgram
 from livekit.plugins import langchain as lk_langchain
 from llm_fakes import FakeChatModel, RecordingResolver
@@ -156,6 +156,38 @@ def test_latency_observer_separates_endpointing_from_assistant_processing() -> N
             end_to_end_seconds=0.625,
             endpointing_seconds=0.25,
             processing_seconds=0.375,
+            interrupted=False,
+        )
+    ]
+
+
+def test_latency_observer_ignores_agent_handoff_without_losing_the_pending_turn() -> None:
+    callbacks = {}
+    observed: list[TurnLatencyMeasurement] = []
+
+    class Session:
+        def on(self, event_name: str):
+            def register(callback):
+                callbacks[event_name] = callback
+                return callback
+
+            return register
+
+    _attach_turn_metrics_logger(Session(), observed.append)
+    callback = callbacks["conversation_item_added"]
+    callback(SimpleNamespace(item=SimpleNamespace(role="user", metrics={"end_of_turn_delay": 0.2})))
+    callback(SimpleNamespace(item=AgentHandoff(new_agent_id="frontline")))
+    callback(
+        SimpleNamespace(
+            item=SimpleNamespace(role="assistant", interrupted=False, metrics={"e2e_latency": 0.5})
+        )
+    )
+
+    assert observed == [
+        TurnLatencyMeasurement(
+            end_to_end_seconds=0.5,
+            endpointing_seconds=0.2,
+            processing_seconds=0.3,
             interrupted=False,
         )
     ]

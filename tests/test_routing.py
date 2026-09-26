@@ -601,7 +601,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "8492aae5690004cf3e5445b766242b2147b98a10091f84036fd92a42e6590496"
+        "80bb783df1bce2bececb2591b552cc70df522b1330645c518c64512ee34f68c1"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -708,6 +708,57 @@ def test_projector_keeps_product_reference_separate_from_actionable_offer() -> N
     assert context.has_offered_product is False
     assert state.live_product_reference("reply-turn") is not None
     assert state.live_product_offer("reply-turn") is None
+
+
+def test_projector_exposes_only_a_live_open_help_prompt() -> None:
+    registry = _registry(Converse, ViewCart)
+
+    def project(*turn_ids: str) -> RoutingContext:
+        state = ReasoningState.model_validate(
+            {
+                "consumed_turn_ids": turn_ids,
+                "assistant_prompt": {"kind": "open_help", "turn_id": "invitation-turn"},
+            }
+        )
+        result = project_routing_context(
+            CommittedTurn(text="Yes.", message_id="reply-turn"),
+            state,
+            identity_store=CallerIdentityStore(),
+            cart_store=CartStore(),
+            recent_orders=RecentOrderContext(max_refs=3),
+            registry=registry,
+            assistant_prompt_completed=True,
+        )
+        assert isinstance(result, RoutingContext)
+        return result
+
+    answering = project("invitation-turn", "reply-turn")
+    assert answering.awaiting_reply_kind == "open_help"
+    assert answering.has_offered_product is False
+
+    stale = project("invitation-turn", "intervening-turn", "reply-turn")
+    assert stale.awaiting_reply_kind is None
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_projector_requires_completed_speech_for_open_help(completed: bool) -> None:
+    state = ReasoningState.model_validate(
+        {
+            "consumed_turn_ids": ("invitation-turn", "reply-turn"),
+            "assistant_prompt": {"kind": "open_help", "turn_id": "invitation-turn"},
+        }
+    )
+    context = project_routing_context(
+        CommittedTurn(text="Yes.", message_id="reply-turn"),
+        state,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=3),
+        registry=_registry(Converse, ViewCart),
+        assistant_prompt_completed=completed,
+    )
+    assert isinstance(context, RoutingContext)
+    assert context.awaiting_reply_kind == ("open_help" if completed else None)
 
 
 def test_a_product_offer_survives_the_automation_reset_that_dispatch_applies() -> None:

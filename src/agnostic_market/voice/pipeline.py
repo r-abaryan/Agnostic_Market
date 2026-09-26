@@ -376,8 +376,10 @@ def _attach_turn_metrics_logger(
 
     @session.on("conversation_item_added")
     def _log_turn_metrics(ev: ConversationItemAddedEvent) -> None:
+        role = getattr(ev.item, "role", None)
+        if role not in ("user", "assistant"):
+            return
         metrics = getattr(ev.item, "metrics", None) or {}
-        role = ev.item.role
         if turn_latency_observer is not None and role == "user":
             pending_endpointing.append(metric_value(metrics.get("end_of_turn_delay")))
         elif turn_latency_observer is not None and role == "assistant" and pending_endpointing:
@@ -455,4 +457,4 @@ def _attach_turn_metrics_logger(
             if (value := metrics.get(name)) is not None
         )
         if fields:
-            logger.info("turn metrics [%s]: %s", ev.item.role, fields)
+            logger.info("turn metrics [%s]: %s", role, fields)

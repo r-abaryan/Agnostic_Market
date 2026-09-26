@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, TypedDict, get_args, get_origin
 
 import pytest
@@ -130,6 +131,7 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
+    AssistantPrompt,
     BatchCancelOutcome,
     CancelTarget,
     CartClarification,
@@ -138,6 +140,7 @@ from agnostic_market.dtos.state import (
     HandoffRequest,
     HandoffSource,
     IdentityClarification,
+    PendingAck,
     PendingCancelBatch,
     PendingCartMutation,
     PendingIdentity,
@@ -166,7 +169,7 @@ from agnostic_market.durability.session_state import SessionStateCoordinator
 from agnostic_market.session import CallerContext
 from agnostic_market.voice.graph import GraphVoiceAdapter
 
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 _WAIT_TIMEOUT_SECONDS = 5.0
 _DISPATCH_REJECTION_LINE = "I couldn't complete that request. Please try again."
 
@@ -413,7 +416,28 @@ async def _adapter_turn(
     text: str,
     message_id: str,
 ) -> list[str]:
-    state = {"messages": [HumanMessage(content=text, id=message_id)]}
+    prior_reply_id = f"{message_id}:prior-reply"
+    adapter.attach_session(
+        SimpleNamespace(
+            history=SimpleNamespace(
+                items=(
+                    SimpleNamespace(
+                        id=prior_reply_id,
+                        type="message",
+                        role="assistant",
+                        interrupted=False,
+                    ),
+                )
+            )
+        )
+    )
+    state = {
+        "messages": [
+            HumanMessage(content="previous turn", id=f"{message_id}:prior-turn"),
+            AIMessage(content="previous reply", id=prior_reply_id),
+            HumanMessage(content=text, id=message_id),
+        ]
+    }
     return [chunk async for chunk in adapter.astream(state)]
 
 
@@ -828,6 +852,26 @@ async def test_active_router_direct_dispatches_one_typed_owner(config_root: Path
     assert state.active_invocation is None
     assert state.pending_capability_dispatch is None
     assert frontline.invoke_count == 0 and reasoning.invoke_count == 0
+
+
+@pytest.mark.parametrize(
+    ("interrupted", "expected_prompt"),
+    [(False, "open_help"), (True, None), (None, None)],
+)
+async def test_ordinary_routing_requires_completed_open_help_speech(
+    config_root: Path, interrupted: bool | None, expected_prompt: str | None
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer(_routing_attempt(RouteDecision.direct(ViewCart())))
+    engine, _ = _engine(
+        config_root,
+        cart=_cart_with_fixture_product(config_root),
+        routing_recognizer=recognizer,
+    )
+    await _events(engine, "show my cart")
+
+    await _events(engine, "yes", TurnFacts(readback_interrupted=interrupted))
+
+    assert recognizer.contexts[1].awaiting_reply_kind == expected_prompt
 
 
 async def test_same_id_no_action_redelivery_does_not_recall_router(config_root: Path) -> None:
@@ -1657,6 +1701,16 @@ async def test_barged_readback_makes_yes_invalid_and_reconfirms(config_root: Pat
     # A clean committed yes on the re-confirm places it.
     await _events(engine, "yes")
     assert store.placed_count == 1
+
+
+async def test_unknown_readback_completion_cannot_authorize_placement(config_root: Path) -> None:
+    engine, store = _engine(config_root, cart=_checkout_cart())
+    await _pause_at_confirmation(engine)
+
+    events = await _events(engine, "yes", TurnFacts(readback_interrupted=None))
+
+    assert store.placed_count == 0
+    assert any(isinstance(event, InterruptEvent) for event in events)
 
 
 async def test_unclear_answer_reconfirms_once_then_cancels(config_root: Path) -> None:
@@ -2876,6 +2930,8 @@ def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> No
 
 
 _CHECKPOINT_CHANNEL_VALUES = (
+    AssistantPrompt(kind="open_help", turn_id="turn-1"),
+    PendingAck(text="Anything else I can help with?", assistant_prompt_kind="open_help"),
     ProductOffer(skus=("SKU-1",), turn_id="turn-1"),
     ProductReference(skus=("SKU-1",), turn_id="turn-1"),
     ActiveInvocation(request=ViewCart(), opened_turn_id="turn-1"),

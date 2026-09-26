@@ -60,7 +60,7 @@ from agnostic_market.dtos.state import CartLine, PolicyContext, ReasoningState
 # returnless high on purpose (the default): the legacy amount-gate/step-up scenarios run
 # refunds against the SHIPPED ORD-1001 in isolation; the return-first tests tighten via model_copy.
 _POLICY = make_policy()
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 _CUST1_OTP = TEST_OTP_CODES["CUST-001"]
 _CUST2_OTP = TEST_OTP_CODES["CUST-002"]
 _ORIGINAL_INSTRUMENT = "original payment method"

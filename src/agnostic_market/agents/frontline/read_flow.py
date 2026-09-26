@@ -61,6 +61,7 @@ from agnostic_market.dtos.orchestration import (
     VerifyOrderStatus,
 )
 from agnostic_market.dtos.state import (
+    AssistantPrompt,
     HandoffRequest,
     PolicyContext,
     ProductOffer,
@@ -428,6 +429,9 @@ def build_read_flow_nodes(
             update={
                 "active_invocation": None,
                 "session_revision": committed.session_revision,
+                "assistant_prompt": AssistantPrompt(
+                    kind="open_help", turn_id=state.consumed_turn_ids[-1]
+                ),
                 "messages": [AIMessage(line)],
             },
         )

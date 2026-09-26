@@ -31,7 +31,7 @@ from agnostic_market.dtos.state import PolicyContext
 
 # returnless high (the default): the return tests drive the RETURN door directly.
 _POLICY = make_policy()
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 # ORD-1003 was delivered 2026-07-01T00:00:00Z (fixture) = this UTC epoch; window tests
 # freeze the flow clock relative to it (fixture dates age against wall clock).
 _DELIVERED_EPOCH = 1782864000.0

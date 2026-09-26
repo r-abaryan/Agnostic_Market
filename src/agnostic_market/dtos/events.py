@@ -84,11 +84,12 @@ TurnEvent = TokenEvent | SpokenMessageEvent | InterruptEvent
 class TurnFacts(BaseModel):
     """Perception-layer facts the voice plane asserts about THIS turn's input.
 
-    `readback_interrupted`: the caller barged over the pending confirmation readback
-    before it finished playing — a confirmation given over a truncated readback is not
-    consent (VOICE_PIPELINE §4a); the confirm node re-confirms instead of placing.
+    `readback_interrupted` describes the preceding assistant speech, whether or not a
+    confirmation is pending. False means playback completed, True means it was interrupted,
+    and None means playback status is unavailable. Only False licenses interpreting
+    the next turn as an answer to a confirmation readback or open-help question.
     """
 
     model_config = _FROZEN
 
-    readback_interrupted: bool = False
+    readback_interrupted: bool | None = None

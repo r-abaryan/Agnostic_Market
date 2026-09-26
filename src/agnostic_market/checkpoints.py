@@ -48,12 +48,14 @@ from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.session import AuthorityIdentifier
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
+    AssistantPrompt,
     CartClarification,
     CheckpointSchemaError,
     ClarificationLiveness,
     HandoffRequest,
     HandoffSource,
     IdentityClarification,
+    PendingAck,
     PendingCancelBatch,
     PendingCartMutation,
     PendingIdentity,
@@ -112,8 +114,10 @@ _CHECKPOINT_CHANNEL_DTOS = (
     CartClarification,
     ClarificationLiveness,
     HandoffRequest,
+    PendingAck,
     ProductOffer,
     ProductReference,
+    AssistantPrompt,
 )
 _CHECKPOINT_NESTED_ENUMS = (
     CapabilityId,

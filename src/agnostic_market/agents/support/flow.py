@@ -134,6 +134,7 @@ from agnostic_market.dtos.orchestration import (
     project_principal_transition,
 )
 from agnostic_market.dtos.state import (
+    AssistantPrompt,
     BatchCancelOutcome,
     CancelTarget,
     HandoffRequest,
@@ -621,12 +622,17 @@ def build_support_nodes(
             request.kind.value,
             answer_source="code_authored_read",
         )
-        return {
+        update: dict[str, object] = {
             "active_invocation": None,
             "execution_owner": None,
             "session_revision": committed.session_revision,
             "messages": [AIMessage(line)],
         }
+        if request.scope == "account":
+            update["assistant_prompt"] = AssistantPrompt(
+                kind="open_help", turn_id=state.consumed_turn_ids[-1]
+            )
+        return update
 
     async def capability_entry_node(state: ReasoningState) -> dict[str, object]:
         """Prepare one typed Support request; downstream nodes retain effect authority.

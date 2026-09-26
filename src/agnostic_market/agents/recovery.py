@@ -151,7 +151,7 @@ class CommerceEffectFinishers:
     """The complete flow-owned post-commit projection boundary used by normal and recovery."""
 
     placement: Callable[[str, PlacedOrder], Awaitable[dict[str, object]]]
-    cart_mutation: Callable[[CartMutationRecord], dict[str, object]]
+    cart_mutation: Callable[[CartMutationRecord, str], dict[str, object]]
     refund: Callable[[str, RefundRecord], Awaitable[dict[str, object]]]
     cancel: Callable[[PendingCancelBatch, BatchCancelOutcome, bool], Awaitable[dict[str, object]]]
     return_: Callable[[str, ReturnRecord], Awaitable[dict[str, object]]]
@@ -949,7 +949,9 @@ def build_recovery_node(
                     receipt.record, CartMutationRecord
                 ):
                     telemetry.record(node_failure_event(marker))
-                    return complete(finishers.cart_mutation(receipt.record))
+                    return complete(
+                        finishers.cart_mutation(receipt.record, state.consumed_turn_ids[-1])
+                    )
                 if not isinstance(receipt, NotCommittedReceipt):
                     return terminal_result(node_failure_event(marker))
             lines = cart_store.view()

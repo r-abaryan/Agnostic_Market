@@ -37,4 +37,9 @@ async def committed_turn_events(
     facts: TurnFacts | None = None,
 ) -> list[TurnEvent]:
     """Collect one caller turn while preserving its transport-supplied identity."""
-    return [event async for event in engine.stream_turn(turn, facts or TurnFacts())]
+    return [
+        event
+        async for event in engine.stream_turn(
+            turn, facts if facts is not None else TurnFacts(readback_interrupted=False)
+        )
+    ]

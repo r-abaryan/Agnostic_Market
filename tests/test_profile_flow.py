@@ -19,7 +19,7 @@ from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, Turn
 from agnostic_market.dtos.orchestration import ChangeProfile, RouteDecision, RouteResolution
 
 _POLICY = make_policy(refund_returnless_under_usd=50.0)
-_FACTS = TurnFacts()
+_FACTS = TurnFacts(readback_interrupted=False)
 _VALID_OTP = "482913"
 _NEW_ADDRESS = "7 Elm Street, Dover"
 _REQUEST = f"Please update my delivery address to {_NEW_ADDRESS}"

@@ -3,7 +3,12 @@ engine (the §A0 mockability promise, proven: no graph, no LiveKit session, no n
 
 from __future__ import annotations
 
+import asyncio
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from livekit.agents import Agent, AgentSession
+from livekit.agents.voice.io import TextOutput
+from livekit.plugins.langchain import LLMAdapter
 
 from agnostic_market.dtos.events import (
     CommittedTurn,
@@ -29,10 +34,11 @@ class ScriptedEngine:
 
 
 class _FakeHistoryItem:
-    def __init__(self, role: str, interrupted: object) -> None:
+    def __init__(self, role: str, interrupted: object, item_id: str | None = None) -> None:
         self.type = "message"
         self.role = role
         self.interrupted = interrupted
+        self.id = item_id
 
 
 class _FakeSession:
@@ -46,8 +52,22 @@ class _FakeSession:
         self.history.items = items or []
 
 
+def test_unsupplied_playback_status_is_unknown() -> None:
+    assert TurnFacts().readback_interrupted is None
+
+
 async def _spoken(adapter: GraphVoiceAdapter, state: dict) -> list[str]:
     return [text async for text in adapter.astream(state, None)]
+
+
+def _turn_after_reply(text: str = "yes") -> dict:
+    return {
+        "messages": [
+            HumanMessage("previous request", id="previous-turn"),
+            AIMessage("Previous reply", id="reply-1"),
+            HumanMessage(text, id="turn-1"),
+        ]
+    }
 
 
 async def test_adapter_renders_all_event_kinds_as_text() -> None:
@@ -141,12 +161,12 @@ async def test_adapter_passes_the_transport_interruption_fact_without_checkpoint
     adapter.attach_session(
         _FakeSession(
             [
-                _FakeHistoryItem("user", interrupted=False),
-                _FakeHistoryItem("assistant", interrupted=True),  # the barged readback
+                _FakeHistoryItem("user", interrupted=False, item_id="previous-turn"),
+                _FakeHistoryItem("assistant", interrupted=True, item_id="reply-1"),
             ]
         )
     )
-    await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
+    await _spoken(adapter, _turn_after_reply())
     assert engine.calls[0][1].readback_interrupted is True
 
 
@@ -155,35 +175,182 @@ async def test_transport_interruption_fact_is_perceptual_not_resume_authority() 
     # checkpoint makes that fact relevant to a confirmation resume.
     engine = ScriptedEngine([])
     adapter = GraphVoiceAdapter(engine)
-    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=True)]))
-    await _spoken(
-        adapter,
-        {"messages": [HumanMessage("what's the status", id="turn-1")]},
-    )
+    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", True, "reply-1")]))
+    await _spoken(adapter, _turn_after_reply("what's the status"))
     assert engine.calls[0][1].readback_interrupted is True
 
 
 async def test_4a_fact_false_when_readback_played_out() -> None:
     engine = ScriptedEngine([])
     adapter = GraphVoiceAdapter(engine)
-    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", interrupted=False)]))
-    await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
+    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", False, "reply-1")]))
+    await _spoken(adapter, _turn_after_reply())
     assert engine.calls[0][1].readback_interrupted is False
+
+
+async def test_skipped_latest_reply_cannot_borrow_older_playback_completion() -> None:
+    engine = ScriptedEngine([])
+    adapter = GraphVoiceAdapter(engine)
+    adapter.attach_session(
+        _FakeSession(
+            [
+                _FakeHistoryItem("user", False, "older-turn"),
+                _FakeHistoryItem("assistant", False, "older-reply"),
+                _FakeHistoryItem("user", False, "previous-turn"),
+            ]
+        )
+    )
+    await _spoken(
+        adapter,
+        {
+            "messages": [
+                HumanMessage("older request", id="older-turn"),
+                AIMessage("Older completed reply", id="older-reply"),
+                HumanMessage("previous request", id="previous-turn"),
+                HumanMessage("yes", id="current-turn"),
+            ]
+        },
+    )
+
+    assert engine.calls[0][1].readback_interrupted is None
 
 
 async def test_missing_or_invalid_interruption_evidence_fails_closed() -> None:
     class MissingInterruption:
         type = "message"
         role = "assistant"
+        id = "reply-1"
 
-    for item in (MissingInterruption(), _FakeHistoryItem("assistant", "false")):
+    for item in (MissingInterruption(), _FakeHistoryItem("assistant", "false", "reply-1")):
         engine = ScriptedEngine([])
         adapter = GraphVoiceAdapter(engine)
         adapter.attach_session(_FakeSession([item]))
 
-        await _spoken(adapter, {"messages": [HumanMessage("yes", id="turn-1")]})
+        await _spoken(adapter, _turn_after_reply())
 
-        assert engine.calls[0][1].readback_interrupted is True
+        assert engine.calls[0][1].readback_interrupted is None
+
+
+async def test_absent_session_history_or_assistant_is_not_playback_completion() -> None:
+    for session in (None, object(), _FakeSession([])):
+        engine = ScriptedEngine([])
+        adapter = GraphVoiceAdapter(engine)
+        if session is not None:
+            adapter.attach_session(session)
+
+        await _spoken(adapter, _turn_after_reply())
+
+        assert engine.calls[0][1].readback_interrupted is None
+
+
+async def test_playback_history_reply_id_must_match_transport_reply() -> None:
+    engine = ScriptedEngine([])
+    adapter = GraphVoiceAdapter(engine)
+    adapter.attach_session(_FakeSession([_FakeHistoryItem("assistant", False, "older-reply")]))
+
+    await _spoken(adapter, _turn_after_reply())
+
+    assert engine.calls[0][1].readback_interrupted is None
+
+
+async def test_livekit_session_correlates_a_completed_reply_with_the_next_turn() -> None:
+    engine = ScriptedEngine([SpokenMessageEvent(text="Anything else?", node="test_reply")])
+    adapter = GraphVoiceAdapter(engine)
+    session = AgentSession(llm=LLMAdapter(adapter))  # type: ignore[arg-type]
+    adapter.attach_session(session)
+
+    await session.start(Agent(instructions=""), record=False)
+    try:
+        first = session.generate_reply(user_input="first request")
+        await asyncio.wait_for(first.wait_for_playout(), timeout=10)
+        second = session.generate_reply(user_input="second request")
+        await asyncio.wait_for(second.wait_for_playout(), timeout=10)
+
+        assert len(engine.calls) == 2
+        assert engine.calls[1][1].readback_interrupted is False
+    finally:
+        await session.aclose()
+
+
+async def test_livekit_session_does_not_borrow_status_across_an_extra_reply() -> None:
+    engine = ScriptedEngine([SpokenMessageEvent(text="Anything else?", node="test_reply")])
+    adapter = GraphVoiceAdapter(engine)
+    session = AgentSession(llm=LLMAdapter(adapter))  # type: ignore[arg-type]
+    adapter.attach_session(session)
+
+    await session.start(Agent(instructions=""), record=False)
+    try:
+        first = session.generate_reply(user_input="first request")
+        await asyncio.wait_for(first.wait_for_playout(), timeout=10)
+        extra = session.say("Unrelated assistant speech.")
+        await asyncio.wait_for(extra.wait_for_playout(), timeout=10)
+        assistant_items = [
+            item for item in session.history.items if getattr(item, "role", None) == "assistant"
+        ]
+        assert len(assistant_items) == 2
+        assert all(item.interrupted is False for item in assistant_items)
+        second = session.generate_reply(user_input="second request")
+        await asyncio.wait_for(second.wait_for_playout(), timeout=10)
+
+        assert len(engine.calls) == 2
+        assert engine.calls[1][1].readback_interrupted is None
+    finally:
+        await session.aclose()
+
+
+async def test_livekit_session_correlates_an_interrupted_reply_with_the_next_turn() -> None:
+    class CapturedText(TextOutput):
+        def __init__(self) -> None:
+            super().__init__(label="test-output", next_in_chain=None)
+            self.captured = asyncio.Event()
+
+        async def capture_text(self, text: str) -> None:
+            if text.strip():
+                self.captured.set()
+
+        def flush(self) -> None:
+            pass
+
+    class StreamingEngine:
+        def __init__(self) -> None:
+            self.calls: list[tuple[CommittedTurn, TurnFacts]] = []
+            self.streaming = asyncio.Event()
+
+        async def stream_turn(self, turn: CommittedTurn, facts: TurnFacts):
+            self.calls.append((turn, facts))
+            if len(self.calls) == 1:
+                yield SpokenMessageEvent(text="Anything else?", node="test_reply")
+                self.streaming.set()
+                await asyncio.Future()
+            else:
+                yield SpokenMessageEvent(text="What can I help with?", node="test_reply")
+
+    engine = StreamingEngine()
+    adapter = GraphVoiceAdapter(engine)
+    session = AgentSession(llm=LLMAdapter(adapter))  # type: ignore[arg-type]
+    adapter.attach_session(session)
+
+    await session.start(Agent(instructions=""), record=False)
+    try:
+        output = CapturedText()
+        session.output.transcription = output
+        first = session.generate_reply(user_input="previous request")
+        await asyncio.wait_for(engine.streaming.wait(), timeout=10)
+        await asyncio.wait_for(output.captured.wait(), timeout=10)
+        await asyncio.wait_for(session.interrupt(), timeout=10)
+        await asyncio.wait_for(first.wait_for_playout(), timeout=10)
+        interrupted = [
+            item for item in session.history.items if getattr(item, "role", None) == "assistant"
+        ]
+        assert len(interrupted) == 1
+        assert interrupted[0].interrupted is True
+        second = session.generate_reply(user_input="yes")
+        await asyncio.wait_for(second.wait_for_playout(), timeout=10)
+
+        assert len(engine.calls) == 2
+        assert engine.calls[1][1].readback_interrupted is True
+    finally:
+        await session.aclose()
 
 
 async def test_unconsumed_turn_never_reaches_the_engine() -> None:
@@ -206,7 +373,7 @@ async def test_unconsumed_turn_never_reaches_the_engine() -> None:
     assert engine.calls == [
         (
             CommittedTurn(text="no, wait", message_id="turn-2"),
-            TurnFacts(readback_interrupted=False),
+            TurnFacts(readback_interrupted=None),
         )
     ]
     assert spoken == ["never spoken"]

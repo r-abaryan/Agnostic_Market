@@ -185,7 +185,7 @@ _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
 # 29 -> 28 on 2026-09-21: clarify(missing_target) dropped when its only case was retired.
-_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 35
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 36
 _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
@@ -1593,7 +1593,12 @@ async def _observe_scenario(
             text=utterance,
             message_id=f"{scenario_key}:turn:{turn_index}",
         )
-        events = tuple([event async for event in engine.stream_turn(turn, TurnFacts())])
+        events = tuple(
+            [
+                event
+                async for event in engine.stream_turn(turn, TurnFacts(readback_interrupted=False))
+            ]
+        )
         state, completed_tool_calls, admitted_user_messages = await _checkpoint_observation(engine)
         turns.append(
             TurnObservation(

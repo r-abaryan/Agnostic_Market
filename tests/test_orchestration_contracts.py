@@ -1044,6 +1044,7 @@ def test_routing_context_is_bounded_and_authority_free() -> None:
         # Same discipline for the product offer: presence only, never the offered SKUs.
         "has_offered_product",
         "has_product_reference",
+        "awaiting_reply_kind",
     }
     assert context.has_focused_order is False
     assert context.has_offered_product is False

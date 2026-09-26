@@ -42,10 +42,12 @@ ConversationAct = Literal[
     "greeting",
     "acknowledgment",
     "farewell",
+    "invite_request",
     "capability_summary",
     "channel_check",
     "repair",
 ]
+AssistantPromptKind = Literal["open_help"]
 ListOrderScope = Literal["session", "account"]
 CartOperation = Literal["add", "remove", "set_quantity"]
 OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
@@ -693,6 +695,8 @@ class RoutingContext(BaseModel):
     has_offered_product: StrictBool = False
     # Presence only; the catalog and cart owners re-resolve SKUs against live products.
     has_product_reference: StrictBool = False
+    # A code-authored conversational question, never consent or target authority.
+    awaiting_reply_kind: AssistantPromptKind | None = None
     cart_state: Literal["empty", "nonempty"]
     available_capabilities: tuple[CapabilityId, ...] = Field(min_length=1)
 

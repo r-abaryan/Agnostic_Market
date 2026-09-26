@@ -77,6 +77,7 @@ from agnostic_market.dtos.orchestration import (
     CartItemChoices,
     CartItemQuery,
     ClarificationReason,
+    Converse,
     DiscloseAiIdentity,
     ExplicitOrderSet,
     FocusedOrderSet,
@@ -98,9 +99,11 @@ from agnostic_market.dtos.orchestration import (
 )
 from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
+    AssistantPrompt,
     CartClarification,
     ClarificationLiveness,
     HandoffSource,
+    PendingAck,
     PendingCartMutation,
     ProductOffer,
     ProductReference,
@@ -571,7 +574,7 @@ def test_direct_dispatch_replaces_invocation_and_clears_old_liveness(
             active_invocation=old,
             execution_owner="cart",
             identity_claim_misses=1,
-            pending_ack="old response",
+            pending_ack=PendingAck(text="old response"),
             pending_clarification=CartClarification(detail="item"),
             clarification_liveness=ClarificationLiveness(
                 owner=InvocationClarificationOwner(invocation_id=old.invocation_id),
@@ -1551,6 +1554,7 @@ async def test_dispatch_reaches_session_list_owner_without_a_model_call(
     assert result["active_invocation"] is None
     assert result["execution_owner"] is None
     assert "hit a snag" not in _only_spoken(result).lower()
+    assert result.get("assistant_prompt") is None
 
 
 def test_identity_capability_entry_is_preparation_only(config_root: Path) -> None:
@@ -2468,6 +2472,9 @@ async def test_order_status_owner_grants_and_renders_one_explicit_order_without_
     assert model.invoke_count == 0
     assert result["active_invocation"] is None
     assert "Your order ORD-1001" in _only_spoken(result)
+    assert result["assistant_prompt"] == AssistantPrompt(
+        kind="open_help", turn_id="status-explicit"
+    )
     assert _answered_rows(graph) == [
         {
             "utterance": "ORD-1001, my phone is [phone]",
@@ -2965,6 +2972,7 @@ async def test_cart_view_owner_speaks_the_live_cart_without_a_model_call(
     line = _only_spoken(result)
     assert "waterproof rain jacket" in line and "129.00" in line
     assert cart.line_count == 1  # a read mutates nothing
+    assert result["assistant_prompt"] == AssistantPrompt(kind="open_help", turn_id="typed-cart")
 
 
 async def test_cart_view_owner_re_reads_the_store_on_every_turn(config_root: Path) -> None:
@@ -2987,10 +2995,35 @@ async def test_cart_view_owner_speaks_the_empty_line_with_no_close(config_root: 
 
     graph = _graph(config_root, FakeChatModel(), cart_store=CartStore())
 
-    line = _only_spoken(await _typed_read(graph, ViewCart(), turn_id="cart-empty", text="my cart?"))
+    result = await _typed_read(graph, ViewCart(), turn_id="cart-empty", text="my cart?")
+    line = _only_spoken(result)
 
     assert line == "Your cart's empty at the moment."
     assert not any(line.endswith(close) for close in all_closes())
+    assert result.get("assistant_prompt") is None
+
+
+async def test_open_help_affirmative_has_a_non_effectful_spoken_response(
+    config_root: Path,
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    result = await _typed_read(
+        graph, Converse(act="invite_request"), turn_id="invite-1", text="Yes, one more thing"
+    )
+    assert _only_spoken(result) == "Of course. What can I help you with?"
+    assert result["assistant_prompt"] == AssistantPrompt(kind="open_help", turn_id="invite-1")
+    assert result.get("automation_terminal", False) is False
+
+
+@pytest.mark.parametrize("act", ("greeting", "capability_summary"))
+async def test_code_authored_open_help_questions_mark_the_following_turn(
+    config_root: Path, act: str
+) -> None:
+    graph = _graph(config_root, FakeChatModel())
+    result = await _typed_read(graph, Converse(act=act), turn_id="open-help-1", text="hello")
+
+    assert "?" in _only_spoken(result)
+    assert result["assistant_prompt"] == AssistantPrompt(kind="open_help", turn_id="open-help-1")
 
 
 async def test_typed_cart_read_uses_the_shared_live_renderer(config_root: Path) -> None:
@@ -3054,9 +3087,11 @@ async def test_identity_status_owner_reports_the_live_binding_only(config_root: 
     assert bound_result["active_invocation"] is None
     # The unverified branch carries its own invitation, so it takes no warm close.
     assert unbound == IDENTITY_STATUS_UNVERIFIED
+    assert unbound_result.get("assistant_prompt") is None
     # A resolved answer closes like every other code-authored line.
     assert bound.startswith(IDENTITY_STATUS_VERIFIED)
     assert any(bound.endswith(close) for close in all_closes())
+    assert bound_result["assistant_prompt"] == AssistantPrompt(kind="open_help", turn_id="id-2")
     # Bound-or-unbound ONLY: never the customer reference, never the contact on file.
     assert "CUST-001" not in bound and "0119" not in bound
 

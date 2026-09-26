@@ -62,10 +62,12 @@ from agnostic_market.dtos.orchestration import (
     ResolvedCartItemRef,
 )
 from agnostic_market.dtos.state import (
+    AssistantPrompt,
     CartClarification,
     CartClarificationDetail,
     CartLine,
     HandoffRequest,
+    PendingAck,
     PendingCartMutation,
     PendingPlacement,
     PolicyContext,
@@ -289,7 +291,7 @@ def build_cart_nodes(
                 return {
                     "active_invocation": None,
                     "execution_owner": None,
-                    "pending_ack": _EMPTY_CART_CHECKOUT_LINE,
+                    "pending_ack": PendingAck(text=_EMPTY_CART_CHECKOUT_LINE),
                 }
             return {
                 "active_invocation": None,
@@ -354,7 +356,7 @@ def build_cart_nodes(
                 "messages": new_messages,
                 "active_invocation": None,
                 "execution_owner": None,
-                "pending_ack": _EMPTY_CART_REVIEW_LINE,
+                "pending_ack": PendingAck(text=_EMPTY_CART_REVIEW_LINE),
             }
 
         # A product reference grounds an explicit add request but is not an offer. Even if
@@ -551,8 +553,16 @@ def build_cart_nodes(
         """Speak the code-authored in-flow line (mutation ack / review listing / empty-cart)
         and clear it. A completed typed mutation has already cleared its execution phase.
         Clear-before-speak keeps the acknowledgement from replaying."""
-        ack = state.pending_ack or warm_close()
-        return {"pending_ack": None, "messages": [AIMessage(ack)]}
+        ack = state.pending_ack or PendingAck(text=warm_close(), assistant_prompt_kind="open_help")
+        update: dict[str, object] = {
+            "pending_ack": None,
+            "messages": [AIMessage(ack.text)],
+        }
+        if ack.assistant_prompt_kind is not None:
+            update["assistant_prompt"] = AssistantPrompt(
+                kind=ack.assistant_prompt_kind, turn_id=state.consumed_turn_ids[-1]
+            )
+        return update
 
     def _mutation_action(pending: PendingCartMutation) -> str:
         if pending.operation == "add":
@@ -640,12 +650,13 @@ def build_cart_nodes(
     def finish_mutation(
         record: CartMutationRecord,
         *,
+        turn_id: str,
         session_revision: int | None = None,
         reconciled: bool = False,
         speak_now: bool = False,
     ) -> dict[str, object]:
         """Project one authoritative mutation result into state and speech."""
-        ack = _mutation_result_ack(record)
+        ack = PendingAck(text=_mutation_result_ack(record), assistant_prompt_kind="open_help")
         update: dict[str, object] = {
             "pending_cart_mutation": None,
             "execution_owner": None,
@@ -654,7 +665,8 @@ def build_cart_nodes(
             ),
         }
         if speak_now:
-            update["messages"] = [AIMessage(ack)]
+            update["messages"] = [AIMessage(ack.text)]
+            update["assistant_prompt"] = AssistantPrompt(kind="open_help", turn_id=turn_id)
         else:
             update["pending_ack"] = ack
         if not reconciled and record.outcome == "applied":
@@ -682,12 +694,13 @@ def build_cart_nodes(
         )
         return finish_mutation(
             committed.value,
+            turn_id=state.consumed_turn_ids[-1],
             session_revision=committed.session_revision,
         )
 
-    def reconcile_mutation(record: CartMutationRecord) -> dict[str, object]:
+    def reconcile_mutation(record: CartMutationRecord, turn_id: str) -> dict[str, object]:
         """Project a committed receipt without replaying effect telemetry."""
-        return finish_mutation(record, reconciled=True, speak_now=True)
+        return finish_mutation(record, turn_id=turn_id, reconciled=True, speak_now=True)
 
     def clarify_node(state: ReasoningState) -> dict[str, object]:
         clarification = state.pending_clarification
