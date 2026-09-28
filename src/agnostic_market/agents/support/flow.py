@@ -1509,7 +1509,7 @@ def build_support_nodes(
         phrase = _refund_confirmation_phrase(pending, ISSUE_REFUND_POLICY)
         answer = interrupt(f"Just to confirm: {phrase}. Shall I go ahead?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
             decision = classify_confirmation(retry)
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
@@ -1738,7 +1738,7 @@ def build_support_nodes(
         # must read as yes (plain classify_consent reads the 'cancel' as a no).
         answer = interrupt(_cancel_readback_line(pending))
         decision = classify_confirmation(answer, cancel_action=True)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             phrases = "; ".join(_cancel_target_phrase(t) for t in pending.targets)
             retry = interrupt(f"Sorry - just to be clear: cancel {phrases}? Yes or no?")
             decision = classify_confirmation(retry, cancel_action=True)
@@ -2088,7 +2088,7 @@ def build_support_nodes(
         phrase = _return_confirmation_phrase(pending, CREATE_RETURN_POLICY)
         answer = interrupt(f"Just to confirm - {phrase}. Shall I go ahead?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
             decision = classify_confirmation(retry)
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
@@ -2254,7 +2254,7 @@ def build_support_nodes(
         phrase = _profile_confirmation_phrase(pending)
         answer = interrupt(f"Just to confirm - {phrase}. Shall I go ahead?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}? Yes or no?")
             decision = classify_confirmation(retry)
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"

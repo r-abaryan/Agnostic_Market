@@ -644,7 +644,7 @@ def build_cart_nodes(
         action = _mutation_action(pending)
         answer = interrupt(f"Just to confirm: {action}?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {action}. Please say yes or no.")
             decision = classify_confirmation(retry)
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
@@ -847,7 +847,7 @@ def build_cart_nodes(
         phrase = _placement_confirmation_phrase(pending, PLACE_ORDER_POLICY)
         answer = interrupt(f"Just to confirm: shall I place {phrase}?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: shall I place {phrase}? Yes or no?")
             decision = classify_confirmation(retry)
         verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"

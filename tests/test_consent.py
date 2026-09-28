@@ -17,11 +17,7 @@ def test_unheard_confirmation_cannot_authorize_yes(cancel_action: bool) -> None:
 
 @pytest.mark.parametrize("source", tuple(HandoffSource))
 def test_unheard_readback_still_reaches_a_person(source: HandoffSource) -> None:
-    """Hearing the readback gates consent, never escape.
-
-    ROUTING_FAILURE_POLICY is set when routing is unavailable, which is exactly when leaving the
-    caller with a declined action and no route to a person is least acceptable.
-    """
+    """Hearing the readback gates consent, never escape, including when routing is unavailable."""
     decision = classify_confirmation(
         {"text": "let me talk to someone", "handoff_source": source, "readback_interrupted": True},
     )

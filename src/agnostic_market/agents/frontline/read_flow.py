@@ -258,7 +258,7 @@ def build_read_flow_nodes(
         subject = "that order" if len(order_ids) == 1 else "those orders"
         answer = interrupt(f"I heard {listed}. Did you mean {subject}?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             answer = interrupt(f"To confirm, should I check {listed}? Please say yes or no.")
             decision = classify_confirmation(answer)
         if decision.verdict == "yes":

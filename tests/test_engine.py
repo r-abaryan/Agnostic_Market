@@ -1745,7 +1745,10 @@ async def test_unclear_answer_reconfirms_once_then_cancels(config_root: Path) ->
     assert any("won't place it" in e.text.lower() for e in spoken)
 
 
-async def test_human_request_at_confirmation_escapes(config_root: Path) -> None:
+@pytest.mark.parametrize("playback_fact", (False, True, None))
+async def test_human_request_at_confirmation_escapes(
+    config_root: Path, playback_fact: bool | None
+) -> None:
     recognizer = _DeterministicRoutingRecognizer()
     engine, store = _engine(
         config_root,
@@ -1754,7 +1757,11 @@ async def test_human_request_at_confirmation_escapes(config_root: Path) -> None:
     )
     await _pause_at_confirmation(engine)
     recognizer.choose(RouteDecision.direct(RequestPerson()))
-    events = await _events(engine, "just get me a real person please")
+    events = await _events(
+        engine,
+        "just get me a real person please",
+        TurnFacts(readback_interrupted=playback_fact),
+    )
     assert store.placed_count == 0
     assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
@@ -1805,8 +1812,9 @@ async def test_affirmative_confirmation_never_consults_the_semantic_router(
     assert [context.utterance for context in recognizer.contexts] == ["checkout now please"]
 
 
+@pytest.mark.parametrize("playback_fact", (False, True, None))
 async def test_confirmation_router_outage_fails_closed_to_the_human_onramp(
-    config_root: Path,
+    config_root: Path, playback_fact: bool | None
 ) -> None:
     recognizer = _DeterministicRoutingRecognizer()
     engine, store = _engine(
@@ -1817,7 +1825,11 @@ async def test_confirmation_router_outage_fails_closed_to_the_human_onramp(
     await _pause_at_confirmation(engine)
     recognizer.choose(RoutingFailure(reason="routing_unavailable"))
 
-    events = await _events(engine, "I need some help before deciding")
+    events = await _events(
+        engine,
+        "I need some help before deciding",
+        TurnFacts(readback_interrupted=playback_fact),
+    )
     spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
     state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
 

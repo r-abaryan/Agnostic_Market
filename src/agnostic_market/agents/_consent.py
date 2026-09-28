@@ -134,12 +134,7 @@ def classify_confirmation(
     *,
     cancel_action: bool = False,
 ) -> ConfirmationDecision:
-    """An unheard readback cannot authorize consent; reaching a person does not depend on it.
-
-    The handoff marker is checked first on purpose. It is engine-authored and only set when the
-    caller's words were already unclear, so it can never short-circuit a spoken yes. One of its
-    sources is routing being unavailable, which is when stranding the caller is least acceptable.
-    """
+    """An unheard readback cannot authorize consent; reaching a person does not depend on it."""
 
     source_value = answer.get("handoff_source")
     if source_value is not None:

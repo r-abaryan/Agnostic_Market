@@ -559,7 +559,7 @@ def build_frontline_graph(
         )
         answer = interrupt(prompt)
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             action = "switch accounts" if switching else "verify the account"
             answer = interrupt(f"To {action} and clear this call's context, say yes or no.")
             decision = classify_confirmation(answer)
