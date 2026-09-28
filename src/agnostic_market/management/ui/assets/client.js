@@ -289,17 +289,21 @@ export function selectMerchantWorkspace(state, merchantId) {
     simulationLatency: null,
     pendingSimulationTurn: null,
     lastReplyPlayback: null,
+    playbackNotice: "",
   });
 }
 
-export function simulationTurnRequest(current, input, requestIdFactory) {
-  if (
+// A retry keeps its request id and playback fact: the failed attempt may have committed.
+export function simulationTurnReused(current, input) {
+  return (
     current?.tenantId === input.tenantId &&
     current.simulationId === input.simulationId &&
     current.text === input.text
-  ) {
-    return current;
-  }
+  );
+}
+
+export function simulationTurnRequest(current, input, requestIdFactory) {
+  if (simulationTurnReused(current, input)) return current;
   return { ...input, requestId: requestIdFactory() };
 }
 
@@ -308,6 +312,18 @@ export function simulationPlaybackFact(lastReply, voiceOutcome, manualInterrupti
   if (!lastReply) return null;
   // Text-only simulation treats a displayed reply as completed.
   return lastReply.voiced ? voiceOutcome ?? null : false;
+}
+
+const PLAYBACK_FACT_LABELS = new Map([
+  [false, "received"],
+  [true, "interrupted"],
+  [null, "unknown"],
+]);
+
+export function playbackFactNotice(fact, { retry = false } = {}) {
+  const label = PLAYBACK_FACT_LABELS.get(fact ?? null);
+  if (retry) return `Retry resends the original turn, with the previous reply ${label}.`;
+  return fact === false ? "" : `Last turn sent the previous reply as ${label}.`;
 }
 
 export function simulationMessages(events) {

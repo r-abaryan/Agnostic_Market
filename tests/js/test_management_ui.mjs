@@ -7,10 +7,12 @@ import {
   buildDraftUpdate,
   canRollback,
   parseCatalog,
+  playbackFactNotice,
   selectMerchantWorkspace,
   simulationDiagnostics,
   simulationPlaybackFact,
   simulationTurnRequest,
+  simulationTurnReused,
   simulationMessages,
 } from "../../src/agnostic_market/management/ui/assets/client.js";
 import {
@@ -342,6 +344,19 @@ test("simulation playback facts preserve text-only completion and voice uncertai
   assert.equal(simulationPlaybackFact({ voiced: true }, false, false), false);
   assert.equal(simulationPlaybackFact({ voiced: true }, true, false), true);
   assert.equal(simulationPlaybackFact({ voiced: true }, null, true), true);
+});
+
+test("the sent playback fact is visible, and a retry names the fact it resends", () => {
+  assert.equal(playbackFactNotice(false), "");
+  assert.equal(playbackFactNotice(true), "Last turn sent the previous reply as interrupted.");
+  assert.equal(playbackFactNotice(null), "Last turn sent the previous reply as unknown.");
+  assert.match(playbackFactNotice(false, { retry: true }), /previous reply received\.$/);
+  assert.match(playbackFactNotice(null, { retry: true }), /previous reply unknown\.$/);
+
+  const pending = { tenantId: "t", simulationId: "s", text: "yes", readbackInterrupted: null };
+  assert.equal(simulationTurnReused(pending, { tenantId: "t", simulationId: "s", text: "yes" }), true);
+  assert.equal(simulationTurnReused(pending, { tenantId: "t", simulationId: "s", text: "no" }), false);
+  assert.equal(simulationTurnReused(null, { tenantId: "t", simulationId: "s", text: "yes" }), false);
 });
 
 test("capture is converted to the exact PCM shape the STT engine accepts", () => {
@@ -936,6 +951,13 @@ test("playback facts distinguish natural end, caller interruption, and unknown a
   assert.equal(voice.playbackOutcome("session:5"), null);
   await voice.reset();
   assert.equal(voice.playbackOutcome("session:5"), null);
+
+  assert.equal(await voice.speak("sixth", "session:6"), true);
+  sources.at(-1).onended();
+  await voice.reset({ keepPlaybackOutcome: true });
+  assert.equal(voice.playbackOutcome("session:6"), false);
+  await voice.reset();
+  assert.equal(voice.playbackOutcome("session:6"), null);
 });
 
 // captureSupport is frozen at module load, so the stubs must exist before the module is

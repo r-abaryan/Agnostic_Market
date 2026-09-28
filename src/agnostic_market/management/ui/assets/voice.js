@@ -606,10 +606,11 @@ export function createVoiceController({
       }, 900);
     },
 
-    async reset() {
+    // A failed turn keeps the finished reply's outcome; a new or reset session discards it.
+    async reset({ keepPlaybackOutcome = false } = {}) {
       stopAcknowledgeTimer();
       controller.stopSpeaking();
-      playback = null;
+      if (!keepPlaybackOutcome) playback = null;
       await discardCapture();
       emitState("idle");
     },
