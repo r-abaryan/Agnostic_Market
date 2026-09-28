@@ -4,7 +4,7 @@ steward_id: project-owner
 frozen_at: "2026-09-19T18:32:42.1779564+01:00"
 lineage_reference: config/qualification/semantic_routing_readiness_recipe.yaml
 generation_recipe_fingerprint: 3227e80a804119b36443cf8c4281c92a37533eb204520d360b107437e7ffa0d0
-source_disjoint_from_corpus_fingerprint: b93f3f11db46eaa3ad0b249c83f62c8114af31a5ef237ec04844b131d2ec1c9c
+source_disjoint_from_corpus_fingerprint: c3dc55d435b0b06f30ece858930ac5775f44c8debfe4afbb236a33271edb5dd5
 labels_not_used_for_selection: true
 
 lineage:

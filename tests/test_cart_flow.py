@@ -61,9 +61,11 @@ from agnostic_market.commerce.verification import RiskProvider, VerificationStor
 from agnostic_market.dtos.events import InterruptEvent, SpokenMessageEvent, TokenEvent
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
+    CartItemChoices,
     CartItemQuery,
     ModifyCart,
     PlaceOrder,
+    ResolvedCartItemRef,
 )
 from agnostic_market.dtos.state import (
     AssistantPrompt,
@@ -327,6 +329,144 @@ async def test_typed_cart_mutation_requires_confirmation_before_effect(
     assert any(product.name in line for line in _ai_texts(out))
 
 
+async def test_quantity_first_cart_proposal_asks_for_the_missing_item(
+    config_root: Path,
+) -> None:
+    selector = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_slots", {"quantity": 3})],
+            [("provide_cart_slots", {"candidate_key": "1"})],
+        ]
+    )
+    telemetry = make_session_telemetry("acme_store", "quantity-first-session")
+    graph, store, cart = _build(config_root, reasoning=selector, telemetry=telemetry)
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
+    turn_id = "quantity-first-add"
+
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="Make that three, please", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"), opened_turn_id=turn_id
+            ),
+        },
+        _CFG,
+    )
+
+    snapshot = graph.get_state(_CFG)
+    request = snapshot.values["active_invocation"].request
+    assert isinstance(request, ModifyCart)
+    assert request.item is None
+    assert request.quantity == 3
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["item"]
+    assert snapshot.values.get("pending_cart_mutation") is None
+    assert cart.is_empty()
+    assert store.placed_count == 0
+    slot_records = [
+        record
+        for record in telemetry.operational.sink.records
+        if record.event == "cart_slot_proposal"
+    ]
+    assert [record.attributes for record in slot_records] == [
+        {
+            "turn_id": turn_id,
+            "operation": "add",
+            "model_item_supplied": False,
+            "model_quantity_supplied": True,
+            "retained_item_resolved": False,
+            "retained_quantity_present": True,
+            "slot_complete": False,
+        }
+    ]
+
+    followup_id = "quantity-first-item-followup"
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content=f"The {product.name}", id=followup_id)],
+            "consumed_turn_ids": (followup_id,),
+        },
+        _CFG,
+    )
+    paused = graph.get_state(_CFG)
+    assert paused.interrupts[0].value == (f"Just to confirm: add 3 of {product.name} to your cart?")
+    assert paused.values["pending_cart_mutation"].sku == product.sku
+    assert cart.is_empty()
+    slot_records = [
+        record
+        for record in telemetry.operational.sink.records
+        if record.event == "cart_slot_proposal"
+    ]
+    assert slot_records[-1].attributes == {
+        "turn_id": followup_id,
+        "operation": "add",
+        "model_item_supplied": True,
+        "model_quantity_supplied": False,
+        "retained_item_resolved": True,
+        "retained_quantity_present": True,
+        "slot_complete": True,
+    }
+
+
+async def test_item_first_cart_proposal_asks_for_the_missing_quantity(
+    config_root: Path,
+) -> None:
+    selector = FakeChatModel(scripted_calls=[[("provide_cart_slots", {"candidate_key": "1"})]])
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
+    turn_id = "item-first-add"
+
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content=f"Add the {product.name}", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"), opened_turn_id=turn_id
+            ),
+        },
+        _CFG,
+    )
+
+    snapshot = graph.get_state(_CFG)
+    request = snapshot.values["active_invocation"].request
+    assert isinstance(request, ModifyCart)
+    assert request.item == ResolvedCartItemRef(sku=product.sku)
+    assert request.quantity is None
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["quantity"]
+    assert snapshot.values.get("pending_cart_mutation") is None
+    assert cart.is_empty()
+
+
+async def test_quantity_proposal_preserves_unresolved_item_choices(
+    config_root: Path,
+) -> None:
+    products = load_catalog_fixture(config_root, "acme_store").products[:2]
+    choices = CartItemChoices(skus=tuple(product.sku for product in products))
+    selector = FakeChatModel(scripted_calls=[[("provide_cart_slots", {"quantity": 2})]])
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    turn_id = "choices-quantity-add"
+
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="Two, please", id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add", item=choices), opened_turn_id=turn_id
+            ),
+        },
+        _CFG,
+    )
+
+    snapshot = graph.get_state(_CFG)
+    request = snapshot.values["active_invocation"].request
+    assert isinstance(request, ModifyCart)
+    assert request.item == choices
+    assert request.quantity == 2
+    assert _ai_texts(out)[-1].endswith(_CART_CLARIFICATION_LINES["item"])
+    assert snapshot.values.get("pending_cart_mutation") is None
+    assert cart.is_empty()
+
+
 async def test_an_offered_product_is_marked_for_the_selector_not_substituted(
     config_root: Path,
 ) -> None:
@@ -408,6 +548,101 @@ async def test_explicit_add_uses_reference_without_treating_it_as_an_offer(
     assert graph.get_state(_CFG).interrupts[0].value == (
         f"Just to confirm: add 2 of {jacket.name} to your cart?"
     )
+
+
+@pytest.mark.parametrize(
+    ("selector", "expected_outcomes"),
+    [
+        (
+            FakeChatModel(
+                force_tool="request_cart_clarification",
+                canned_args={"request_cart_clarification": {}},
+            ),
+            ("clarification_requested",),
+        ),
+        (FakeChatModel(emit_tool_calls=False), ("no_tool_call",)),
+        (
+            FakeChatModel(
+                scripted_calls=[
+                    [("provide_cart_slots", {"candidate_key": "missing-key"})],
+                    [("provide_cart_slots", {"candidate_key": "missing-key"})],
+                ]
+            ),
+            ("invalid_proposal", "invalid_proposal"),
+        ),
+    ],
+)
+async def test_referenced_cart_selector_reports_why_no_item_was_retained(
+    config_root: Path,
+    selector: FakeChatModel,
+    expected_outcomes: tuple[str, ...],
+) -> None:
+    jacket = next(
+        product
+        for product in load_catalog_fixture(config_root, "acme_store").products
+        if "jacket" in product.name
+    )
+    telemetry = make_session_telemetry("acme_store", "selector-outcome-session")
+    graph, _store, cart = _build(config_root, reasoning=selector, telemetry=telemetry)
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="Okay. Add it to the basket.", id="add-turn")],
+            "consumed_turn_ids": ("description-turn", "add-turn"),
+            "product_reference": ProductReference(skus=(jacket.sku,), turn_id="description-turn"),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"), opened_turn_id="add-turn"
+            ),
+        },
+        _CFG,
+    )
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["item"]
+    assert cart.is_empty()
+    assert graph.get_state(_CFG).values["active_invocation"].request.item is None
+    records = [
+        record
+        for record in telemetry.operational.sink.records
+        if record.event == "cart_selector_outcome"
+    ]
+    assert [record.attributes for record in records] == [
+        {
+            "turn_id": "add-turn",
+            "operation": "add",
+            "attempt": attempt,
+            "available_reference_count": 1,
+            "selector_outcome": outcome,
+        }
+        for attempt, outcome in enumerate(expected_outcomes, start=1)
+    ]
+    tool_schema = selector.bound_tools["request_cart_clarification"]
+    assert tool_schema["function"]["parameters"]["properties"] == {}
+
+
+async def test_cart_clarification_asks_quantity_only_after_item_is_resolved(
+    config_root: Path,
+) -> None:
+    jacket = next(
+        product
+        for product in load_catalog_fixture(config_root, "acme_store").products
+        if "jacket" in product.name
+    )
+    selector = FakeChatModel(
+        force_tool="request_cart_clarification",
+        canned_args={"request_cart_clarification": {}},
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    out = await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="I didn't say how many", id="quantity-turn")],
+            "consumed_turn_ids": ("quantity-turn",),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add", item=ResolvedCartItemRef(sku=jacket.sku)),
+                opened_turn_id="quantity-turn",
+            ),
+        },
+        _CFG,
+    )
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["quantity"]
+    assert cart.is_empty()
 
 
 async def test_reference_alone_cannot_turn_bare_assent_into_a_cart_add(

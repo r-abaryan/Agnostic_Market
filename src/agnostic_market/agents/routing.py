@@ -42,6 +42,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     ModifyCart,
     PlaceOrder,
+    ReadOrderTotal,
     RecentOrderSet,
     RefundOrder,
     RequestPerson,
@@ -132,6 +133,14 @@ def _materialize_order_status(proposal: RouteProposal) -> IntentRequest:
     raise ValueError("verify_order_status requires order_status_selector")
 
 
+def _materialize_order_total(proposal: RouteProposal) -> IntentRequest:
+    if proposal.order_total_selector == "explicit":
+        return ReadOrderTotal()
+    if proposal.order_total_selector == "focused":
+        return ReadOrderTotal(target=FocusedOrderSet())
+    raise ValueError("read_order_total requires order_total_selector")
+
+
 _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingProxyType(
     {
         CapabilityId.ANSWER_QUESTION: _CapabilityDefinition(
@@ -169,6 +178,13 @@ _CAPABILITY_DEFINITIONS: Mapping[CapabilityId, _CapabilityDefinition] = MappingP
             commerce_effect=False,
             unsafe_misroute=False,
             materialize=_materialize_order_status,
+        ),
+        CapabilityId.READ_ORDER_TOTAL: _CapabilityDefinition(
+            meaning="read the paid total for one session-placed or verified-account order.",
+            discriminators=frozenset({"order_total_selector"}),
+            commerce_effect=False,
+            unsafe_misroute=True,
+            materialize=_materialize_order_total,
         ),
         CapabilityId.LIST_ORDERS: _CapabilityDefinition(
             meaning="list session-visible or verified-account orders.",
@@ -363,6 +379,11 @@ explicit order references; focused means one live focused recent order; recent m
 recent order set. With no recent order context, use explicit so the owner gathers the target.
 When has_focused_order is true, a caller asking about their order without naming one means that
 focused order: use focused rather than making the owner ask for a reference it already holds.
+For read_order_total, order_total_selector=explicit asks the order owner to resolve one stated
+order; focused reads one live focused recent order. It is a paid-order read, not view_cart or a
+product-price question. Use focused when the caller asks what they paid for the one focused order.
+Use explicit when they identify an order or no focused order exists. The owner enforces stronger
+authorization for the paid amount than for order status; routing never grants that access.
 For list_orders, list_scope=session covers only orders placed during this call and needs no
 account; account reaches a verified account, so an unbound caller must verify first, which clears
 this call's cart and order context. When bound_customer is false, choose session unless the caller
@@ -386,10 +407,23 @@ that task normally instead. This prompt is not consent for a product or commerce
 not override an active capability, actionable product offer, or code-owned confirmation.
 With a nonempty cart, a clear question about the cart or basket total is direct view_cart; that
 owner reports live items and their total, not an amount owed or already charged. "What is my
-total?" may use view_cart when the cart is the only grounded monetary referent. A vague cost or
-amount-due question with both a cart and a product or order referent is ambiguous_intent. A clear
+total?" is direct view_cart when the cart is the only grounded monetary referent. A reminder
+of "how much it was" or "how much it will cost" also reads that live cart when there is no
+competing product or order referent; it does not claim a past payment. A vague cost or amount-due
+question with both a cart and a product or order referent is ambiguous_intent. A clear
 question about the referenced product's price goes to search_catalog; an existing order's status
 or amount belongs to its order owner. The caller's words decide when multiple referents exist.
+When a cart is nonempty and no focused existing order or product reference competes, a caller's
+prospective "my order" or checkout cost means that live cart: direct view_cart even if they do not
+say "cart". It reports the current cart total, not a payment or a promise about other charges.
+When the cart is empty and one placed order is focused, a cost recap of that completed purchase
+is read_order_total with order_total_selector=focused, even if the caller uses loose future tense
+or omits the word "order". Do not turn a prior order into a prospective cart, or a current cart
+into an already paid order. With both a cart and focused prior order, an unqualified cost pronoun
+needs clarification; an identified product's unit price belongs to search_catalog.
+An order's paid amount is read_order_total, while its progress is verify_order_status. If a vague
+"how much was it?" could refer to both a product unit price and an order total, clarify rather
+than picking one.
 Pronouns may use focused/recent only when the supplied recent context supports them.
 
 Contrastive examples:
@@ -399,6 +433,12 @@ Contrastive examples:
   {"decision":"direct","capability":"cancel_orders","cancel_selector":"explicit"}
 - ordinary, one focused recent order: "Any news on my order?" ->
   {"decision":"direct","capability":"verify_order_status","order_status_selector":"focused"}
+- ordinary, one focused recent order, no product reference: "How much did that order cost?" ->
+  {"decision":"direct","capability":"read_order_total","order_total_selector":"focused"}
+- ordinary, focused placed order, empty cart: "How much is it going to cost again?" ->
+  {"decision":"direct","capability":"read_order_total","order_total_selector":"focused"}
+- ordinary, no recent order: "What did I pay for ORD-1001?" ->
+  {"decision":"direct","capability":"read_order_total","order_total_selector":"explicit"}
 - ordinary: "Run through everything I have bought from you." ->
   {"decision":"direct","capability":"list_orders","list_scope":"account"}
 - ordinary: "Anything I have ordered since we started talking?" ->
@@ -432,6 +472,8 @@ Contrastive examples:
 - ordinary: "Leave everything as is and read my cart back." ->
   {"decision":"direct","capability":"view_cart"}
 - ordinary, cart nonempty: "What does my basket come to?" ->
+  {"decision":"direct","capability":"view_cart"}
+- ordinary, cart nonempty, no focused order or product reference: "What will my order come to?" ->
   {"decision":"direct","capability":"view_cart"}
 - ordinary, product just referenced: "How much is that jacket?" ->
   {"decision":"direct","capability":"search_catalog"}
@@ -553,7 +595,7 @@ def resolve_route(context: RoutingContext, decision: RouteDecision) -> RouteReso
             return RoutingFailure(reason="decision_rejected")
         if request.kind not in context.available_capabilities:
             return RouteDecision.clarify("unsupported_capability")
-        if isinstance(request, VerifyOrderStatus) and (
+        if isinstance(request, VerifyOrderStatus | ReadOrderTotal) and (
             (
                 isinstance(request.target, FocusedOrderSet | RecentOrderSet)
                 and context.recent_order_count == 0
@@ -562,7 +604,7 @@ def resolve_route(context: RoutingContext, decision: RouteDecision) -> RouteReso
             # asking for a reference anyway; downgrade so it asks for one deliberately.
             or (isinstance(request.target, FocusedOrderSet) and not context.has_focused_order)
         ):
-            return RouteDecision.direct(VerifyOrderStatus())
+            return RouteDecision.direct(type(request)())
         if (
             isinstance(request, CancelOrders)
             and isinstance(request.target, FocusedOrderSet)
@@ -824,6 +866,8 @@ def _routing_attempt_event(
             "router_prompt_fingerprint": attempt.prompt_fingerprint,
             "registry_fingerprint": attempt.registry_fingerprint,
             "context_projector_version": attempt.projector_version,
+            "has_product_reference": context.has_product_reference,
+            "has_offered_product": context.has_offered_product,
             "provider_call_outcome": attempt.provider_call_outcome,
         }
     )

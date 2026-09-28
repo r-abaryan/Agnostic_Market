@@ -53,6 +53,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     ModifyCart,
     PlaceOrder,
+    ReadOrderTotal,
     RecentOrderSet,
     RefundOrder,
     RequestPerson,
@@ -294,6 +295,8 @@ async def test_routing_session_resolves_and_emits_only_closed_route_fields() -> 
             "registry_fingerprint": "registry-fingerprint",
             "context_projector_version": CONTEXT_PROJECTOR_VERSION,
             "provider_call_outcome": "completed",
+            "has_product_reference": False,
+            "has_offered_product": False,
         }
     ]
     serialized = json.dumps(records)
@@ -301,6 +304,32 @@ async def test_routing_session_resolves_and_emits_only_closed_route_fields() -> 
     assert "7700" not in serialized
     assert "utterance" not in records[0]
     assert "request" not in records[0]
+
+
+async def test_routing_evidence_reports_reference_presence_without_product_identity() -> None:
+    sink = InMemoryTelemetrySink()
+    telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("reference-route")
+    recognizer = _RecordingRecognizer(_attempt(RouteDecision.direct(ModifyCart(operation="add"))))
+    routing = RoutingSession(
+        recognizer,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=1),
+        registry=_registry(ModifyCart),
+        telemetry=telemetry.routing_evidence,
+    )
+    state = ReasoningState(
+        consumed_turn_ids=("price-turn", "add-turn"),
+        product_offer=ProductOffer(skus=("SKU-BLU-07",), turn_id="price-turn"),
+        product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="price-turn"),
+    )
+    turn = CommittedTurn(text="Add that product", message_id="add-turn")
+
+    await routing.resolve(turn, state)
+
+    assert sink.records[0].attributes["has_product_reference"] is True
+    assert sink.records[0].attributes["has_offered_product"] is True
+    assert "SKU-BLU-07" not in json.dumps(sink.records[0].flattened())
 
 
 async def test_routing_projection_failure_calls_no_recognizer() -> None:
@@ -370,6 +399,15 @@ def test_route_resolver_normalizes_recent_order_selector_without_recent_context(
         context,
         RouteDecision.direct(VerifyOrderStatus(target=target)),
     ) == RouteDecision.direct(VerifyOrderStatus())
+
+
+def test_order_total_focused_selector_requires_a_focused_order() -> None:
+    context = _context(CapabilityId.READ_ORDER_TOTAL)
+
+    assert resolve_route(
+        context,
+        RouteDecision.direct(ReadOrderTotal(target=FocusedOrderSet())),
+    ) == RouteDecision.direct(ReadOrderTotal())
 
 
 @pytest.mark.parametrize(
@@ -461,6 +499,22 @@ def test_route_materializer_covers_every_capability_from_one_coarse_contract() -
                 order_status_selector="recent",
             ),
             VerifyOrderStatus(target=RecentOrderSet()),
+        ),
+        (
+            RouteProposal(
+                decision="direct",
+                capability=CapabilityId.READ_ORDER_TOTAL,
+                order_total_selector="explicit",
+            ),
+            ReadOrderTotal(),
+        ),
+        (
+            RouteProposal(
+                decision="direct",
+                capability=CapabilityId.READ_ORDER_TOTAL,
+                order_total_selector="focused",
+            ),
+            ReadOrderTotal(target=FocusedOrderSet()),
         ),
         (
             RouteProposal(
@@ -601,7 +655,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "80bb783df1bce2bececb2591b552cc70df522b1330645c518c64512ee34f68c1"
+        "405c443e3566ebbdad69a378630040bd1c0d49b678492727df16f6b3fd0f2fad"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -850,6 +904,7 @@ def test_unsafe_misroute_targets_cover_effects_and_session_control() -> None:
             CapabilityId.SWITCH_ACCOUNT,
             CapabilityId.ABORT_CURRENT,
             CapabilityId.REQUEST_PERSON,
+            CapabilityId.READ_ORDER_TOTAL,
         }
         == UNSAFE_MISROUTE_CAPABILITIES
     )

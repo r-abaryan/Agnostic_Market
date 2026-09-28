@@ -288,7 +288,7 @@ def order_read_allowed(
     guest_orders: GuestOrderScope,
     identity: CallerIdentityStore,
 ) -> bool:
-    """May this session read that order? The ONE order-read authorization check — the
+    """May this session read that order? The shared status/details read check — the
     Voice tool, Frontline render/forced-status paths, and Support candidate filters all call
     THIS (the shared-predicate stance: two independent computations would drift, and a drifted
     render or prompt path would leak around the tool's gate).
@@ -322,6 +322,34 @@ def order_mutation_allowed(
     that the caller either placed the order THIS session (per-session store — no cross-caller
     path) or is OTP-BOUND to the customer that owns it (SECURITY §7d). An unbound caller who
     fails this is routed into the identity OTP flow, not granted (support/flow.py)."""
+    return _order_session_or_bound_owner_allowed(
+        order_id, store=store, guest_orders=guest_orders, identity=identity
+    )
+
+
+def order_total_read_allowed(
+    order_id: str,
+    *,
+    store: OrderPort,
+    guest_orders: GuestOrderScope,
+    identity: CallerIdentityStore,
+) -> bool:
+    """Paid totals require this session's placement or a bound owning principal.
+
+    Keep paid-total and mutation gates separate so call sites declare their security purpose.
+    """
+    return _order_session_or_bound_owner_allowed(
+        order_id, store=store, guest_orders=guest_orders, identity=identity
+    )
+
+
+def _order_session_or_bound_owner_allowed(
+    order_id: str,
+    *,
+    store: OrderPort,
+    guest_orders: GuestOrderScope,
+    identity: CallerIdentityStore,
+) -> bool:
     if store.is_guest_order(order_id, guest_orders):
         return True
     bound = identity.current()

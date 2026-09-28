@@ -201,6 +201,64 @@ test("simulation diagnostics expose only the closed operational fields", () => {
   );
 });
 
+test("product-reference diagnostics expose only bounded counts and slot presence", () => {
+  const lines = simulationDiagnostics({
+    routing_records: [
+      {
+        event: "semantic_route",
+        attributes: { has_product_reference: true, has_offered_product: false, sku: "private-sku" },
+      },
+      {
+        event: "catalog_reference",
+        attributes: {
+          prior_reference_count: 1,
+          model_reference_count: 1,
+          model_offer_count: 1,
+          spoken_product_count: 0,
+          eligible_reference_count: 1,
+          recorded_reference_count: 1,
+          recorded_offer_count: 0,
+          answer: "private answer",
+        },
+      },
+    ],
+    operational_records: [
+      {
+        event: "cart_selector_outcome",
+        attributes: {
+          operation: "add",
+          attempt: 1,
+          available_reference_count: 1,
+          selector_outcome: "clarification_requested",
+          sku: "private-sku",
+        },
+      },
+      {
+        event: "cart_slot_proposal",
+        attributes: {
+          operation: "add",
+          model_item_supplied: false,
+          model_quantity_supplied: true,
+          retained_item_resolved: false,
+          retained_quantity_present: true,
+          slot_complete: false,
+          utterance: "private utterance",
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(lines, [
+    "semantic_route | has_product_reference=true | has_offered_product=false",
+    "catalog_reference | prior_reference_count=1 | model_reference_count=1 | model_offer_count=1 | spoken_product_count=0 | eligible_reference_count=1 | recorded_reference_count=1 | recorded_offer_count=0",
+    "cart_selector_outcome | operation=add | attempt=1 | available_reference_count=1 | selector_outcome=clarification_requested",
+    "cart_slot_proposal | operation=add | model_item_supplied=false | model_quantity_supplied=true | retained_item_resolved=false | retained_quantity_present=true | slot_complete=false",
+  ]);
+  for (const secret of ["private-sku", "private answer", "private utterance"]) {
+    assert.equal(lines.join(" ").includes(secret), false);
+  }
+});
+
 test("changing merchants clears every tenant-bound workspace value", () => {
   const state = {
     merchantId: "acme_store",
@@ -395,7 +453,18 @@ function fakeMedia({ onNode } = {}) {
       language: "en-US",
       mediaDevices: {
         async getUserMedia() {
-          const track = { stopped: false, stop() { this.stopped = true; } };
+          const track = {
+            stopped: false,
+            stop() { this.stopped = true; },
+            getSettings() {
+              return {
+                sampleRate: 48000,
+                echoCancellation: true,
+                noiseSuppression: true,
+                deviceId: "do-not-report-device-id",
+              };
+            },
+          };
           tracks.push(track);
           // Resolve on a later tick so a second call can start while this one is pending.
           await new Promise((resolve) => setTimeout(resolve, 5));
@@ -515,6 +584,82 @@ test("hands-free speech interrupts playback without mistaking low-level echo for
   assert.deepEqual(heard, ["another question"]);
   await voice.reset();
   assert.ok(tracks.every((track) => track.stopped));
+});
+
+test("opt-in voice diagnostics locate arming, low levels, barge-in, and STT without content", async () => {
+  let captureNode;
+  fakeMedia({ onNode: (node) => { captureNode = node; } });
+  globalThis.AudioContext.prototype.decodeAudioData = async () => ({});
+  globalThis.AudioContext.prototype.createBufferSource = () => ({
+    connect() {}, start() {}, stop() {},
+  });
+  globalThis.AudioContext.prototype.destination = {};
+  const module = await import(
+    `../../src/agnostic_market/management/ui/assets/voice.js?stub=diagnostic-trace`
+  );
+  const events = [];
+  const voice = module.createVoiceController({
+    api: {
+      synthesizeSpeech: async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }),
+      transcribeCapture: async () => ({ text: "private caller words" }),
+    },
+    tenantId: () => "private-tenant",
+    versionId: () => "private-version",
+    onDiagnostic: (record) => events.push(record),
+  });
+
+  assert.equal(await voice.speak("private assistant words"), true);
+  assert.equal(await voice.listen({ autoSendOnSilence: true, monitorPlayback: true }), true);
+  const low = Float32Array.from({ length: 160 }, () => 0.02);
+  for (let index = 0; index < 30; index += 1) captureNode.port.onmessage({ data: low });
+  assert.equal(voice.state, "barge-ready");
+  const speech = Float32Array.from({ length: 160 }, () => 0.12);
+  for (let index = 0; index < 30; index += 1) captureNode.port.onmessage({ data: speech });
+  for (let index = 0; index < 90; index += 1) {
+    captureNode.port.onmessage({ data: new Float32Array(160) });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const phases = events.map((record) => record.phase);
+  for (const phase of [
+    "synthesis_start", "playback_start", "capture_request", "capture_ready",
+    "barge_level", "barge_trigger", "transcription_start", "transcription_result",
+  ]) assert.ok(phases.includes(phase), phase);
+  const ready = events.find((record) => record.phase === "capture_ready");
+  assert.equal(ready.track_sample_rate, 48000);
+  assert.equal(ready.context_sample_rate, 16000);
+  assert.equal(ready.echo_cancellation, true);
+  assert.equal(ready.noise_suppression, true);
+  assert.ok(events.some((record) => record.phase === "barge_level" && record.peak_rms < 0.05));
+  assert.equal(events.find((record) => record.phase === "transcription_result").has_text, true);
+  const serialized = JSON.stringify(events);
+  for (const secret of [
+    "private assistant words", "private caller words", "private-tenant", "private-version",
+    "do-not-report-device-id",
+  ]) assert.equal(serialized.includes(secret), false, secret);
+  await voice.reset();
+});
+
+test("a failing diagnostic observer cannot stop voice capture", async () => {
+  fakeMedia();
+  const module = await import(
+    `../../src/agnostic_market/management/ui/assets/voice.js?stub=diagnostic-observer`
+  );
+  let observed = 0;
+  const voice = module.createVoiceController({
+    api: {},
+    tenantId: () => "t",
+    versionId: () => "v",
+    onDiagnostic() {
+      observed += 1;
+      throw new Error("diagnostic sink unavailable");
+    },
+  });
+
+  assert.equal(await voice.listen(), true);
+  assert.ok(observed > 0);
+  assert.equal(voice.state, "listening");
+  await voice.reset();
 });
 
 test("a completed reply continues on the already-open hands-free microphone", async () => {

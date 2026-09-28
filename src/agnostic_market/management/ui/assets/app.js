@@ -17,6 +17,17 @@ import {
 } from "./voice.js";
 
 const api = new ManagementApi();
+const voiceDiagnosticsEnabled =
+  new URLSearchParams(window.location.search).get("voice_diagnostics") === "1";
+
+function reportVoiceDiagnostic(record) {
+  if (!voiceDiagnosticsEnabled) return;
+  try {
+    console.info("[voice-preview]", record);
+  } catch {
+    // Console diagnostics must not affect the preview turn.
+  }
+}
 
 const state = {
   merchantId: "",
@@ -169,6 +180,7 @@ const voice = createVoiceController({
     if (category === "capture" || category === "transcription") state.handsFreeArmed = false;
     syncVoiceAvailability();
   },
+  onDiagnostic: voiceDiagnosticsEnabled ? reportVoiceDiagnostic : undefined,
 });
 
 function speakLatestReply(replies) {
@@ -228,10 +240,27 @@ function queueHandsFreeListen() {
 }
 
 function queueHandsFreeMonitor() {
-  if (!state.handsFreeArmed || state.busy || !state.simulation) return;
+  const eligible = state.handsFreeArmed && !state.busy && Boolean(state.simulation);
+  reportVoiceDiagnostic({
+    phase: "monitor_queue",
+    at_ms: Math.round(performance.now()),
+    eligible,
+    armed: state.handsFreeArmed,
+    busy: state.busy,
+    simulation_active: Boolean(state.simulation),
+  });
+  if (!eligible) return;
   queueMicrotask(() => {
-    if (state.handsFreeArmed && !state.busy && state.simulation &&
-        voice.state === "speaking" && !voice.acquiring) {
+    const canStart = state.handsFreeArmed && !state.busy && Boolean(state.simulation) &&
+      voice.state === "speaking" && !voice.acquiring;
+    reportVoiceDiagnostic({
+      phase: "monitor_decision",
+      at_ms: Math.round(performance.now()),
+      started: canStart,
+      voice_state: voice.state,
+      acquiring: voice.acquiring,
+    });
+    if (canStart) {
       void voice.listen({ autoSendOnSilence: true, monitorPlayback: true });
     }
   });

@@ -26,6 +26,7 @@ cases:
         - converse
         - disclose_ai_identity
         - verify_order_status
+        - read_order_total
         - abort_current
         - request_person
     expected:
@@ -59,6 +60,139 @@ cases:
       request:
         kind: verify_order_status
         target: { selector: recent }
+
+  - case_id: order_total_focused
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: acceptance
+    context:
+      <<: *base_context
+      utterance: "How much did I pay for the order I just placed?"
+      recent_order_operation: place
+      recent_order_count: 1
+      has_focused_order: true
+    expected:
+      decision: direct
+      request: { kind: read_order_total, target: { selector: focused } }
+
+  - case_id: order_total_explicit
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What did I pay for ORD-1001?"
+    expected:
+      decision: direct
+      request: { kind: read_order_total, target: null }
+
+  - case_id: order_total_vs_product_price
+    scenario_class: counterfactual
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: acceptance
+    context:
+      <<: *base_context
+      utterance: "How much was it?"
+      recent_order_operation: place
+      recent_order_count: 1
+      has_focused_order: true
+      has_product_reference: true
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: development_prospective_order_cart_total
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What will this order come to?"
+      cart_state: nonempty
+    expected:
+      decision: direct
+      request: { kind: view_cart }
+
+  - case_id: development_cart_cost_recap
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Remind me what my checkout would come to"
+      cart_state: nonempty
+    expected:
+      decision: direct
+      request: { kind: view_cart }
+
+  - case_id: development_elliptical_cart_cost_recap
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "Remind me how much that was again"
+      cart_state: nonempty
+    expected:
+      decision: direct
+      request: { kind: view_cart }
+
+  - case_id: development_placed_order_cost_recap
+    scenario_class: direct
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "How much is that going to cost again?"
+      recent_order_operation: place
+      recent_order_count: 1
+      has_focused_order: true
+    expected:
+      decision: direct
+      request: { kind: read_order_total, target: { selector: focused } }
+
+  - case_id: development_cost_cart_with_prior_order
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: account_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "How much was it?"
+      cart_state: nonempty
+      recent_order_operation: read
+      recent_order_count: 1
+      has_focused_order: true
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
+
+  - case_id: development_unit_price_with_cart
+    scenario_class: adversarial
+    risk_class: *critical
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "What does that pair cost each?"
+      cart_state: nonempty
+      has_product_reference: true
+    expected:
+      decision: direct
+      request: { kind: search_catalog, query: null }
+
+  - case_id: development_no_monetary_referent
+    scenario_class: clarification
+    risk_class: *critical
+    risk_domain: commerce_read
+    evaluation_split: *development
+    context:
+      <<: *base_context
+      utterance: "How much will this cost?"
+    expected: { decision: clarify, clarification_reason: ambiguous_intent }
 
   - case_id: list_session_orders
     scenario_class: direct

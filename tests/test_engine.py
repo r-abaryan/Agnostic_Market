@@ -2002,7 +2002,7 @@ async def test_cancelled_cart_capability_entry_reviews_cart_and_consumes_queued_
 ) -> None:
     reasoning = _BlockingFirstResponseModel(
         force_tool="request_cart_clarification",
-        canned_args={"request_cart_clarification": {"detail": "item"}},
+        canned_args={"request_cart_clarification": {}},
         tool_call_limit=1,
     )
     recognizer = _DeterministicRoutingRecognizer(

@@ -329,6 +329,8 @@ export function simulationMessages(events) {
 const DIAGNOSTIC_ATTRIBUTE_KEYS = [
   "decision",
   "capability",
+  "has_product_reference",
+  "has_offered_product",
   "clarification_reason",
   "failure_reason",
   "provider_call_outcome",
@@ -338,6 +340,22 @@ const DIAGNOSTIC_ATTRIBUTE_KEYS = [
   "action",
   "disposition",
   "latency_ms",
+  "prior_reference_count",
+  "model_reference_count",
+  "model_offer_count",
+  "spoken_product_count",
+  "eligible_reference_count",
+  "recorded_reference_count",
+  "recorded_offer_count",
+  "operation",
+  "attempt",
+  "available_reference_count",
+  "selector_outcome",
+  "model_item_supplied",
+  "model_quantity_supplied",
+  "retained_item_resolved",
+  "retained_quantity_present",
+  "slot_complete",
 ];
 
 export function simulationDiagnostics(result) {

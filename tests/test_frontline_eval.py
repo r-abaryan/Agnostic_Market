@@ -50,6 +50,7 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     OrderTargetProposal,
     PlaceOrder,
+    ReadOrderTotal,
     RefundOrder,
     RequestPerson,
     RouteDecision,
@@ -141,6 +142,10 @@ def _proposal_payload_for_expected(
                 "explicit"
                 if target is None or target.selector == "explicit_set"
                 else target.selector
+            )
+        elif isinstance(request, ReadOrderTotal):
+            payload["order_total_selector"] = (
+                "focused" if isinstance(request.target, FocusedOrderSet) else "explicit"
             )
     proposal = RouteProposal.model_validate(payload)
     assert materialize_route(context, proposal) == expected
@@ -902,8 +907,8 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     corpus = _load_semantic_route_corpus(config_root / "eval" / "frontline_semantic_routes.yaml")
     by_id = {case.case_id: case for case in corpus.cases}
 
-    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 80
-    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 39
+    assert sum(case.evaluation_split == "development" for case in corpus.cases) + 1 == 88
+    assert sum(case.evaluation_split == "acceptance" for case in corpus.cases) == 41
     # Every counterfactual and asr_like case gates. Structural rule, chosen before
     # looking at any score: these are the cases that test whether the model reads
     # state rather than words, so they belong where a miss blocks.
@@ -961,6 +966,33 @@ def test_semantic_route_corpus_is_current_and_covers_closed_boundaries(
     assert all(
         by_id[case_id].expected == RouteDecision.direct(VerifyOrderStatus())
         for case_id in ("status_without_recent_context", "stop_word_order_status")
+    )
+    assert by_id["order_total_focused"].expected == RouteDecision.direct(
+        ReadOrderTotal(target=FocusedOrderSet())
+    )
+    assert by_id["order_total_explicit"].expected == RouteDecision.direct(ReadOrderTotal())
+    assert by_id["order_total_vs_product_price"].expected == RouteDecision.clarify(
+        "ambiguous_intent"
+    )
+    assert all(
+        by_id[case_id].expected == RouteDecision.direct(ViewCart())
+        for case_id in (
+            "development_prospective_order_cart_total",
+            "development_cart_cost_recap",
+            "development_elliptical_cart_cost_recap",
+        )
+    )
+    assert by_id["development_placed_order_cost_recap"].expected == RouteDecision.direct(
+        ReadOrderTotal(target=FocusedOrderSet())
+    )
+    assert by_id["development_cost_cart_with_prior_order"].expected == RouteDecision.clarify(
+        "ambiguous_intent"
+    )
+    assert by_id["development_unit_price_with_cart"].expected == RouteDecision.direct(
+        SearchCatalog()
+    )
+    assert by_id["development_no_monetary_referent"].expected == RouteDecision.clarify(
+        "ambiguous_intent"
     )
     request_person_cases = [
         case for case in corpus.cases if case.case_id.startswith("request_person_")
@@ -1249,10 +1281,10 @@ def test_structural_supplement_closes_route_and_checklist_debt_without_mutating_
     assert len(supplement.cases) == 13
     assert report["qualification"] is None
     assert report["purpose"] == "development_only"
-    assert report["canonical_route_leaf_count"] == 36
+    assert report["canonical_route_leaf_count"] == 38
     assert report["checklist"]["total_cells"] == 16
-    assert len(report["checklist"]["frozen_cells"]) == 7
-    assert len(report["checklist"]["supplement_cells"]) == 9
+    assert len(report["checklist"]["frozen_cells"]) == 8
+    assert len(report["checklist"]["supplement_cells"]) == 8
     assert report["checklist"]["uncovered_cells"] == ()
     assert {
         case.required_route_leaf
@@ -1331,7 +1363,7 @@ def test_cli_runs_structural_coverage_without_provider_construction(
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["qualification"] is None
-    assert report["canonical_route_leaf_count"] == 36
+    assert report["canonical_route_leaf_count"] == 38
     assert report["checklist"]["uncovered_cells"] == []
 
 
@@ -2424,6 +2456,7 @@ def test_route_signature_keeps_only_reviewed_coarse_discriminators() -> None:
         "cart_operation",
         "profile_field",
         "order_status_selector",
+        "order_total_selector",
         "failure_reason",
     }
 
