@@ -655,7 +655,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "405c443e3566ebbdad69a378630040bd1c0d49b678492727df16f6b3fd0f2fad"
+        "e77f0f7d9af56eb9f262e57d5b70a15f229d5415d2ff376bc61f7ad3c45b28d9"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 

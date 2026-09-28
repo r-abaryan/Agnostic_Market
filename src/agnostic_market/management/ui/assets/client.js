@@ -288,6 +288,7 @@ export function selectMerchantWorkspace(state, merchantId) {
     simulationDiagnostics: [],
     simulationLatency: null,
     pendingSimulationTurn: null,
+    lastReplyPlayback: null,
   });
 }
 
@@ -295,12 +296,18 @@ export function simulationTurnRequest(current, input, requestIdFactory) {
   if (
     current?.tenantId === input.tenantId &&
     current.simulationId === input.simulationId &&
-    current.text === input.text &&
-    current.readbackInterrupted === input.readbackInterrupted
+    current.text === input.text
   ) {
     return current;
   }
   return { ...input, requestId: requestIdFactory() };
+}
+
+export function simulationPlaybackFact(lastReply, voiceOutcome, manualInterruption) {
+  if (manualInterruption) return true;
+  if (!lastReply) return null;
+  // Text-only simulation treats a displayed reply as completed.
+  return lastReply.voiced ? voiceOutcome ?? null : false;
 }
 
 export function simulationMessages(events) {

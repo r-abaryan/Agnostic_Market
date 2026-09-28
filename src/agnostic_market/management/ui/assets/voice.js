@@ -152,6 +152,8 @@ export function createVoiceController({
   let monitoringPlayback = false;
   let promoteMonitor = null;
   let source = null;
+  // Only the latest reply has an outcome: natural end, caller interruption, or unknown.
+  let playback = null;
   let synthesisPending = false;
   let playbackAnalyser = null;
   let playbackFrame = null;
@@ -222,6 +224,10 @@ export function createVoiceController({
     get playbackActive() {
       return synthesisPending || source !== null;
     },
+    playbackOutcome(replyId) {
+      if (!playback || replyId == null) return null;
+      return playback.replyId === replyId ? playback.outcome : null;
+    },
 
     async listen({ autoSendOnSilence = false, monitorPlayback = false } = {}) {
       if (!captureSupport.input || controller.inputBlocked) return false;
@@ -231,7 +237,7 @@ export function createVoiceController({
       if (controller.state === "listening" || controller.state === "barge-ready" ||
           controller.acquiring) return false;
       monitoringPlayback = monitorPlayback && autoSendOnSilence && controller.playbackActive;
-      if (!monitoringPlayback) controller.stopSpeaking();
+      if (!monitoringPlayback) controller.stopSpeaking(true);
       stopAcknowledgeTimer();
       controller.acquiring = true;
       emitState("arming");
@@ -326,7 +332,7 @@ export function createVoiceController({
                 sustained_ms: Math.round(voicedSamples * 1000 / rate),
               });
               onBargeIn?.();
-              controller.stopSpeaking();
+              controller.stopSpeaking(true);
               emitState("listening");
             }
             return;
@@ -463,7 +469,7 @@ export function createVoiceController({
      * live for the rest of the session.
      */
     think() {
-      controller.stopSpeaking();
+      controller.stopSpeaking(true);
       stopAcknowledgeTimer();
       emitState("thinking");
       // Returned for callers that want to await teardown; the visible state is already correct.
@@ -478,9 +484,10 @@ export function createVoiceController({
       await discardCapture();
     },
 
-    async speak(text) {
+    async speak(text, replyId = null) {
       const spoken = String(text ?? "").trim();
       controller.stopSpeaking();
+      playback = replyId === null ? null : { replyId, outcome: null };
       if (!captureSupport.output || !spoken) {
         controller.acknowledge();
         return false;
@@ -527,6 +534,7 @@ export function createVoiceController({
           // clear the shared reference and leave newer audio unstoppable.
           if (mine !== playbackToken) return;
           source = null;
+          if (playback) playback.outcome = false;
           diagnostic("playback_end", { monitor_active: monitoringPlayback });
           stopPlaybackMeter();
           if (monitoringPlayback && controller.state === "barge-ready") {
@@ -570,9 +578,10 @@ export function createVoiceController({
       return true;
     },
 
-    stopSpeaking() {
+    stopSpeaking(interruptedByCaller = false) {
       // Claiming the token invalidates synthesis still in flight and retires any onended
       // belonging to the playback being stopped.
+      if (source && playback) playback.outcome = interruptedByCaller ? true : null;
       if (synthesisPending || source) {
         diagnostic("playback_cancel", { during_synthesis: synthesisPending });
       }
@@ -600,6 +609,7 @@ export function createVoiceController({
     async reset() {
       stopAcknowledgeTimer();
       controller.stopSpeaking();
+      playback = null;
       await discardCapture();
       emitState("idle");
     },

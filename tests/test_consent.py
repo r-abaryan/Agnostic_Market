@@ -2,7 +2,32 @@
 
 import pytest
 
-from agnostic_market.agents._consent import classify_consent
+from agnostic_market.agents._consent import classify_confirmation, classify_consent
+from agnostic_market.dtos.state import HandoffSource
+
+
+@pytest.mark.parametrize("cancel_action", (False, True))
+def test_unheard_confirmation_cannot_authorize_yes(cancel_action: bool) -> None:
+    decision = classify_confirmation(
+        {"text": "yes", "readback_interrupted": True},
+        cancel_action=cancel_action,
+    )
+    assert decision.verdict == "unclear"
+
+
+@pytest.mark.parametrize("source", tuple(HandoffSource))
+def test_unheard_readback_still_reaches_a_person(source: HandoffSource) -> None:
+    """Hearing the readback gates consent, never escape.
+
+    ROUTING_FAILURE_POLICY is set when routing is unavailable, which is exactly when leaving the
+    caller with a declined action and no route to a person is least acceptable.
+    """
+    decision = classify_confirmation(
+        {"text": "let me talk to someone", "handoff_source": source, "readback_interrupted": True},
+    )
+
+    assert decision.verdict == "human"
+    assert decision.handoff_source is source
 
 
 @pytest.mark.parametrize(

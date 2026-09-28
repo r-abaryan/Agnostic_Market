@@ -40,6 +40,22 @@ _ORDER_SET_CONNECTORS = frozenset({"and", "also", "plus"})
 _ORDER_SET_BLOCKERS = frozenset({"dont", "never", "no", "not", "rather", "instead"})
 # Seven digits is the shortest dialable local number accepted by the voice boundary.
 _MIN_PHONE_DIGITS = 7
+# Longer numeric replies stay with the cart owner's normal slot proposal.
+_MAX_STANDALONE_QUANTITY_DIGITS = 6
+_QUANTITY_WORDS = {
+    **{word: int(digit) for word, digit in _DIGIT_WORDS.items() if word != "oh"},
+    "ten": 10,
+}
+
+
+def standalone_quantity(text: str) -> int | None:
+    """Parse only an unambiguous, bounded quantity reply, regardless of input channel."""
+    token = text.strip().casefold().removesuffix(".").removesuffix("!").strip()
+    if token in _QUANTITY_WORDS:
+        return _QUANTITY_WORDS[token]
+    if token.isascii() and token.isdecimal() and len(token) <= _MAX_STANDALONE_QUANTITY_DIGITS:
+        return int(token)
+    return None
 
 
 def spoken_digits(text: str) -> str:

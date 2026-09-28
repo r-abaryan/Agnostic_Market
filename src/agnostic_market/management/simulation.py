@@ -393,8 +393,10 @@ class PublishedMerchantSimulator:
         *,
         request_id: str,
         text: str,
-        readback_interrupted: bool = False,
+        readback_interrupted: bool | None = False,
     ) -> SimulationTurnResult:
+        """An omitted playback fact assumes the previous text reply was received."""
+
         tenant_id, simulation_id = self._key(tenant_id, simulation_id)
         request_id = _AUTHORITY.validate_python(request_id, strict=True)
         opened = await self._require_open(tenant_id, simulation_id)

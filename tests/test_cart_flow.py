@@ -437,6 +437,46 @@ async def test_item_first_cart_proposal_asks_for_the_missing_quantity(
     assert cart.is_empty()
 
 
+@pytest.mark.parametrize("answer", ("1", "one", "One."))
+async def test_standalone_quantity_answer_completes_fixed_cart_item_without_model_clarification(
+    config_root: Path,
+    answer: str,
+) -> None:
+    jacket = next(
+        product
+        for product in load_catalog_fixture(config_root, "acme_store").products
+        if "jacket" in product.name
+    )
+    selector = FakeChatModel(
+        force_tool="request_cart_clarification",
+        canned_args={"request_cart_clarification": {}},
+    )
+    graph, _store, cart = _build(config_root, reasoning=selector)
+    turn_id = "fixed-item-quantity"
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content=answer, id=turn_id)],
+            "consumed_turn_ids": (turn_id,),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add", item=ResolvedCartItemRef(sku=jacket.sku)),
+                opened_turn_id=turn_id,
+            ),
+        },
+        _CFG,
+    )
+
+    paused = graph.get_state(_CFG)
+    assert paused.interrupts[0].value == f"Just to confirm: add 1 of {jacket.name} to your cart?"
+    assert paused.values["pending_cart_mutation"].sku == jacket.sku
+    assert selector.invoke_count == 0
+    assert cart.is_empty()
+
+    await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
+    assert cart.view()[0].sku == jacket.sku
+    assert cart.view()[0].quantity == 1
+
+
 async def test_quantity_proposal_preserves_unresolved_item_choices(
     config_root: Path,
 ) -> None:

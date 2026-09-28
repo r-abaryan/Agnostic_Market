@@ -50,6 +50,7 @@ from agnostic_market.commerce.orders import (
     RecentOrderContext,
     speak_lines,
 )
+from agnostic_market.commerce.spoken import standalone_quantity
 from agnostic_market.dtos.confirmation import (
     ToolConfirmationPolicy,
     validate_confirmation_rendering,
@@ -435,6 +436,25 @@ def build_cart_nodes(
                 return clarify("item")
         else:
             live_item = None
+
+        # After the item is fixed, a bare numeric answer to the quantity question needs no
+        # model interpretation. Typed digits and spoken number words share this same path.
+        if (
+            request.operation in {"add", "set_quantity"}
+            and isinstance(request.item, ResolvedCartItemRef)
+            and request.quantity is None
+        ):
+            current_user_message = state.current_committed_user_message()
+            if current_user_message is not None and isinstance(current_user_message.content, str):
+                quantity = standalone_quantity(current_user_message.content)
+                if quantity is not None and (request.operation != "add" or quantity > 0):
+                    retain(
+                        ModifyCart(
+                            operation=request.operation,
+                            item=request.item,
+                            quantity=quantity,
+                        )
+                    )
 
         if selecting_item or not request.is_slot_complete():
             proposal_tool = provide_cart_slots

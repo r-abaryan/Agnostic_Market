@@ -1713,6 +1713,26 @@ async def test_unknown_readback_completion_cannot_authorize_placement(config_roo
     assert any(isinstance(event, InterruptEvent) for event in events)
 
 
+@pytest.mark.parametrize("playback_fact", (True, None))
+async def test_unheard_retry_cannot_authorize_placement(
+    config_root: Path, playback_fact: bool | None
+) -> None:
+    engine, store = _engine(config_root, cart=_checkout_cart())
+    await _pause_at_confirmation(engine)
+
+    first = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+    assert any(isinstance(event, InterruptEvent) for event in first)
+    second = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+
+    assert store.placed_count == 0
+    assert not await engine.apending_interrupt()
+    assert any(
+        "won't place" in event.text.lower()
+        for event in second
+        if isinstance(event, SpokenMessageEvent)
+    )
+
+
 async def test_unclear_answer_reconfirms_once_then_cancels(config_root: Path) -> None:
     engine, store = _engine(config_root, cart=_checkout_cart())
     await _pause_at_confirmation(engine)

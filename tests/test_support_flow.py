@@ -373,6 +373,21 @@ async def test_refund_reconfirmation_repeats_policy_fields_before_refunding(
     assert store.refund_count == 1
 
 
+@pytest.mark.parametrize("playback_fact", (True, None))
+async def test_unheard_refund_retry_does_not_move_money(
+    config_root: Path, playback_fact: bool | None
+) -> None:
+    engine, store, _, _ = _engine(config_root, thread_id=f"refund-unheard-retry-{playback_fact}")
+    await _pause_at_otp(engine)
+    await _events(engine, _CUST2_OTP)
+    await _events(engine, "yes", TurnFacts(readback_interrupted=True))
+
+    await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+
+    assert store.refund_count == 0
+    assert not await engine.apending_interrupt()
+
+
 async def test_refund_accepts_supported_natural_affirmation(config_root: Path) -> None:
     engine, store, _, _ = _engine(config_root, thread_id="refund-natural-affirmation")
     await _pause_at_otp(engine)
@@ -538,6 +553,23 @@ async def test_cancel_barged_readback_reconfirms_before_voiding(config_root: Pat
     assert "yes or no" in reconfirms[0].prompt.lower()
     await _events(engine, "yes")  # a clean committed yes voids it
     assert store.cancel_count == 1
+
+
+@pytest.mark.parametrize("playback_fact", (True, None))
+async def test_unheard_cancel_retry_keeps_order(
+    config_root: Path, playback_fact: bool | None
+) -> None:
+    engine, store, _, _ = _cancel_engine(
+        config_root, _CANCEL_PROCESSING, thread_id=f"cancel-unheard-retry-{playback_fact}"
+    )
+    await _events(engine, "cancel my rain jacket order")
+    await _events(engine, "yes", TurnFacts(readback_interrupted=True))
+
+    await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+
+    assert store.cancel_count == 0
+    assert store.order_status("ORD-1002") == "processing"
+    assert not await engine.apending_interrupt()
 
 
 async def test_cancel_is_idempotent_across_double_resume(config_root: Path) -> None:

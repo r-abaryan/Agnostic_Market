@@ -377,7 +377,7 @@ owner gather its slot.
 For verify_order_status, order_status_selector=explicit means the owner must extract or ask for
 explicit order references; focused means one live focused recent order; recent means the complete
 recent order set. With no recent order context, use explicit so the owner gathers the target.
-When has_focused_order is true, a caller asking about their order without naming one means that
+When has_focused_order is true, a caller asking about their one order without naming it means that
 focused order: use focused rather than making the owner ask for a reference it already holds.
 For read_order_total, order_total_selector=explicit asks the order owner to resolve one stated
 order; focused reads one live focused recent order. It is a paid-order read, not view_cart or a
@@ -390,6 +390,11 @@ this call's cart and order context. When bound_customer is false, choose session
 explicitly asks for their account or their past history: the session answer already offers
 verification, so it costs the caller nothing and discards nothing. When bound_customer is true,
 follow what they asked for.
+For a request about the status of "my orders" in the plural without stated order references, use
+list_orders to enumerate the authorized scope and each order's current status. A focused or recent
+status selector only covers the latest focused order or the latest bounded operation, not every
+order placed during the call. Use verify_order_status for one order or a specified recent set,
+including "those orders" after a list; that owner gives detailed progress for those targets.
 When has_offered_product is true, the assistant's own previous turn named specific products and the
 caller is replying to that offer. A reply that accepts it, confirms it, points at it, or asks for a
 quantity of it is direct modify_cart with cart_operation=add; the cart owner already holds which
@@ -433,6 +438,10 @@ Contrastive examples:
   {"decision":"direct","capability":"cancel_orders","cancel_selector":"explicit"}
 - ordinary, one focused recent order: "Any news on my order?" ->
   {"decision":"direct","capability":"verify_order_status","order_status_selector":"focused"}
+- ordinary, one focused recent order, unbound caller: "What is the status of my orders?" ->
+  {"decision":"direct","capability":"list_orders","list_scope":"session"}
+- ordinary, two recently listed orders: "What is the status of those orders?" ->
+  {"decision":"direct","capability":"verify_order_status","order_status_selector":"recent"}
 - ordinary, one focused recent order, no product reference: "How much did that order cost?" ->
   {"decision":"direct","capability":"read_order_total","order_total_selector":"focused"}
 - ordinary, focused placed order, empty cart: "How much is it going to cost again?" ->

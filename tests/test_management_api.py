@@ -8,6 +8,7 @@ from pathlib import Path
 from shutil import copytree
 from unittest.mock import Mock
 
+import pytest
 from fastapi.testclient import TestClient
 from llm_fakes import TEST_STRUCTURED_OUTPUT_METHOD, FakeChatModel
 from routing_helpers import ArchitectureRoutingRecognizer
@@ -308,9 +309,11 @@ def test_api_preview_publish_version_diff_and_audit_flow(
     ]
 
 
+@pytest.mark.parametrize("playback_fact", [False, None])
 def test_api_runs_and_resets_an_isolated_published_version_simulation(
     tmp_path: Path,
     config_root: Path,
+    playback_fact: bool | None,
 ) -> None:
     with _simulation_client(tmp_path, config_root) as client:
         seeded = client.post(
@@ -344,7 +347,7 @@ def test_api_runs_and_resets_an_isolated_published_version_simulation(
                 "schema_version": 1,
                 "request_id": "turn-1",
                 "text": "What is your return policy?",
-                "readback_interrupted": False,
+                "readback_interrupted": playback_fact,
             },
         )
         state = client.get("/v1/merchants/acme_store/simulations/demo/state")
@@ -354,7 +357,16 @@ def test_api_runs_and_resets_an_isolated_published_version_simulation(
                 "schema_version": 1,
                 "request_id": "turn-1",
                 "text": "What is your return policy?",
-                "readback_interrupted": False,
+                "readback_interrupted": playback_fact,
+            },
+        )
+        fact_conflict = client.post(
+            "/v1/merchants/acme_store/simulations/demo/turns",
+            json={
+                "schema_version": 1,
+                "request_id": "turn-1",
+                "text": "What is your return policy?",
+                "readback_interrupted": None if playback_fact is False else False,
             },
         )
         conflict = client.post(
@@ -363,7 +375,7 @@ def test_api_runs_and_resets_an_isolated_published_version_simulation(
                 "schema_version": 1,
                 "request_id": "turn-1",
                 "text": "Show me the catalog.",
-                "readback_interrupted": False,
+                "readback_interrupted": playback_fact,
             },
         )
         reset = client.post("/v1/merchants/acme_store/simulations/demo/reset")
@@ -384,6 +396,7 @@ def test_api_runs_and_resets_an_isolated_published_version_simulation(
     ]
     assert replay.status_code == 200
     assert replay.json()["replayed"] is True
+    assert fact_conflict.status_code == 409
     assert conflict.status_code == 409
     assert conflict.json()["code"] == "replay_conflict"
     assert reset.status_code == 200
