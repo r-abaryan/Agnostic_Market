@@ -130,6 +130,7 @@ from agnostic_market.dtos.orchestration import (
     ModifyCart,
     OrderContextOperation,
     OrderTargetProposal,
+    ReadOrderTotal,
     RecentOrderSet,
     RouteDecision,
     RouteProposal,
@@ -185,7 +186,7 @@ _SEMANTIC_ROUTE_CORPUS_SCHEMA_VERSION = "5"
 _SEMANTIC_ROUTE_STRUCTURAL_SCHEMA_VERSION = "1"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_SCHEMA_VERSION = "1"
 # 29 -> 28 on 2026-09-21: clarify(missing_target) dropped when its only case was retired.
-_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 36
+_SEMANTIC_ROUTE_CANONICAL_LEAF_COUNT = 38
 _SEMANTIC_ROUTE_REPORT_SCHEMA_VERSION = SEMANTIC_ROUTING_QUALIFICATION_SCHEMA_VERSION
 _SEMANTIC_ROUTE_REPORT_PATH = _CONFIG_ROOT / "telemetry" / "semantic_routing_report.json"
 _SEMANTIC_ROUTE_STRUCTURAL_REPORT_PATH = (
@@ -2044,6 +2045,7 @@ _ROUTE_SIGNATURE_DISCRIMINATORS = frozenset(
         "cart_operation",
         "profile_field",
         "order_status_selector",
+        "order_total_selector",
     }
 )
 _ACTUAL_ROUTE_PROPOSAL_DISCRIMINATORS = frozenset(RouteProposal.model_fields) - {
@@ -2146,6 +2148,7 @@ def _route_signature(
         "cart_operation": None,
         "profile_field": None,
         "order_status_selector": None,
+        "order_total_selector": None,
         "failure_reason": None,
     }
     if isinstance(resolution, RoutingFailure):
@@ -2182,6 +2185,10 @@ def _route_signature(
             signature["order_status_selector"] = "recent"
         else:
             signature["order_status_selector"] = "explicit"
+    elif isinstance(request, ReadOrderTotal):
+        signature["order_total_selector"] = (
+            "focused" if isinstance(request.target, FocusedOrderSet) else "explicit"
+        )
     return signature
 
 
@@ -2203,6 +2210,7 @@ def _require_producible_ground_truth(
         cart_operation=signature["cart_operation"],
         profile_field=signature["profile_field"],
         order_status_selector=signature["order_status_selector"],
+        order_total_selector=signature["order_total_selector"],
     )
     if materialize_route(context, proposal) != expected:
         raise ValueError("semantic route ground truth must be producible by the router")

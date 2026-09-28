@@ -31,6 +31,7 @@ from agnostic_market.checkpoints import (
     build_checkpointer,
     graph_contract_fingerprint,
 )
+from agnostic_market.dtos.orchestration import ActiveInvocation, FocusedOrderSet, ReadOrderTotal
 from agnostic_market.dtos.state import CheckpointSchemaError
 from agnostic_market.durability.encryption import AesGcmSessionCipher
 
@@ -155,6 +156,20 @@ def _checkpoint_cipher() -> AesGcmSessionCipher:
         active_key_version="checkpoint-key-v1",
         keys={"checkpoint-key-v1": b"c" * 32},
     )
+
+
+def test_order_total_invocation_round_trips_through_checkpoint_serializer() -> None:
+    invocation = ActiveInvocation(
+        request=ReadOrderTotal(target=FocusedOrderSet()),
+        opened_turn_id="order-total-turn",
+    )
+    serializer = build_checkpoint_serializer()
+
+    restored = serializer.loads_typed(serializer.dumps_typed(invocation))
+
+    assert isinstance(restored, ActiveInvocation)
+    assert isinstance(restored.request, ReadOrderTotal)
+    assert isinstance(restored.request.target, FocusedOrderSet)
 
 
 @pytest.mark.parametrize(

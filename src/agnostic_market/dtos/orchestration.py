@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -51,6 +51,7 @@ AssistantPromptKind = Literal["open_help"]
 ListOrderScope = Literal["session", "account"]
 CartOperation = Literal["add", "remove", "set_quantity"]
 OrderStatusRouteSelector = Literal["explicit", "focused", "recent"]
+OrderTotalRouteSelector = Literal["explicit", "focused"]
 # The router names which order the caller meant, never which order to act on: the owner
 # re-resolves focus and still confirms before any cancellation.
 CancelRouteSelector = Literal["explicit", "focused"]
@@ -80,6 +81,7 @@ class CapabilityId(StrEnum):
     CONVERSE = "converse"
     SEARCH_CATALOG = "search_catalog"
     VERIFY_ORDER_STATUS = "verify_order_status"
+    READ_ORDER_TOTAL = "read_order_total"
     LIST_ORDERS = "list_orders"
     VIEW_CART = "view_cart"
     MODIFY_CART = "modify_cart"
@@ -229,43 +231,42 @@ class SearchCatalog(IntentRequestModel):
         return self.query is not None
 
 
-class VerifyOrderStatus(IntentRequestModel):
+class OrderReadRequest(IntentRequestModel):
     model_config = _FROZEN
 
-    kind: Literal[CapabilityId.VERIFY_ORDER_STATUS] = CapabilityId.VERIFY_ORDER_STATUS
     target: OrderStatusSelector | None = None
     explicit_target_turn_id: SkipJsonSchema[NonEmptyText | None] = None
     explicit_target_confirmed: SkipJsonSchema[StrictBool] = False
 
     @model_validator(mode="after")
-    def code_owned_target_evidence_is_coherent(self) -> VerifyOrderStatus:
+    def code_owned_target_evidence_is_coherent(self) -> Self:
         if (
             self.explicit_target_turn_id is not None or self.explicit_target_confirmed
         ) and not isinstance(self.target, ExplicitOrderSet):
-            raise ValueError("only an explicit order-status target can carry caller evidence")
+            raise ValueError("only an explicit order-read target can carry caller evidence")
         if self.explicit_target_confirmed and self.explicit_target_turn_id is None:
-            raise ValueError("order-status confirmation requires its admitted source turn")
+            raise ValueError("order-read confirmation requires its admitted source turn")
         return self
 
-    def with_explicit_target_turn(self, turn_id: str) -> VerifyOrderStatus:
+    def with_explicit_target_turn(self, turn_id: str) -> Self:
         if not isinstance(self.target, ExplicitOrderSet):
-            raise ValueError("order-status target evidence requires an explicit target")
+            raise ValueError("order-read target evidence requires an explicit target")
         normalized_turn_id = turn_id.strip()
         if (
             self.explicit_target_turn_id is not None
             and self.explicit_target_turn_id != normalized_turn_id
         ):
-            raise ValueError("order-status target evidence turn cannot be replaced")
-        return VerifyOrderStatus(
+            raise ValueError("order-read target evidence turn cannot be replaced")
+        return type(self)(
             target=self.target,
             explicit_target_turn_id=normalized_turn_id,
             explicit_target_confirmed=self.explicit_target_confirmed,
         )
 
-    def with_confirmed_explicit_target(self) -> VerifyOrderStatus:
+    def with_confirmed_explicit_target(self) -> Self:
         if not isinstance(self.target, ExplicitOrderSet) or self.explicit_target_turn_id is None:
-            raise ValueError("order-status confirmation requires explicit target evidence")
-        return VerifyOrderStatus(
+            raise ValueError("order-read confirmation requires explicit target evidence")
+        return type(self)(
             target=self.target,
             explicit_target_turn_id=self.explicit_target_turn_id,
             explicit_target_confirmed=True,
@@ -273,6 +274,14 @@ class VerifyOrderStatus(IntentRequestModel):
 
     def is_slot_complete(self) -> bool:
         return self.target is not None
+
+
+class VerifyOrderStatus(OrderReadRequest):
+    kind: Literal[CapabilityId.VERIFY_ORDER_STATUS] = CapabilityId.VERIFY_ORDER_STATUS
+
+
+class ReadOrderTotal(OrderReadRequest):
+    kind: Literal[CapabilityId.READ_ORDER_TOTAL] = CapabilityId.READ_ORDER_TOTAL
 
 
 class ListOrders(_CompleteIntentRequest):
@@ -444,6 +453,7 @@ IntentRequest = Annotated[
     | Converse
     | SearchCatalog
     | VerifyOrderStatus
+    | ReadOrderTotal
     | ListOrders
     | ViewCart
     | ModifyCart
@@ -580,6 +590,7 @@ class RouteProposal(BaseModel):
     cart_operation: CartOperation | None = None
     profile_field: ProfileField | None = None
     order_status_selector: OrderStatusRouteSelector | None = None
+    order_total_selector: OrderTotalRouteSelector | None = None
 
 
 class RouteDecision(BaseModel):
@@ -612,11 +623,11 @@ class RouteDecision(BaseModel):
                 self.request.item, (CartItemChoices, ResolvedCartItemRef)
             ):
                 raise ValueError("code-owned cart selectors are minted by the owning capability")
-            if isinstance(self.request, VerifyOrderStatus) and (
+            if isinstance(self.request, OrderReadRequest) and (
                 self.request.explicit_target_turn_id is not None
                 or self.request.explicit_target_confirmed
             ):
-                raise ValueError("order-status target evidence is minted by its owning flow")
+                raise ValueError("order-read target evidence is minted by its owning flow")
         elif self.request is not None or self.clarification_reason is not None:
             raise ValueError("continue carries no payload")
         return self

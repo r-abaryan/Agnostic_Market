@@ -124,10 +124,21 @@ export function createVoiceController({
   onError,
   onLevel,
   onBargeIn,
+  onDiagnostic,
 } = {}) {
+  const nowMs = () => globalThis.performance?.now?.() ?? Date.now();
+  const diagnostic = (phase, fields = {}) => {
+    if (!onDiagnostic) return;
+    try {
+      onDiagnostic({ phase, at_ms: Math.round(nowMs()), ...fields });
+    } catch {
+      // Optional local diagnostics must not interrupt a caller turn.
+    }
+  };
   const emitState = (next) => {
     if (controller.state === next) return;
     controller.state = next;
+    diagnostic("state", { state: next });
     onState?.(next);
   };
 
@@ -234,6 +245,15 @@ export function createVoiceController({
       let quietSamples = 0;
       let speechStarted = false;
       let acquired = null;
+      let firstFrame = true;
+      let levelWindowSamples = 0;
+      let levelWindowPeak = 0;
+      let levelWindowAboveFloor = 0;
+      let levelWindowLongestRun = 0;
+      const requestedAt = nowMs();
+      diagnostic("capture_request", {
+        mode: monitoringPlayback ? "barge" : autoSendOnSilence ? "auto" : "manual",
+      });
       promoteMonitor = () => {
         blocks = [];
         capturedSamples = 0;
@@ -266,6 +286,12 @@ export function createVoiceController({
           const block = event.data;
           if (!block?.length) return;
           const rate = context?.sampleRate ?? CAPTURE_SAMPLE_RATE;
+          if (firstFrame) {
+            firstFrame = false;
+            diagnostic("capture_first_frame", {
+              since_request_ms: Math.round(nowMs() - requestedAt),
+            });
+          }
           const level = captureRms(block);
           if (controller.state === "barge-ready") {
             blocks.push(block);
@@ -274,10 +300,31 @@ export function createVoiceController({
               capturedSamples -= blocks.shift().length;
             }
             voicedSamples = level >= BARGE_RMS_FLOOR ? voicedSamples + block.length : 0;
+            if (onDiagnostic) {
+              levelWindowSamples += block.length;
+              levelWindowPeak = Math.max(levelWindowPeak, level);
+              if (level >= BARGE_RMS_FLOOR) levelWindowAboveFloor += block.length;
+              levelWindowLongestRun = Math.max(levelWindowLongestRun, voicedSamples);
+              if (levelWindowSamples >= rate / 4) {
+                diagnostic("barge_level", {
+                  peak_rms: Number(levelWindowPeak.toFixed(3)),
+                  above_floor_ms: Math.round(levelWindowAboveFloor * 1000 / rate),
+                  longest_run_ms: Math.round(levelWindowLongestRun * 1000 / rate),
+                });
+                levelWindowSamples = 0;
+                levelWindowPeak = 0;
+                levelWindowAboveFloor = 0;
+                levelWindowLongestRun = 0;
+              }
+            }
             if (voicedSamples >= rate * BARGE_CONFIRM_SECONDS) {
               speechStarted = true;
               speechDetected = true;
               monitoringPlayback = false;
+              diagnostic("barge_trigger", {
+                rms: Number(level.toFixed(3)),
+                sustained_ms: Math.round(voicedSamples * 1000 / rate),
+              });
               onBargeIn?.();
               controller.stopSpeaking();
               emitState("listening");
@@ -296,6 +343,9 @@ export function createVoiceController({
             if (voicedSamples >= rate * VOICE_CONFIRM_SECONDS) {
               speechStarted = true;
               speechDetected = true;
+              diagnostic("capture_speech_detected", {
+                sustained_ms: Math.round(voicedSamples * 1000 / rate),
+              });
             }
             return;
           }
@@ -312,6 +362,24 @@ export function createVoiceController({
           }
         };
         context.createMediaStreamSource(stream).connect(node);
+        let settings = {};
+        try {
+          const track = acquired.getAudioTracks?.()[0] ?? acquired.getTracks?.()[0];
+          settings = track?.getSettings?.() ?? {};
+        } catch {
+          // Browser settings are diagnostic data, not a capture prerequisite.
+        }
+        const echoCancellation = settings.echoCancellation;
+        diagnostic("capture_ready", {
+          since_request_ms: Math.round(nowMs() - requestedAt),
+          context_sample_rate: context.sampleRate,
+          track_sample_rate: Number.isFinite(settings.sampleRate) ? settings.sampleRate : null,
+          echo_cancellation: typeof echoCancellation === "boolean" ||
+            echoCancellation === "all" || echoCancellation === "remote-only"
+            ? echoCancellation : null,
+          noise_suppression: typeof settings.noiseSuppression === "boolean"
+            ? settings.noiseSuppression : null,
+        });
       } catch (error) {
         stopTracks(acquired);
         await teardownCapture();
@@ -319,6 +387,9 @@ export function createVoiceController({
         promoteMonitor = null;
         // A refused permission never recovers within the page; stop offering the control.
         controller.inputBlocked = error?.name === "NotAllowedError";
+        diagnostic("capture_failed", {
+          reason: controller.inputBlocked ? "permission_denied" : "capture_error",
+        });
         onError?.(
           controller.inputBlocked
             ? "Microphone permission was refused. Allow it for this site, then reload."
@@ -346,15 +417,19 @@ export function createVoiceController({
       const mine = ++captureToken;
       blocks = [];
       captureCompletionPending = true;
+      diagnostic("capture_stop", { had_speech: hadSpeech, automatic });
       emitState("thinking");
       await teardownCapture();
       if (mine !== captureToken) return "";
       const samples = resampleTo(concatSamples(captured), rate);
       if (!samples.length || (automatic && !hadSpeech)) {
         captureCompletionPending = false;
+        diagnostic("capture_empty");
         emitState("idle");
         return "";
       }
+      const transcriptionStartedAt = nowMs();
+      diagnostic("transcription_start", { sample_count: samples.length });
       try {
         const result = await api.transcribeCapture(tenantId(), versionId(), toPcm16(samples));
         // Transcription takes seconds. A close or reset during that window must win, or an
@@ -362,12 +437,19 @@ export function createVoiceController({
         if (mine !== captureToken) return "";
         captureCompletionPending = false;
         const heard = String(result?.text ?? "").trim();
+        diagnostic("transcription_result", {
+          elapsed_ms: Math.round(nowMs() - transcriptionStartedAt),
+          has_text: Boolean(heard),
+        });
         if (heard) onTranscript?.(heard);
         else emitState("idle");
         return heard;
       } catch {
         if (mine !== captureToken) return "";
         captureCompletionPending = false;
+        diagnostic("transcription_failed", {
+          elapsed_ms: Math.round(nowMs() - transcriptionStartedAt),
+        });
         onError?.("Transcription failed. The turn can still be typed.", "transcription");
         emitState("idle");
         return "";
@@ -405,12 +487,15 @@ export function createVoiceController({
       }
       const mine = ++playbackToken;
       synthesisPending = true;
+      const synthesisStartedAt = nowMs();
+      diagnostic("synthesis_start");
       let blob = null;
       try {
         blob = await api.synthesizeSpeech(tenantId(), versionId(), spoken);
       } catch {
         if (mine !== playbackToken) return false;
         synthesisPending = false;
+        diagnostic("synthesis_failed");
         onError?.("Speech synthesis failed. The reply is still shown in the transcript.", "playback");
         controller.acknowledge();
         return false;
@@ -418,6 +503,9 @@ export function createVoiceController({
       // Synthesis takes seconds. A reset or a newer reply during that window must win, or the
       // stale one starts speaking over a session that has already moved on.
       if (mine !== playbackToken) return false;
+      diagnostic("synthesis_complete", {
+        elapsed_ms: Math.round(nowMs() - synthesisStartedAt),
+      });
       const context = playbackReady();
       if (context.state === "suspended") await context.resume().catch(() => {});
       try {
@@ -439,6 +527,7 @@ export function createVoiceController({
           // clear the shared reference and leave newer audio unstoppable.
           if (mine !== playbackToken) return;
           source = null;
+          diagnostic("playback_end", { monitor_active: monitoringPlayback });
           stopPlaybackMeter();
           if (monitoringPlayback && controller.state === "barge-ready") {
             promoteMonitor?.();
@@ -449,6 +538,9 @@ export function createVoiceController({
         };
         emitState("speaking");
         source.start();
+        diagnostic("playback_start", {
+          since_synthesis_ms: Math.round(nowMs() - synthesisStartedAt),
+        });
         synthesisPending = false;
         if (playbackAnalyser) {
           const samples = new Uint8Array(playbackAnalyser.fftSize);
@@ -469,6 +561,7 @@ export function createVoiceController({
         if (mine !== playbackToken) return false;
         synthesisPending = false;
         source = null;
+        diagnostic("playback_failed");
         stopPlaybackMeter();
         onError?.("Playback failed. The reply is still shown in the transcript.", "playback");
         controller.acknowledge();
@@ -480,6 +573,9 @@ export function createVoiceController({
     stopSpeaking() {
       // Claiming the token invalidates synthesis still in flight and retires any onended
       // belonging to the playback being stopped.
+      if (synthesisPending || source) {
+        diagnostic("playback_cancel", { during_synthesis: synthesisPending });
+      }
       playbackToken += 1;
       synthesisPending = false;
       stopPlaybackMeter();

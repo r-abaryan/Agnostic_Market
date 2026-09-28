@@ -35,8 +35,8 @@ from agnostic_market.dtos.orchestration import (
     ClarificationOwner,
     IntentRequest,
     NonEmptyText,
+    OrderReadRequest,
     RouterNoActionEnvelope,
-    VerifyOrderStatus,
 )
 from agnostic_market.dtos.recovery import PendingRecovery
 
@@ -696,7 +696,7 @@ class ReasoningState(BaseModel):
             raise ValueError("active invocation opening turn was not admitted")
         if (
             invocation is not None
-            and isinstance(invocation.request, VerifyOrderStatus)
+            and isinstance(invocation.request, OrderReadRequest)
             and invocation.request.explicit_target_turn_id is not None
             and invocation.request.explicit_target_turn_id not in self.consumed_turn_ids
         ):

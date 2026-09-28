@@ -130,6 +130,7 @@ def test_route_proposal_exposes_only_coarse_ownership_fields() -> None:
         "cart_operation",
         "profile_field",
         "order_status_selector",
+        "order_total_selector",
     }
 
     assert set(RouteProposal.model_fields) == expected_fields
@@ -184,7 +185,7 @@ def test_order_status_target_confirmation_is_code_owned() -> None:
             target=ExplicitOrderSet(order_refs=("ORD-1002",)),
             explicit_target_confirmed=True,
         )
-    with pytest.raises(ValidationError, match="explicit order-status target"):
+    with pytest.raises(ValidationError, match="explicit order-read target"):
         VerifyOrderStatus(
             target=FocusedOrderSet(),
             explicit_target_turn_id="status-turn",
@@ -726,6 +727,10 @@ def test_every_capability_id_has_one_valid_intent_shape() -> None:
         CapabilityId.SEARCH_CATALOG: {"kind": "search_catalog", "query": "running shoes"},
         CapabilityId.VERIFY_ORDER_STATUS: {
             "kind": "verify_order_status",
+            "target": {"selector": "focused"},
+        },
+        CapabilityId.READ_ORDER_TOTAL: {
+            "kind": "read_order_total",
             "target": {"selector": "focused"},
         },
         CapabilityId.LIST_ORDERS: {"kind": "list_orders", "scope": "session"},

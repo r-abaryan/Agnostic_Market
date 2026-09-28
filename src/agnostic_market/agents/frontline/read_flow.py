@@ -36,6 +36,7 @@ from agnostic_market.commerce.identity import (
     CustomerDirectoryPort,
     classify_contact_claims,
     order_read_allowed,
+    order_total_read_allowed,
     try_grant_orders_by_contact,
 )
 from agnostic_market.commerce.orders import (
@@ -55,10 +56,11 @@ from agnostic_market.dtos.orchestration import (
     CatalogAnswer,
     ExplicitOrderSet,
     FocusedOrderSet,
+    OrderReadRequest,
     OrderTargetProposal,
+    ReadOrderTotal,
     RecentOrderSet,
     SearchCatalog,
-    VerifyOrderStatus,
 )
 from agnostic_market.dtos.state import (
     AssistantPrompt,
@@ -104,6 +106,10 @@ _ANSWER_CONTEXT_QUESTION = "What would you like me to explain?"
 _ANSWER_UNSUPPORTED_RETRY = (
     "Please restate that as a specific store request, including the order, product, account, "
     "or cart detail I should use."
+)
+_ORDER_TOTAL_VERIFY_LINE = (
+    "I can read an earlier order's total after account verification. "
+    "Please ask me to verify your account first."
 )
 
 
@@ -158,7 +164,7 @@ def build_read_flow_nodes(
         method=structured_output_method,
     )
 
-    def resolve_order_target(request: VerifyOrderStatus) -> tuple[str, ...] | None:
+    def resolve_order_target(request: OrderReadRequest) -> tuple[str, ...] | None:
         target = request.target
         if isinstance(target, ExplicitOrderSet):
             refs = tuple(dict.fromkeys(ref.strip().upper() for ref in target.order_refs))
@@ -170,7 +176,8 @@ def build_read_flow_nodes(
             refs = recent.order_refs if recent.complete else ()
         else:
             refs = ()
-        if not refs or len(refs) > policy.cancel_batch_max:
+        max_targets = 1 if isinstance(request, ReadOrderTotal) else policy.cancel_batch_max
+        if not refs or len(refs) > max_targets:
             return None
         if any(re.fullmatch(r"ORD-\d+", ref) is None for ref in refs):
             return None
@@ -178,15 +185,15 @@ def build_read_flow_nodes(
 
     def order_status_entry_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
-            raise TypeError("order-status entry requires a verify-order-status invocation")
+        if invocation is None or not isinstance(invocation.request, OrderReadRequest):
+            raise TypeError("order-read entry requires an order-read invocation")
         if invocation.request.target is not None:
             return Command(goto=ORDER_STATUS_FULFILL_NODE)
         return Command(goto=ORDER_STATUS_TARGET_PROPOSE_NODE)
 
     def order_status_target_ask_node(state: ReasoningState) -> dict[str, object]:
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
+        if invocation is None or not isinstance(invocation.request, OrderReadRequest):
             raise TypeError("order-status target question requires an active invocation")
         line = (
             ORDER_NUMBER_QUESTION if invocation.request.target is None else ACCOUNT_CONTACT_QUESTION
@@ -195,7 +202,7 @@ def build_read_flow_nodes(
 
     async def order_status_target_propose_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
+        if invocation is None or not isinstance(invocation.request, OrderReadRequest):
             raise TypeError("order-status proposer requires a verify-order-status invocation")
         if invocation.request.target is not None:
             raise ValueError("order-status proposer requires a missing target")
@@ -220,7 +227,7 @@ def build_read_flow_nodes(
             if not refs and identity_store.current() is None and not guest_orders.order_refs:
                 return Command(goto=ORDER_STATUS_NO_VISIBLE_ORDERS_NODE)
             return Command(goto=ORDER_STATUS_TARGET_ASK_NODE)
-        request = VerifyOrderStatus(target=ExplicitOrderSet(order_refs=refs))
+        request = type(invocation.request)(target=ExplicitOrderSet(order_refs=refs))
         return Command(
             goto=ORDER_STATUS_FULFILL_NODE,
             update={"active_invocation": invocation.with_request(request)},
@@ -228,7 +235,7 @@ def build_read_flow_nodes(
 
     def order_status_target_confirm_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
+        if invocation is None or not isinstance(invocation.request, OrderReadRequest):
             raise TypeError("order-status target confirmation requires an active invocation")
         request = invocation.request
         if (
@@ -280,7 +287,7 @@ def build_read_flow_nodes(
 
     def order_status_no_visible_orders_node(state: ReasoningState) -> dict[str, object]:
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
+        if invocation is None or not isinstance(invocation.request, OrderReadRequest):
             raise TypeError("no-visible-orders reply requires an active invocation")
         # Retained like the target ask, so a number given next turn continues this owner.
         return {"messages": [AIMessage(NO_VISIBLE_ORDERS_LINE)]}
@@ -301,8 +308,8 @@ def build_read_flow_nodes(
 
     async def order_status_fulfill_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation
-        if invocation is None or not isinstance(invocation.request, VerifyOrderStatus):
-            raise TypeError("order-status fulfilment requires a verify-order-status invocation")
+        if invocation is None or not isinstance(invocation.request, OrderReadRequest):
+            raise TypeError("order-read fulfilment requires an order-read invocation")
         order_ids = resolve_order_target(invocation.request)
         if order_ids is None:
             return Command(
@@ -339,6 +346,59 @@ def build_read_flow_nodes(
                 )
         if authorization_message is None or not isinstance(authorization_message.content, str):
             raise ValueError("order-status fulfilment requires committed caller text")
+
+        if isinstance(request, ReadOrderTotal):
+            order_id = order_ids[0]
+            if not order_total_read_allowed(
+                order_id,
+                store=order_store,
+                guest_orders=guest_orders,
+                identity=identity_store,
+            ):
+                _order_read_denied(order_ids)
+                line = (
+                    _ORDER_TOTAL_VERIFY_LINE
+                    if identity_store.current() is None
+                    else BOUND_ORDER_READ_UNAVAILABLE_LINE
+                )
+                return Command(
+                    goto=END,
+                    update={"active_invocation": None, "messages": [AIMessage(line)]},
+                )
+            total = order_store.captured_total(order_id)
+            if total is None:
+                _order_read_denied(order_ids)
+                return Command(
+                    goto=END,
+                    update={
+                        "active_invocation": None,
+                        "messages": [AIMessage(BOUND_ORDER_READ_UNAVAILABLE_LINE)],
+                    },
+                )
+            committed = await session_state.record_recent_orders(
+                recent_orders_operation_id("read", invocation.invocation_id),
+                order_ids,
+                operation="read",
+            )
+            record_capability_answered(
+                routing_telemetry,
+                authorization_message.content,
+                CapabilityId.READ_ORDER_TOTAL.value,
+                answer_source="code_authored_read",
+            )
+            return Command(
+                goto=END,
+                update={
+                    "active_invocation": None,
+                    "session_revision": committed.session_revision,
+                    "assistant_prompt": AssistantPrompt(
+                        kind="open_help", turn_id=state.consumed_turn_ids[-1]
+                    ),
+                    "messages": [
+                        AIMessage(f"Your order {order_id} total was ${total:.2f}. {warm_close()}")
+                    ],
+                },
+            )
 
         unresolved = tuple(
             order_id
@@ -532,6 +592,19 @@ def build_read_flow_nodes(
             dict.fromkeys(
                 sku for sku in (*response.referenced_skus, *offered) if sku in eligible_reference
             )
+        )
+        routing_telemetry.record(
+            {
+                "event": "catalog_reference",
+                "turn_id": state.consumed_turn_ids[-1],
+                "prior_reference_count": len(prior_skus),
+                "model_reference_count": len(response.referenced_skus),
+                "model_offer_count": len(response.offered_skus),
+                "spoken_product_count": len(unambiguous_spoken),
+                "eligible_reference_count": len(eligible_reference),
+                "recorded_reference_count": len(referenced),
+                "recorded_offer_count": len(offered),
+            }
         )
 
         record_capability_answered(

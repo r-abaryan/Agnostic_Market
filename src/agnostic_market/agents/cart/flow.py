@@ -178,8 +178,8 @@ def build_cart_nodes(
     tenant/policy bound in code at build time, never carried in conversation state)."""
 
     @tool
-    def request_cart_clarification(detail: CartClarificationDetail) -> str:
-        """Ask one platform-authored Cart question for the selected missing detail."""
+    def request_cart_clarification() -> str:
+        """Ask about the missing cart field selected by the platform."""
         raise NotImplementedError("intercepted by the capability entry; never executed")
 
     @tool
@@ -439,6 +439,22 @@ def build_cart_nodes(
         if selecting_item or not request.is_slot_complete():
             proposal_tool = provide_cart_slots
             prompt_candidates = candidates if selecting_item else number_candidates([live_item])
+            available_reference_count = len(
+                {candidate.sku for candidate in prompt_candidates} & set(referenced_skus)
+            )
+
+            def record_selector_outcome(outcome: str, attempt: int) -> None:
+                telemetry.record(
+                    {
+                        "event": "cart_selector_outcome",
+                        "turn_id": state.consumed_turn_ids[-1],
+                        "operation": request.operation,
+                        "attempt": attempt,
+                        "available_reference_count": available_reference_count,
+                        "selector_outcome": outcome,
+                    }
+                )
+
             capability_model = reasoning_model.bind_tools(
                 (proposal_tool, request_cart_clarification, leave_cart)
             )
@@ -461,6 +477,7 @@ def build_cart_nodes(
             for _attempt in range(2):
                 response = await capability_model.ainvoke(messages)
                 if not response.tool_calls:
+                    record_selector_outcome("no_tool_call", _attempt + 1)
                     return clarify("item" if selecting_item else "quantity")
                 new_messages.append(response)
                 ack_extra_tool_calls(response, new_messages)
@@ -468,6 +485,7 @@ def build_cart_nodes(
                 if call["name"] == leave_cart.name:
                     return _leave_result(new_messages, call["id"])
                 if call["name"] == request_cart_clarification.name:
+                    record_selector_outcome("clarification_requested", _attempt + 1)
                     new_messages.append(
                         ToolMessage("cart clarification requested", tool_call_id=call["id"])
                     )
@@ -499,6 +517,7 @@ def build_cart_nodes(
                             quantity=quantity,
                         )
                     except (TypeError, ValueError):
+                        record_selector_outcome("invalid_proposal", _attempt + 1)
                         new_messages.append(
                             ToolMessage(
                                 "The proposal was invalid. Send only fields the caller "
@@ -512,14 +531,31 @@ def build_cart_nodes(
                         ToolMessage("cart request updated", tool_call_id=call["id"])
                     )
                     retain(updated)
-                    if not request.is_slot_complete():
-                        return clarify("quantity")
+                    slot_complete = request.is_slot_complete()
+                    telemetry.record(
+                        {
+                            "event": "cart_slot_proposal",
+                            "turn_id": state.consumed_turn_ids[-1],
+                            "operation": request.operation,
+                            "model_item_supplied": proposal.candidate_key is not None,
+                            "model_quantity_supplied": proposal.quantity is not None,
+                            "retained_item_resolved": isinstance(request.item, ResolvedCartItemRef),
+                            "retained_quantity_present": request.quantity is not None,
+                            "slot_complete": slot_complete,
+                        }
+                    )
+                    if not slot_complete:
+                        missing_item = request.item is None or isinstance(
+                            request.item, CartItemChoices
+                        )
+                        return clarify("item" if missing_item else "quantity")
                     break
                 if call["name"] not in {
                     expected_tool,
                     request_cart_clarification.name,
                     leave_cart.name,
                 }:
+                    record_selector_outcome("unexpected_tool", _attempt + 1)
                     new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_cart.name))
                     messages = [prompt, current_user_message, *new_messages]
                     continue

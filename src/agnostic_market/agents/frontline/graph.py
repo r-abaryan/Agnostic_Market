@@ -87,6 +87,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     ModifyCart,
     PlaceOrder,
+    ReadOrderTotal,
     RefundOrder,
     RequestPerson,
     ReturnOrder,
@@ -135,6 +136,7 @@ _CONVERSE_LINES: Mapping[str, str] = MappingProxyType(
 _CAPABILITY_CALLER_PHRASES: Mapping[CapabilityId, str] = MappingProxyType(
     {
         CapabilityId.VERIFY_ORDER_STATUS: "check an order",
+        CapabilityId.READ_ORDER_TOTAL: "read an order total",
         CapabilityId.LIST_ORDERS: "go through your orders",
         CapabilityId.CANCEL_ORDERS: "cancel an order",
         CapabilityId.REFUND_ORDER: "arrange a refund",
@@ -227,6 +229,7 @@ def build_frontline_capability_registry() -> CapabilityRegistry:
                 VerifyOrderStatus,
                 order_status_entry,
             ),
+            CapabilitySpec(CapabilityId.READ_ORDER_TOTAL, ReadOrderTotal, order_status_entry),
             CapabilitySpec(
                 CapabilityId.ABORT_CURRENT,
                 AbortCurrent,

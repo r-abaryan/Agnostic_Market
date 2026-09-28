@@ -18,6 +18,7 @@ from agnostic_market.commerce.identity import (
     load_customers_fixture,
     order_mutation_allowed,
     order_read_allowed,
+    order_total_read_allowed,
     try_grant_orders_by_contact,
 )
 from agnostic_market.commerce.orders import GuestOrderScope, OrderStore, load_orders_fixture
@@ -227,6 +228,48 @@ def test_order_read_allowed_is_the_one_shared_check(config_root: Path) -> None:
     )
     guest_orders.record(placed.order_id)
     assert order_read_allowed(
+        placed.order_id,
+        store=store,
+        guest_orders=guest_orders,
+        identity=CallerIdentityStore(),
+    )
+
+
+def test_order_total_requires_session_placement_or_bound_owner(config_root: Path) -> None:
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="total-read")
+    identity = CallerIdentityStore()
+
+    assert not order_total_read_allowed(
+        "ORD-1001", store=store, guest_orders=guest_orders, identity=identity
+    )
+    identity.grant_orders("ORD-1001")
+    assert order_read_allowed("ORD-1001", store=store, guest_orders=guest_orders, identity=identity)
+    assert not order_total_read_allowed(
+        "ORD-1001", store=store, guest_orders=guest_orders, identity=identity
+    )
+
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    assert order_total_read_allowed(
+        "ORD-1001", store=store, guest_orders=guest_orders, identity=identity
+    )
+    assert not order_total_read_allowed(
+        "ORD-1002", store=store, guest_orders=guest_orders, identity=identity
+    )
+
+    placed = store.place_cart(
+        "total-read-placement",
+        lines=[CartLine(sku="SKU-GRN-15", name="socks", price_usd=14.5, quantity=2)],
+        total_usd=29.0,
+    )
+    assert not order_total_read_allowed(
+        placed.order_id,
+        store=store,
+        guest_orders=guest_orders,
+        identity=CallerIdentityStore(),
+    )
+    guest_orders.record(placed.order_id)
+    assert order_total_read_allowed(
         placed.order_id,
         store=store,
         guest_orders=guest_orders,

@@ -86,6 +86,7 @@ from agnostic_market.dtos.orchestration import (
     ListOrders,
     ModifyCart,
     PlaceOrder,
+    ReadOrderTotal,
     RecentOrderSet,
     RequestPerson,
     ResolvedCartItemRef,
@@ -101,6 +102,7 @@ from agnostic_market.dtos.recovery import AbandonmentKind, ExceptionAction
 from agnostic_market.dtos.state import (
     AssistantPrompt,
     CartClarification,
+    CartLine,
     ClarificationLiveness,
     HandoffSource,
     PendingAck,
@@ -367,6 +369,7 @@ def test_support_capability_registry_and_dispatch_topology_are_closed(
         CapabilityId.CONVERSE,
         CapabilityId.DISCLOSE_AI_IDENTITY,
         CapabilityId.VERIFY_ORDER_STATUS,
+        CapabilityId.READ_ORDER_TOTAL,
         CapabilityId.ABORT_CURRENT,
         CapabilityId.REQUEST_PERSON,
     )
@@ -1714,6 +1717,10 @@ async def test_catalog_owner_records_only_skus_the_live_catalog_supplied(
     assert _only_spoken(result) == "We have trail running shoes at $89.99."
     assert result["product_offer"].skus == ("SKU-RED-42",)
     assert result["product_offer"].turn_id == "catalog-offer"
+    offer_record = next(row for row in _rows(graph) if row["event"] == "catalog_reference")
+    assert offer_record["model_offer_count"] == 2
+    assert offer_record["recorded_offer_count"] == 1
+    assert "SKU-RED-42" not in str(offer_record)
 
 
 async def test_catalog_owner_drops_a_sku_its_own_answer_never_named(
@@ -1835,6 +1842,52 @@ async def test_catalog_fact_refreshes_reference_without_refreshing_offer(
     )
     assert ReasoningState.model_validate(result).live_product_offer("next-turn") is None
     assert "JUST REFERENCED" in response_model._seen_prompts[-1]
+    assert [row for row in _rows(graph) if row["event"] == "catalog_reference"] == [
+        {
+            "event": "catalog_reference",
+            "turn_id": "price-turn",
+            "prior_reference_count": 1,
+            "model_reference_count": 1,
+            "model_offer_count": 0,
+            "spoken_product_count": 0,
+            "eligible_reference_count": 1,
+            "recorded_reference_count": 1,
+            "recorded_offer_count": 0,
+        }
+    ]
+
+
+async def test_catalog_named_product_without_reported_reference_is_diagnosable(
+    config_root: Path,
+) -> None:
+    graph = _graph(
+        config_root,
+        FakeChatModel(
+            structured_args=catalog_answer_args("The waterproof rain jacket is $129.00.")
+        ),
+    )
+
+    result = await _typed_read(
+        graph,
+        SearchCatalog(query="rain jacket price"),
+        turn_id="price-without-reference",
+        text="How much is the rain jacket?",
+    )
+
+    assert result["product_reference"] is None
+    assert [row for row in _rows(graph) if row["event"] == "catalog_reference"] == [
+        {
+            "event": "catalog_reference",
+            "turn_id": "price-without-reference",
+            "prior_reference_count": 0,
+            "model_reference_count": 0,
+            "model_offer_count": 0,
+            "spoken_product_count": 1,
+            "eligible_reference_count": 1,
+            "recorded_reference_count": 0,
+            "recorded_offer_count": 0,
+        }
+    ]
 
 
 async def test_catalog_no_match_clears_old_reference(config_root: Path) -> None:
@@ -2484,6 +2537,88 @@ async def test_order_status_owner_grants_and_renders_one_explicit_order_without_
             "answer_source": "code_authored_read",
         }
     ]
+
+
+async def test_order_total_reads_session_placement_from_focused_order(
+    config_root: Path,
+) -> None:
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="frontline-graph")
+    placed = store.place_cart(
+        "total-session-placement",
+        lines=[CartLine(sku="SKU-COAT", name="rain jacket", price_usd=129, quantity=2)],
+        total_usd=258,
+    )
+    guest_orders.record(placed.order_id)
+    recent = RecentOrderContext(max_refs=3)
+    recent.record((placed.order_id,), operation="place")
+    model = FakeChatModel()
+    graph = _graph(config_root, model, store=store, guest_orders=guest_orders, recent_orders=recent)
+
+    result = await _typed_read(
+        graph,
+        ReadOrderTotal(target=FocusedOrderSet()),
+        turn_id="session-total",
+        text="How much did that order cost?",
+    )
+
+    assert model.invoke_count == 0
+    assert _only_spoken(result).startswith(f"Your order {placed.order_id} total was $258.00.")
+    assert result["active_invocation"] is None
+
+
+async def test_order_total_rejects_contact_grant_without_account_verification(
+    config_root: Path,
+) -> None:
+    identity = CallerIdentityStore()
+    identity.grant_orders("ORD-1001")
+    recent = RecentOrderContext(max_refs=3)
+    recent.record(("ORD-1001",), operation="read")
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    graph = _graph(
+        config_root, FakeChatModel(), identity=identity, recent_orders=recent, store=store
+    )
+
+    result = await _typed_read(
+        graph,
+        ReadOrderTotal(target=FocusedOrderSet()),
+        turn_id="contact-grant-total",
+        text="What was the total for that order?",
+    )
+
+    spoken = _only_spoken(result)
+    assert "verify your account" in spoken
+    assert str(store.captured_total("ORD-1001")) not in spoken
+    assert "ORD-1001" not in spoken
+    assert result["active_invocation"] is None
+
+
+async def test_order_total_reads_only_a_bound_owners_order(config_root: Path) -> None:
+    identity = CallerIdentityStore()
+    identity.bind(BoundIdentity(customer_ref="CUST-001", masked_contact="number ending 0119"))
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    recent = RecentOrderContext(max_refs=3)
+    recent.record(("ORD-1001",), operation="read")
+    graph = _graph(
+        config_root, FakeChatModel(), identity=identity, recent_orders=recent, store=store
+    )
+
+    owned = await _typed_read(
+        graph,
+        ReadOrderTotal(target=FocusedOrderSet()),
+        turn_id="bound-total",
+        text="What did I pay for that order?",
+    )
+    assert f"${store.captured_total('ORD-1001'):.2f}" in _only_spoken(owned)
+
+    foreign = await _typed_read(
+        graph,
+        ReadOrderTotal(target=ExplicitOrderSet(order_refs=("ORD-1002",))),
+        turn_id="foreign-total",
+        text="What did I pay for ORD-1002?",
+    )
+    assert "couldn't retrieve an order" in _only_spoken(foreign).lower()
+    assert f"${store.captured_total('ORD-1002'):.2f}" not in _only_spoken(foreign)
 
 
 async def test_order_status_spoken_email_after_contact_phrase_matches_end_to_end(
