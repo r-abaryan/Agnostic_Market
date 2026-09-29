@@ -472,7 +472,10 @@ def build_read_flow_nodes(
             )
             for order_id in order_ids
         )
-        line = f"{line} {warm_close()}"
+        # A pending readback is read again next, so the answer must not end with its own close.
+        closes = not state.answers_before_readback()
+        if closes:
+            line = f"{line} {warm_close()}"
         committed = await session_state.record_recent_orders(
             recent_orders_operation_id("read", invocation.invocation_id),
             order_ids,
@@ -484,17 +487,16 @@ def build_read_flow_nodes(
             CapabilityId.VERIFY_ORDER_STATUS.value,
             answer_source="code_authored_read",
         )
-        return Command(
-            goto=END,
-            update={
-                "active_invocation": None,
-                "session_revision": committed.session_revision,
-                "assistant_prompt": AssistantPrompt(
-                    kind="open_help", turn_id=state.consumed_turn_ids[-1]
-                ),
-                "messages": [AIMessage(line)],
-            },
-        )
+        update: dict[str, object] = {
+            "active_invocation": None,
+            "session_revision": committed.session_revision,
+            "messages": [AIMessage(line)],
+        }
+        if closes:
+            update["assistant_prompt"] = AssistantPrompt(
+                kind="open_help", turn_id=state.consumed_turn_ids[-1]
+            )
+        return Command(goto=END, update=update)
 
     def catalog_entry_node(state: ReasoningState) -> Command:
         invocation = state.active_invocation

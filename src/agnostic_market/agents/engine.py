@@ -57,7 +57,7 @@ from agnostic_market.agents.recovery import (
     NodeRecoveryPolicy,
     clear_automation_state,
 )
-from agnostic_market.agents.routing import RoutingSession
+from agnostic_market.agents.routing import UNSAFE_MISROUTE_CAPABILITIES, RoutingSession
 from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.checkpoints import (
     CheckpointScopeError,
@@ -75,6 +75,8 @@ from agnostic_market.dtos.events import (
 from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     CapabilityDispatchEnvelope,
+    CapabilityId,
+    IntentRequest,
     InvocationClarificationOwner,
     PrincipalTransition,
     RequestPerson,
@@ -87,10 +89,12 @@ from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
     CheckpointSchemaError,
+    ConversationEntry,
     HandoffSource,
     PendingCartMutation,
     ReasoningState,
     StateSchemaError,
+    append_conversation,
     merge_consumed_turn_ids,
     open_active_invocation,
     validate_reasoning_state_keys,
@@ -229,6 +233,62 @@ class _TurnSpeech:
             ):
                 yield TokenEvent(text=text)
         self._buffers.clear()
+
+
+# Longer than any spoken reply; the record is context for models, not an archive.
+_CONVERSATION_TEXT_LIMIT = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class _RelayedReply:
+    """What one admitted turn sent to the caller, held until the next turn reports playback."""
+
+    turn_id: str
+    text: str
+
+
+def _admitted_turn(
+    message_id: str,
+    text: str,
+    conversation: tuple[ConversationEntry, ...],
+) -> dict[str, object]:
+    """What every interpreted caller turn writes when it is admitted as an ordinary turn."""
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "messages": [HumanMessage(content=text, id=message_id)],
+        "consumed_turn_ids": (message_id,),
+        "conversation": conversation,
+    }
+
+
+def _direct_dispatch(message_id: str, request: IntentRequest) -> dict[str, object]:
+    return {
+        "pending_capability_dispatch": CapabilityDispatchEnvelope(
+            turn_id=message_id,
+            mode="direct",
+            request=request,
+        ),
+        "clarification_liveness": None,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadbackReply:
+    """How a turn that arrives at a paused consent readback is handled."""
+
+    handoff_source: HandoffSource | None = None
+    # A different request replaces the readback's turn: it is admitted as an ordinary turn.
+    request: IntentRequest | None = None
+    # That request only reads, so the readback is read again after it answers.
+    reread: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Detour:
+    """A paused readback set aside for a read, restored once the read has answered."""
+
+    node: str
+    automation: Mapping[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,7 +477,9 @@ def _classify_cancelled_checkpoint(
 ) -> _CancellationCheckpoint:
     state = ReasoningState.from_checkpoint(snapshot.values)
     if state.pending_recovery is not None:
-        return _CancellationCheckpoint("invalid")
+        # A re-read waiting to run is at rest: the next turn re-enters the gate, as after restore.
+        detour = state.pending_recovery.trigger == "confirmation_detour"
+        return _CancellationCheckpoint("complete" if detour else "invalid")
     if snapshot.interrupts:
         interrupt_node = _interrupt_node(snapshot, policies)
         if interrupt_node is None or (
@@ -515,6 +577,7 @@ class ReasoningEngine:
         # A session is a serial conversation. A waiter re-checks the checkpoint so two
         # concurrent deliveries of one resume cannot both produce final result speech.
         self._turn_lock = asyncio.Lock()
+        self._relayed_reply: _RelayedReply | None = None
         self._lifecycle = lifecycle
         if not isinstance(routing, RoutingSession):
             raise ValueError("ReasoningEngine requires an active RoutingSession")
@@ -1065,7 +1128,7 @@ class ReasoningEngine:
                     and marker.action == policy.on_exception
                 )
                 or (
-                    marker.trigger == "session_restored"
+                    marker.trigger in {"session_restored", "confirmation_detour"}
                     and marker.origin_node in self._restore_reconfirmation_nodes
                     and marker.action == policy.on_exception
                 )
@@ -1144,24 +1207,106 @@ class ReasoningEngine:
             return None
         return classify_cancel_consent(text) if kind == "cancel" else classify_consent(text)
 
-    async def _confirmation_handoff_source(
+    async def _readback_reply(
         self,
         turn: CommittedTurn,
         state: ReasoningState,
         node: str,
-    ) -> HandoffSource | None:
+        conversation: tuple[ConversationEntry, ...],
+        facts: TurnFacts,
+    ) -> _ReadbackReply:
+        """Route a reply the consent grammar cannot read; only the grammar grants consent."""
         if self._closed_consent_verdict(node, turn.text) != "unclear":
-            return None
-        resolution = await self._routing.resolve_confirmation_escape(turn, state)
-        if (
-            isinstance(resolution, RouteDecision)
-            and resolution.decision == "direct"
-            and isinstance(resolution.request, RequestPerson)
-        ):
-            return HandoffSource.SEMANTIC_ROUTER
-        if isinstance(resolution, RoutingFailure) and resolution.reason == "routing_unavailable":
-            return HandoffSource.ROUTING_FAILURE_POLICY
-        return None
+            return _ReadbackReply()
+        update: dict[str, object] = {
+            "conversation": append_conversation(state.conversation, conversation)
+        }
+        if (reference := state.pending_readback_reference()) is not None:
+            update["product_reference"] = reference
+        resolution = await self._routing.resolve(
+            turn,
+            state.model_copy(update=update),
+            assistant_prompt_completed=facts.readback_interrupted is False,
+        )
+        if isinstance(resolution, RoutingFailure):
+            if resolution.reason == "routing_unavailable":
+                return _ReadbackReply(handoff_source=HandoffSource.ROUTING_FAILURE_POLICY)
+            return _ReadbackReply()
+        request = resolution.request if resolution.decision == "direct" else None
+        if isinstance(request, RequestPerson):
+            return _ReadbackReply(handoff_source=HandoffSource.SEMANTIC_ROUTER)
+        # The same request restated or changed keeps the readback: its owner cannot yet see
+        # the details the caller already settled, so it would ask for them again. A stop keeps
+        # it too: at a cancel readback "cancel it" means yes, and reads as a stop.
+        if request is None or request.kind in {
+            CapabilityId.CONVERSE,
+            CapabilityId.ABORT_CURRENT,
+            state.pending_confirmation_capability(),
+        }:
+            return _ReadbackReply()
+        reread = (
+            request.kind not in UNSAFE_MISROUTE_CAPABILITIES
+            and node in self._restore_reconfirmation_nodes
+        )
+        return _ReadbackReply(request=request, reread=reread)
+
+    def _readback_set_aside_payload(
+        self,
+        turn: CommittedTurn,
+        state: ReasoningState,
+        conversation: tuple[ConversationEntry, ...],
+        reply: _ReadbackReply,
+    ) -> dict[str, object]:
+        """An ordinary turn for the new request; LangGraph drops the paused readback task."""
+        message_id = turn.message_id
+        assert message_id is not None and reply.request is not None
+        payload = {
+            **_admitted_turn(message_id, turn.text, conversation),
+            **_direct_dispatch(message_id, reply.request),
+        }
+        if (reference := state.pending_readback_reference()) is not None:
+            payload["product_reference"] = reference
+        if reply.reread:
+            payload["confirmation_detour_turn"] = message_id
+        return payload
+
+    async def _areread_detoured_readback(self, detour: _Detour) -> bool:
+        """After a read answered, restore the set-aside readback and re-enter its gate."""
+        snapshot = await self._graph.aget_state(self._config)
+        state = ReasoningState.from_checkpoint(snapshot.values)
+        clean = not (
+            snapshot.interrupts
+            or snapshot.next
+            or snapshot.tasks
+            or state.automation_terminal
+            or state.handover is not None
+        )
+        if not clean:
+            self._telemetry.record({"event": "confirmation_detour_dropped", "node": detour.node})
+            return False
+        marker = PendingRecovery(
+            origin_node=detour.node,
+            action=self._node_recovery_policies[detour.node].on_exception,
+            trigger="confirmation_detour",
+        )
+        await self._aupdate_state(
+            self._config,
+            {
+                **detour.automation,
+                "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "confirmation_detour_turn": None,
+                "pending_recovery": marker,
+            },
+            as_node="__start__",
+        )
+        prepared = await self._graph.aget_state(self._config)
+        seeded = self._validated_pending_recovery(
+            prepared, ReasoningState.from_checkpoint(prepared.values)
+        )
+        if seeded != marker:
+            raise RuntimeError("detoured readback re-entry did not seed its marker")
+        self._telemetry.record({"event": "confirmation_detour_reread", "node": detour.node})
+        return True
 
     @staticmethod
     def _no_action_owner(state: ReasoningState):
@@ -1182,11 +1327,8 @@ class ReasoningEngine:
         message_id = turn.message_id
         if message_id is None:
             raise ValueError("ordinary routed turn requires a committed id")
-        payload: dict[str, object] = {
-            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "messages": [HumanMessage(content=turn.text, id=message_id)],
-            "consumed_turn_ids": (message_id,),
-        }
+        conversation = self._conversation_update(turn, state, facts)
+        payload = _admitted_turn(message_id, turn.text, conversation)
         invocation = state.active_invocation
         if invocation is not None and not self._routing.capability_available(invocation.capability):
             payload.update(
@@ -1201,24 +1343,18 @@ class ReasoningEngine:
             )
             return payload
 
+        # The router must see the reply that just finished, which the checkpoint gains only
+        # when this payload is applied.
+        heard_so_far = append_conversation(state.conversation, conversation)
         resolution = await self._routing.resolve(
             turn,
-            state,
+            state.model_copy(update={"conversation": heard_so_far}),
             assistant_prompt_completed=facts.readback_interrupted is False,
         )
         if isinstance(resolution, RouteDecision) and resolution.decision == "direct":
             request = resolution.request
             if request is not None:
-                payload.update(
-                    {
-                        "pending_capability_dispatch": CapabilityDispatchEnvelope(
-                            turn_id=message_id,
-                            mode="direct",
-                            request=request,
-                        ),
-                        "clarification_liveness": None,
-                    }
-                )
+                payload.update(_direct_dispatch(message_id, request))
                 return payload
             resolution = RoutingFailure(reason="decision_rejected")
         elif isinstance(resolution, RouteDecision) and resolution.decision == "continue":
@@ -1372,13 +1508,49 @@ class ReasoningEngine:
                 _write_ingress_rejection("session_closed", self._telemetry)
                 return
             stream = self._stream_admitted_turn(turn, facts)
+            sent: list[str] = []
             try:
                 async for event in stream:
+                    text = event.prompt if isinstance(event, InterruptEvent) else event.text
+                    if text.strip():
+                        sent.append(text.strip())
                     yield event
             finally:
                 # Delegating with `async for` does not close the inner generator when this
                 # public stream is closed at a yield; its principal-rotation finalizer must run.
                 await stream.aclose()
+                if sent and turn.message_id is not None:
+                    self._relayed_reply = _RelayedReply(turn.message_id, " ".join(sent))
+
+    def _conversation_update(
+        self,
+        turn: CommittedTurn,
+        state: ReasoningState,
+        facts: TurnFacts,
+    ) -> tuple[ConversationEntry, ...]:
+        """The previous reply with its playback fact, then this caller turn."""
+        entries: list[ConversationEntry] = []
+        reply = self._relayed_reply
+        # Only the reply to the last admitted turn; after a restart the engine holds none.
+        if reply is not None and state.consumed_turn_ids[-1:] == (reply.turn_id,):
+            heard = None if facts.readback_interrupted is None else not facts.readback_interrupted
+            entries.append(
+                ConversationEntry(
+                    speaker="assistant",
+                    text=reply.text[:_CONVERSATION_TEXT_LIMIT],
+                    turn_id=reply.turn_id,
+                    heard=heard,
+                )
+            )
+        if turn.message_id is not None and turn.text.strip():
+            entries.append(
+                ConversationEntry(
+                    speaker="caller",
+                    text=turn.text.strip()[:_CONVERSATION_TEXT_LIMIT],
+                    turn_id=turn.message_id,
+                )
+            )
+        return tuple(entries)
 
     async def _stream_admitted_turn(
         self,
@@ -1445,6 +1617,7 @@ class ReasoningEngine:
                     else self._validated_pending_recovery(snapshot, snapshot_state)
                 )
                 resumed_interrupt_node: str | None = None
+                detour: _Detour | None = None
                 if snapshot_state.automation_terminal:
                     if message_id in snapshot_state.consumed_turn_ids:
                         self._telemetry.record(
@@ -1543,21 +1716,49 @@ class ReasoningEngine:
                         if resumed_interrupt_node is None:
                             yield await self._aenter_last_resort()
                             return
-                        resume_payload: dict[str, object] = {
-                            "text": turn.text,
-                            "readback_interrupted": facts.readback_interrupted is not False,
-                        }
-                        handoff_source = await self._confirmation_handoff_source(
+                        conversation = self._conversation_update(turn, snapshot_state, facts)
+                        reply = await self._readback_reply(
                             turn,
                             snapshot_state,
                             resumed_interrupt_node,
+                            conversation,
+                            facts,
                         )
-                        if handoff_source is not None:
-                            resume_payload["handoff_source"] = handoff_source.value
-                        payload = Command(
-                            resume=resume_payload,
-                            update={"consumed_turn_ids": (message_id,)},
-                        )
+                        if reply.request is not None:
+                            self._telemetry.record(
+                                {
+                                    "event": "confirmation_set_aside",
+                                    "node": resumed_interrupt_node,
+                                    "capability": reply.request.kind.value,
+                                    "reread": reply.reread,
+                                }
+                            )
+                            if reply.reread:
+                                detour = _Detour(
+                                    node=resumed_interrupt_node,
+                                    automation={
+                                        field: getattr(snapshot_state, field)
+                                        for field in clear_automation_state()
+                                    },
+                                )
+                            payload = self._readback_set_aside_payload(
+                                turn, snapshot_state, conversation, reply
+                            )
+                            resumed_interrupt_node = None
+                        else:
+                            resume_payload: dict[str, object] = {
+                                "text": turn.text,
+                                "readback_interrupted": facts.readback_interrupted is not False,
+                            }
+                            if reply.handoff_source is not None:
+                                resume_payload["handoff_source"] = reply.handoff_source.value
+                            payload = Command(
+                                resume=resume_payload,
+                                update={
+                                    "consumed_turn_ids": (message_id,),
+                                    "conversation": conversation,
+                                },
+                            )
                     else:
                         payload = Command(update={"consumed_turn_ids": (message_id,)})
                 elif snapshot.next:
@@ -1602,9 +1803,18 @@ class ReasoningEngine:
                     owned_stream_thread_id = None
                     owned_resumed_interrupt_node = None
                     transition = await self._arotate_pending_transition(message_id)
-                    if transition is None or transition.continuation is None:
-                        break
-                    payload = None
+                    if transition is not None and transition.continuation is not None:
+                        payload = None
+                        continue
+                    if detour is not None:
+                        reread = transition is None and await self._areread_detoured_readback(
+                            detour
+                        )
+                        detour = None
+                        if reread:
+                            payload = None
+                            continue
+                    break
             except asyncio.CancelledError as original_cancellation:
                 cancelled_stream = True
                 if owned_stream_thread_id is not None:

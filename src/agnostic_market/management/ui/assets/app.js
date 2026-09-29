@@ -11,6 +11,7 @@ import {
   simulationTurnRequest,
   simulationTurnReused,
   simulationMessages,
+  spokenTurnText,
 } from "./client.js";
 import {
   captureSupport,
@@ -174,7 +175,7 @@ const voice = createVoiceController({
     // Heard speech fills the same composer the text path uses, so one send path stays authoritative.
     elements["simulation-turn"].value = heard;
     announce(`Heard: ${heard}`);
-    if (state.simulation && !state.busy) void sendSimulationTurn();
+    if (state.simulation && !state.busy) void sendSimulationTurn({ spoken: true });
   },
   onError(message, category) {
     // A reply that failed to play stays unknown; later replies switch to text so consent can finish.
@@ -202,11 +203,7 @@ function speakLatestReply(replies, replyId) {
     voice.acknowledge();
     return;
   }
-  // Only the assistant's own lines are spoken; caller echoes would read the operator back to itself.
-  const spoken = [...replies]
-    .reverse()
-    .find((message) => message.kind !== "caller");
-  void voice.speak(spoken?.text ?? "", replyId);
+  void voice.speak(spokenTurnText(replies), replyId);
   syncVoiceAvailability();
 }
 
@@ -828,7 +825,7 @@ async function startSimulation() {
   );
 }
 
-async function sendSimulationTurn() {
+async function sendSimulationTurn({ spoken = false } = {}) {
   if (!state.simulation) return;
   const text = elements["simulation-turn"].value.trim();
   if (!text) {
@@ -848,6 +845,7 @@ async function sendSimulationTurn() {
         state.lastReplyPlayback,
         voice.playbackOutcome(state.lastReplyPlayback?.replyId),
         elements["readback-interrupted"].checked,
+        { typed: !spoken },
       ),
     },
     () => requestId("simulation-turn"),
@@ -992,7 +990,7 @@ elements["refresh-history"].addEventListener("click", async () => {
 });
 elements["compare-versions"].addEventListener("click", compareVersions);
 elements["start-simulation"].addEventListener("click", startSimulation);
-elements["send-simulation-turn"].addEventListener("click", sendSimulationTurn);
+elements["send-simulation-turn"].addEventListener("click", () => sendSimulationTurn());
 elements["simulation-turn"].addEventListener("input", syncReadbackOverride);
 elements["simulation-turn"].addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {

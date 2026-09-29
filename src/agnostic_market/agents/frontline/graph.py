@@ -370,8 +370,9 @@ def build_frontline_graph(
             state.active_invocation.request, ViewCart
         ):
             raise TypeError("cart view render requires a view-cart invocation")
-        has_cart = not cart_store.is_empty()
-        line = _cart_view_line(f" {warm_close()}" if has_cart else "")
+        # A pending readback is read again next, so the answer must not end with its own close.
+        closes = not cart_store.is_empty() and not state.answers_before_readback()
+        line = _cart_view_line(f" {warm_close()}" if closes else "")
         record_capability_answered(
             routing_telemetry,
             state.last_user_text(),
@@ -379,7 +380,7 @@ def build_frontline_graph(
             answer_source="code_authored_read",
         )
         update: dict[str, object] = {"active_invocation": None, "messages": [AIMessage(line)]}
-        if has_cart:
+        if closes:
             update["assistant_prompt"] = AssistantPrompt(
                 kind="open_help", turn_id=state.consumed_turn_ids[-1]
             )
@@ -398,7 +399,8 @@ def build_frontline_graph(
         # Only the verified line takes a close; the unverified one already ends in an invitation.
         verified = identity_store.current() is not None
         line = identity_status_line(verified=verified)
-        if verified:
+        closes = verified and not state.answers_before_readback()
+        if closes:
             line = f"{line} {warm_close()}"
         record_capability_answered(
             routing_telemetry,
@@ -407,7 +409,7 @@ def build_frontline_graph(
             answer_source="code_authored_read",
         )
         update: dict[str, object] = {"active_invocation": None, "messages": [AIMessage(line)]}
-        if verified:
+        if closes:
             update["assistant_prompt"] = AssistantPrompt(
                 kind="open_help", turn_id=state.consumed_turn_ids[-1]
             )

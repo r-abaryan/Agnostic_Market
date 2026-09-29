@@ -382,10 +382,12 @@ async def test_unheard_refund_retry_does_not_move_money(
     await _events(engine, _CUST2_OTP)
     await _events(engine, "yes", TurnFacts(readback_interrupted=True))
 
-    await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+    events = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
 
     assert store.refund_count == 0
     assert not await engine.apending_interrupt()
+    spoken = [event.text for event in events if isinstance(event, SpokenMessageEvent)]
+    assert "I didn't get a clear yes, so I haven't refunded anything." in spoken
 
 
 async def test_refund_accepts_supported_natural_affirmation(config_root: Path) -> None:
@@ -565,11 +567,13 @@ async def test_unheard_cancel_retry_keeps_order(
     await _events(engine, "cancel my rain jacket order")
     await _events(engine, "yes", TurnFacts(readback_interrupted=True))
 
-    await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+    events = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
 
     assert store.cancel_count == 0
     assert store.order_status("ORD-1002") == "processing"
     assert not await engine.apending_interrupt()
+    spoken = [event.text for event in events if isinstance(event, SpokenMessageEvent)]
+    assert "I didn't get a clear yes, so I haven't cancelled anything." in spoken
 
 
 async def test_cancel_is_idempotent_across_double_resume(config_root: Path) -> None:

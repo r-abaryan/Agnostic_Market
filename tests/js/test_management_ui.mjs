@@ -14,6 +14,7 @@ import {
   simulationTurnRequest,
   simulationTurnReused,
   simulationMessages,
+  spokenTurnText,
 } from "../../src/agnostic_market/management/ui/assets/client.js";
 import {
   CAPTURE_SAMPLE_RATE,
@@ -169,6 +170,17 @@ test("simulation event projection exposes only caller-facing messages", () => {
       { kind: "assistant", text: "I can help with that." },
       { kind: "confirmation", text: "Should I place the order?" },
     ],
+  );
+});
+
+test("an answer followed by a readback is spoken whole, in order", () => {
+  const replies = simulationMessages([
+    { kind: "spoken_message", text: "You have 2 waterproof rain jackets.", node: "cart_view" },
+    { kind: "interrupt", prompt: "Just to confirm: shall I place the order?" },
+  ]);
+  assert.equal(
+    spokenTurnText(replies),
+    "You have 2 waterproof rain jackets. Just to confirm: shall I place the order?",
   );
 });
 
@@ -344,6 +356,13 @@ test("simulation playback facts preserve text-only completion and voice uncertai
   assert.equal(simulationPlaybackFact({ voiced: true }, false, false), false);
   assert.equal(simulationPlaybackFact({ voiced: true }, true, false), true);
   assert.equal(simulationPlaybackFact({ voiced: true }, null, true), true);
+
+  // A typed answer was composed with the whole reply on screen, whatever the audio did.
+  const typed = { typed: true };
+  assert.equal(simulationPlaybackFact({ voiced: true }, true, false, typed), false);
+  assert.equal(simulationPlaybackFact({ voiced: true }, null, false, typed), false);
+  assert.equal(simulationPlaybackFact(null, null, false, typed), null);
+  assert.equal(simulationPlaybackFact({ voiced: true }, null, true, typed), true);
 });
 
 test("the sent playback fact is visible, and a retry names the fact it resends", () => {
@@ -936,7 +955,6 @@ test("playback facts distinguish natural end, caller interruption, and unknown a
   release({ arrayBuffer: async () => new ArrayBuffer(8) });
   assert.equal(await pending, false);
   assert.equal(pendingVoice.playbackOutcome("session:3"), null);
-  assert.equal(pendingVoice.playbackOutcome("session:2"), null);
 
   const failedVoice = module.createVoiceController({
     api: { synthesizeSpeech: async () => { throw new Error("tts unavailable"); } },

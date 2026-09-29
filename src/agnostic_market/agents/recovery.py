@@ -894,7 +894,7 @@ def build_recovery_node(
             and marker.abandoned_message_id in state.consumed_turn_ids
         )
         restored_confirmation_valid = bool(
-            marker.trigger == "session_restored"
+            marker.trigger in {"session_restored", "confirmation_detour"}
             and marker.origin_node in restore_reconfirmation_nodes
             and policy is not None
             and marker.action == policy.on_exception
@@ -978,7 +978,7 @@ _NON_PREFIXED_AUTOMATION_FIELDS = frozenset(
         "clarification_liveness",
     }
 )
-_PROTECTED_STATE_FIELDS = frozenset({"messages", "automation_terminal"})
+_PROTECTED_STATE_FIELDS = frozenset({"messages", "conversation", "automation_terminal"})
 _AUTOMATION_STATE_RESET: Mapping[str, object] = MappingProxyType(
     {
         "handover": None,

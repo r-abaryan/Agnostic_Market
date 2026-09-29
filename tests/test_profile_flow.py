@@ -269,6 +269,19 @@ async def test_barged_profile_readback_repeats_the_new_value_before_changing(
     assert h.profile.change_count == 1
 
 
+async def test_profile_unheard_twice_changes_nothing_and_says_so(config_root: Path) -> None:
+    h = _profile_harness(config_root)
+    await _events(h.engine, _REQUEST)
+    await _events(h.engine, _VALID_OTP)
+    await _events(h.engine, "yes", TurnFacts(readback_interrupted=True))
+
+    events = await _events(h.engine, "yes", TurnFacts(readback_interrupted=True))
+
+    assert h.profile.change_count == 0
+    spoken = [e.text for e in events if isinstance(e, SpokenMessageEvent)]
+    assert "I didn't get a clear yes, so your details are unchanged." in spoken
+
+
 async def test_payment_change_still_defers_honestly(config_root: Path) -> None:
     # Phase 5: payment_change must NOT enter the flow — the honest deferral speaks once.
     h = _profile_harness(

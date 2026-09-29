@@ -3,7 +3,7 @@ purpose: development_only
 frozen_corpus_fingerprint: c3dc55d435b0b06f30ece858930ac5775f44c8debfe4afbb236a33271edb5dd5
 route_schema_fingerprint: 40854dba1b9111b086134b56a005b9d32511ff9989070be2712cccdfca2d6fed
 registry_fingerprint: 2a5cd3f41f5008c6ff40f58d53e14786c7aea4f7c15a573b61c70ff300e85ee7
-context_projector_version: "8"
+context_projector_version: "10"
 
 cases:
   - case_id: structural_remove_base

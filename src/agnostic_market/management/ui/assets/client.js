@@ -307,11 +307,17 @@ export function simulationTurnRequest(current, input, requestIdFactory) {
   return { ...input, requestId: requestIdFactory() };
 }
 
-export function simulationPlaybackFact(lastReply, voiceOutcome, manualInterruption) {
+export function simulationPlaybackFact(
+  lastReply,
+  voiceOutcome,
+  manualInterruption,
+  { typed = false } = {},
+) {
   if (manualInterruption) return true;
   if (!lastReply) return null;
-  // Text-only simulation treats a displayed reply as completed.
-  return lastReply.voiced ? voiceOutcome ?? null : false;
+  // A displayed reply counts as received when the reply or the answer to it is text.
+  if (typed || !lastReply.voiced) return false;
+  return voiceOutcome ?? null;
 }
 
 const PLAYBACK_FACT_LABELS = new Map([
@@ -347,6 +353,14 @@ export function simulationMessages(events) {
   }
   flushStream();
   return messages;
+}
+
+// Every assistant line of one turn, in order: an answer can be followed by a readback.
+export function spokenTurnText(replies) {
+  return replies
+    .filter((message) => message.kind !== "caller")
+    .map((message) => message.text)
+    .join(" ");
 }
 
 const DIAGNOSTIC_ATTRIBUTE_KEYS = [

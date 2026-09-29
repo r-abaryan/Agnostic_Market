@@ -613,7 +613,11 @@ def build_support_nodes(
         else:
             committed = await session_state.clear_recent_orders(operation_id)
         telemetry.record({"event": "order_list_rendered", "order_scope": request.scope})
-        line = f"{render_order_list_line(orders, scope=request.scope)} {close}"
+        # A pending readback is read again next, so the answer must not end with its own close.
+        closes = not state.answers_before_readback()
+        line = render_order_list_line(orders, scope=request.scope)
+        if closes:
+            line = f"{line} {close}"
         # This node ENDs, bypassing the frontline's finalize sink, so the answered-turn record
         # is written here rather than there.
         record_capability_answered(
@@ -628,7 +632,7 @@ def build_support_nodes(
             "session_revision": committed.session_revision,
             "messages": [AIMessage(line)],
         }
-        if request.scope == "account":
+        if request.scope == "account" and closes:
             update["assistant_prompt"] = AssistantPrompt(
                 kind="open_help", turn_id=state.consumed_turn_ids[-1]
             )
@@ -1512,7 +1516,7 @@ def build_support_nodes(
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
             decision = classify_confirmation(retry)
-        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
+        verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
             telemetry.record({"event": "refund_cancelled", "reason": "human_requested"})
@@ -1525,12 +1529,18 @@ def build_support_nodes(
                     source=decision.handoff_source,
                 ),
             }
-        if verdict == "no":
-            telemetry.record({"event": "refund_cancelled", "reason": "declined"})
+        if verdict in {"no", "unclear"}:
+            reason = "declined" if verdict == "no" else "unclear"
+            telemetry.record({"event": "refund_cancelled", "reason": reason})
+            line = (
+                "Okay, I won't refund anything - nothing has changed."
+                if verdict == "no"
+                else "I didn't get a clear yes, so I haven't refunded anything."
+            )
             return {
                 "pending_refund": None,
                 "execution_owner": None,
-                "messages": [AIMessage("Okay, I won't refund anything - nothing has changed.")],
+                "messages": [AIMessage(line)],
             }
         return {}  # yes: pending survives; router -> place
 
@@ -1742,7 +1752,7 @@ def build_support_nodes(
             phrases = "; ".join(_cancel_target_phrase(t) for t in pending.targets)
             retry = interrupt(f"Sorry - just to be clear: cancel {phrases}? Yes or no?")
             decision = classify_confirmation(retry, cancel_action=True)
-        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
+        verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
             telemetry.record({"event": "cancel_declined", "reason": "human_requested"})
@@ -1755,13 +1765,15 @@ def build_support_nodes(
                     source=decision.handoff_source,
                 ),
             }
-        if verdict == "no":
-            telemetry.record({"event": "cancel_declined", "reason": "declined"})
-            decline_line = (
-                "Okay, I'll leave that order as it is - nothing changed."
-                if len(pending.targets) == 1
-                else "Okay, I'll leave those orders as they are - nothing changed."
-            )
+        if verdict in {"no", "unclear"}:
+            reason = "declined" if verdict == "no" else "unclear"
+            telemetry.record({"event": "cancel_declined", "reason": reason})
+            if verdict == "unclear":
+                decline_line = "I didn't get a clear yes, so I haven't cancelled anything."
+            elif len(pending.targets) == 1:
+                decline_line = "Okay, I'll leave that order as it is - nothing changed."
+            else:
+                decline_line = "Okay, I'll leave those orders as they are - nothing changed."
             return {
                 "pending_cancel": None,
                 "execution_owner": None,
@@ -2091,7 +2103,7 @@ def build_support_nodes(
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
             decision = classify_confirmation(retry)
-        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
+        verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
             telemetry.record({"event": "return_cancelled", "reason": "human_requested"})
@@ -2104,12 +2116,18 @@ def build_support_nodes(
                     source=decision.handoff_source,
                 ),
             }
-        if verdict == "no":
-            telemetry.record({"event": "return_cancelled", "reason": "declined"})
+        if verdict in {"no", "unclear"}:
+            reason = "declined" if verdict == "no" else "unclear"
+            telemetry.record({"event": "return_cancelled", "reason": reason})
+            line = (
+                "Okay, I won't set up a return - nothing has changed."
+                if verdict == "no"
+                else "I didn't get a clear yes, so I haven't set up a return."
+            )
             return {
                 "pending_return": None,
                 "execution_owner": None,
-                "messages": [AIMessage("Okay, I won't set up a return - nothing has changed.")],
+                "messages": [AIMessage(line)],
             }
         return {}  # yes: pending survives; router -> place
 
@@ -2257,7 +2275,7 @@ def build_support_nodes(
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}? Yes or no?")
             decision = classify_confirmation(retry)
-        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
+        verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
             telemetry.record({"event": "profile_change_cancelled", "reason": "human_requested"})
@@ -2272,14 +2290,18 @@ def build_support_nodes(
                     source=decision.handoff_source,
                 ),
             }
-        if verdict == "no":
-            telemetry.record({"event": "profile_change_cancelled", "reason": "declined"})
+        if verdict in {"no", "unclear"}:
+            reason = "declined" if verdict == "no" else "unclear"
+            telemetry.record({"event": "profile_change_cancelled", "reason": reason})
+            line = (
+                "Okay, I'll leave your details as they are - nothing has changed."
+                if verdict == "no"
+                else "I didn't get a clear yes, so your details are unchanged."
+            )
             return {
                 "pending_profile_change": None,
                 "execution_owner": None,
-                "messages": [
-                    AIMessage("Okay, I'll leave your details as they are - nothing has changed.")
-                ],
+                "messages": [AIMessage(line)],
             }
         return {}  # yes: pending survives; router -> place
 

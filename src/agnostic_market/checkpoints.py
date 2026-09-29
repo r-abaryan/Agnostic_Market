@@ -52,6 +52,7 @@ from agnostic_market.dtos.state import (
     CartClarification,
     CheckpointSchemaError,
     ClarificationLiveness,
+    ConversationEntry,
     HandoffRequest,
     HandoffSource,
     IdentityClarification,
@@ -118,6 +119,7 @@ _CHECKPOINT_CHANNEL_DTOS = (
     ProductOffer,
     ProductReference,
     AssistantPrompt,
+    ConversationEntry,
 )
 _CHECKPOINT_NESTED_ENUMS = (
     CapabilityId,
