@@ -134,7 +134,7 @@ def classify_confirmation(
     *,
     cancel_action: bool = False,
 ) -> ConfirmationDecision:
-    """Combine code-owned consent with an engine-authored semantic handoff marker."""
+    """An unheard readback cannot authorize consent; reaching a person does not depend on it."""
 
     source_value = answer.get("handoff_source")
     if source_value is not None:
@@ -143,6 +143,10 @@ def classify_confirmation(
         except (TypeError, ValueError) as exc:
             raise ValueError("confirmation handoff source is invalid") from exc
         return ConfirmationDecision("human", source)
+
+    if answer.get("readback_interrupted"):
+        return ConfirmationDecision("unclear")
+
     text = str(answer.get("text", ""))
     verdict = classify_cancel_consent(text) if cancel_action else classify_consent(text)
     return ConfirmationDecision(verdict)

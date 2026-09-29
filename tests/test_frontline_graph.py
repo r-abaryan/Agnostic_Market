@@ -1560,6 +1560,51 @@ async def test_dispatch_reaches_session_list_owner_without_a_model_call(
     assert result.get("assistant_prompt") is None
 
 
+async def test_session_list_recovers_both_placements_after_recent_focus_moves(
+    config_root: Path,
+) -> None:
+    store = OrderStore("acme_store", load_orders_fixture(config_root, "acme_store").orders)
+    guest_orders = GuestOrderScope(tenant_id="acme_store", session_id="frontline-graph")
+    first = store.place_cart(
+        "session-list-first",
+        lines=[CartLine(sku="SKU-SHOE", name="trail shoes", price_usd=89.99, quantity=1)],
+        total_usd=89.99,
+    )
+    second = store.place_cart(
+        "session-list-second",
+        lines=[CartLine(sku="SKU-COAT", name="rain jacket", price_usd=129, quantity=1)],
+        total_usd=129,
+    )
+    guest_orders.record(first.order_id)
+    guest_orders.record(second.order_id)
+    recent = RecentOrderContext(max_refs=3)
+    recent.record((second.order_id,), operation="place")
+    assert recent.snapshot().order_refs == (second.order_id,)
+    model = FakeChatModel()
+    graph = _graph(
+        config_root,
+        model,
+        store=store,
+        guest_orders=guest_orders,
+        recent_orders=recent,
+    )
+
+    result = await _typed_read(
+        graph,
+        ListOrders(scope="session"),
+        turn_id="session-list-after-placements",
+        text="What is the status of my orders?",
+    )
+
+    line = _only_spoken(result)
+    assert "placed 2 orders on this call" in line
+    assert first.order_id in line and second.order_id in line
+    assert "trail shoes" in line and "rain jacket" in line
+    assert line.count("being prepared") == 2
+    assert recent.snapshot().order_refs == (first.order_id, second.order_id)
+    assert model.invoke_count == 0
+
+
 def test_identity_capability_entry_is_preparation_only(config_root: Path) -> None:
     frontline = FakeChatModel()
     reasoning = FakeChatModel()

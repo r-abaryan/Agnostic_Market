@@ -243,12 +243,14 @@ class MerchantSimulationStart(BaseModel):
 
 
 class MerchantSimulationTurn(BaseModel):
+    """Omitted playback facts keep text callers' completed-readback convention."""
+
     model_config = _TRANSPORT
 
     schema_version: Literal[1] = 1
     request_id: AuthorityIdentifier
     text: str = Field(min_length=1, max_length=20_000)
-    readback_interrupted: bool = False
+    readback_interrupted: bool | None = False
 
 
 class _UncachedStaticFiles(StaticFiles):

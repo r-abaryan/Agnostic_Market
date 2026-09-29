@@ -35,6 +35,7 @@ from pydantic import BaseModel, PrivateAttr, ValidationError
 from telemetry_helpers import make_session_telemetry
 from turn_helpers import (
     TEST_CANCELLATION_QUIESCENCE_TIMEOUT_SECONDS,
+    committed_turn_events,
     engine_events,
     next_committed_turn,
 )
@@ -48,6 +49,7 @@ from agnostic_market.agents.engine import (
     _classify_cancelled_checkpoint,
     _GraphSpans,
     _interrupt_node,
+    _RelayedReply,
     _session_ahead_evidence_matches,
     _TurnSpeech,
 )
@@ -131,12 +133,14 @@ from agnostic_market.dtos.orchestration import (
 from agnostic_market.dtos.recovery import ExceptionAction, PendingRecovery
 from agnostic_market.dtos.state import (
     CHECKPOINT_SCHEMA_VERSION,
+    CONVERSATION_ENTRY_LIMIT,
     AssistantPrompt,
     BatchCancelOutcome,
     CancelTarget,
     CartClarification,
     CartLine,
     ClarificationLiveness,
+    ConversationEntry,
     HandoffRequest,
     HandoffSource,
     IdentityClarification,
@@ -153,6 +157,7 @@ from agnostic_market.dtos.state import (
     ReasoningState,
     StateSchemaError,
     SupportClarification,
+    append_conversation,
     open_active_invocation,
 )
 from agnostic_market.durability.session_payload import (
@@ -462,6 +467,86 @@ async def test_first_admitted_turn_persists_checkpoint_schema_version(
         engine._graph.get_state(engine._config).values["checkpoint_schema_version"]
         == CHECKPOINT_SCHEMA_VERSION
     )
+
+
+def _conversation(engine: ReasoningEngine) -> list[tuple[str, str, bool | None]]:
+    state = ReasoningState.from_checkpoint(engine._graph.get_state(engine._config).values)
+    return [(entry.speaker, entry.text, entry.heard) for entry in state.conversation]
+
+
+def _sent_text(events: list) -> str:
+    texts = (event.prompt if isinstance(event, InterruptEvent) else event.text for event in events)
+    return " ".join(text.strip() for text in texts if text.strip())
+
+
+async def test_conversation_records_a_readback_and_the_reply_to_it(config_root: Path) -> None:
+    engine, store = _engine(config_root, cart=_checkout_cart())
+    paused = await _pause_at_confirmation(engine)
+
+    await _events(engine, "yes")
+
+    assert store.placed_count == 1
+    assert _conversation(engine) == [
+        ("caller", "checkout now please", None),
+        ("assistant", _sent_text(paused), True),
+        ("caller", "yes", None),
+    ]
+
+
+@pytest.mark.parametrize(("playback_fact", "heard"), ((True, False), (None, None)))
+async def test_conversation_records_whether_the_reply_was_heard(
+    config_root: Path, playback_fact: bool | None, heard: bool | None
+) -> None:
+    engine, _ = _engine(config_root, cart=_checkout_cart())
+    paused = await _pause_at_confirmation(engine)
+
+    await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+
+    assert _conversation(engine)[1] == ("assistant", _sent_text(paused), heard)
+
+
+async def test_conversation_attaches_a_reply_only_to_the_turn_it_answered(
+    config_root: Path,
+) -> None:
+    engine, _ = _engine(config_root)
+    await _events(engine, "hello")
+    engine._relayed_reply = _RelayedReply("another-turn", "a line from another turn")
+
+    await _events(engine, "what can you do?")
+
+    assert [text for _speaker, text, _heard in _conversation(engine)] == [
+        "hello",
+        "what can you do?",
+    ]
+
+
+async def test_router_sees_the_reply_that_just_finished(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, _ = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    declined = await _events(engine, "no")
+
+    await _events(engine, "but I said yes")
+
+    assert [(turn.speaker, turn.text) for turn in recognizer.contexts[-1].recent_turns] == [
+        ("caller", "no"),
+        ("assistant", _sent_text(declined)),
+    ]
+
+
+def test_conversation_keeps_each_line_once_and_only_the_latest() -> None:
+    line = ConversationEntry(speaker="caller", text="yes", turn_id="turn-1")
+    assert append_conversation((line,), (line,)) == (line,)
+    lines = tuple(
+        ConversationEntry(speaker="caller", text=f"line {index}", turn_id=f"turn-{index}")
+        for index in range(CONVERSATION_ENTRY_LIMIT + 3)
+    )
+    assert append_conversation((), lines) == lines[-CONVERSATION_ENTRY_LIMIT:]
+
+
+def test_a_caller_line_carries_no_playback_fact() -> None:
+    with pytest.raises(ValueError, match="no playback fact"):
+        ConversationEntry(speaker="caller", text="yes", turn_id="turn-1", heard=True)
 
 
 async def test_initial_checkpoint_seed_is_exact_and_cannot_overwrite_state(
@@ -1447,8 +1532,10 @@ async def test_resume_yes_places_exactly_once(config_root: Path) -> None:
 
 
 async def test_contradictory_confirmation_cannot_place_an_order(config_root: Path) -> None:
-    engine, store = _engine(config_root, cart=_checkout_cart())
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
     await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.clarify("ambiguous_intent"))
 
     first = await _events(engine, "that is not correct")
 
@@ -1713,19 +1800,134 @@ async def test_unknown_readback_completion_cannot_authorize_placement(config_roo
     assert any(isinstance(event, InterruptEvent) for event in events)
 
 
-async def test_unclear_answer_reconfirms_once_then_cancels(config_root: Path) -> None:
+@pytest.mark.parametrize("playback_fact", (True, None))
+async def test_unheard_retry_cannot_authorize_placement(
+    config_root: Path, playback_fact: bool | None
+) -> None:
     engine, store = _engine(config_root, cart=_checkout_cart())
     await _pause_at_confirmation(engine)
-    first = await _events(engine, "wait, do you have it in blue?")
+
+    first = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+    assert any(isinstance(event, InterruptEvent) for event in first)
+    second = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+
+    assert store.placed_count == 0
+    assert not await engine.apending_interrupt()
+    # The caller said yes to a readback they did not hear: nothing happens, and nothing
+    # claims they declined.
+    spoken = [event.text for event in second if isinstance(event, SpokenMessageEvent)]
+    assert any("didn't get a clear yes" in text for text in spoken)
+    assert not any("won't place" in text.lower() for text in spoken)
+    assert {"event": "checkout_cancelled", "reason": "unclear"} in _telemetry_records(engine)
+
+
+async def test_unclear_answer_reconfirms_once_then_cancels(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.clarify("ambiguous_intent"))
+    first = await _events(engine, "hmm, let me think")
     assert any(isinstance(e, InterruptEvent) for e in first)  # ONE re-confirm
-    second = await _events(engine, "hmm what about the weather")
+    second = await _events(engine, "I'm not sure")
     assert store.placed_count == 0
     assert not await engine.apending_interrupt()  # cancelled, not trapped
-    spoken = [e for e in second if isinstance(e, SpokenMessageEvent)]
-    assert any("won't place it" in e.text.lower() for e in spoken)
+    spoken = [e.text for e in second if isinstance(e, SpokenMessageEvent)]
+    assert any("didn't get a clear yes" in text for text in spoken)
+    assert not any("won't place" in text.lower() for text in spoken)
 
 
-async def test_human_request_at_confirmation_escapes(config_root: Path) -> None:
+async def test_a_question_at_a_readback_is_answered_then_the_readback_is_read_again(
+    config_root: Path,
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    paused = await _pause_at_confirmation(engine)
+    readback = [event.prompt for event in paused if isinstance(event, InterruptEvent)]
+    recognizer.choose(RouteDecision.direct(ViewCart()))
+
+    answered = await _events(engine, "what's in my cart?")
+
+    spoken = [event.text for event in answered if isinstance(event, SpokenMessageEvent)]
+    assert len(spoken) == 1 and "waterproof rain jacket" in spoken[0]
+    # The readback follows, so the answer does not end with its own closing question.
+    assert "?" not in spoken[0]
+    assert [event.prompt for event in answered if isinstance(event, InterruptEvent)] == readback
+    assert store.placed_count == 0
+
+    await _events(engine, "yes")
+
+    assert store.placed_count == 1
+
+
+async def test_a_different_request_at_a_readback_sets_it_aside(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(ModifyCart(operation="remove")))
+
+    await _events(engine, "take the jacket out first")
+
+    state = ReasoningState.from_checkpoint(engine._graph.get_state(engine._config).values)
+    assert state.pending_placement is None
+    assert store.placed_count == 0
+    assert {
+        "event": "confirmation_set_aside",
+        "node": "cart_confirm",
+        "capability": "modify_cart",
+        "reread": False,
+    } in _telemetry_records(engine)
+
+
+async def test_the_same_request_restated_at_a_readback_is_read_again(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(PlaceOrder()))
+
+    restated = await _events(engine, "yes, place the order")
+
+    retry = [event.prompt for event in restated if isinstance(event, InterruptEvent)]
+    assert len(retry) == 1 and retry[0].startswith("Sorry - just to be clear")
+    await _events(engine, "yes")
+    assert store.placed_count == 1
+
+
+async def test_a_reply_to_a_cart_readback_sees_the_readback_products(
+    config_root: Path,
+) -> None:
+    product = load_catalog_fixture(config_root, "acme_store").products[0]
+    recognizer = _DeterministicRoutingRecognizer(
+        _routing_attempt(RouteDecision.clarify("ambiguous_intent"))
+    )
+    engine, _ = _engine(config_root, routing_recognizer=recognizer)
+    dispatch_id = "cart-readback-turn"
+    request = ModifyCart(operation="add", item=CartItemQuery(query=product.name), quantity=1)
+    engine._graph.update_state(
+        engine._config,
+        {
+            "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "messages": [HumanMessage(content=f"add one {product.name}", id=dispatch_id)],
+            "consumed_turn_ids": (dispatch_id,),
+            "pending_capability_dispatch": CapabilityDispatchEnvelope(
+                turn_id=dispatch_id, mode="direct", request=request
+            ),
+        },
+        as_node="__start__",
+    )
+    await committed_turn_events(
+        engine, CommittedTurn(text=f"add one {product.name}", message_id=dispatch_id)
+    )
+    assert await engine.apending_interrupt()
+
+    await _events(engine, "how much is it?")
+
+    assert recognizer.contexts[-1].has_product_reference is True
+
+
+@pytest.mark.parametrize("playback_fact", (False, True, None))
+async def test_human_request_at_confirmation_escapes(
+    config_root: Path, playback_fact: bool | None
+) -> None:
     recognizer = _DeterministicRoutingRecognizer()
     engine, store = _engine(
         config_root,
@@ -1734,7 +1936,11 @@ async def test_human_request_at_confirmation_escapes(config_root: Path) -> None:
     )
     await _pause_at_confirmation(engine)
     recognizer.choose(RouteDecision.direct(RequestPerson()))
-    events = await _events(engine, "just get me a real person please")
+    events = await _events(
+        engine,
+        "just get me a real person please",
+        TurnFacts(readback_interrupted=playback_fact),
+    )
     assert store.placed_count == 0
     assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
@@ -1785,8 +1991,9 @@ async def test_affirmative_confirmation_never_consults_the_semantic_router(
     assert [context.utterance for context in recognizer.contexts] == ["checkout now please"]
 
 
+@pytest.mark.parametrize("playback_fact", (False, True, None))
 async def test_confirmation_router_outage_fails_closed_to_the_human_onramp(
-    config_root: Path,
+    config_root: Path, playback_fact: bool | None
 ) -> None:
     recognizer = _DeterministicRoutingRecognizer()
     engine, store = _engine(
@@ -1797,7 +2004,11 @@ async def test_confirmation_router_outage_fails_closed_to_the_human_onramp(
     await _pause_at_confirmation(engine)
     recognizer.choose(RoutingFailure(reason="routing_unavailable"))
 
-    events = await _events(engine, "I need some help before deciding")
+    events = await _events(
+        engine,
+        "I need some help before deciding",
+        TurnFacts(readback_interrupted=playback_fact),
+    )
     spoken = [event for event in events if isinstance(event, SpokenMessageEvent)]
     state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
 
@@ -2563,6 +2774,45 @@ def test_cancelled_checkpoint_classifier_rejects_every_ambiguous_shape(
     assert tracker_mismatch.outcome == "invalid"
 
 
+@pytest.mark.parametrize(
+    ("trigger", "outcome"),
+    (("confirmation_detour", "complete"), ("session_restored", "invalid")),
+)
+async def test_a_cancelled_stream_leaves_a_pending_reread_at_rest(
+    config_root: Path, trigger: str, outcome: str
+) -> None:
+    engine, _ = _engine(config_root)
+    state = ReasoningState(
+        consumed_turn_ids=("question-turn",),
+        pending_recovery=PendingRecovery(
+            origin_node="cart_confirm",
+            action=engine._node_recovery_policies["cart_confirm"].on_exception,
+            trigger=trigger,
+        ),
+    )
+    snapshot = StateSnapshot(
+        values=state.model_dump(),
+        next=(engine._recovery_entry_node,),
+        config=engine._config,
+        metadata=None,
+        created_at=None,
+        parent_config=None,
+        tasks=(),
+        interrupts=(),
+    )
+
+    result = _classify_cancelled_checkpoint(
+        snapshot,
+        policies=engine._node_recovery_policies,
+        infrastructure_nodes=engine._recovery_infrastructure_nodes,
+        active_node_names=frozenset(),
+        abandoned_message_id="question-turn",
+        resumed_interrupt_node=None,
+    )
+
+    assert result.outcome == outcome
+
+
 async def test_untyped_bare_next_terminalizes_without_replaying_graph_work(
     config_root: Path,
 ) -> None:
@@ -2931,6 +3181,7 @@ def test_checkpoint_nested_enum_allowlist_exactly_covers_reachable_enums() -> No
 
 _CHECKPOINT_CHANNEL_VALUES = (
     AssistantPrompt(kind="open_help", turn_id="turn-1"),
+    ConversationEntry(speaker="assistant", text="Anything else?", turn_id="turn-1", heard=True),
     PendingAck(text="Anything else I can help with?", assistant_prompt_kind="open_help"),
     ProductOffer(skus=("SKU-1",), turn_id="turn-1"),
     ProductReference(skus=("SKU-1",), turn_id="turn-1"),

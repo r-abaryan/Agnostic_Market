@@ -14,7 +14,29 @@ from agnostic_market.commerce.spoken import (
     caller_stated_phone,
     redact_contact,
     scan_contact_candidates,
+    standalone_quantity,
 )
+
+
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    (
+        ("1", 1),
+        ("one", 1),
+        ("One.", 1),
+        ("10", 10),
+        ("ten", 10),
+        ("zero", 0),
+        ("oh", None),
+        ("one of the other jackets", None),
+        ("1 or 2", None),
+        ("1000000", None),
+    ),
+)
+def test_standalone_quantity_accepts_only_bounded_unambiguous_answers(
+    utterance: str, expected: int | None
+) -> None:
+    assert standalone_quantity(utterance) == expected
 
 
 @pytest.mark.parametrize(

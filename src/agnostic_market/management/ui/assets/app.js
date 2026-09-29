@@ -5,9 +5,13 @@ import {
   canRollback,
   parseCatalog,
   selectMerchantWorkspace,
+  playbackFactNotice,
   simulationDiagnostics,
+  simulationPlaybackFact,
   simulationTurnRequest,
+  simulationTurnReused,
   simulationMessages,
+  spokenTurnText,
 } from "./client.js";
 import {
   captureSupport,
@@ -45,6 +49,8 @@ const state = {
   simulationDiagnostics: [],
   simulationLatency: null,
   pendingSimulationTurn: null,
+  lastReplyPlayback: null,
+  playbackNotice: "",
   busy: false,
   voiceMode: "manual",
   handsFreeArmed: false,
@@ -93,6 +99,7 @@ const elements = Object.fromEntries(
     "simulation-transcript",
     "simulation-turn",
     "readback-interrupted",
+    "playback-fact-status",
     "send-simulation-turn",
     "simulation-publication",
     "simulation-turn-count",
@@ -162,16 +169,20 @@ const voice = createVoiceController({
     orb.style.setProperty("--voice-wave-amplitude", (0.35 + level * 0.9).toFixed(3));
   },
   onBargeIn() {
-    noteInterruptedReadback();
     state.voiceAwaitingReply = false;
   },
   onTranscript(heard) {
     // Heard speech fills the same composer the text path uses, so one send path stays authoritative.
     elements["simulation-turn"].value = heard;
     announce(`Heard: ${heard}`);
-    if (state.simulation && !state.busy) void sendSimulationTurn();
+    if (state.simulation && !state.busy) void sendSimulationTurn({ spoken: true });
   },
   onError(message, category) {
+    // A reply that failed to play stays unknown; later replies switch to text so consent can finish.
+    if (category === "playback" && elements["voice-speak-replies"].checked) {
+      elements["voice-speak-replies"].checked = false;
+      message = `${message} Spoken replies are now off.`;
+    }
     // The announce channel is sr-only, so a sighted operator saw nothing when the microphone
     // failed. Voice problems belong on the voice panel, where the control that failed lives.
     elements["voice-support"].textContent = message;
@@ -183,23 +194,17 @@ const voice = createVoiceController({
   onDiagnostic: voiceDiagnosticsEnabled ? reportVoiceDiagnostic : undefined,
 });
 
-function speakLatestReply(replies) {
+function speakLatestReply(replies, replyId) {
+  state.lastReplyPlayback = {
+    replyId,
+    voiced: elements["voice-speak-replies"].checked,
+  };
   if (!elements["voice-speak-replies"].checked) {
     voice.acknowledge();
     return;
   }
-  // Only the assistant's own lines are spoken; caller echoes would read the operator back to itself.
-  const spoken = [...replies]
-    .reverse()
-    .find((message) => message.kind !== "caller");
-  void voice.speak(spoken?.text ?? "");
+  void voice.speak(spokenTurnText(replies), replyId);
   syncVoiceAvailability();
-}
-
-function noteInterruptedReadback() {
-  if (state.simulationMessages.at(-1)?.kind === "confirmation") {
-    elements["readback-interrupted"].checked = true;
-  }
 }
 
 function syncVoiceAvailability() {
@@ -299,6 +304,21 @@ function showError(error) {
   }
 }
 
+function syncReadbackOverride() {
+  const pending = state.pendingSimulationTurn;
+  const retry = simulationTurnReused(pending, {
+    tenantId: state.merchantId,
+    simulationId: state.simulation?.simulation_id,
+    text: elements["simulation-turn"].value.trim(),
+  });
+  elements["readback-interrupted"].disabled = state.busy || !state.simulation || retry;
+  const notice = retry
+    ? playbackFactNotice(pending.readbackInterrupted, { retry: true })
+    : state.playbackNotice;
+  elements["playback-fact-status"].textContent = notice;
+  elements["playback-fact-status"].hidden = !notice;
+}
+
 function syncButtonStates() {
   for (const button of document.querySelectorAll("button")) {
     if (!button.closest("dialog")) button.disabled = state.busy;
@@ -312,7 +332,7 @@ function syncButtonStates() {
   elements["close-simulation"].disabled = state.busy || !simulationActive;
   elements["send-simulation-turn"].disabled = state.busy || !simulationActive;
   elements["simulation-turn"].disabled = state.busy || !simulationActive;
-  elements["readback-interrupted"].disabled = state.busy || !simulationActive;
+  syncReadbackOverride();
   elements["simulation-id"].disabled = state.busy || simulationActive;
   elements["simulation-version"].disabled = state.busy || simulationActive;
   elements["merchant-select"].disabled = state.busy || simulationActive;
@@ -464,6 +484,7 @@ function renderVersions() {
 }
 
 function renderSimulation() {
+  syncReadbackOverride();
   const active = Boolean(state.simulation);
   elements["simulation-status"].textContent = active ? "Running" : "Stopped";
   elements["simulation-status"].className = `pill ${active ? "published" : "neutral"}`;
@@ -782,6 +803,9 @@ async function startSimulation() {
     }
   });
   if (!opened) return;
+  state.handsFreeArmed = false;
+  state.voiceAwaitingReply = false;
+  await voice.reset();
   state.simulation = opened.status;
   state.simulationState = await runAction("Inspecting simulation state", () =>
     api.inspectSimulation(state.merchantId, simulationId),
@@ -790,6 +814,9 @@ async function startSimulation() {
   state.simulationDiagnostics = [];
   state.simulationLatency = null;
   state.pendingSimulationTurn = null;
+  state.lastReplyPlayback = null;
+  state.playbackNotice = "";
+  elements["readback-interrupted"].checked = false;
   renderSimulation();
   // The bound voice belongs to the pinned publication, so it is resolved once one exists.
   await refreshVoiceIdentity();
@@ -798,26 +825,32 @@ async function startSimulation() {
   );
 }
 
-async function sendSimulationTurn() {
+async function sendSimulationTurn({ spoken = false } = {}) {
   if (!state.simulation) return;
   const text = elements["simulation-turn"].value.trim();
   if (!text) {
     showError(new ManagementApiError(422, "invalid_request"));
     return;
   }
-  if (voice.playbackActive) noteInterruptedReadback();
+  state.voiceAwaitingReply = state.handsFreeArmed;
+  // Finalize audible interruption before taking the fact for this request.
+  voice.stopSpeaking(true);
   const turn = simulationTurnRequest(
     state.pendingSimulationTurn,
     {
       tenantId: state.merchantId,
       simulationId: state.simulation.simulation_id,
       text,
-      readbackInterrupted: elements["readback-interrupted"].checked,
+      readbackInterrupted: simulationPlaybackFact(
+        state.lastReplyPlayback,
+        voice.playbackOutcome(state.lastReplyPlayback?.replyId),
+        elements["readback-interrupted"].checked,
+        { typed: !spoken },
+      ),
     },
     () => requestId("simulation-turn"),
   );
   state.pendingSimulationTurn = turn;
-  state.voiceAwaitingReply = state.handsFreeArmed;
   void voice.think();
   const result = await runAction("Running the caller turn", () =>
     api.sendSimulationTurn(
@@ -831,10 +864,11 @@ async function sendSimulationTurn() {
   if (!result) {
     state.handsFreeArmed = false;
     state.voiceAwaitingReply = false;
-    void voice.reset();
+    void voice.reset({ keepPlaybackOutcome: true });
     return;
   }
   state.pendingSimulationTurn = null;
+  state.playbackNotice = playbackFactNotice(turn.readbackInterrupted);
   const replies = simulationMessages(result.events);
   state.simulationMessages.push(
     { kind: "caller", text },
@@ -846,7 +880,7 @@ async function sendSimulationTurn() {
   elements["simulation-turn"].value = "";
   elements["readback-interrupted"].checked = false;
   renderSimulation();
-  speakLatestReply(replies);
+  speakLatestReply(replies, `${state.simulation.simulation_id}:${result.turn_number}`);
   announce(`Completed simulation turn ${result.turn_number}.`);
 }
 
@@ -868,6 +902,9 @@ async function resetSimulation() {
   state.simulationDiagnostics = [];
   state.simulationLatency = null;
   state.pendingSimulationTurn = null;
+  state.lastReplyPlayback = null;
+  state.playbackNotice = "";
+  elements["readback-interrupted"].checked = false;
   renderSimulation();
   announce(`Reset simulation on ${reset.publication_version_id}.`);
 }
@@ -889,6 +926,9 @@ async function closeSimulation() {
   state.simulationDiagnostics = [];
   state.simulationLatency = null;
   state.pendingSimulationTurn = null;
+  state.lastReplyPlayback = null;
+  state.playbackNotice = "";
+  elements["readback-interrupted"].checked = false;
   renderSimulation();
   await refreshVoiceIdentity();
   announce("Closed the isolated simulation.");
@@ -929,7 +969,11 @@ async function rollbackTo(version) {
 
 elements["refresh-merchants"].addEventListener("click", refreshMerchants);
 elements["merchant-select"].addEventListener("change", () => {
+  state.handsFreeArmed = false;
+  state.voiceAwaitingReply = false;
+  void voice.reset();
   selectMerchantWorkspace(state, elements["merchant-select"].value);
+  elements["readback-interrupted"].checked = false;
   renderWorkspace();
 });
 elements["load-draft"].addEventListener("click", loadWorkspace);
@@ -946,7 +990,8 @@ elements["refresh-history"].addEventListener("click", async () => {
 });
 elements["compare-versions"].addEventListener("click", compareVersions);
 elements["start-simulation"].addEventListener("click", startSimulation);
-elements["send-simulation-turn"].addEventListener("click", sendSimulationTurn);
+elements["send-simulation-turn"].addEventListener("click", () => sendSimulationTurn());
+elements["simulation-turn"].addEventListener("input", syncReadbackOverride);
 elements["simulation-turn"].addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -966,7 +1011,6 @@ elements["voice-listen"].addEventListener("click", () => {
   } else if (voice.state === "listening" || voice.acquiring) {
     void voice.cancelListening();
   } else {
-    if (voice.playbackActive) noteInterruptedReadback();
     void voice.listen();
   }
   syncVoiceAvailability();

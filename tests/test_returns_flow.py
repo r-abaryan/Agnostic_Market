@@ -100,6 +100,18 @@ async def test_stray_turn_after_completion_never_double_creates(config_root: Pat
     assert h.store.return_count == 1
 
 
+async def test_return_unheard_twice_creates_nothing_and_says_so(config_root: Path) -> None:
+    h = _return_harness(config_root, thread_id="return-unheard-twice")
+    await _events(h.engine, "I need to return this order")
+    await _events(h.engine, "yes", TurnFacts(readback_interrupted=True))
+
+    events = await _events(h.engine, "yes", TurnFacts(readback_interrupted=True))
+
+    assert h.store.return_count == 0
+    spoken = [e.text for e in events if isinstance(e, SpokenMessageEvent)]
+    assert "I didn't get a clear yes, so I haven't set up a return." in spoken
+
+
 @pytest.mark.parametrize(
     ("response", "facts", "thread_id"),
     [

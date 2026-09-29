@@ -50,6 +50,7 @@ from agnostic_market.commerce.orders import (
     RecentOrderContext,
     speak_lines,
 )
+from agnostic_market.commerce.spoken import standalone_quantity
 from agnostic_market.dtos.confirmation import (
     ToolConfirmationPolicy,
     validate_confirmation_rendering,
@@ -71,11 +72,14 @@ from agnostic_market.dtos.state import (
     PendingCartMutation,
     PendingPlacement,
     PolicyContext,
+    ProductReference,
     ReasoningState,
 )
 from agnostic_market.durability.session_state import SessionStateCoordinator
 
 logger = logging.getLogger("agnostic_market.agents.cart")
+# Two exchanges: every case in the 2026-09-29 selector replay fit inside them.
+_SELECTOR_RECENT_TURNS = 4
 
 # place_order's declared confirmation contract (VOICE_PIPELINE §7a): the readback MUST speak
 # these critical fields at explicit_yes strength. `line_items` (not `quantity`) — a single
@@ -436,6 +440,34 @@ def build_cart_nodes(
         else:
             live_item = None
 
+        # After the item is fixed, a bare numeric answer to the quantity question needs no
+        # model interpretation. Typed digits and spoken number words share this same path.
+        if (
+            request.operation in {"add", "set_quantity"}
+            and isinstance(request.item, ResolvedCartItemRef)
+            and request.quantity is None
+            and current_message is not None
+            and isinstance(current_message.content, str)
+        ):
+            quantity = standalone_quantity(current_message.content)
+            if quantity is not None and (request.operation != "add" or quantity > 0):
+                retain(
+                    ModifyCart(
+                        operation=request.operation,
+                        item=request.item,
+                        quantity=quantity,
+                    )
+                )
+                # A separate event: no model proposed this slot.
+                telemetry.record(
+                    {
+                        "event": "cart_slot_parsed",
+                        "turn_id": state.consumed_turn_ids[-1],
+                        "operation": request.operation,
+                        "slot": "quantity",
+                    }
+                )
+
         if selecting_item or not request.is_slot_complete():
             proposal_tool = provide_cart_slots
             prompt_candidates = candidates if selecting_item else number_candidates([live_item])
@@ -467,6 +499,12 @@ def build_cart_nodes(
                     proposal_tool.name,
                     offered_skus=offered_skus if selecting_item else (),
                     referenced_skus=referenced_skus if selecting_item else (),
+                    recent_turns=tuple(
+                        (entry.speaker, entry.text)
+                        for entry in state.conversation_before(
+                            state.consumed_turn_ids[-1], _SELECTOR_RECENT_TURNS
+                        )
+                    ),
                 )
             )
             current_user_message = state.current_committed_user_message()
@@ -624,10 +662,10 @@ def build_cart_nodes(
         action = _mutation_action(pending)
         answer = interrupt(f"Just to confirm: {action}?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {action}. Please say yes or no.")
             decision = classify_confirmation(retry)
-        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
+        verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
             telemetry.record({"event": "cart_mutation_cancelled", "reason": "human_requested"})
@@ -640,12 +678,22 @@ def build_cart_nodes(
                     source=decision.handoff_source,
                 ),
             }
-        if verdict == "no":
-            telemetry.record({"event": "cart_mutation_cancelled", "reason": "declined"})
+        if verdict in {"no", "unclear"}:
+            reason = "declined" if verdict == "no" else "unclear"
+            telemetry.record({"event": "cart_mutation_cancelled", "reason": reason})
+            line = (
+                "Okay, I won't change your cart."
+                if verdict == "no"
+                else "I didn't get a clear yes, so I haven't changed your cart."
+            )
             return {
                 "pending_cart_mutation": None,
                 "execution_owner": None,
-                "messages": [AIMessage("Okay, I won't change your cart.")],
+                # The caller was just deciding about this product: "actually, add it" means it.
+                "product_reference": ProductReference(
+                    skus=(pending.sku,), turn_id=state.consumed_turn_ids[-1]
+                ),
+                "messages": [AIMessage(line)],
             }
         return {}
 
@@ -827,10 +875,10 @@ def build_cart_nodes(
         phrase = _placement_confirmation_phrase(pending, PLACE_ORDER_POLICY)
         answer = interrupt(f"Just to confirm: shall I place {phrase}?")
         decision = classify_confirmation(answer)
-        if answer.get("readback_interrupted") or decision.verdict == "unclear":
+        if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: shall I place {phrase}? Yes or no?")
             decision = classify_confirmation(retry)
-        verdict = decision.verdict if decision.verdict in {"yes", "human"} else "no"
+        verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
             telemetry.record({"event": "checkout_cancelled", "reason": "human_requested"})
@@ -843,17 +891,19 @@ def build_cart_nodes(
                     source=decision.handoff_source,
                 ),
             }
-        if verdict == "no":
-            telemetry.record({"event": "checkout_cancelled", "reason": "declined"})
+        if verdict in {"no", "unclear"}:
+            reason = "declined" if verdict == "no" else "unclear"
+            telemetry.record({"event": "checkout_cancelled", "reason": reason})
+            line = (
+                "Okay, I won't place it - your cart's still saved if you want to change anything."
+                if verdict == "no"
+                else "I didn't get a clear yes, so I haven't placed the order - your cart's still "
+                "saved."
+            )
             return {
                 "pending_placement": None,
                 "execution_owner": None,
-                "messages": [
-                    AIMessage(
-                        "Okay, I won't place it - your cart's still saved if you want to change "
-                        "anything."
-                    )
-                ],
+                "messages": [AIMessage(line)],
             }
         return {}  # yes: pending survives; the router sends us to place
 

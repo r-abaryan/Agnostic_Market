@@ -288,19 +288,48 @@ export function selectMerchantWorkspace(state, merchantId) {
     simulationDiagnostics: [],
     simulationLatency: null,
     pendingSimulationTurn: null,
+    lastReplyPlayback: null,
+    playbackNotice: "",
   });
 }
 
-export function simulationTurnRequest(current, input, requestIdFactory) {
-  if (
+// A retry keeps its request id and playback fact: the failed attempt may have committed.
+export function simulationTurnReused(current, input) {
+  return (
     current?.tenantId === input.tenantId &&
     current.simulationId === input.simulationId &&
-    current.text === input.text &&
-    current.readbackInterrupted === input.readbackInterrupted
-  ) {
-    return current;
-  }
+    current.text === input.text
+  );
+}
+
+export function simulationTurnRequest(current, input, requestIdFactory) {
+  if (simulationTurnReused(current, input)) return current;
   return { ...input, requestId: requestIdFactory() };
+}
+
+export function simulationPlaybackFact(
+  lastReply,
+  voiceOutcome,
+  manualInterruption,
+  { typed = false } = {},
+) {
+  if (manualInterruption) return true;
+  if (!lastReply) return null;
+  // A displayed reply counts as received when the reply or the answer to it is text.
+  if (typed || !lastReply.voiced) return false;
+  return voiceOutcome ?? null;
+}
+
+const PLAYBACK_FACT_LABELS = new Map([
+  [false, "received"],
+  [true, "interrupted"],
+  [null, "unknown"],
+]);
+
+export function playbackFactNotice(fact, { retry = false } = {}) {
+  const label = PLAYBACK_FACT_LABELS.get(fact ?? null);
+  if (retry) return `Retry resends the original turn, with the previous reply ${label}.`;
+  return fact === false ? "" : `Last turn sent the previous reply as ${label}.`;
 }
 
 export function simulationMessages(events) {
@@ -324,6 +353,14 @@ export function simulationMessages(events) {
   }
   flushStream();
   return messages;
+}
+
+// Every assistant line of one turn, in order: an answer can be followed by a readback.
+export function spokenTurnText(replies) {
+  return replies
+    .filter((message) => message.kind !== "caller")
+    .map((message) => message.text)
+    .join(" ");
 }
 
 const DIAGNOSTIC_ATTRIBUTE_KEYS = [

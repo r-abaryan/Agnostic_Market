@@ -69,7 +69,12 @@ from agnostic_market.dtos.orchestration import (
     ViewCart,
     ViewIdentityStatus,
 )
-from agnostic_market.dtos.state import ProductOffer, ProductReference, ReasoningState
+from agnostic_market.dtos.state import (
+    ConversationEntry,
+    ProductOffer,
+    ProductReference,
+    ReasoningState,
+)
 
 _SELECTION = ProviderModel(provider="fake", model="router")
 
@@ -306,7 +311,13 @@ async def test_routing_session_resolves_and_emits_only_closed_route_fields() -> 
     assert "request" not in records[0]
 
 
-async def test_routing_evidence_reports_reference_presence_without_product_identity() -> None:
+@pytest.mark.parametrize(
+    ("offered", "expected_reference", "expected_offer"),
+    ((False, True, False), (True, False, True)),
+)
+async def test_routing_evidence_reports_reference_presence_without_product_identity(
+    offered: bool, expected_reference: bool, expected_offer: bool
+) -> None:
     sink = InMemoryTelemetrySink()
     telemetry = TenantTelemetry("acme_store", sink, sink).bind_session("reference-route")
     recognizer = _RecordingRecognizer(_attempt(RouteDecision.direct(ModifyCart(operation="add"))))
@@ -320,15 +331,17 @@ async def test_routing_evidence_reports_reference_presence_without_product_ident
     )
     state = ReasoningState(
         consumed_turn_ids=("price-turn", "add-turn"),
-        product_offer=ProductOffer(skus=("SKU-BLU-07",), turn_id="price-turn"),
+        product_offer=(
+            ProductOffer(skus=("SKU-BLU-07",), turn_id="price-turn") if offered else None
+        ),
         product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="price-turn"),
     )
     turn = CommittedTurn(text="Add that product", message_id="add-turn")
 
     await routing.resolve(turn, state)
 
-    assert sink.records[0].attributes["has_product_reference"] is True
-    assert sink.records[0].attributes["has_offered_product"] is True
+    assert sink.records[0].attributes["has_product_reference"] is expected_reference
+    assert sink.records[0].attributes["has_offered_product"] is expected_offer
     assert "SKU-BLU-07" not in json.dumps(sink.records[0].flattened())
 
 
@@ -655,7 +668,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "405c443e3566ebbdad69a378630040bd1c0d49b678492727df16f6b3fd0f2fad"
+        "d2a097b217141abbee345b3e2e7b835fefb05d08e5ef5a05f5d15645c533ed33"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -762,6 +775,59 @@ def test_projector_keeps_product_reference_separate_from_actionable_offer() -> N
     assert context.has_offered_product is False
     assert state.live_product_reference("reply-turn") is not None
     assert state.live_product_offer("reply-turn") is None
+
+
+def test_projector_never_reports_an_offer_as_a_bare_reference() -> None:
+    """Both flags true let the reference rule veto every bare accept of the offer."""
+    offered = ReasoningState(
+        messages=[HumanMessage("Want the jacket?", id="offer-turn")],
+        consumed_turn_ids=("offer-turn", "reply-turn"),
+        product_offer=ProductOffer(skus=("SKU-BLU-07",), turn_id="offer-turn"),
+        product_reference=ProductReference(skus=("SKU-BLU-07",), turn_id="offer-turn"),
+    )
+    context = project_routing_context(
+        CommittedTurn(text="Yeah.", message_id="reply-turn"),
+        offered,
+        identity_store=CallerIdentityStore(),
+        cart_store=CartStore(),
+        recent_orders=RecentOrderContext(max_refs=3),
+        registry=_registry(ModifyCart),
+    )
+
+    assert isinstance(context, RoutingContext)
+    assert context.has_offered_product is True
+    assert context.has_product_reference is False
+    assert offered.live_product_reference("reply-turn") is not None
+
+
+def test_projector_shows_the_router_the_last_exchange_before_the_utterance() -> None:
+    def line(speaker: str, text: str, turn_id: str) -> ConversationEntry:
+        return ConversationEntry(speaker=speaker, text=text, turn_id=turn_id)
+
+    def project(*conversation: ConversationEntry) -> RoutingContext:
+        context = project_routing_context(
+            CommittedTurn(text="Jacket.", message_id="turn-3"),
+            ReasoningState(consumed_turn_ids=("turn-1", "turn-2"), conversation=conversation),
+            identity_store=CallerIdentityStore(),
+            cart_store=CartStore(),
+            recent_orders=RecentOrderContext(max_refs=3),
+            registry=_registry(SearchCatalog),
+        )
+        assert isinstance(context, RoutingContext)
+        return context
+
+    context = project(
+        line("caller", "Hi.", "turn-1"),
+        line("assistant", "Hi! How can I help you today?", "turn-1"),
+        line("caller", "Find me another.", "turn-2"),
+        line("assistant", "What kind of product are you looking for?", "turn-2"),
+        line("caller", "Jacket.", "turn-3"),
+    )
+    assert [(turn.speaker, turn.text) for turn in context.recent_turns] == [
+        ("caller", "Find me another."),
+        ("assistant", "What kind of product are you looking for?"),
+    ]
+    assert "recent_turns" not in project().model_dump_json()
 
 
 def test_projector_exposes_only_a_live_open_help_prompt() -> None:

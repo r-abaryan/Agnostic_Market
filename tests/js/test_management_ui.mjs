@@ -7,10 +7,14 @@ import {
   buildDraftUpdate,
   canRollback,
   parseCatalog,
+  playbackFactNotice,
   selectMerchantWorkspace,
   simulationDiagnostics,
+  simulationPlaybackFact,
   simulationTurnRequest,
+  simulationTurnReused,
   simulationMessages,
+  spokenTurnText,
 } from "../../src/agnostic_market/management/ui/assets/client.js";
 import {
   CAPTURE_SAMPLE_RATE,
@@ -126,6 +130,7 @@ test("simulation client methods preserve tenant and session scope", async () => 
 
   await api.startSimulation("tenant a", "session/1", "version-2");
   await api.sendSimulationTurn("tenant a", "session/1", "turn-1", "hello", true);
+  await api.sendSimulationTurn("tenant a", "session/1", "turn-2", "again", null);
   await api.inspectSimulation("tenant a", "session/1");
   await api.resetSimulation("tenant a", "session/1");
   await api.closeSimulation("tenant a", "session/1");
@@ -145,9 +150,10 @@ test("simulation client methods preserve tenant and session scope", async () => 
     text: "hello",
     readback_interrupted: true,
   });
-  assert.equal(calls[2].path.endsWith("/state"), true);
-  assert.equal(calls[3].path.endsWith("/reset"), true);
-  assert.equal(calls[4].options.method, "DELETE");
+  assert.equal(JSON.parse(calls[2].options.body).readback_interrupted, null);
+  assert.equal(calls[3].path.endsWith("/state"), true);
+  assert.equal(calls[4].path.endsWith("/reset"), true);
+  assert.equal(calls[5].options.method, "DELETE");
 });
 
 test("simulation event projection exposes only caller-facing messages", () => {
@@ -164,6 +170,17 @@ test("simulation event projection exposes only caller-facing messages", () => {
       { kind: "assistant", text: "I can help with that." },
       { kind: "confirmation", text: "Should I place the order?" },
     ],
+  );
+});
+
+test("an answer followed by a readback is spoken whole, in order", () => {
+  const replies = simulationMessages([
+    { kind: "spoken_message", text: "You have 2 waterproof rain jackets.", node: "cart_view" },
+    { kind: "interrupt", prompt: "Just to confirm: shall I place the order?" },
+  ]);
+  assert.equal(
+    spokenTurnText(replies),
+    "You have 2 waterproof rain jackets. Just to confirm: shall I place the order?",
   );
 });
 
@@ -275,6 +292,7 @@ test("changing merchants clears every tenant-bound workspace value", () => {
     simulationDiagnostics: ["turn_failed | node=answer_response"],
     simulationLatency: { total_seconds: 0.1 },
     pendingSimulationTurn: { requestId: "turn-1" },
+    lastReplyPlayback: { replyId: "old-session:1", voiced: true },
     merchants: [{ tenant_id: "acme_store" }, { tenant_id: "demo_shop" }],
     busy: false,
   };
@@ -297,6 +315,7 @@ test("changing merchants clears every tenant-bound workspace value", () => {
     "simulationState",
     "simulationLatency",
     "pendingSimulationTurn",
+    "lastReplyPlayback",
   ]) {
     assert.equal(state[key], null, key);
   }
@@ -319,10 +338,44 @@ test("an unchanged simulation turn reuses its request id until completion", () =
   const first = simulationTurnRequest(null, input, nextId);
   const retry = simulationTurnRequest(first, input, nextId);
   const changed = simulationTurnRequest(first, { ...input, text: "add two shirts" }, nextId);
+  const changedPlayback = simulationTurnRequest(
+    first, { ...input, readbackInterrupted: true }, nextId,
+  );
 
   assert.strictEqual(retry, first);
+  assert.strictEqual(changedPlayback, first);
   assert.equal(retry.requestId, "simulation-turn-1");
+  assert.equal(changedPlayback.readbackInterrupted, false);
   assert.equal(changed.requestId, "simulation-turn-2");
+});
+
+test("simulation playback facts preserve text-only completion and voice uncertainty", () => {
+  assert.equal(simulationPlaybackFact(null, null, false), null);
+  assert.equal(simulationPlaybackFact({ voiced: false }, null, false), false);
+  assert.equal(simulationPlaybackFact({ voiced: true }, null, false), null);
+  assert.equal(simulationPlaybackFact({ voiced: true }, false, false), false);
+  assert.equal(simulationPlaybackFact({ voiced: true }, true, false), true);
+  assert.equal(simulationPlaybackFact({ voiced: true }, null, true), true);
+
+  // A typed answer was composed with the whole reply on screen, whatever the audio did.
+  const typed = { typed: true };
+  assert.equal(simulationPlaybackFact({ voiced: true }, true, false, typed), false);
+  assert.equal(simulationPlaybackFact({ voiced: true }, null, false, typed), false);
+  assert.equal(simulationPlaybackFact(null, null, false, typed), null);
+  assert.equal(simulationPlaybackFact({ voiced: true }, null, true, typed), true);
+});
+
+test("the sent playback fact is visible, and a retry names the fact it resends", () => {
+  assert.equal(playbackFactNotice(false), "");
+  assert.equal(playbackFactNotice(true), "Last turn sent the previous reply as interrupted.");
+  assert.equal(playbackFactNotice(null), "Last turn sent the previous reply as unknown.");
+  assert.match(playbackFactNotice(false, { retry: true }), /previous reply received\.$/);
+  assert.match(playbackFactNotice(null, { retry: true }), /previous reply unknown\.$/);
+
+  const pending = { tenantId: "t", simulationId: "s", text: "yes", readbackInterrupted: null };
+  assert.equal(simulationTurnReused(pending, { tenantId: "t", simulationId: "s", text: "yes" }), true);
+  assert.equal(simulationTurnReused(pending, { tenantId: "t", simulationId: "s", text: "no" }), false);
+  assert.equal(simulationTurnReused(null, { tenantId: "t", simulationId: "s", text: "yes" }), false);
 });
 
 test("capture is converted to the exact PCM shape the STT engine accepts", () => {
@@ -565,7 +618,7 @@ test("hands-free speech interrupts playback without mistaking low-level echo for
     onTranscript: (text) => heard.push(text),
   });
 
-  assert.equal(await voice.speak("the answer"), true);
+  assert.equal(await voice.speak("the answer", "session:barge"), true);
   assert.equal(await voice.listen({ autoSendOnSilence: true, monitorPlayback: true }), true);
   assert.equal(voice.state, "barge-ready");
   assert.equal(playback.stopped, false);
@@ -575,6 +628,7 @@ test("hands-free speech interrupts playback without mistaking low-level echo for
   const speech = Float32Array.from({ length: 160 }, () => 0.12);
   for (let index = 0; index < 30; index += 1) captureNode.port.onmessage({ data: speech });
   assert.equal(playback.stopped, true);
+  assert.equal(voice.playbackOutcome("session:barge"), true);
   assert.equal(voice.state, "listening");
   assert.equal(interrupted.length, 1);
   for (let index = 0; index < 90; index += 1) {
@@ -843,10 +897,85 @@ test("submitting a typed turn stops a reply already playing", async () => {
     versionId: () => "v",
   });
 
-  assert.equal(await voice.speak("old reply"), true);
+  assert.equal(await voice.speak("old reply", "session:typed"), true);
   await voice.think();
   assert.equal(source.stopped, true);
+  assert.equal(voice.playbackOutcome("session:typed"), true);
   assert.equal(voice.state, "thinking");
+});
+
+test("playback facts distinguish natural end, caller interruption, and unknown audio", async () => {
+  fakeMedia();
+  const sources = [];
+  globalThis.AudioContext = class {
+    state = "running";
+    destination = {};
+    async decodeAudioData() { return {}; }
+    createBufferSource() {
+      const source = {
+        connect() {}, start() {}, stop() { this.stopped = true; }, stopped: false,
+      };
+      sources.push(source);
+      return source;
+    }
+  };
+  const module = await import(
+    `../../src/agnostic_market/management/ui/assets/voice.js?stub=playback-facts`
+  );
+  const voice = module.createVoiceController({
+    api: { synthesizeSpeech: async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }) },
+    tenantId: () => "t",
+    versionId: () => "v",
+  });
+
+  assert.equal(voice.playbackOutcome(undefined), null);
+  assert.equal(voice.playbackOutcome(null), null);
+  assert.equal(voice.playbackOutcome("session:missing"), null);
+  assert.equal(await voice.speak("first", "session:1"), true);
+  assert.equal(voice.playbackOutcome("session:1"), null);
+  sources[0].onended();
+  assert.equal(voice.playbackOutcome("session:1"), false);
+
+  assert.equal(await voice.speak("second", "session:2"), true);
+  assert.equal(voice.playbackOutcome("session:1"), null);
+  voice.stopSpeaking(true);
+  assert.equal(sources[1].stopped, true);
+  assert.equal(voice.playbackOutcome("session:2"), true);
+  sources[1].onended();
+  assert.equal(voice.playbackOutcome("session:2"), true);
+
+  let release;
+  const pendingVoice = module.createVoiceController({
+    api: { synthesizeSpeech: () => new Promise((resolve) => { release = resolve; }) },
+    tenantId: () => "t",
+    versionId: () => "v",
+  });
+  const pending = pendingVoice.speak("third", "session:3");
+  pendingVoice.stopSpeaking(true);
+  release({ arrayBuffer: async () => new ArrayBuffer(8) });
+  assert.equal(await pending, false);
+  assert.equal(pendingVoice.playbackOutcome("session:3"), null);
+
+  const failedVoice = module.createVoiceController({
+    api: { synthesizeSpeech: async () => { throw new Error("tts unavailable"); } },
+    tenantId: () => "t",
+    versionId: () => "v",
+  });
+  assert.equal(await failedVoice.speak("fourth", "session:4"), false);
+  assert.equal(failedVoice.playbackOutcome("session:4"), null);
+
+  assert.equal(await voice.speak("fifth", "session:5"), true);
+  voice.stopSpeaking();
+  assert.equal(voice.playbackOutcome("session:5"), null);
+  await voice.reset();
+  assert.equal(voice.playbackOutcome("session:5"), null);
+
+  assert.equal(await voice.speak("sixth", "session:6"), true);
+  sources.at(-1).onended();
+  await voice.reset({ keepPlaybackOutcome: true });
+  assert.equal(voice.playbackOutcome("session:6"), false);
+  await voice.reset();
+  assert.equal(voice.playbackOutcome("session:6"), null);
 });
 
 // captureSupport is frozen at module load, so the stubs must exist before the module is
@@ -962,13 +1091,14 @@ test("a superseded playback completion cannot orphan newer audio", async () => {
   const api = { synthesizeSpeech: async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }) };
   const voice = module.createVoiceController({ api, tenantId: () => "t", versionId: () => "v" });
 
-  await voice.speak("first reply");
+  await voice.speak("first reply", "session:first");
   const first = started[0];
-  await voice.speak("second reply");
+  await voice.speak("second reply", "session:second");
   const second = started[1];
 
   // The first source was stopped by the second speak; its late completion must be ignored.
   first.onended?.();
+  assert.equal(voice.playbackOutcome("session:second"), null);
   voice.stopSpeaking();
 
   assert.equal(second.stopped, true, "the newer source must still be stoppable");

@@ -31,6 +31,7 @@ from agnostic_market.dtos.orchestration import (
     AssistantPromptKind,
     CancellableOrderScope,
     CapabilityDispatchEnvelope,
+    CapabilityId,
     CartOperation,
     ClarificationOwner,
     IntentRequest,
@@ -43,8 +44,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["6"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "6"
+CheckpointSchemaVersion = Literal["7"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "7"
 
 
 class CheckpointSchemaError(ValueError):
@@ -513,6 +514,42 @@ class PendingAck(BaseModel):
     assistant_prompt_kind: AssistantPromptKind | None = None
 
 
+class ConversationEntry(BaseModel):
+    """One line the caller said or was sent, recorded by the engine that relayed it."""
+
+    model_config = _FROZEN
+
+    speaker: Literal["caller", "assistant"]
+    text: NonEmptyText
+    turn_id: NonEmptyText
+    # Assistant lines only, from the next turn's playback fact; None when it was unavailable.
+    heard: bool | None = None
+
+    @model_validator(mode="after")
+    def only_assistant_lines_carry_playback(self) -> Self:
+        if self.speaker == "caller" and self.heard is not None:
+            raise ValueError("a caller line carries no playback fact")
+        return self
+
+
+CONVERSATION_ENTRY_LIMIT = 12
+
+
+def append_conversation(
+    existing: tuple[ConversationEntry, ...],
+    update: tuple[ConversationEntry, ...],
+) -> tuple[ConversationEntry, ...]:
+    """Append each line once per speaker and turn, keeping only the most recent entries."""
+    merged = list(existing)
+    seen = {(entry.speaker, entry.turn_id) for entry in existing}
+    for entry in update:
+        key = (entry.speaker, entry.turn_id)
+        if key not in seen:
+            merged.append(entry)
+            seen.add(key)
+    return tuple(merged[-CONVERSATION_ENTRY_LIMIT:])
+
+
 class ClarificationLiveness(BaseModel):
     """Consecutive clarification questions for one explicit owner."""
 
@@ -591,6 +628,10 @@ class ReasoningState(BaseModel):
     product_reference: ProductReference | None = None
     # Conversational context only. It cannot authorize an effect or replace a flow owner.
     assistant_prompt: AssistantPrompt | None = None
+    # What the caller said and was sent, newest last. Context for models, never authority.
+    conversation: Annotated[tuple[ConversationEntry, ...], append_conversation] = ()
+    # The turn whose answer is followed by a re-read readback; read owners then skip their close.
+    confirmation_detour_turn: NonEmptyText | None = None
 
     @classmethod
     def from_checkpoint(cls, values: Mapping[str, object]) -> Self:
@@ -627,6 +668,48 @@ class ReasoningState(BaseModel):
             reference
             if reference is not None and self._is_previous_turn(reference.turn_id, turn_id)
             else None
+        )
+
+    def conversation_before(self, turn_id: str | None, limit: int) -> tuple[ConversationEntry, ...]:
+        """The recorded lines before this caller turn, newest last, at most `limit` of them."""
+        earlier = tuple(
+            entry
+            for entry in self.conversation
+            if not (entry.speaker == "caller" and entry.turn_id == turn_id)
+        )
+        return earlier[-limit:] if limit > 0 else ()
+
+    def pending_confirmation_capability(self) -> CapabilityId | None:
+        """The capability whose pending action a paused readback is confirming."""
+        for pending, capability in (
+            (self.pending_cart_mutation, CapabilityId.MODIFY_CART),
+            (self.pending_placement, CapabilityId.PLACE_ORDER),
+            (self.pending_refund, CapabilityId.REFUND_ORDER),
+            (self.pending_cancel, CapabilityId.CANCEL_ORDERS),
+            (self.pending_return, CapabilityId.RETURN_ORDER),
+            (self.pending_profile_change, CapabilityId.CHANGE_PROFILE),
+        ):
+            if pending is not None:
+                return capability
+        return self.active_invocation.capability if self.active_invocation is not None else None
+
+    def pending_readback_reference(self) -> ProductReference | None:
+        """The pending cart action's products, the referent of a reply to its readback."""
+        if self.pending_cart_mutation is not None:
+            skus: tuple[str, ...] = (self.pending_cart_mutation.sku,)
+        elif self.pending_placement is not None:
+            skus = tuple(dict.fromkeys(line.sku for line in self.pending_placement.lines))
+        else:
+            return None
+        if not self.consumed_turn_ids:
+            return None
+        return ProductReference(skus=skus, turn_id=self.consumed_turn_ids[-1])
+
+    def answers_before_readback(self) -> bool:
+        """Whether this turn's answer is followed by the re-read of a pending readback."""
+        return bool(
+            self.confirmation_detour_turn is not None
+            and self.consumed_turn_ids[-1:] == (self.confirmation_detour_turn,)
         )
 
     def live_assistant_prompt(self, turn_id: str | None = None) -> AssistantPrompt | None:

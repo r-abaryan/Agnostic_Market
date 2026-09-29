@@ -15,11 +15,13 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StringConstraints,
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
@@ -687,6 +689,15 @@ def validate_route_output(value: object) -> RouteResolution:
         return RoutingFailure(reason="invalid_output")
 
 
+class RecentTurn(BaseModel):
+    """One line said before the utterance; untrusted, like the utterance itself."""
+
+    model_config = _FROZEN
+
+    speaker: Literal["caller", "assistant"]
+    text: NonEmptyText
+
+
 class RoutingContext(BaseModel):
     """Bounded, authority-free input projected for the semantic router."""
 
@@ -694,6 +705,9 @@ class RoutingContext(BaseModel):
 
     routing_scope: Literal["ordinary", "confirmation_escape"] = "ordinary"
     utterance: NonEmptyText
+    # Oldest first. Omitted from dumps when empty, so a context without history serializes
+    # exactly as before and every no-history measurement and corpus fingerprint stays valid.
+    recent_turns: tuple[RecentTurn, ...] = ()
     bound_customer: StrictBool
     active_capability: CapabilityId | None = None
     recent_order_operation: OrderContextOperation | None = None
@@ -723,6 +737,13 @@ class RoutingContext(BaseModel):
         if (self.recent_order_operation is None) != (self.recent_order_count == 0):
             raise ValueError("recent order operation and count must be present together")
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_empty_history(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if not self.recent_turns:
+            data.pop("recent_turns", None)
+        return data
 
 
 class VerificationProof(BaseModel):

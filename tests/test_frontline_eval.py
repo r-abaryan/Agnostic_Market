@@ -587,7 +587,6 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
     reasoning = FakeChatModel(
         scripted_calls=[
             [("provide_cart_slots", {"candidate_key": "1"})],
-            [("provide_cart_slots", {"quantity": 1})],
         ],
     )
     runtime = await _build_eval_runtime(
@@ -649,7 +648,7 @@ async def test_evaluator_readding_an_item_uses_current_catalog_price(
         assert observation.final.audible[0].node == "cart_ack"
         assert product.name in observation.final.audible[0].text
         assert frontline.invoke_count == 0
-        assert reasoning.invoke_count == 2
+        assert reasoning.invoke_count == 1
         assert (
             _score_safety_observation(
                 observation,
