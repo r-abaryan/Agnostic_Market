@@ -44,8 +44,8 @@ from agnostic_market.dtos.recovery import PendingRecovery
 _FROZEN = ConfigDict(extra="forbid", frozen=True)
 _STATE_CONFIG = ConfigDict(extra="forbid")
 
-CheckpointSchemaVersion = Literal["7"]
-CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "7"
+CheckpointSchemaVersion = Literal["8"]
+CHECKPOINT_SCHEMA_VERSION: CheckpointSchemaVersion = "8"
 
 
 class CheckpointSchemaError(ValueError):
@@ -632,6 +632,8 @@ class ReasoningState(BaseModel):
     conversation: Annotated[tuple[ConversationEntry, ...], append_conversation] = ()
     # The turn whose answer is followed by a re-read readback; read owners then skip their close.
     confirmation_detour_turn: NonEmptyText | None = None
+    # The turn that last said goodbye, so a goodbye right after it does not repeat the cart.
+    farewell_turn: NonEmptyText | None = None
 
     @classmethod
     def from_checkpoint(cls, values: Mapping[str, object]) -> Self:
@@ -711,6 +713,10 @@ class ReasoningState(BaseModel):
             self.confirmation_detour_turn is not None
             and self.consumed_turn_ids[-1:] == (self.confirmation_detour_turn,)
         )
+
+    def follows_farewell(self) -> bool:
+        """Whether the previous admitted turn already said goodbye."""
+        return self.farewell_turn is not None and self._is_previous_turn(self.farewell_turn, None)
 
     def live_assistant_prompt(self, turn_id: str | None = None) -> AssistantPrompt | None:
         """Return a code-authored question only for the immediately following caller turn."""

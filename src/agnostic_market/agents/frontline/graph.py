@@ -69,6 +69,7 @@ from agnostic_market.commerce.orders import (
     OrderPort,
     RecentOrderContext,
     render_cart_line,
+    speak_lines,
 )
 from agnostic_market.commerce.payment_instruments import PaymentInstrumentPort
 from agnostic_market.commerce.profile import ProfilePort
@@ -130,6 +131,12 @@ _CONVERSE_LINES: Mapping[str, str] = MappingProxyType(
         "channel_check": "Yes, I can hear you clearly. Go ahead.",
         "repair": "Sorry about that. Could you say that again?",
     }
+)
+# The goodbye while the cart holds items. A statement, not a question: a bare yes to a question
+# here would get a clarification, not the order.
+_CART_FAREWELL_LINE = (
+    "Before you go, you still have {items} in your cart. "
+    "Just say place my order whenever you're ready. Thanks for calling {display_name}."
 )
 # Caller-facing phrase per capability. capability_summary is rendered from the session's real
 # registry, so an unavailable capability can never be offered.
@@ -494,15 +501,20 @@ def build_frontline_graph(
             raise TypeError("converse owner requires a converse invocation")
         act = invocation.request.act
         routing_telemetry.record({"event": "conversation_act_served", "act": act})
-        line = (
-            capability_summary_line()
-            if act == "capability_summary"
-            else _CONVERSE_LINES[act].format(display_name=display_name)
-        )
+        if act == "capability_summary":
+            line = capability_summary_line()
+        elif act == "farewell" and not cart_store.is_empty() and not state.follows_farewell():
+            line = _CART_FAREWELL_LINE.format(
+                items=speak_lines(cart_store.view()), display_name=display_name
+            )
+        else:
+            line = _CONVERSE_LINES[act].format(display_name=display_name)
         update: dict[str, object] = {
             **clear_automation_state(),
             "messages": [AIMessage(line)],
         }
+        if act == "farewell":
+            update["farewell_turn"] = state.consumed_turn_ids[-1]
         if act in {"greeting", "capability_summary", "invite_request"}:
             update["assistant_prompt"] = AssistantPrompt(
                 kind="open_help", turn_id=state.consumed_turn_ids[-1]

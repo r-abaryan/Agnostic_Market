@@ -113,6 +113,7 @@ from agnostic_market.dtos.orchestration import (
     CapabilityId,
     CartItemChoices,
     CartItemQuery,
+    Converse,
     DiscloseAiIdentity,
     ExplicitOrderSet,
     ListOrders,
@@ -532,6 +533,36 @@ async def test_router_sees_the_reply_that_just_finished(config_root: Path) -> No
         ("caller", "no"),
         ("assistant", _sent_text(declined)),
     ]
+
+
+async def test_a_goodbye_with_an_unplaced_cart_says_so_once(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    recognizer.choose(RouteDecision.direct(Converse(act="farewell")))
+
+    first = _sent_text(await _events(engine, "No, that's all."))
+    second = _sent_text(await _events(engine, "No thanks."))
+
+    assert first == (
+        "Before you go, you still have 2 waterproof rain jackets in your cart. "
+        "Just say place my order whenever you're ready. Thanks for calling Acme Store."
+    )
+    assert second == "Thanks for calling Acme Store. Goodbye."
+    assert store.placed_count == 0
+
+
+async def test_the_order_can_still_be_placed_after_the_cart_goodbye(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    recognizer.choose(RouteDecision.direct(Converse(act="farewell")))
+    await _events(engine, "No, that's all.")
+    recognizer.choose(RouteDecision.direct(PlaceOrder()))
+
+    readback = await _events(engine, "Place my order.")
+
+    assert any(isinstance(event, InterruptEvent) for event in readback)
+    await _events(engine, "yes")
+    assert store.placed_count == 1
 
 
 def test_conversation_keeps_each_line_once_and_only_the_latest() -> None:

@@ -3206,6 +3206,51 @@ async def test_code_authored_open_help_questions_mark_the_following_turn(
     assert result["assistant_prompt"] == AssistantPrompt(kind="open_help", turn_id="open-help-1")
 
 
+_CART_GOODBYE = (
+    "Before you go, you still have 3 merino hiking socks in your cart. "
+    "Just say place my order whenever you're ready. Thanks for calling Acme Store."
+)
+_PLAIN_GOODBYE = "Thanks for calling Acme Store. Goodbye."
+
+
+@pytest.mark.parametrize(
+    ("quantity", "earlier_turns", "expected"),
+    (
+        (0, ("bye-1", "other-1"), _PLAIN_GOODBYE),
+        (3, ("bye-1", "other-1"), _CART_GOODBYE),
+        (3, ("other-1", "bye-1"), _PLAIN_GOODBYE),
+    ),
+    ids=("empty cart", "goodbye then another turn", "right after a goodbye"),
+)
+async def test_a_goodbye_names_an_unplaced_cart_unless_it_just_said_goodbye(
+    config_root: Path, quantity: int, earlier_turns: tuple[str, ...], expected: str
+) -> None:
+    cart = CartStore()
+    if quantity:
+        cart.add_item(
+            sku="SKU-GRN-15", name="merino hiking socks", price_usd=14.5, quantity=quantity
+        )
+    graph = _graph(config_root, FakeChatModel(), cart_store=cart)
+
+    result = await graph.ainvoke(
+        _admitted_turn(
+            "No thanks.",
+            turn_id="bye-2",
+            consumed_turn_ids=(*earlier_turns, "bye-2"),
+            farewell_turn="bye-1",
+            active_invocation=ActiveInvocation(
+                request=Converse(act="farewell"), opened_turn_id="bye-2"
+            ),
+        )
+    )
+
+    assert _only_spoken(result) == expected
+    assert result["farewell_turn"] == "bye-2"
+    assert cart.line_count == (1 if quantity else 0)
+    assert result.get("assistant_prompt") is None
+    assert result.get("automation_terminal", False) is False
+
+
 async def test_typed_cart_read_uses_the_shared_live_renderer(config_root: Path) -> None:
     cart = CartStore()
     cart.add_item(sku="SKU-1", name="waterproof rain jacket", price_usd=129.0, quantity=1)
