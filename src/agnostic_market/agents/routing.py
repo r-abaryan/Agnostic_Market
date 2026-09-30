@@ -412,10 +412,15 @@ caller is replying to that offer. A reply that accepts it, confirms it, points a
 quantity of it is direct modify_cart with cart_operation=add; the cart owner already holds which
 products were named and asks for anything missing. A reply that declines the offer is not a cart
 request.
+has_offered_product false does not mean nothing was offered: when has_product_reference is
+true and the assistant's last turn in recent_turns offered to add that product, whether it
+asked or said it could if the caller wants, a reply that accepts it is direct modify_cart with
+cart_operation=add as well.
 When has_product_reference is true, a product was discussed in the preceding turn but not offered.
 An explicit request to add that product is direct modify_cart with cart_operation=add; the cart
-owner resolves the product. A bare "yes" or "go ahead" with only a product reference and no
-actionable offer is clarify ambiguous_intent, never a cart add.
+owner resolves the product. A bare "yes" or "go ahead" with only a product reference is a cart
+add only when the assistant's last turn offered to add that product; otherwise it is clarify
+ambiguous_intent.
 When has_offered_product or has_product_reference is true, a question about that product, its
 price, or its properties is direct search_catalog.
 When awaiting_reply_kind is open_help, the assistant just asked whether the caller needs anything
@@ -501,8 +506,10 @@ Contrastive examples:
   {"decision":"direct","capability":"search_catalog"}
 - ordinary, product just referenced, no offer: "Add it to my cart." ->
   {"decision":"direct","capability":"modify_cart","cart_operation":"add"}
-- ordinary, product just referenced, no offer: "Yes." ->
+- ordinary, product just referenced, assistant last stated its price: "Yes." ->
   {"decision":"clarify","clarification_reason":"ambiguous_intent"}
+- ordinary, product just referenced, assistant last offered to add it: "Yes." ->
+  {"decision":"direct","capability":"modify_cart","cart_operation":"add"}
 - ordinary, awaiting open_help: "Yes, one more thing." ->
   {"decision":"direct","capability":"converse","conversation_act":"invite_request"}
 - ordinary, awaiting open_help: "No." ->

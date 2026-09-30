@@ -42,6 +42,15 @@ def compose_catalog_response_prompt(
     else:
         catalog_facts = "- The catalog is empty."
         lookup_instruction = "Say that there are no products to offer right now."
+    # Measured 2026-09-29: without this rule, asked for more detail, the model invented product
+    # features in 10 of 10 answers; with it, 0 of 70.
+    facts_only = (
+        "The list is everything you know about each product: its name, its price, and the "
+        "colour its SKU spells out (say the colour, never the SKU). Say nothing more about a "
+        "product: no features, materials, fit, quality, performance or uses that the list does "
+        "not state. When the caller asks for more detail than that, say that is all the detail "
+        "you have on hand, and ask whether they would like it added to their cart."
+    )
     return "\n".join(
         (
             compose_shared_context(display_name, policy),
@@ -51,6 +60,7 @@ def compose_catalog_response_prompt(
             "Name only products from the list, using their listed name and price. Do not "
             "invent products, prices, SKUs, stock, shipping, or availability, and do not "
             "claim a product exists because the caller asked for it.",
+            facts_only,
             "Answer about the products and nothing else. You may suggest a product and you "
             "may offer to add one you named to the cart, because another owner can carry that "
             "out. Never offer to place an order, check an order, change an account, or take "
@@ -62,7 +72,9 @@ def compose_catalog_response_prompt(
             "suggest or recommend it, or ask whether to add it. Leave offered_skus empty when "
             "you are only listing what exists or answering a factual question such as a price "
             "or whether a product suits a purpose: the caller's next word may be yes, and yes "
-            "must mean the products you actually put forward.",
+            "must mean the products you actually put forward. An answer that asks whether to add "
+            "a product, or says you can add it, puts that product forward: include it in "
+            "offered_skus, even after a factual answer.",
             "Set referenced_skus to the live products this answer actually discusses, "
             "whether you name them or answer with a pronoun. A JUST REFERENCED product was "
             "discussed in the preceding turn; use it only when the caller refers back to it. "

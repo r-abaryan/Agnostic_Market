@@ -668,7 +668,7 @@ def test_router_capability_meanings_are_total_and_byte_stable() -> None:
     )[0]
 
     assert ROUTER_PROMPT_FINGERPRINT == (
-        "d2a097b217141abbee345b3e2e7b835fefb05d08e5ef5a05f5d15645c533ed33"
+        "1203dc649bbd687b85ecf91a36170d4e9651899cb1c3f72df113a06c171a981a"
     )
     assert all(meaning_block.count(capability_id.value) == 1 for capability_id in CapabilityId)
 
@@ -984,6 +984,14 @@ def test_router_prompt_distinguishes_reported_speech_and_context_gaps() -> None:
     assert "ambiguous among capability owners" in prompt
     assert "requires unavailable live account membership" in prompt
     assert "no recent order context" in prompt
+
+
+def test_router_prompt_accepts_an_offer_the_caller_heard_even_if_unrecorded() -> None:
+    # The catalog model does not always record its own offers; what was said decides.
+    prompt = " ".join(ROUTER_SYSTEM_PROMPT.split())
+
+    assert "has_offered_product false does not mean nothing was offered" in prompt
+    assert "is a cart add only when the assistant's last turn offered to add that product" in prompt
 
 
 async def test_attempt_records_when_the_resolver_rewrote_the_models_decision() -> None:

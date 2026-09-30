@@ -2113,6 +2113,10 @@ async def test_catalog_prompt_grounds_every_named_product_in_the_live_catalog(
         prompt
     )
     assert "Leave offered_skus empty when you are only listing what exists" in prompt
+    # The listed facts are the only product facts, and an offer said in words is recorded.
+    assert "The list is everything you know about each product" in prompt
+    assert "say that is all the detail you have on hand" in prompt
+    assert "puts that product forward: include it in offered_skus" in prompt
     assert "claim a product exists because the caller asked for it" in prompt
     assert "If nothing is a genuine fit, say so plainly" in prompt
     assert "trail running shoes; SKU SKU-RED-42; price $89.99" in prompt
