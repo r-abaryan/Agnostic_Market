@@ -32,6 +32,7 @@ from turn_helpers import (
 )
 from verification_helpers import make_otp_provider
 
+from agnostic_market.agents._person_question import PERSON_QUESTION
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
@@ -1282,10 +1283,13 @@ async def test_cart_mutation_human_reply_uses_the_existing_terminal_path(
         _CFG,
     )
 
-    out = await graph.ainvoke(
+    await graph.ainvoke(
         Command(resume={"text": "I want a person", "handoff_source": "semantic_router"}),
         _CFG,
     )
+    # A routed person request is confirmed before automation ends.
+    assert graph.get_state(_CFG).interrupts[0].value == PERSON_QUESTION
+    out = await graph.ainvoke(Command(resume={"text": "yes"}), _CFG)
 
     assert cart.is_empty()
     assert out["automation_terminal"] is True

@@ -24,6 +24,7 @@ from policy_helpers import make_policy
 from telemetry_helpers import make_session_telemetry
 from verification_helpers import grant_verification, make_otp_provider
 
+from agnostic_market.agents._person_question import PERSON_QUESTION
 from agnostic_market.agents.capabilities import CapabilityRegistry as _CapabilityRegistry
 from agnostic_market.agents.frontline import build_frontline_graph, read_flow
 from agnostic_market.agents.frontline import graph as frontline_graph
@@ -2925,13 +2926,22 @@ async def test_order_status_target_confirmation_human_escape_uses_terminal_hando
         thread_id="status-confirm-human",
     )
 
-    result = await graph.ainvoke(
+    await graph.ainvoke(
         Command(
             resume={
                 "text": "I want a person",
                 "handoff_source": HandoffSource.SEMANTIC_ROUTER.value,
             },
             update={"consumed_turn_ids": ("status-confirm-human-answer",)},
+        ),
+        config,
+    )
+    # A routed person request is confirmed before automation ends.
+    assert (await graph.aget_state(config)).interrupts[0].value == PERSON_QUESTION
+    result = await graph.ainvoke(
+        Command(
+            resume={"text": "yes"},
+            update={"consumed_turn_ids": ("status-confirm-human-yes",)},
         ),
         config,
     )
@@ -3487,7 +3497,6 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     expected_abandonment = {
         AbandonmentKind.PURE_ABORT: {
             "entry",
-            "request_person",
             "abort_current",
             "order_status_no_visible_orders",
             "converse",
@@ -3541,6 +3550,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         },
         AbandonmentKind.LIFECYCLE_SPECIAL: {
             "principal_warning",
+            "request_person",
             "order_status_target_confirm",
             "cart_mutation_confirm",
             "cart_confirm",
@@ -3565,6 +3575,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
         ExceptionAction.SAFE_ABORT: {
             *expected_abandonment[AbandonmentKind.PURE_ABORT],
             "order_status_target_confirm",
+            "request_person",
         },
         ExceptionAction.CART_REVIEW: {
             "cart_capability_entry",
@@ -3621,6 +3632,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     assert graph.recovery_handled_infrastructure_nodes == frozenset({RECOVERY_NODE_NAME})
     assert graph.consent_interrupt_kinds == {
         "principal_warning": "standard",
+        "request_person": "standard",
         "order_status_target_confirm": "standard",
         "cart_mutation_confirm": "standard",
         "cart_confirm": "standard",
@@ -3631,6 +3643,7 @@ def test_all_regular_nodes_have_the_reviewed_recovery_policy(config_root: Path) 
     }
     assert graph.restore_reconfirmation_nodes == frozenset(
         {
+            "request_person",
             "order_status_target_confirm",
             "cart_mutation_confirm",
             "cart_confirm",

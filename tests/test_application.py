@@ -30,6 +30,7 @@ from turn_helpers import (
     engine_events,
 )
 
+from agnostic_market.agents._person_question import PERSON_QUESTION
 from agnostic_market.agents.recovery import AUTOMATION_TERMINAL_LINE, TURN_FALLBACK_LINE
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, SessionTelemetry
 from agnostic_market.application import (
@@ -1256,12 +1257,18 @@ async def test_application_request_person_route_terminalizes_and_closes_once(
     )
 
     try:
-        requested = await engine_events(application.engine, "i want a person")
+        asked = await engine_events(application.engine, "i want a person")
+        requested = await engine_events(application.engine, "yes")
         repeated = await engine_events(application.engine, "what is in my cart")
         state = ReasoningState.model_validate(
             application.engine._graph.get_state(application.engine._config).values
         )
 
+        # Ending automated help is confirmed first; the terminal contract starts at the yes.
+        assert [event.prompt for event in asked if isinstance(event, InterruptEvent)] == [
+            PERSON_QUESTION
+        ]
+        assert not any(isinstance(event, SpokenMessageEvent) for event in asked)
         assert [
             (event.node, event.text) for event in requested if isinstance(event, SpokenMessageEvent)
         ] == [("automation_terminal_response", AUTOMATION_TERMINAL_LINE)]

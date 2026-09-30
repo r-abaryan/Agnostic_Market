@@ -2,7 +2,12 @@
 
 import pytest
 
-from agnostic_market.agents._consent import classify_confirmation, classify_consent
+from agnostic_market.agents._consent import (
+    classify_confirmation,
+    classify_consent,
+    classify_person_confirmation,
+    classify_person_consent,
+)
 from agnostic_market.dtos.state import HandoffSource
 
 
@@ -127,3 +132,27 @@ def test_mixed_or_ambiguous_replies_never_authorize(utterance: str) -> None:
 @pytest.mark.parametrize("utterance", ("place it", "yes, place it"))
 def test_placement_specific_language_is_not_generic_consent(utterance: str) -> None:
     assert classify_consent(utterance) != "yes"
+
+
+@pytest.mark.parametrize(
+    ("reply", "verdict"),
+    (
+        ("yes", "yes"),
+        ("Yes, stop it", "yes"),
+        ("okay", "yes"),
+        ("no", "no"),
+        ("No thanks", "no"),
+        ("never mind", "no"),
+        # A reply that says more is read with the conversation, never forced by a word.
+        ("No, I want a real person", "unclear"),
+        ("No, I just want the price", "unclear"),
+        ("stop the automated help", "unclear"),
+    ),
+)
+def test_the_person_question_decides_only_bare_answers(reply: str, verdict: str) -> None:
+    assert classify_person_consent(reply) == verdict
+
+
+def test_reaching_a_person_does_not_depend_on_the_question_playing_out() -> None:
+    decision = classify_person_confirmation({"text": "yes", "readback_interrupted": True})
+    assert decision.verdict == "yes"

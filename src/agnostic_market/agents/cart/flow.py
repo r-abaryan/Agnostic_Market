@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agnostic_market.agents._consent import classify_confirmation, classify_consent
 from agnostic_market.agents._copy import warm_close
+from agnostic_market.agents._person_question import settle_person_request
 from agnostic_market.agents._toolcalls import (
     ack_extra_tool_calls,
     current_turn_called,
@@ -661,10 +662,10 @@ def build_cart_nodes(
             }
         action = _mutation_action(pending)
         answer = interrupt(f"Just to confirm: {action}?")
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {action}. Please say yes or no.")
-            decision = classify_confirmation(retry)
+            decision = settle_person_request(classify_confirmation(retry))
         verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
@@ -874,10 +875,10 @@ def build_cart_nodes(
             }
         phrase = _placement_confirmation_phrase(pending, PLACE_ORDER_POLICY)
         answer = interrupt(f"Just to confirm: shall I place {phrase}?")
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: shall I place {phrase}? Yes or no?")
-            decision = classify_confirmation(retry)
+            decision = settle_person_request(classify_confirmation(retry))
         verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None

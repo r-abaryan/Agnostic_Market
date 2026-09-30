@@ -972,6 +972,7 @@ async def test_guest_context_warning_human_exit_clears_invocation(config_root: P
     assert any(isinstance(event, InterruptEvent) for event in events)
 
     await _events(h.engine, "I want a person")
+    await _events(h.engine, "yes")  # the person question comes before automation ends
 
     state = _validated_state(h, "mb-warning-human")
     assert state.active_invocation is None
@@ -1107,20 +1108,22 @@ async def test_risk_after_identity_clears_scope_without_voiding(config_root: Pat
 
 
 @pytest.mark.parametrize(
-    ("utterance", "thread_id"),
+    ("utterances", "thread_id"),
     [
-        ("never mind, forget it", "mb-abort"),
-        ("I want a person", "mb-human"),
+        (("never mind, forget it",), "mb-abort"),
+        # The person question comes before automation ends.
+        (("I want a person", "yes"), "mb-human"),
     ],
 )
 async def test_identity_exit_paths_clear_retained_cancel_scope(
-    config_root: Path, utterance: str, thread_id: str
+    config_root: Path, utterances: tuple[str, ...], thread_id: str
 ) -> None:
     h = _scope_engine(config_root, thread_id=thread_id)
     await _enter_unbound_cancel_scope(h)
     assert _active_request(h, thread_id) is not None
 
-    await _events(h.engine, utterance)
+    for utterance in utterances:
+        await _events(h.engine, utterance)
     assert _active_request(h, thread_id) is None
     assert _pending_cancel(h, thread_id) is None
     assert h.store.cancel_count == 0

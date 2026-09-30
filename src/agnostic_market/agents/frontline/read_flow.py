@@ -19,6 +19,7 @@ from agnostic_market.agents._copy import (
     ORDER_NUMBER_QUESTION,
     warm_close,
 )
+from agnostic_market.agents._person_question import settle_person_request
 from agnostic_market.agents.frontline.typed_prompt import (
     ORDER_TARGET_PROPOSAL_PROMPT,
     compose_answer_response_prompt,
@@ -257,10 +258,10 @@ def build_read_flow_nodes(
         )
         subject = "that order" if len(order_ids) == 1 else "those orders"
         answer = interrupt(f"I heard {listed}. Did you mean {subject}?")
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             answer = interrupt(f"To confirm, should I check {listed}? Please say yes or no.")
-            decision = classify_confirmation(answer)
+            decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "yes":
             confirmed = request.with_confirmed_explicit_target()
             return Command(

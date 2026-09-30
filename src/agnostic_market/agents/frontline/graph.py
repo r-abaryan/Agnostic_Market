@@ -15,6 +15,7 @@ from langgraph.types import Command, interrupt
 
 from agnostic_market.agents._consent import classify_confirmation
 from agnostic_market.agents._copy import identity_status_line, warm_close
+from agnostic_market.agents._person_question import ask_person_question, settle_person_request
 from agnostic_market.agents.capabilities import (
     CapabilityEntry,
     CapabilityRegistry,
@@ -122,6 +123,8 @@ _AI_IDENTITY_DISCLOSURE = (
     "Yes, I am an AI assistant for {display_name}, not a person. "
     "I can keep helping, or put you through to someone."
 )
+_PERSON_DECLINED_LINE = "Okay, I'll keep helping. What can I do for you?"
+_PERSON_UNCLEAR_LINE = "I didn't get a clear yes, so I'll keep helping. What can I do for you?"
 _CONVERSE_LINES: Mapping[str, str] = MappingProxyType(
     {
         "greeting": "Hello, you're through to {display_name}. What can I help you with?",
@@ -270,6 +273,7 @@ FRONTLINE_SPEAKABLE_NODES = frozenset(
         "handover",
         "automation_terminal_response",
         _ABORT_CURRENT_NODE,
+        _REQUEST_PERSON_NODE,
         _CONVERSE_NODE,
         _DISCLOSE_AI_IDENTITY_NODE,
         "owner_declined",
@@ -462,13 +466,27 @@ def build_frontline_graph(
         invocation = state.active_invocation
         if invocation is None or not isinstance(invocation.request, RequestPerson):
             raise TypeError("request-person owner requires a request-person invocation")
-        routing_telemetry.record({"event": "semantic_human_requested"})
+        # The node re-runs on every resume; the request is logged once, when it arrives.
+        routing_telemetry.record_once(
+            f"semantic_human_requested:{invocation.invocation_id}",
+            {"event": "semantic_human_requested"},
+        )
+        decision = ask_person_question()
+        if decision.verdict in {"yes", "human"}:
+            return {
+                **clear_automation_state(),
+                "handover": HandoffRequest(
+                    destination="human",
+                    reason_code="other",
+                    source=decision.handoff_source or HandoffSource.SEMANTIC_ROUTER,
+                ),
+            }
+        line = _PERSON_DECLINED_LINE if decision.verdict == "no" else _PERSON_UNCLEAR_LINE
         return {
             **clear_automation_state(),
-            "handover": HandoffRequest(
-                destination="human",
-                reason_code="other",
-                source=HandoffSource.SEMANTIC_ROUTER,
+            "messages": [AIMessage(line)],
+            "assistant_prompt": AssistantPrompt(
+                kind="open_help", turn_id=state.consumed_turn_ids[-1]
             ),
         }
 
@@ -572,11 +590,11 @@ def build_frontline_graph(
             "conversation. Would you like to continue?"
         )
         answer = interrupt(prompt)
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             action = "switch accounts" if switching else "verify the account"
             answer = interrupt(f"To {action} and clear this call's context, say yes or no.")
-            decision = classify_confirmation(answer)
+            decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "yes":
             return {"execution_owner": "identity"}
         if decision.verdict == "human":
@@ -1074,7 +1092,9 @@ def build_frontline_graph(
         _REQUEST_PERSON_NODE,
         request_person_node,
         ExceptionAction.SAFE_ABORT,
-        AbandonmentKind.PURE_ABORT,
+        AbandonmentKind.LIFECYCLE_SPECIAL,
+        consent_interrupt_kind="standard",
+        restore_reconfirmation=True,
     )
     node_registry.register(
         _ABORT_CURRENT_NODE,
@@ -1529,7 +1549,11 @@ def build_frontline_graph(
             _CAPABILITY_DISPATCH_NODE: _CAPABILITY_DISPATCH_NODE,
         },
     )
-    graph.add_edge(_REQUEST_PERSON_NODE, "handover")
+    graph.add_conditional_edges(
+        _REQUEST_PERSON_NODE,
+        lambda state: "handover" if state.handover is not None else END,
+        ["handover", END],
+    )
     graph.add_edge(_ABORT_CURRENT_NODE, END)
     graph.add_edge(_CONVERSE_NODE, END)
     graph.add_edge(_DISCLOSE_AI_IDENTITY_NODE, END)

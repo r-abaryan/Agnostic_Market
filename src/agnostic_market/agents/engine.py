@@ -46,7 +46,9 @@ from pydantic import ValidationError
 from agnostic_market.agents._consent import (
     classify_cancel_consent,
     classify_consent,
+    classify_person_consent,
 )
+from agnostic_market.agents._person_question import PERSON_QUESTIONS
 from agnostic_market.agents.execution import await_resisting_cancellation
 from agnostic_market.agents.lifecycle import PrincipalTransitionLifecycle
 from agnostic_market.agents.recovery import (
@@ -1201,10 +1203,13 @@ class ReasoningEngine:
             and _task_matches(snapshot, self._recovery_entry_node, interrupted=False)
         )
 
-    def _closed_consent_verdict(self, node: str, text: str) -> str | None:
+    def _closed_consent_verdict(self, node: str, prompt: str, text: str) -> str | None:
         kind = self._consent_interrupt_kinds.get(node)
         if kind is None:
             return None
+        # A node that pauses on the person question hears the reply with that question's grammar.
+        if prompt in PERSON_QUESTIONS:
+            return classify_person_consent(text)
         return classify_cancel_consent(text) if kind == "cancel" else classify_consent(text)
 
     async def _readback_reply(
@@ -1212,11 +1217,12 @@ class ReasoningEngine:
         turn: CommittedTurn,
         state: ReasoningState,
         node: str,
+        prompt: str,
         conversation: tuple[ConversationEntry, ...],
         facts: TurnFacts,
     ) -> _ReadbackReply:
         """Route a reply the consent grammar cannot read; only the grammar grants consent."""
-        if self._closed_consent_verdict(node, turn.text) != "unclear":
+        if self._closed_consent_verdict(node, prompt, turn.text) != "unclear":
             return _ReadbackReply()
         update: dict[str, object] = {
             "conversation": append_conversation(state.conversation, conversation)
@@ -1233,20 +1239,24 @@ class ReasoningEngine:
                 return _ReadbackReply(handoff_source=HandoffSource.ROUTING_FAILURE_POLICY)
             return _ReadbackReply()
         request = resolution.request if resolution.decision == "direct" else None
+        # The paused owner asks the person question itself, so its own person branch still runs.
         if isinstance(request, RequestPerson):
             return _ReadbackReply(handoff_source=HandoffSource.SEMANTIC_ROUTER)
+        pending = state.pending_confirmation_capability()
         # The same request restated or changed keeps the readback: its owner cannot yet see
         # the details the caller already settled, so it would ask for them again. A stop keeps
         # it too: at a cancel readback "cancel it" means yes, and reads as a stop.
         if request is None or request.kind in {
             CapabilityId.CONVERSE,
             CapabilityId.ABORT_CURRENT,
-            state.pending_confirmation_capability(),
+            pending,
         }:
             return _ReadbackReply()
+        # The person question guards no pending effect: a caller who moves on has answered it.
         reread = (
             request.kind not in UNSAFE_MISROUTE_CAPABILITIES
             and node in self._restore_reconfirmation_nodes
+            and pending != CapabilityId.REQUEST_PERSON
         )
         return _ReadbackReply(request=request, reread=reread)
 
@@ -1721,6 +1731,7 @@ class ReasoningEngine:
                             turn,
                             snapshot_state,
                             resumed_interrupt_node,
+                            str(snapshot.interrupts[0].value),
                             conversation,
                             facts,
                         )

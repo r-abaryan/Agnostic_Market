@@ -305,7 +305,10 @@ async def test_human_at_readback_escapes_with_onramp_package(
 ) -> None:
     h = _return_harness(config_root)
     await _events(h.engine, "I need to return this order")
-    events = await _events(h.engine, "just get me a real person")
+    await _events(h.engine, "just get me a real person")
+    # The return readback is set aside for the person question; the yes ends automation.
+    assert await h.engine.apending_interrupt()
+    events = await _events(h.engine, "yes")
     assert h.store.return_count == 0
     assert not await h.engine.apending_interrupt()  # §A9: never trapped
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
@@ -328,6 +331,9 @@ async def test_human_at_readback_escapes_with_onramp_package(
         "source",
     }
     assert onramp.attributes["handover_schema_version"] == 2
+    # The return owner's own person branch still runs, so the handover keeps its reason.
+    assert onramp.attributes["reason_code"] == "refund"
+    assert {"event": "return_cancelled", "reason": "human_requested"} in _telemetry_events(h)
     responses = [
         e for e in _telemetry_events(h) if e.get("event") == "automation_terminal_response"
     ]

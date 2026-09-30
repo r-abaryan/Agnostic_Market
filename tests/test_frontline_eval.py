@@ -4890,7 +4890,7 @@ async def test_direct_human_request_uses_the_same_terminal_session_contract(
     )
     observation = await _observe_scenario(
         harness.engine,
-        ("I need a person.", "okay"),
+        ("I need a person.", "yes", "okay"),
         scenario_key="eval-direct-human-terminal",
         store=harness.store,
         profile_store=harness.profile,
@@ -4899,11 +4899,13 @@ async def test_direct_human_request_uses_the_same_terminal_session_contract(
         identity_store=harness.identity,
         model_call_count=lambda: _model_calls(frontline),
     )
-    _assert_terminal_turn(observation.turns[0])
+    # The first turn asks before ending automated help; the contract starts at the yes.
+    assert observation.turns[0].state.automation_terminal is False
+    _assert_terminal_turn(observation.turns[1])
     _assert_terminal_turn(observation.final)
-    assert observation.final.model_calls == observation.turns[0].model_calls
-    assert observation.final.completed_tool_calls == observation.turns[0].completed_tool_calls
-    assert observation.final.effects == observation.turns[0].effects
+    assert observation.final.model_calls == observation.turns[1].model_calls
+    assert observation.final.completed_tool_calls == observation.turns[1].completed_tool_calls
+    assert observation.final.effects == observation.turns[1].effects
 
 
 async def test_non_identity_human_path_uses_the_same_terminal_session_contract(
@@ -4998,7 +5000,7 @@ async def test_fresh_session_is_not_blocked_by_prior_session_exhaustion(
     )
     prior_observation = await _observe_scenario(
         prior.engine,
-        ("I need a person.",),
+        ("I need a person.", "yes"),
         scenario_key="eval-session-to-close",
         store=prior.store,
         profile_store=prior.profile,

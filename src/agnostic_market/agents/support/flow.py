@@ -54,6 +54,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from agnostic_market.agents._consent import classify_confirmation
 from agnostic_market.agents._copy import ORDER_NUMBER_QUESTION, guest_list_close, warm_close
+from agnostic_market.agents._person_question import settle_person_request
 from agnostic_market.agents._toolcalls import (
     ack_extra_tool_calls,
     current_turn_called,
@@ -1512,10 +1513,10 @@ def build_support_nodes(
             }
         phrase = _refund_confirmation_phrase(pending, ISSUE_REFUND_POLICY)
         answer = interrupt(f"Just to confirm: {phrase}. Shall I go ahead?")
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
-            decision = classify_confirmation(retry)
+            decision = settle_person_request(classify_confirmation(retry))
         verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
@@ -1747,11 +1748,11 @@ def build_support_nodes(
         # Cancel-polarity consent: the question IS "shall I cancel?", so "yeah cancel them"
         # must read as yes (plain classify_consent reads the 'cancel' as a no).
         answer = interrupt(_cancel_readback_line(pending))
-        decision = classify_confirmation(answer, cancel_action=True)
+        decision = settle_person_request(classify_confirmation(answer, cancel_action=True))
         if decision.verdict == "unclear":
             phrases = "; ".join(_cancel_target_phrase(t) for t in pending.targets)
             retry = interrupt(f"Sorry - just to be clear: cancel {phrases}? Yes or no?")
-            decision = classify_confirmation(retry, cancel_action=True)
+            decision = settle_person_request(classify_confirmation(retry, cancel_action=True))
         verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
@@ -2099,10 +2100,10 @@ def build_support_nodes(
             }
         phrase = _return_confirmation_phrase(pending, CREATE_RETURN_POLICY)
         answer = interrupt(f"Just to confirm - {phrase}. Shall I go ahead?")
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}. Yes or no?")
-            decision = classify_confirmation(retry)
+            decision = settle_person_request(classify_confirmation(retry))
         verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None
@@ -2271,10 +2272,10 @@ def build_support_nodes(
             }
         phrase = _profile_confirmation_phrase(pending)
         answer = interrupt(f"Just to confirm - {phrase}. Shall I go ahead?")
-        decision = classify_confirmation(answer)
+        decision = settle_person_request(classify_confirmation(answer))
         if decision.verdict == "unclear":
             retry = interrupt(f"Sorry - just to be clear: {phrase}? Yes or no?")
-            decision = classify_confirmation(retry)
+            decision = settle_person_request(classify_confirmation(retry))
         verdict = decision.verdict
         if verdict == "human":
             assert decision.handoff_source is not None

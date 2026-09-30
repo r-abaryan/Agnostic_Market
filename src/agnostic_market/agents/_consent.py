@@ -65,6 +65,17 @@ _CANCEL_PHRASE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# At the person question the action word IS the request: "yes, stop it" is a yes.
+_PERSON_ACTION_RE = re.compile(
+    r"\bstop(?:\s+(?:it|that|this|now|the\s+automated\s+help|automated\s+help))?\b",
+    re.IGNORECASE,
+)
+# Only a bare decline declines there; a "no" that says more is read with the conversation.
+_BARE_DECLINE_RE = re.compile(
+    r"(?:(?:no thank you|no thanks|not now|never ?mind|forget it|don'?t|do not|no|nope|nah)"
+    r"\s*)+"
+)
+
 Consent = Literal["no", "yes", "unclear"]
 ConfirmationVerdict = Literal["human", "no", "yes", "unclear"]
 
@@ -129,6 +140,34 @@ def classify_cancel_consent(text: str) -> Consent:
     return classify_consent(_CANCEL_PHRASE_RE.sub(" ", text))
 
 
+def classify_person_consent(text: str) -> Consent:
+    """The person question: yes or a bare decline decide; anything else goes to the router."""
+    normalized = _normalize_consent_reply(_PERSON_ACTION_RE.sub(" ", text))
+    if _BARE_DECLINE_RE.fullmatch(normalized):
+        return "no"
+    if _is_bounded_affirmative(normalized):
+        return "yes"
+    return "unclear"
+
+
+def _handoff_decision(answer: Mapping[str, object]) -> ConfirmationDecision | None:
+    source_value = answer.get("handoff_source")
+    if source_value is None:
+        return None
+    try:
+        return ConfirmationDecision("human", HandoffSource(source_value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("confirmation handoff source is invalid") from exc
+
+
+def classify_person_confirmation(answer: Mapping[str, object]) -> ConfirmationDecision:
+    """Reaching a person never depends on whether the question finished playing."""
+    handoff = _handoff_decision(answer)
+    if handoff is not None:
+        return handoff
+    return ConfirmationDecision(classify_person_consent(str(answer.get("text", ""))))
+
+
 def classify_confirmation(
     answer: Mapping[str, object],
     *,
@@ -136,13 +175,9 @@ def classify_confirmation(
 ) -> ConfirmationDecision:
     """An unheard readback cannot authorize consent; reaching a person does not depend on it."""
 
-    source_value = answer.get("handoff_source")
-    if source_value is not None:
-        try:
-            source = HandoffSource(source_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("confirmation handoff source is invalid") from exc
-        return ConfirmationDecision("human", source)
+    handoff = _handoff_decision(answer)
+    if handoff is not None:
+        return handoff
 
     if answer.get("readback_interrupted"):
         return ConfirmationDecision("unclear")

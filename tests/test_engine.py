@@ -41,6 +41,7 @@ from turn_helpers import (
 )
 from verification_helpers import make_otp_provider
 
+from agnostic_market.agents._person_question import PERSON_QUESTION, PERSON_QUESTION_RETRY
 from agnostic_market.agents.capabilities import CapabilityRegistry
 from agnostic_market.agents.cart import flow as cart_flow
 from agnostic_market.agents.engine import (
@@ -1046,32 +1047,160 @@ async def test_graph_terminal_state_bypasses_router_without_pending_route_state(
     assert state.pending_router_no_action is None
 
 
-async def test_semantic_human_request_uses_registered_owner_on_the_first_turn(
-    config_root: Path,
-) -> None:
+def _person_engine(
+    config_root: Path, **kwargs: object
+) -> tuple[ReasoningEngine, OrderStore, _DeterministicRoutingRecognizer]:
     recognizer = _DeterministicRoutingRecognizer(
         _routing_attempt(RouteDecision.direct(RequestPerson()))
     )
-    engine, _ = _engine(
-        config_root,
-        thread_id="structured-human-request",
-        routing_recognizer=recognizer,
-    )
+    engine, store = _engine(config_root, routing_recognizer=recognizer, **kwargs)
+    return engine, store, recognizer
 
-    spoken = await _adapter_turn(
-        GraphVoiceAdapter(engine),
-        "Is there anyone else I can talk to?",
-        "structured-human-turn",
-    )
 
-    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
-    assert spoken == [AUTOMATION_TERMINAL_LINE]
+def _prompts(events: list) -> list[str]:
+    return [event.prompt for event in events if isinstance(event, InterruptEvent)]
+
+
+def _state(engine: ReasoningEngine) -> ReasoningState:
+    return ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+
+
+async def test_semantic_human_request_asks_before_automated_help_ends(config_root: Path) -> None:
+    engine, _, recognizer = _person_engine(config_root, thread_id="structured-human-request")
+
+    asked = await _events(engine, "Is there anyone else I can talk to?")
+    paused = _state(engine)
+    confirmed = await _events(engine, "yes")
+
+    state = _state(engine)
+    assert _prompts(asked) == [PERSON_QUESTION]
+    assert not paused.automation_terminal
+    assert _sent_text(confirmed) == AUTOMATION_TERMINAL_LINE
     assert [context.utterance for context in recognizer.contexts] == [
         "Is there anyone else I can talk to?"
     ]
     assert state.automation_terminal
     assert state.pending_capability_dispatch is None
     assert state.pending_router_no_action is None
+    # The node runs again on every resume; the request is still logged once.
+    requested = [
+        record
+        for record in engine._routing._telemetry.sink.records
+        if record.event == "semantic_human_requested"
+    ]
+    assert len(requested) == 1
+
+
+@pytest.mark.parametrize("reply", ("yes", "Yes, stop it", "No, I want a real person"))
+async def test_a_reply_that_wants_a_person_reaches_one(config_root: Path, reply: str) -> None:
+    engine, _, _ = _person_engine(config_root)
+    await _events(engine, "get me a person")
+
+    confirmed = await _events(engine, reply)
+
+    assert _sent_text(confirmed) == AUTOMATION_TERMINAL_LINE
+    assert _state(engine).automation_terminal
+
+
+@pytest.mark.parametrize("playback_fact", (True, None))
+async def test_a_yes_over_the_person_question_still_reaches_a_person(
+    config_root: Path, playback_fact: bool | None
+) -> None:
+    engine, _, _ = _person_engine(config_root)
+    await _events(engine, "get me a person")
+
+    confirmed = await _events(engine, "yes", TurnFacts(readback_interrupted=playback_fact))
+
+    assert _sent_text(confirmed) == AUTOMATION_TERMINAL_LINE
+
+
+@pytest.mark.parametrize("reply", ("no", "No thanks", "never mind"))
+async def test_a_declined_human_request_keeps_helping(config_root: Path, reply: str) -> None:
+    engine, _, _ = _person_engine(config_root)
+    await _events(engine, "I need a rep to confirm the price")
+
+    declined = await _events(engine, reply)
+
+    state = _state(engine)
+    assert _sent_text(declined) == "Okay, I'll keep helping. What can I do for you?"
+    assert not state.automation_terminal and state.handover is None
+    assert state.assistant_prompt is not None and state.assistant_prompt.kind == "open_help"
+    assert not await engine.apending_interrupt()
+
+
+async def test_two_unclear_replies_to_the_person_question_keep_helping(config_root: Path) -> None:
+    engine, _, recognizer = _person_engine(config_root)
+    await _events(engine, "get me a person")
+    recognizer.choose(RouteDecision.clarify("ambiguous_intent"))
+
+    retried = await _events(engine, "hmm")
+    kept = await _events(engine, "hmm")
+
+    assert _prompts(retried) == [PERSON_QUESTION_RETRY]
+    assert _sent_text(kept) == (
+        "I didn't get a clear yes, so I'll keep helping. What can I do for you?"
+    )
+    assert not _state(engine).automation_terminal
+
+
+@pytest.mark.parametrize("reply", ("what's in my cart?", "No, just tell me what's in my cart"))
+async def test_another_request_at_the_person_question_is_served_and_not_asked_again(
+    config_root: Path, reply: str
+) -> None:
+    engine, _, recognizer = _person_engine(config_root, cart=_checkout_cart())
+    await _events(engine, "I need a rep to confirm the price")
+    recognizer.choose(RouteDecision.direct(ViewCart()))
+
+    answered = await _events(engine, reply)
+
+    assert "waterproof rain jacket" in _sent_text(answered)
+    assert not _state(engine).automation_terminal
+    assert not await engine.apending_interrupt()
+
+
+async def test_declining_a_person_at_checkout_reads_the_checkout_again(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(RequestPerson()))
+
+    asked = await _events(engine, "just get me a real person please")
+    reread = await _events(engine, "no")
+
+    assert _prompts(asked) == [PERSON_QUESTION]
+    assert len(_prompts(reread)) == 1
+    assert _prompts(reread)[0].startswith("Sorry - just to be clear")
+    assert _state(engine).pending_placement is not None
+    await _events(engine, "yes")
+    assert store.placed_count == 1
+
+
+async def test_a_restored_session_asks_the_person_question_again(config_root: Path) -> None:
+    engine, _, _ = _person_engine(config_root, thread_id="restore-person-question")
+    await _events(engine, "get me a person")
+    paused = await engine._graph.aget_state(engine._config)
+    assert _interrupt_node(paused, engine._node_recovery_policies) == "request_person"
+
+    await engine.aprepare_current_restore(0)
+    reasked = await _events(engine, "yes")
+    confirmed = await _events(engine, "yes")
+
+    # A yes from before the restore is never taken as the answer; the question is asked again.
+    assert _prompts(reasked) == [PERSON_QUESTION]
+    assert _sent_text(confirmed) == AUTOMATION_TERMINAL_LINE
+
+
+async def test_asking_for_a_person_again_at_the_person_question_hands_over(
+    config_root: Path,
+) -> None:
+    engine, _, _ = _person_engine(config_root)
+    await _events(engine, "is there anyone else I can talk to?")
+
+    confirmed = await _events(engine, "I said a real person")
+
+    state = ReasoningState.model_validate(engine._graph.get_state(engine._config).values)
+    assert _sent_text(confirmed) == AUTOMATION_TERMINAL_LINE
+    assert state.automation_terminal
 
 
 @pytest.mark.parametrize(
@@ -1956,7 +2085,7 @@ async def test_a_reply_to_a_cart_readback_sees_the_readback_products(
 
 
 @pytest.mark.parametrize("playback_fact", (False, True, None))
-async def test_human_request_at_confirmation_escapes(
+async def test_human_request_at_confirmation_asks_then_escapes(
     config_root: Path, playback_fact: bool | None
 ) -> None:
     recognizer = _DeterministicRoutingRecognizer()
@@ -1967,11 +2096,13 @@ async def test_human_request_at_confirmation_escapes(
     )
     await _pause_at_confirmation(engine)
     recognizer.choose(RouteDecision.direct(RequestPerson()))
-    events = await _events(
+    asked = await _events(
         engine,
         "just get me a real person please",
         TurnFacts(readback_interrupted=playback_fact),
     )
+    assert _prompts(asked) == [PERSON_QUESTION]
+    events = await _events(engine, "yes")
     assert store.placed_count == 0
     assert not await engine.apending_interrupt()
     spoken = [e for e in events if isinstance(e, SpokenMessageEvent)]
