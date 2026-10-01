@@ -110,6 +110,7 @@ from agnostic_market.dtos.orchestration import (
     ActiveInvocation,
     AnswerQuestion,
     CancellableOrderScope,
+    CancelOrders,
     CapabilityDispatchEnvelope,
     CapabilityId,
     CartItemChoices,
@@ -1924,8 +1925,11 @@ async def test_placed_order_is_queryable_same_session(config_root: Path) -> None
 
 
 async def test_resume_no_cancels_without_placing(config_root: Path) -> None:
-    engine, store = _engine(config_root, cart=_checkout_cart())
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
     await _pause_at_confirmation(engine)
+    # Not a bare decline, so the router reads it too; the live router stops (abort_current).
+    recognizer.choose(RouteDecision.direct(AbortCurrent()))
     events = await _events(engine, "no, don't do it")
     assert store.placed_count == 0
     assert not await engine.apending_interrupt()
@@ -2035,7 +2039,169 @@ async def test_a_different_request_at_a_readback_sets_it_aside(config_root: Path
         "node": "cart_confirm",
         "capability": "modify_cart",
         "reread": False,
+        "declined": False,
     } in _telemetry_records(engine)
+
+
+async def test_a_no_that_asks_for_a_read_declines_and_answers(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(ViewCart()))
+
+    answered = await _events(engine, "No, what's in my cart?")
+
+    spoken = [event.text for event in answered if isinstance(event, SpokenMessageEvent)]
+    assert len(spoken) == 1 and "waterproof rain jacket" in spoken[0]
+    # The caller said no, so the checkout is over rather than read again.
+    assert _prompts(answered) == []
+    assert _state(engine).pending_placement is None
+    assert not await engine.apending_interrupt()
+    assert store.placed_count == 0
+    assert {
+        "event": "confirmation_set_aside",
+        "node": "cart_confirm",
+        "capability": "view_cart",
+        "reread": False,
+        "declined": True,
+    } in _telemetry_records(engine)
+
+
+@pytest.mark.parametrize(
+    ("reply", "effect"),
+    (
+        ("No, cancel the order.", CancelOrders()),
+        ("No, add a pair of socks first.", ModifyCart(operation="add")),
+    ),
+)
+async def test_a_no_that_names_an_effect_only_declines(
+    config_root: Path, reply: str, effect: CancelOrders | ModifyCart
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(effect))
+
+    declined = await _events(engine, reply)
+
+    assert _sent_text(declined).startswith("Okay, I won't place it")
+    assert store.placed_count == 0 and store.cancel_count == 0
+    assert not await engine.apending_interrupt()
+    records = _telemetry_records(engine)
+    assert {"event": "checkout_cancelled", "reason": "declined"} in records
+    assert not any(record["event"] == "confirmation_set_aside" for record in records)
+
+
+@pytest.mark.parametrize("reply", ("no", "No thanks.", "nope, not now"))
+async def test_a_bare_no_at_a_readback_never_consults_the_router(
+    config_root: Path, reply: str
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, _ = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(ViewCart()))
+
+    declined = await _events(engine, reply)
+
+    assert _sent_text(declined).startswith("Okay, I won't place it")
+    assert [context.utterance for context in recognizer.contexts] == ["checkout now please"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "route", "outcome"),
+    (
+        ("yes", RequestPerson(), AUTOMATION_TERMINAL_LINE),
+        ("no", RequestPerson(), "Okay, I'll keep helping. What can I do for you?"),
+        ("No, what's in my cart?", ViewCart(), "waterproof rain jacket"),
+    ),
+)
+async def test_a_no_with_a_person_request_ends_the_readback_then_asks(
+    config_root: Path, answer: str, route: RequestPerson | ViewCart, outcome: str
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RouteDecision.direct(RequestPerson()))
+
+    asked = await _events(engine, "No. Get me a person to talk to.")
+    paused = await engine._graph.aget_state(engine._config)
+    recognizer.choose(RouteDecision.direct(route))
+    settled = await _events(engine, answer)
+
+    assert _sent_text(asked) == PERSON_QUESTION
+    # The caller said no to the checkout: it is over, and the person question stands alone.
+    assert _interrupt_node(paused, engine._node_recovery_policies) == "request_person"
+    requested = [
+        record
+        for record in engine._routing._telemetry.sink.records
+        if record.event == "semantic_human_requested"
+    ]
+    assert len(requested) == 1
+    assert ReasoningState.from_checkpoint(paused.values).pending_placement is None
+    assert {
+        "event": "confirmation_set_aside",
+        "node": "cart_confirm",
+        "capability": "request_person",
+        "reread": False,
+        "declined": True,
+    } in _telemetry_records(engine)
+    assert _prompts(settled) == []
+    assert outcome in _sent_text(settled)
+    assert store.placed_count == 0
+
+
+async def test_after_a_no_and_no_person_the_cart_waits_for_a_fresh_checkout(
+    config_root: Path,
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    readback = _prompts(await _pause_at_confirmation(engine))
+    recognizer.choose(RouteDecision.direct(RequestPerson()))
+    await _events(engine, "No. Get me a person to talk to.")
+    await _events(engine, "no")
+    recognizer.choose(RouteDecision.direct(PlaceOrder()))
+
+    fresh = await _events(engine, "place my order")
+
+    assert _prompts(fresh) == readback
+    assert store.placed_count == 0
+    await _events(engine, "yes")
+    assert store.placed_count == 1
+
+
+@pytest.mark.parametrize("answer", ("what's in my cart?", "No, what's in my cart?"))
+async def test_a_person_request_without_a_no_resumes_the_readback_after_a_question(
+    config_root: Path, answer: str
+) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    readback = _prompts(await _pause_at_confirmation(engine))
+    recognizer.choose(RouteDecision.direct(RequestPerson()))
+    asked = await _events(engine, "just get me a real person please")
+    recognizer.choose(RouteDecision.direct(ViewCart()))
+
+    answered = await _events(engine, answer)
+
+    assert _prompts(asked) == [PERSON_QUESTION]
+    assert "waterproof rain jacket" in _sent_text(answered)
+    # The caller never said no to the checkout, so it is read again after the answer.
+    assert _prompts(answered) == readback
+    await _events(engine, "yes")
+    assert store.placed_count == 1
+
+
+async def test_a_no_that_says_more_stands_when_routing_is_unavailable(config_root: Path) -> None:
+    recognizer = _DeterministicRoutingRecognizer()
+    engine, store = _engine(config_root, cart=_checkout_cart(), routing_recognizer=recognizer)
+    await _pause_at_confirmation(engine)
+    recognizer.choose(RoutingFailure(reason="routing_unavailable"))
+
+    declined = await _events(engine, "No, what's in my cart?")
+
+    state = _state(engine)
+    assert _sent_text(declined).startswith("Okay, I won't place it")
+    assert not state.automation_terminal and state.handover is None
+    assert store.placed_count == 0
 
 
 async def test_the_same_request_restated_at_a_readback_is_read_again(config_root: Path) -> None:

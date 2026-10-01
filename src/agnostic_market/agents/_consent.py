@@ -140,12 +140,17 @@ def classify_cancel_consent(text: str) -> Consent:
     return classify_consent(_CANCEL_PHRASE_RE.sub(" ", text))
 
 
+def is_bare_decline(text: str) -> bool:
+    """A reply that only declines, with nothing more for the router to read."""
+    return _BARE_DECLINE_RE.fullmatch(_normalize_consent_reply(text)) is not None
+
+
 def classify_person_consent(text: str) -> Consent:
     """The person question: yes or a bare decline decide; anything else goes to the router."""
-    normalized = _normalize_consent_reply(_PERSON_ACTION_RE.sub(" ", text))
-    if _BARE_DECLINE_RE.fullmatch(normalized):
+    stripped = _PERSON_ACTION_RE.sub(" ", text)
+    if is_bare_decline(stripped):
         return "no"
-    if _is_bounded_affirmative(normalized):
+    if _is_bounded_affirmative(_normalize_consent_reply(stripped)):
         return "yes"
     return "unclear"
 

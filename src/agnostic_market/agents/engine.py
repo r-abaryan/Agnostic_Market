@@ -47,6 +47,7 @@ from agnostic_market.agents._consent import (
     classify_cancel_consent,
     classify_consent,
     classify_person_consent,
+    is_bare_decline,
 )
 from agnostic_market.agents._person_question import PERSON_QUESTIONS
 from agnostic_market.agents.execution import await_resisting_cancellation
@@ -59,7 +60,11 @@ from agnostic_market.agents.recovery import (
     NodeRecoveryPolicy,
     clear_automation_state,
 )
-from agnostic_market.agents.routing import UNSAFE_MISROUTE_CAPABILITIES, RoutingSession
+from agnostic_market.agents.routing import (
+    COMMERCE_EFFECT_CAPABILITIES,
+    UNSAFE_MISROUTE_CAPABILITIES,
+    RoutingSession,
+)
 from agnostic_market.agents.telemetry import TelemetryRecorder
 from agnostic_market.checkpoints import (
     CheckpointScopeError,
@@ -283,6 +288,8 @@ class _ReadbackReply:
     request: IntentRequest | None = None
     # That request only reads, so the readback is read again after it answers.
     reread: bool = False
+    # The caller said no to the readback as well as asking for the request.
+    declined: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1221,8 +1228,13 @@ class ReasoningEngine:
         conversation: tuple[ConversationEntry, ...],
         facts: TurnFacts,
     ) -> _ReadbackReply:
-        """Route a reply the consent grammar cannot read; only the grammar grants consent."""
-        if self._closed_consent_verdict(node, prompt, turn.text) != "unclear":
+        """Route a reply the consent grammar cannot read, or a no that says more.
+
+        Only the grammar grants consent: a no stays a no whatever the router finds.
+        """
+        verdict = self._closed_consent_verdict(node, prompt, turn.text)
+        declined = verdict == "no" and not is_bare_decline(turn.text)
+        if verdict != "unclear" and not declined:
             return _ReadbackReply()
         update: dict[str, object] = {
             "conversation": append_conversation(state.conversation, conversation)
@@ -1235,12 +1247,16 @@ class ReasoningEngine:
             assistant_prompt_completed=facts.readback_interrupted is False,
         )
         if isinstance(resolution, RoutingFailure):
-            if resolution.reason == "routing_unavailable":
+            # A no already answered the readback; only an unanswered one falls to policy.
+            if resolution.reason == "routing_unavailable" and not declined:
                 return _ReadbackReply(handoff_source=HandoffSource.ROUTING_FAILURE_POLICY)
             return _ReadbackReply()
         request = resolution.request if resolution.decision == "direct" else None
-        # The paused owner asks the person question itself, so its own person branch still runs.
         if isinstance(request, RequestPerson):
+            # After a no the readback is over, so the person question is asked on its own.
+            if declined:
+                return _ReadbackReply(request=request, declined=True)
+            # The paused owner asks the person question itself, so its own person branch runs.
             return _ReadbackReply(handoff_source=HandoffSource.SEMANTIC_ROUTER)
         pending = state.pending_confirmation_capability()
         # The same request restated or changed keeps the readback: its owner cannot yet see
@@ -1252,13 +1268,18 @@ class ReasoningEngine:
             pending,
         }:
             return _ReadbackReply()
+        # A decline's own words name effects ("No, cancel the order." reaches cancel_orders), so
+        # an effect read from one is not started; the no stands.
+        if declined and request.kind in COMMERCE_EFFECT_CAPABILITIES:
+            return _ReadbackReply()
         # The person question guards no pending effect: a caller who moves on has answered it.
         reread = (
-            request.kind not in UNSAFE_MISROUTE_CAPABILITIES
+            not declined
+            and request.kind not in UNSAFE_MISROUTE_CAPABILITIES
             and node in self._restore_reconfirmation_nodes
             and pending != CapabilityId.REQUEST_PERSON
         )
-        return _ReadbackReply(request=request, reread=reread)
+        return _ReadbackReply(request=request, reread=reread, declined=declined)
 
     def _readback_set_aside_payload(
         self,
@@ -1742,6 +1763,7 @@ class ReasoningEngine:
                                     "node": resumed_interrupt_node,
                                     "capability": reply.request.kind.value,
                                     "reread": reply.reread,
+                                    "declined": reply.declined,
                                 }
                             )
                             if reply.reread:

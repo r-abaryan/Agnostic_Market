@@ -7,6 +7,7 @@ from agnostic_market.agents._consent import (
     classify_consent,
     classify_person_confirmation,
     classify_person_consent,
+    is_bare_decline,
 )
 from agnostic_market.dtos.state import HandoffSource
 
@@ -151,6 +152,25 @@ def test_placement_specific_language_is_not_generic_consent(utterance: str) -> N
 )
 def test_the_person_question_decides_only_bare_answers(reply: str, verdict: str) -> None:
     assert classify_person_consent(reply) == verdict
+
+
+@pytest.mark.parametrize(
+    ("reply", "bare"),
+    (
+        ("no", True),
+        ("No thanks.", True),
+        ("nope, not now", True),
+        ("Never mind", True),
+        ("no, no", True),
+        ("No, cancel the order.", False),
+        ("No. Get me a person.", False),
+        ("no, don't do it", False),
+        ("Cancel.", False),
+        ("", False),
+    ),
+)
+def test_a_bare_decline_says_nothing_more(reply: str, bare: bool) -> None:
+    assert is_bare_decline(reply) is bare
 
 
 def test_reaching_a_person_does_not_depend_on_the_question_playing_out() -> None:

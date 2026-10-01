@@ -512,12 +512,12 @@ function renderSimulation() {
   elements["simulation-revision"].textContent = String(projection?.session_revision ?? 0);
   elements["simulation-cart-total"].textContent = `$${Number(projection?.cart_total_usd ?? 0).toFixed(2)}`;
   const receipts = projection?.committed_receipts;
-  const orderReceipts = receipts
-    ? Object.values(receipts.orders).reduce((total, count) => total + count, 0)
-    : 0;
-  elements["simulation-receipts"].textContent = receipts
-    ? `cart ${receipts.cart.mutations}, orders ${orderReceipts}, profiles ${receipts.profiles.changes}`
-    : "cart 0, orders 0, profiles 0";
+  const orders = receipts?.orders;
+  // Each order ledger on its own: a cancellation is a receipt, not another order.
+  elements["simulation-receipts"].textContent =
+    `cart ${receipts?.cart.mutations ?? 0}; orders: ${orders?.placements ?? 0} placed, ` +
+    `${orders?.cancellations ?? 0} cancelled, ${orders?.refunds ?? 0} refunded, ` +
+    `${orders?.returns ?? 0} returned; profiles ${receipts?.profiles.changes ?? 0}`;
   elements["simulation-latency"].textContent = state.simulationLatency
     ? `${Math.round(state.simulationLatency.total_seconds * 1000)} ms`
     : "-";
