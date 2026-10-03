@@ -66,6 +66,7 @@ def _base() -> dict:
                 "cart": 2,
                 "router": 2,
             },
+            "cart": {"quantity_source": "conversation"},
         },
     }
 
@@ -117,6 +118,17 @@ def test_three_layer_merge_is_last_wins_and_deep() -> None:
     assert config.policies.refunds.auto_approve_under_usd == 50
     # template-only value carried through
     assert config.integration.catalog.freshness_sla_min == 15
+
+
+def test_cart_quantity_source_comes_from_base_and_a_merchant_may_choose_it() -> None:
+    config = resolve_merchant_config(_base(), _template(), _override())
+    assert config.policies.cart.quantity_source == "conversation"
+
+    tuned = _override()
+    tuned["policies"]["cart"] = {"quantity_source": "this_request"}
+    config = resolve_merchant_config(_base(), _template(), tuned)
+    assert config.policies.cart.quantity_source == "this_request"
+    assert config.policies.to_policy_context().cart_quantity_source == "this_request"
 
 
 def test_invalid_policy_value_type_uses_the_resolution_error_contract() -> None:

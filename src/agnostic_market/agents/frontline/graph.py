@@ -675,6 +675,8 @@ def build_frontline_graph(
         recent_orders,
         session_state,
         node_registry.run_sync_effect,
+        response_model=chat_model,
+        structured_output_method=structured_output_method,
         display_name=display_name,
         telemetry=telemetry,
     )

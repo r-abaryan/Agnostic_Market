@@ -62,6 +62,7 @@ class OperationalTelemetryEvent(StrEnum):
     CART_MUTATION_CANCELLED = auto()
     CART_MUTATION_EXPIRED = auto()
     CART_QUANTITY_SET = auto()
+    CART_QUANTITY_UNSTATED = auto()
     CHECKOUT_CANCELLED = auto()
     CHECKOUT_CONFIRMED = auto()
     CHECKOUT_DENIED = auto()

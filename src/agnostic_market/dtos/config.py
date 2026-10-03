@@ -174,6 +174,19 @@ class ClarificationReaskPolicy(BaseModel):
     router: int = Field(ge=0)
 
 
+# Where a cart quantity may come from: conversation, the selector reads it with the recent
+# conversation in view; this_request, only the caller's own words since the request opened.
+CartQuantitySource = Literal["conversation", "this_request"]
+
+
+class CartPolicy(BaseModel):
+    """Merchant cart conversation choices. Required: the value comes from layered config."""
+
+    model_config = _STRICT
+
+    quantity_source: CartQuantitySource
+
+
 class SecurityPolicy(BaseModel):
     """Attempt-BUDGET knobs — merchant-set within platform CEILINGS (_platform.limits, the
     resolver clamps loudly). Every knob here is a budget where a LARGER value WEAKENS security
@@ -222,6 +235,7 @@ class PolicyConfig(BaseModel):
     # Conversational liveness is separate from SecurityPolicy: Cart questions are not auth
     # evidence, even though all three flows share one tracker implementation.
     clarification_reask_max: ClarificationReaskPolicy
+    cart: CartPolicy
     # Max orders in one cancel batch (F-16.2). The required value comes from base.yaml and its
     # path is safety-locked, so template/override layers cannot tune it. Keeping this REQUIRED
     # prevents a second, silent source-code default from drifting away from the base layer.
@@ -260,6 +274,7 @@ class PolicyConfig(BaseModel):
             support_clarification_reask_max=self.clarification_reask_max.support,
             cart_clarification_reask_max=self.clarification_reask_max.cart,
             router_clarification_reask_max=self.clarification_reask_max.router,
+            cart_quantity_source=self.cart.quantity_source,
             cancel_batch_max=self.cancel_batch_max,
         )
 

@@ -9,6 +9,7 @@ needed; the flow's reasoning fake then decides what happens inside (mutate / pla
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from pathlib import Path
 
@@ -18,9 +19,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END
 from langgraph.types import Command
 from llm_fakes import (
+    CONFORMANT_STRUCTURED_ARGS,
     TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
     TEST_STRUCTURED_OUTPUT_METHOD,
     FakeChatModel,
+    NativeAsyncBlockingFakeChatModel,
 )
 from policy_helpers import make_policy
 from pydantic import ValidationError
@@ -34,6 +37,7 @@ from verification_helpers import make_otp_provider
 
 from agnostic_market.agents._person_question import PERSON_QUESTION
 from agnostic_market.agents.cart import flow as cart_flow
+from agnostic_market.agents.cart.prompt import CART_AMOUNT_READER_PROMPT
 from agnostic_market.agents.engine import ReasoningEngine
 from agnostic_market.agents.frontline import build_frontline_graph
 from agnostic_market.agents.telemetry import InMemoryTelemetrySink, TenantTelemetry
@@ -100,6 +104,7 @@ def _build(
     cart: CartStore | None = None,
     recent_orders: RecentOrderContext | None = None,
     telemetry=None,
+    policy=None,
 ):
     fixture = load_orders_fixture(config_root, "acme_store")
     catalog = FixtureCatalog("acme_store", load_catalog_fixture(config_root, "acme_store"))
@@ -139,7 +144,7 @@ def _build(
             "acme_store", load_payment_instruments_fixture(config_root, "acme_store")
         ),
         profile_store=ProfileStore("acme_store", load_profile_fixture(config_root, "acme_store")),
-        policy=_POLICY,
+        policy=policy or _POLICY,
         lifecycle=caller_context,
         structured_output_method=TEST_STRUCTURED_OUTPUT_METHOD,
         caller_audible_model_text_max_chars=TEST_CALLER_AUDIBLE_MODEL_TEXT_MAX_CHARS,
@@ -602,6 +607,270 @@ async def test_explicit_add_uses_reference_without_treating_it_as_an_offer(
     assert graph.get_state(_CFG).interrupts[0].value == (
         f"Just to confirm: add 2 of {jacket.name} to your cart?"
     )
+
+
+def _jacket_and_key(config_root: Path):
+    products = load_catalog_fixture(config_root, "acme_store").products
+    jacket = next(product for product in products if "jacket" in product.name)
+    return jacket, str(products.index(jacket) + 1)
+
+
+_REQUEST_ONLY = _POLICY.model_copy(update={"cart_quantity_source": "this_request"})
+
+
+def _amount_reader(*answers: list[int]) -> FakeChatModel:
+    """The response model answering as the cart amount reader, one answer per call."""
+    return FakeChatModel(
+        structured_args={
+            **CONFORMANT_STRUCTURED_ARGS,
+            "StatedAmounts": tuple({"amounts": amounts} for amounts in answers),
+        },
+        record_prompts=True,
+    )
+
+
+def _after_a_declined_readback(jacket, text: str) -> dict:
+    """After "Just 1." and a declined readback, a new add request opens on this turn."""
+    turn_id = "add-it-turn"
+    readback = f"Just to confirm: add 1 of {jacket.name} to your cart?"
+    return {
+        "messages": [HumanMessage(content=text, id=turn_id)],
+        "consumed_turn_ids": ("quantity-turn", "decline-turn", turn_id),
+        "conversation": (
+            ConversationEntry(speaker="caller", text="Just 1.", turn_id="quantity-turn"),
+            ConversationEntry(
+                speaker="assistant", text=readback, turn_id="quantity-turn", heard=True
+            ),
+            ConversationEntry(speaker="caller", text="no", turn_id="decline-turn"),
+            ConversationEntry(
+                speaker="assistant",
+                text="Okay, I won't change your cart.",
+                turn_id="decline-turn",
+                heard=True,
+            ),
+            ConversationEntry(speaker="caller", text=text, turn_id=turn_id),
+        ),
+        "product_reference": ProductReference(skus=(jacket.sku,), turn_id="decline-turn"),
+        "active_invocation": ActiveInvocation(
+            request=ModifyCart(operation="add"), opened_turn_id=turn_id
+        ),
+    }
+
+
+async def test_by_default_the_selector_reads_the_amount_with_the_conversation(
+    config_root: Path,
+) -> None:
+    jacket, key = _jacket_and_key(config_root)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": key, "quantity": 1})]]
+    )
+    reader = _amount_reader([])
+    graph, _store, cart = _build(config_root, frontline=reader, reasoning=selector)
+
+    await graph.ainvoke(_after_a_declined_readback(jacket, "Actually, add it."), _CFG)
+
+    assert reader.invoke_count == 0
+    assert graph.get_state(_CFG).interrupts[0].value == (
+        f"Just to confirm: add 1 of {jacket.name} to your cart?"
+    )
+    assert cart.is_empty()
+
+
+async def test_under_this_request_an_amount_the_caller_did_not_state_is_asked_for(
+    config_root: Path,
+) -> None:
+    jacket, key = _jacket_and_key(config_root)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": key, "quantity": 1})]]
+    )
+    reader = _amount_reader([])
+    telemetry = make_session_telemetry("acme_store", "unstated-quantity-session")
+    graph, _store, cart = _build(
+        config_root, frontline=reader, reasoning=selector, telemetry=telemetry, policy=_REQUEST_ONLY
+    )
+
+    out = await graph.ainvoke(_after_a_declined_readback(jacket, "Actually, add it."), _CFG)
+
+    snapshot = graph.get_state(_CFG)
+    assert not snapshot.interrupts
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["quantity"]
+    request = snapshot.values["active_invocation"].request
+    assert request.item == ResolvedCartItemRef(sku=jacket.sku)
+    assert request.quantity is None
+    assert cart.is_empty()
+    assert {"turn_id": "add-it-turn", "operation": "add", "cause": "not_stated"} in [
+        record.attributes
+        for record in telemetry.operational.sink.records
+        if record.event == "cart_quantity_unstated"
+    ]
+
+
+async def test_the_amount_reader_sees_only_the_callers_words_since_the_request_opened(
+    config_root: Path,
+) -> None:
+    products = load_catalog_fixture(config_root, "acme_store").products
+    socks = next(product for product in products if "socks" in product.name)
+    key = str(products.index(socks) + 1)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": key, "quantity": 3})]]
+    )
+    reader = _amount_reader([3])
+    graph, _store, cart = _build(
+        config_root, frontline=reader, reasoning=selector, policy=_REQUEST_ONLY
+    )
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="The merino ones.", id="choice-turn")],
+            "consumed_turn_ids": ("quantity-turn", "open-turn", "choice-turn"),
+            "conversation": (
+                ConversationEntry(speaker="caller", text="Just 1.", turn_id="quantity-turn"),
+                ConversationEntry(
+                    speaker="assistant", text="Okay.", turn_id="quantity-turn", heard=True
+                ),
+                ConversationEntry(
+                    speaker="caller", text="Add three pairs of socks.", turn_id="open-turn"
+                ),
+                ConversationEntry(
+                    speaker="assistant",
+                    text=_CART_CLARIFICATION_LINES["item"],
+                    turn_id="open-turn",
+                    heard=True,
+                ),
+                ConversationEntry(speaker="caller", text="The merino ones.", turn_id="choice-turn"),
+            ),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="add"), opened_turn_id="open-turn"
+            ),
+        },
+        _CFG,
+    )
+
+    # Every caller line of this request, nothing from before it and nothing the assistant said.
+    assert reader._seen_prompts == [
+        f"{CART_AMOUNT_READER_PROMPT}\nThe shopper's words, oldest first:\n"
+        "- Add three pairs of socks.\n- The merino ones."
+    ]
+    assert graph.get_state(_CFG).interrupts[0].value == (
+        f"Just to confirm: add 3 of {socks.name} to your cart?"
+    )
+    assert cart.is_empty()
+
+
+async def test_under_this_request_an_amount_the_reader_could_not_check_is_asked_for(
+    config_root: Path,
+) -> None:
+    jacket, key = _jacket_and_key(config_root)
+    selector = FakeChatModel(
+        scripted_calls=[[("provide_cart_slots", {"candidate_key": key, "quantity": 2})]]
+    )
+    reader = FakeChatModel(raise_transport=True)
+    telemetry = make_session_telemetry("acme_store", "reader-down-session")
+    graph, _store, cart = _build(
+        config_root, frontline=reader, reasoning=selector, telemetry=telemetry, policy=_REQUEST_ONLY
+    )
+
+    out = await graph.ainvoke(_after_a_declined_readback(jacket, "Add two of them."), _CFG)
+
+    events = [(record.event, record.attributes) for record in telemetry.operational.sink.records]
+    assert reader.invoke_count == 1
+    assert not graph.get_state(_CFG).interrupts
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["quantity"]
+    assert (
+        "cart_quantity_unstated",
+        {"turn_id": "add-it-turn", "operation": "add", "cause": "reader_unavailable"},
+    ) in events
+    assert all(event != "turn_failed" for event, _attributes in events)
+    assert cart.is_empty()
+
+
+async def test_under_this_request_a_remove_never_consults_the_amount_reader(
+    config_root: Path,
+) -> None:
+    jacket, _key = _jacket_and_key(config_root)
+    cart = CartStore()
+    cart.add_item(sku=jacket.sku, name=jacket.name, price_usd=jacket.price_usd, quantity=2)
+    selector = FakeChatModel(
+        scripted_calls=[
+            [("provide_cart_slots", {"candidate_key": "1", "quantity": 1})],
+            [("provide_cart_slots", {"candidate_key": "1"})],
+        ]
+    )
+    reader = _amount_reader()
+    telemetry = make_session_telemetry("acme_store", "remove-session")
+    graph, _store, _cart = _build(
+        config_root,
+        frontline=reader,
+        reasoning=selector,
+        cart=cart,
+        telemetry=telemetry,
+        policy=_REQUEST_ONLY,
+    )
+
+    await graph.ainvoke(
+        {
+            "messages": [HumanMessage(content="Remove the jacket.", id="remove-turn")],
+            "consumed_turn_ids": ("remove-turn",),
+            "active_invocation": ActiveInvocation(
+                request=ModifyCart(operation="remove"), opened_turn_id="remove-turn"
+            ),
+        },
+        _CFG,
+    )
+
+    # A remove that carries a quantity is still corrected by validation, as before.
+    assert selector.invoke_count == 2
+    assert reader.invoke_count == 0
+    assert [
+        record.attributes["selector_outcome"]
+        for record in telemetry.operational.sink.records
+        if record.event == "cart_selector_outcome"
+    ] == ["invalid_proposal"]
+    assert graph.get_state(_CFG).interrupts[0].value == (
+        f"Just to confirm: remove {jacket.name} from your cart?"
+    )
+
+
+async def test_under_this_request_a_turn_without_a_proposed_amount_never_waits_for_the_reader(
+    config_root: Path,
+) -> None:
+    jacket, key = _jacket_and_key(config_root)
+    selector = FakeChatModel(scripted_calls=[[("provide_cart_slots", {"candidate_key": key})]])
+    reader = NativeAsyncBlockingFakeChatModel()
+    graph, _store, cart = _build(
+        config_root, frontline=reader, reasoning=selector, policy=_REQUEST_ONLY
+    )
+
+    # This reader never answers, so waiting for it would run past the timeout.
+    out = await asyncio.wait_for(
+        graph.ainvoke(_after_a_declined_readback(jacket, "Add a jacket."), _CFG), timeout=3
+    )
+
+    assert _ai_texts(out)[-1] == _CART_CLARIFICATION_LINES["quantity"]
+    assert reader.started.is_set()
+    await asyncio.wait_for(reader.cancelled.wait(), timeout=1)
+    assert cart.is_empty()
+
+
+async def test_under_this_request_a_failed_selector_call_cancels_the_amount_reader(
+    config_root: Path,
+) -> None:
+    jacket, _key = _jacket_and_key(config_root)
+    reader = NativeAsyncBlockingFakeChatModel()
+    graph, _store, cart = _build(
+        config_root,
+        frontline=reader,
+        reasoning=FakeChatModel(raise_transport=True),
+        policy=_REQUEST_ONLY,
+    )
+
+    await asyncio.wait_for(
+        graph.ainvoke(_after_a_declined_readback(jacket, "Add two jackets."), _CFG), timeout=3
+    )
+
+    assert reader.started.is_set()
+    await asyncio.wait_for(reader.cancelled.wait(), timeout=1)
+    assert cart.is_empty()
 
 
 @pytest.mark.parametrize(

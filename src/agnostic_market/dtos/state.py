@@ -24,6 +24,7 @@ from pydantic import (
     model_validator,
 )
 
+from agnostic_market.dtos.config import CartQuantitySource
 from agnostic_market.dtos.confirmation import ProfileField, RefundDestination
 from agnostic_market.dtos.money import UsdAmount
 from agnostic_market.dtos.orchestration import (
@@ -135,6 +136,8 @@ class PolicyContext(BaseModel):
     support_clarification_reask_max: int = Field(ge=0)
     cart_clarification_reask_max: int = Field(ge=0)
     router_clarification_reask_max: int = Field(ge=0)
+    # Where a cart quantity may come from (config `policies.cart.quantity_source`).
+    cart_quantity_source: CartQuantitySource
     # Max orders in one cancel batch — a SAFETY bound (a big batch must fit the LangGraph
     # recursion/step budget), NOT a merchant knob: it is `_safety_locked` in config, so no
     # tenant can touch it. Over-cap asks the caller to narrow, never silently takes the first
