@@ -354,6 +354,7 @@ def _merchant_config(provider: str, model: str) -> MerchantConfig:
                     "cart": 2,
                     "router": 2,
                 },
+                "cart": {"quantity_source": "conversation"},
             },
             "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
             "integration": {

@@ -37,6 +37,7 @@ def _valid_merchant_dict() -> dict:
                 "cart": 2,
                 "router": 2,
             },
+            "cart": {"quantity_source": "conversation"},
         },
         "prompts": {"persona_ref": "prompt://m1/persona@sha256-abc"},
         "integration": {
@@ -185,7 +186,18 @@ def test_to_policy_context_carries_every_enforced_value() -> None:
     assert context.support_clarification_reask_max == 2
     assert context.cart_clarification_reask_max == 2
     assert context.router_clarification_reask_max == 2
+    assert context.cart_quantity_source == "conversation"
     assert context.cancel_batch_max == 10
+
+
+@pytest.mark.parametrize("unknown", ("this_turn", "caller_turns", "", "THIS_REQUEST"))
+def test_cart_quantity_source_accepts_only_the_two_settings(unknown: str) -> None:
+    config = _valid_merchant_dict()
+    config["policies"]["cart"] = {"quantity_source": "this_request"}
+    assert MerchantConfig.model_validate(config).policies.cart.quantity_source == "this_request"
+    config["policies"]["cart"] = {"quantity_source": unknown}
+    with pytest.raises(ValidationError):
+        MerchantConfig.model_validate(config)
 
 
 def test_security_policy_defaults() -> None:

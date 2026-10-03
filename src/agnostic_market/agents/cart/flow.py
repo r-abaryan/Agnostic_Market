@@ -7,6 +7,7 @@ keys, arithmetic, or caller-visible outcomes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -16,7 +17,7 @@ from functools import partial
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ConfigDict, Field
@@ -29,7 +30,11 @@ from agnostic_market.agents._toolcalls import (
     current_turn_called,
     unknown_tool_result,
 )
-from agnostic_market.agents.cart.prompt import compose_cart_capability_prompt
+from agnostic_market.agents.cart.prompt import (
+    CART_AMOUNT_READER_PROMPT,
+    compose_amount_reader_message,
+    compose_cart_capability_prompt,
+)
 from agnostic_market.agents.clarification import (
     advance_clarification,
     invocation_clarification_owner,
@@ -56,6 +61,7 @@ from agnostic_market.dtos.confirmation import (
     ToolConfirmationPolicy,
     validate_confirmation_rendering,
 )
+from agnostic_market.dtos.llm import StructuredOutputMethod
 from agnostic_market.dtos.orchestration import (
     CartItemChoices,
     CartItemQuery,
@@ -140,6 +146,30 @@ class _ProposeSlots(BaseModel):
     quantity: int | None = Field(default=None, strict=True, ge=0)
 
 
+class StatedAmounts(BaseModel):
+    """The amounts the shopper's words state."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    amounts: list[int] = Field(
+        description="Each amount the shopper stated, as a whole number; empty when none."
+    )
+
+
+def _request_caller_lines(
+    state: ReasoningState, opened_turn_id: str, current: str
+) -> tuple[str, ...]:
+    """The caller's own lines since the request opened, oldest first; never the assistant's."""
+    turns = state.consumed_turn_ids
+    earlier = set(turns[turns.index(opened_turn_id) : -1])
+    lines = [
+        entry.text
+        for entry in state.conversation
+        if entry.speaker == "caller" and entry.turn_id in earlier
+    ]
+    return (*lines, current)
+
+
 _MutationOperation = Literal["add", "remove", "set_quantity"]
 
 
@@ -176,11 +206,33 @@ def build_cart_nodes(
     session_state: SessionStateCoordinator,
     run_sync_effect: SyncEffectExecutor,
     *,
+    response_model: BaseChatModel,
+    structured_output_method: StructuredOutputMethod,
     display_name: str,
     telemetry: TelemetryRecorder,
 ) -> CartNodes:
     """Build the cart flow's nodes, closed over the session's stores + policy (§A5:
     tenant/policy bound in code at build time, never carried in conversation state)."""
+
+    amount_reader = response_model.with_structured_output(
+        StatedAmounts, method=structured_output_method
+    )
+
+    async def read_stated_amounts(caller_lines: tuple[str, ...]) -> frozenset[int] | None:
+        """The amounts the caller's own words state; None when the reader is unavailable."""
+        try:
+            answer = await amount_reader.ainvoke(
+                [
+                    SystemMessage(CART_AMOUNT_READER_PROMPT),
+                    HumanMessage(compose_amount_reader_message(caller_lines)),
+                ]
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("cart amount reader unavailable: %s", type(exc).__name__)
+            return None
+        return frozenset(answer.amounts) if isinstance(answer, StatedAmounts) else None
 
     @tool
     def request_cart_clarification() -> str:
@@ -511,98 +563,145 @@ def build_cart_nodes(
             current_user_message = state.current_committed_user_message()
             if current_user_message is None:
                 return clarify("item" if selecting_item else "quantity")
+            # Under this_request a proposed amount stands only if a reader that sees nothing but
+            # the caller's own words for this request finds it there.
+            guarded = (
+                policy.cart_quantity_source == "this_request" and request.operation != "remove"
+            )
+            content = current_user_message.content
+            # The reader runs beside the selector. It is waited for only when the selector
+            # proposes an amount, and cancelled however this node ends.
+            reading = (
+                asyncio.create_task(
+                    read_stated_amounts(
+                        _request_caller_lines(
+                            state,
+                            invocation.opened_turn_id,
+                            content if isinstance(content, str) else "",
+                        )
+                    )
+                )
+                if guarded
+                else None
+            )
             messages: list = [prompt, current_user_message]
             expected_tool = proposal_tool.name
-            for _attempt in range(2):
-                response = await capability_model.ainvoke(messages)
-                if not response.tool_calls:
-                    record_selector_outcome("no_tool_call", _attempt + 1)
-                    return clarify("item" if selecting_item else "quantity")
-                new_messages.append(response)
-                ack_extra_tool_calls(response, new_messages)
-                call = response.tool_calls[0]
-                if call["name"] == leave_cart.name:
-                    return _leave_result(new_messages, call["id"])
-                if call["name"] == request_cart_clarification.name:
-                    record_selector_outcome("clarification_requested", _attempt + 1)
-                    new_messages.append(
-                        ToolMessage("cart clarification requested", tool_call_id=call["id"])
-                    )
-                    return clarify("item" if selecting_item else "quantity")
-                if call["name"] == expected_tool:
-                    try:
-                        proposal = _ProposeSlots.model_validate(call["args"])
-                        if proposal.candidate_key is None and proposal.quantity is None:
-                            raise ValueError("proposal supplied no missing field")
-                        if proposal.candidate_key is not None and not selecting_item:
-                            raise ValueError("item is already fixed")
-                        if proposal.quantity is not None and request.quantity is not None:
-                            raise ValueError("quantity is already fixed")
-                        if proposal.candidate_key is None:
-                            item = request.item
-                        else:
-                            chosen = by_key.get(proposal.candidate_key)
-                            if chosen is None:
-                                raise ValueError("unknown candidate key")
-                            item = ResolvedCartItemRef(sku=chosen.sku)
-                        quantity = (
-                            request.quantity if proposal.quantity is None else proposal.quantity
-                        )
-                        if request.operation == "add" and quantity is not None and quantity < 1:
-                            raise ValueError("add quantity must be positive")
-                        updated = ModifyCart(
-                            operation=request.operation,
-                            item=item,
-                            quantity=quantity,
-                        )
-                    except (TypeError, ValueError):
-                        record_selector_outcome("invalid_proposal", _attempt + 1)
+            try:
+                for _attempt in range(2):
+                    response = await capability_model.ainvoke(messages)
+                    if not response.tool_calls:
+                        record_selector_outcome("no_tool_call", _attempt + 1)
+                        return clarify("item" if selecting_item else "quantity")
+                    new_messages.append(response)
+                    ack_extra_tool_calls(response, new_messages)
+                    call = response.tool_calls[0]
+                    if call["name"] == leave_cart.name:
+                        return _leave_result(new_messages, call["id"])
+                    if call["name"] == request_cart_clarification.name:
+                        record_selector_outcome("clarification_requested", _attempt + 1)
                         new_messages.append(
-                            ToolMessage(
-                                "The proposal was invalid. Send only fields the caller "
-                                "supplied that are still missing.",
-                                tool_call_id=call["id"],
+                            ToolMessage("cart clarification requested", tool_call_id=call["id"])
+                        )
+                        return clarify("item" if selecting_item else "quantity")
+                    if call["name"] == expected_tool:
+                        try:
+                            proposal = _ProposeSlots.model_validate(call["args"])
+                            if proposal.candidate_key is None and proposal.quantity is None:
+                                raise ValueError("proposal supplied no missing field")
+                            if proposal.candidate_key is not None and not selecting_item:
+                                raise ValueError("item is already fixed")
+                            if proposal.quantity is not None and request.quantity is not None:
+                                raise ValueError("quantity is already fixed")
+                            if proposal.candidate_key is None:
+                                item = request.item
+                            else:
+                                chosen = by_key.get(proposal.candidate_key)
+                                if chosen is None:
+                                    raise ValueError("unknown candidate key")
+                                item = ResolvedCartItemRef(sku=chosen.sku)
+                            stated = proposal.quantity
+                            unstated = None
+                            if reading is not None and stated is not None:
+                                # An amount the reader did not find or could not read is asked for.
+                                amounts = await reading
+                                if amounts is None:
+                                    unstated = "reader_unavailable"
+                                elif stated not in amounts:
+                                    unstated = "not_stated"
+                                if unstated is not None:
+                                    stated = None
+                            quantity = request.quantity if stated is None else stated
+                            if request.operation == "add" and quantity is not None and quantity < 1:
+                                raise ValueError("add quantity must be positive")
+                            updated = ModifyCart(
+                                operation=request.operation,
+                                item=item,
+                                quantity=quantity,
                             )
+                        except (TypeError, ValueError):
+                            record_selector_outcome("invalid_proposal", _attempt + 1)
+                            new_messages.append(
+                                ToolMessage(
+                                    "The proposal was invalid. Send only fields the caller "
+                                    "supplied that are still missing.",
+                                    tool_call_id=call["id"],
+                                )
+                            )
+                            messages = [prompt, current_user_message, *new_messages]
+                            continue
+                        new_messages.append(
+                            ToolMessage("cart request updated", tool_call_id=call["id"])
+                        )
+                        if unstated is not None:
+                            telemetry.record(
+                                {
+                                    "event": "cart_quantity_unstated",
+                                    "turn_id": state.consumed_turn_ids[-1],
+                                    "operation": request.operation,
+                                    "cause": unstated,
+                                }
+                            )
+                        retain(updated)
+                        slot_complete = request.is_slot_complete()
+                        telemetry.record(
+                            {
+                                "event": "cart_slot_proposal",
+                                "turn_id": state.consumed_turn_ids[-1],
+                                "operation": request.operation,
+                                "model_item_supplied": proposal.candidate_key is not None,
+                                "model_quantity_supplied": proposal.quantity is not None,
+                                "retained_item_resolved": isinstance(
+                                    request.item, ResolvedCartItemRef
+                                ),
+                                "retained_quantity_present": request.quantity is not None,
+                                "slot_complete": slot_complete,
+                            }
+                        )
+                        if not slot_complete:
+                            missing_item = request.item is None or isinstance(
+                                request.item, CartItemChoices
+                            )
+                            return clarify("item" if missing_item else "quantity")
+                        break
+                    if call["name"] not in {
+                        expected_tool,
+                        request_cart_clarification.name,
+                        leave_cart.name,
+                    }:
+                        record_selector_outcome("unexpected_tool", _attempt + 1)
+                        new_messages.append(
+                            unknown_tool_result(call["id"], leave_tool=leave_cart.name)
                         )
                         messages = [prompt, current_user_message, *new_messages]
                         continue
-                    new_messages.append(
-                        ToolMessage("cart request updated", tool_call_id=call["id"])
+                    raise ValueError(
+                        f"cart capability entry: bound tool has no handler: {call['name']!r}"
                     )
-                    retain(updated)
-                    slot_complete = request.is_slot_complete()
-                    telemetry.record(
-                        {
-                            "event": "cart_slot_proposal",
-                            "turn_id": state.consumed_turn_ids[-1],
-                            "operation": request.operation,
-                            "model_item_supplied": proposal.candidate_key is not None,
-                            "model_quantity_supplied": proposal.quantity is not None,
-                            "retained_item_resolved": isinstance(request.item, ResolvedCartItemRef),
-                            "retained_quantity_present": request.quantity is not None,
-                            "slot_complete": slot_complete,
-                        }
-                    )
-                    if not slot_complete:
-                        missing_item = request.item is None or isinstance(
-                            request.item, CartItemChoices
-                        )
-                        return clarify("item" if missing_item else "quantity")
-                    break
-                if call["name"] not in {
-                    expected_tool,
-                    request_cart_clarification.name,
-                    leave_cart.name,
-                }:
-                    record_selector_outcome("unexpected_tool", _attempt + 1)
-                    new_messages.append(unknown_tool_result(call["id"], leave_tool=leave_cart.name))
-                    messages = [prompt, current_user_message, *new_messages]
-                    continue
-                raise ValueError(
-                    f"cart capability entry: bound tool has no handler: {call['name']!r}"
-                )
-            else:
-                return clarify("item" if selecting_item else "quantity")
+                else:
+                    return clarify("item" if selecting_item else "quantity")
+            finally:
+                if reading is not None:
+                    reading.cancel()
 
         if not isinstance(request.item, ResolvedCartItemRef):
             raise TypeError("complete cart mutation requires a resolved item")

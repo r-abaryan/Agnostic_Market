@@ -2550,9 +2550,11 @@ def test_answer_owner_uses_the_required_configured_structured_transport(config_r
 
     _graph(config_root, response_model, structured_output_method=configured_method)
 
-    # Three typed owners now share the one configured transport: the bounded answer, the order
-    # target proposal, and the catalog answer that carries what it offered.
+    # Four typed owners now share the one configured transport: the cart amount reader, the
+    # bounded answer, the order target proposal, and the catalog answer that carries what it
+    # offered.
     assert response_model.structured_methods == (
+        configured_method,
         configured_method,
         configured_method,
         configured_method,

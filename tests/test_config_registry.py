@@ -49,6 +49,7 @@ _BASE_BODY = (
     "policies:\n"
     "  cancel_batch_max: 10\n"
     "  clarification_reask_max: { identity: 1, support: 2, cart: 2, router: 2 }\n"
+    "  cart: { quantity_source: conversation }\n"
 )
 
 _TEMPLATE_BODY = """\
@@ -116,6 +117,14 @@ def test_both_repository_templates_resolve_the_closed_llm_role_map(
             "anthropic",
             "claude-opus-4-8",
         )
+
+
+def test_shipped_merchants_keep_cart_quantities_with_the_selector(config_root: Path) -> None:
+    registry = ConfigRegistry(config_root).load()
+
+    # base.yaml keeps today's behaviour; a merchant opts into this_request in its own override.
+    for merchant_id in ("acme_store", "demo_shop"):
+        assert registry.get(merchant_id).config.policies.cart.quantity_source == "conversation"
 
 
 @pytest.mark.parametrize(

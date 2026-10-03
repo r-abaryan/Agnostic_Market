@@ -94,7 +94,7 @@ runtime:
   semantic_router_timeout_seconds: 10.0
 
 # Platform-owned structural policy values. This partial block deep-merges with the category
-# template and merchant override; the safety lock above prevents either later layer changing it.
+# template and merchant override; the safety lock above freezes only the keys it lists.
 policies:
   cancel_batch_max: 10
   clarification_reask_max:
@@ -102,6 +102,11 @@ policies:
     support: 2
     cart: 2
     router: 2
+  # Merchant-tunable: where a cart quantity may come from. conversation lets the selector read it
+  # with the recent conversation in view; this_request asks "How many?" unless the caller's own
+  # words for this request state it, so an earlier number never carries over.
+  cart:
+    quantity_source: conversation
 
 # Call-start AI disclosure (COMPLIANCE 2 / EU AI Act Art. 50(1), applies 2 Aug 2026).
 # WORDING is merchant-overridable (brand/voice/locale); WHETHER it plays is code
