@@ -52,24 +52,39 @@ implemented capabilities.
 
 ```text
 src/agnostic_market/
-  agents/       engine, semantic routing, capability registry, and the frontline, cart,
-                support and identity flows
-  commerce/     service ports, fixture adapters, effects, receipts
-  config/       base, template, merchant, policy and provider resolution
-  dtos/         strict Pydantic state, routing, confirmation and money contracts
-  durability/   encryption, migrations, session registry, leases
-  llm/          provider gateway and model conformance
-  voice/        tenant admission, LiveKit pipeline, disclosure
-config/         base, merchant, template, fixtures, eval and qualification artifacts
-scripts/        worker, evaluators, smoke checks, PostgreSQL harness
-tests/          synthetic unit, integration, adversarial and lifecycle tests
+  application.py     tenant services and application-session composition
+  checkpoints.py     strict checkpoint namespace, schema, serializer, and I/O boundary
+  session.py         caller authority, lifecycle, close, and principal transition
+  agents/
+    engine.py        turn admission, semantic routing, replay, and recovery orchestration
+    capabilities.py  immutable typed capability registry
+    routing.py       recognizer-neutral semantic routing boundary
+    frontline/       dispatcher, typed read owners, and caller-facing graph assembly
+    cart/            cart mutation and placement flow
+    support/         cancel, refund, return, and profile-change flow
+    identity/        factor-bound identity flow
+  commerce/          service ports, fixture adapters, effects, receipts, and renderers
+  config/            validated base, template, merchant, policy, and provider resolution
+  dtos/              strict Pydantic state, routing, confirmation, and money contracts
+  durability/        encryption, migrations, session registry, leases, and revisioned state
+  llm/               provider gateway and model conformance
+  management/        merchant workbench API, contracts, datasets, and simulations
+  secrets/           environment-backed secret resolution
+  tenancy/           immutable tenant identity and resolution
+  voice/             trusted tenant admission, LiveKit pipeline, disclosure, speech transport
+config/              base, merchant, template, fixtures, eval, platform, telemetry, qualification,
+                     and conformance artifacts
+scripts/             worker, evaluators, smoke checks, recovery tools, PostgreSQL harness
+tests/               synthetic unit, integration, adversarial, lifecycle, backend contracts
+assets/audio/        the pipeline thinking beep and the latency harness utterances
+.github/workflows/   locked verification workflow
 ```
 
 ## Development setup
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). Docker is needed only for the
-PostgreSQL harness, Node 20+ only for the browser-client tests, and provider credentials only for
-voice and live evaluation.
+PostgreSQL harness (native binaries and a remote DSN also work), Node 20+ only for the
+browser-client tests, and provider credentials only for voice and live evaluation.
 
 ```bash
 uv sync --frozen
@@ -77,6 +92,10 @@ uv run --no-sync ruff format --check .
 uv run --no-sync ruff check .
 uv run --no-sync pytest -m "not postgres"   # offline: no API keys, no network
 ```
+
+The offline suite assembles a complete synthetic configuration from committed fixture and test
+artifacts. Runtime voice sessions require the fixture families under `config/fixtures/` until
+durable service adapters replace them.
 
 ### Merchant workbench
 
