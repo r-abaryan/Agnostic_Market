@@ -68,8 +68,7 @@ tests/          synthetic unit, integration, adversarial and lifecycle tests
 ## Development setup
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). Docker is needed only for the
-PostgreSQL harness, Node 20+ only for the browser-client tests, and provider credentials only for
-voice and live evaluation.
+PostgreSQL harness, Node 20+ only for the browser-client tests, and provider credentials only for voice and live evaluation.
 
 ```bash
 uv sync --frozen
